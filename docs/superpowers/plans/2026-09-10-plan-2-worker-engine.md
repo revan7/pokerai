@@ -6,14 +6,18 @@
 
 **Architecture:** `solver-worker` is an AGPL process with three threads (`control` reads stdin in every state, `writer` serializes stdout, `executor` owns the `PostFlopGame` and the rayon pool); it only depends on `proto` and the vendored library, and every request runs Building -> Solving -> Extracting with cancel checkpoints between steps. `engine` owns the worker process behind the `WorkerLink` trait (a `ProcessWorker` in production, a scripted `FakeWorker` with a `FakeClock` in tests), materializes every tree itself with the pinned §4.6 rules (the worker only cross-checks), and assembles `Recommendation`s under a `DecisionIdentity` that every event carries. `bench` drives the worker through the engine's link on fixed spot files and writes the §13.5 report.
 
-**Tech Stack:** Rust 2021 (stable 1.95, GNU toolchain for this plan), vendored `postflop-solver` at `9d1509fe` (features `bincode`, `rayon`, `zstd`), `serde`/`serde_json`, `sha2 0.10`, `hex 0.4`, `thiserror 1`, `rayon 1` (worker only), `libc`-free Win32 FFI via `extern "system"` declarations, Python 3.12 + `pytest` for `tools/gen_worker_fixtures.py`.
+**Tech Stack:** Rust 2021 on `stable-x86_64-pc-windows-msvc` (1.95), pinned repo-wide by plan 1 Task 1's `rust-toolchain.toml`; ordinary `cargo` commands, no per-plan toolchain override. Vendored `postflop-solver` at `9d1509fe` (features `bincode`, `rayon`, `zstd`), `serde`/`serde_json`, `sha2`, `hex`, `thiserror`, `rayon 1` (worker only) — all from `[workspace.dependencies]`; `libc`-free Win32 FFI via `extern "system"` declarations; Python 3.12 + `pytest` for `tools/gen_worker_fixtures.py`.
 
-**Spec:** `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md` (revision 5), sections 2, 3.1-3.7, 4.4-4.6, 5, 6, 7, 10.1-10.3, 10.6, 12, 13.0, 13.2, 13.3, 13.5. Decisions: `docs/design/2026-09-10-design-outline.md` §0b. Measured facts: `docs/research/R8-solver-bench.md` §2-§4 and addendum A.5.
+**Spec:** `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md` (revision 6), sections 2, 3.1-3.7, 4.4-4.6, 5, 6, 7, 10.1-10.3, 10.6, 12, 13.0, 13.2, 13.3, 13.5. Decisions: `docs/design/2026-09-10-design-outline.md` §0b. Measured facts: `docs/research/R8-solver-bench.md` §2-§4 and addendum A.5. Cross-plan resolutions: `docs/research/REVIEW-cross-plan.md` sections 1-5.
 
 ## Global Constraints
 
 - Pinned upstream commit `9d1509fe5077d019825f833eed04b16d342dfda1`; features default (`bincode` + `rayon`) plus `zstd`; `custom-alloc` never used. Patches: (1) `Cargo.toml` pins `bincode = "=2.0.0-rc.3"`, `bincode_derive = "=2.0.0-rc.3"`; (2) `src/action_tree.rs` lines 393/396/408 `&*(*node).children[i].lock()` -> `&*(&(*node).children)[i].lock()`.
 - AVX2 is a build requirement: `.cargo/config.toml` (plan 1) sets `-C target-feature=+avx2` for both Windows targets; `solver-worker/build.rs` fails when `CARGO_CFG_TARGET_FEATURE` lacks `avx2`; the engine refuses a worker whose `ready.build_features` lacks `avx2` (`EngineError("worker built without AVX2")`).
+- Toolchain: the workspace is pinned to `stable-x86_64-pc-windows-msvc` by plan 1 Task 1's `rust-toolchain.toml`. This plan uses ordinary `cargo` commands and never sets a per-plan toolchain override. Plan 1's V1 check builds the vendored solver on MSVC and, if that fails or is more than 25% slower than the GNU build, falls back to building **only** `solver-worker` with `+stable-x86_64-pc-windows-gnu` (spec §3.6); that check is referenced, never duplicated here. If it selects the GNU fallback, the only change to this plan is the `cargo build`/`cargo test` invocations for `-p solver-worker`, which then carry `+stable-x86_64-pc-windows-gnu`; every engine, bench and workspace command stays MSVC.
+- Dependency versions come from plan 1's `[workspace.dependencies]`: every crate this plan creates writes `serde.workspace = true`, `serde_json.workspace = true`, `sha2.workspace = true`, `hex.workspace = true`, `thiserror.workspace = true`, plus `version.workspace = true`, `edition.workspace = true`, `license.workspace = true` (except `solver-worker`, which declares `license = "AGPL-3.0"` explicitly). Never a second `sha2` or `thiserror` major (cross-plan M18/R6).
+- Workspace membership: plan 1's root manifest uses `members = ["crates/*"]`, so `crates/engine` (Task 2) and `crates/bench` (Task 5) become members the moment their manifests exist. `solver-worker` is outside `crates/`, so Task 7 adds `"solver-worker"` to `members`. Task 1 adds only `exclude = ["third_party/postflop-solver"]` (cross-plan D9). No task ever lists a member whose manifest does not yet exist.
+- `background` is a per-request parameter of the solve path (`SolvePlan.background` -> `SolveRequest.background`), never an engine invariant. This plan exercises only `false`; plan 4's pre-solver sends `true` with `deadline_ms: 600000` (spec §10.5, cross-plan R2).
 - `solver-worker` is `license = "AGPL-3.0"`; every other crate is `MIT OR Apache-2.0`. `solver-worker` depends only on `proto` plus the vendored solver; no crate depends on `solver-worker`. Dependency direction `proto` <- `core-*` <- `engine` <- `bench`.
 - Money: integer chips (`u32`), rake cap `cap_mchips` (thousandths of a chip, `f64` chips only at the library boundary), EV `f32` chips, `ev_bb = ev_chips / bb_chips` at render time only; `pot + stacks < 2^31` else `EngineError`.
 - Protocol (§4.5): UTF-8 JSON Lines, `#[serde(tag = "type")]`, lowercase tags, unknown fields rejected, ids decimal strings; request line <= 1 MiB, result line <= 16 MiB, <= 100,000 exported nodes; `proto_version` 3, `adapter_version` 1; failure codes exactly `invalid_request`, `tree_mismatch`, `tree_too_large`, `out_of_memory`, `lock_mismatch`, `no_iteration`, `internal`.
@@ -23,28 +27,31 @@
 - Deadlines (§7): from monotonic `t0`: first attempt `t0 + 2 s` river, `t0 + 6 s` turn; final delivery `t0 + 15 s` (river, turn); worker `deadline_ms = remaining - 100 ms - 50 ms` at send time; extraction margin river/turn 200 ms (flop 600 ms); heartbeat: no `progress` for 5 s in `Solving` fails the worker; cancel `ack` <= 50 ms, kill after 1.5 s without `result{cancelled}`; watchdog emits at `final delivery - 100 ms`; startup timeout 5 s, one retry, then `EngineError`.
 - Tree rules (§4.6): action order Fold, Check, Call, bets/raises ascending by `to`, AllIn; `rules_version` 3; `merging_threshold` 0.0; donk menus on turn and river are the explicit empty list; `matched` and `pot` accumulate from the tree root; wager cap on non-all-in wagers per street with the observed prefix never removed.
 - Headline (§4.4): highest EV only when every action has `ev_bb` (ties by higher frequency, then menu order), else highest-frequency headline only when every action has `frequency` and `unresolved_mass == 0`, else none. Reasons accumulate and are never removed. Exploitability compared with the target in raw chips.
-- Commits: one per task, `feat(<crate>): ...` / `test(<crate>): ...` / `chore: ...`, trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`. `cargo test --workspace` green after every task. Rust edition 2021; `thiserror` for error enums; `rayon` only in the worker; engine threads are std threads.
+- Commits: one per task, `feat(<crate>): ...` / `test(<crate>): ...` / `chore: ...`, trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`. Rust edition 2021; `thiserror` for error enums; `rayon` only in the worker; engine threads are std threads.
+- **Per-task green command: `cargo test --workspace --release`.** It must pass at the end of every task, with no `--skip` and no known-failing test left in the tree. Release is mandatory because the vendored library is about 30x slower in debug and §13.2's timing assertions assume optimized code; the root manifest additionally carries `[profile.dev.package.postflop-solver] opt-level = 3` (Task 7) so an ad-hoc debug run is not pathological. Any test that needs an artifact built by a `cargo build` step (the `solver-worker.exe` used by `crates/engine/tests/worker_link.rs`) discovers it through `POKERAI_WORKER` or the standard target directory and `#[ignore]`s itself when the binary is absent, so the workspace command never fails on a missing artifact.
 
 ---
 
-## Interfaces consumed from plan 1 (assumed signatures)
+## Interfaces consumed from plan 1 (resolved signatures)
 
-Plan 1 is written in parallel. Every name below is the spec's (§3.5, §4.1-4.6); this plan imports them as written. If plan 1 spelled a name differently, the first task that touches it adjusts the `use` line; the semantics are fixed by the spec.
+These are the **resolved** names of `docs/research/REVIEW-cross-plan.md` section 1 (items M1-M9, M18, M21, Or4, Or6), which plan 1 is being revised to produce. They are not assumptions: import them exactly as written. Every difference from the previous draft of this plan is listed in `docs/research/PLAN-2-CHANGELOG-1.md`.
 
-| Crate | Item | Assumed signature |
+| Crate | Item | Resolved signature |
 |---|---|---|
-| `proto` | cards | `Card(pub u8)` with `Card::rank(self) -> u8`, `Card::suit(self) -> u8`, `Card::new(rank, suit)`, `Card::parse(&str) -> Result<Card, ProtoError>`, `Display` as `"As"`; serde as the two-character string |
+| `proto` | cards | `Card(pub u8)` with `Card::rank(self) -> u8`, `Card::suit(self) -> u8`, `Card::new(rank, suit)`, `impl FromStr for Card { type Err = CardParseError; }` and the convenience `Card::parse(s: &str) -> Result<Card, CardParseError>` (plan 1 Task 2, cross-plan M2); `Display` as `"As"`; serde as the two-character string. There is no `ProtoError` — error text goes through `CardParseError` |
 | `proto` | combos | `ComboIndex = u16`; `combo_index(a: Card, b: Card) -> ComboIndex` (`hi*(hi-1)/2 + lo`); `combo_cards(i: ComboIndex) -> [Card; 2]` (`[lo, hi]`); `Range1326(pub [f32; 1326])` with `Clone`, `PartialEq`, serde as a JSON array of exactly 1326 finite numbers |
 | `proto` | enums | `Street::{Preflop, Flop, Turn, River}` (serde lowercase, `Ord`), `Seat(pub u8)`, `Action::{Fold, Check, Call, Bet{to: u32}, Raise{to: u32}, AllIn{to: u32}}` (serde `tag = "kind"`, lowercase: `{"kind":"allin","to":100}`), `LegalAction::{Fold, Check, Call{cost}, Bet{min_to, max_to}, Raise{min_to, max_to}, AllIn{to}}` |
-| `proto` | state | `GameConfig`, `SolverPrefs { threads: u8, target_bp: u16, flop_budget_s: u8 }`, `Rake::{PotRake{rate: f32, cap_mchips: u32, no_flop_no_drop: bool}, TimeCharge}`, `HandConfig`, `HandState`, `Derived`, `StreetRootSnapshot`, `SolveInput { root, ranges: [Range1326; 2], tree: EffectiveTree, target_bp: u16 }` |
-| `proto` | tree | `EffectiveTree { rules_version: u16, template_id: String, root_street: Street, menus: BTreeMap<Street, PlayerMenus>, add_allin_threshold: f32, force_allin_threshold: f32, merging_threshold: f32, wager_cap: u8, inserted: Vec<(ChipPath, String, Action)>, materialized: Vec<MaterializedNode> }`; `PlayerMenus { oop: SideMenu, ip: SideMenu, donk: Option<Vec<MenuSize>> }` (`donk` serde default `None`); `SideMenu { bet: Vec<MenuSize>, raise: Vec<MenuSize> }`; `MenuSize::{Pot(f32), AllIn}` untagged (`0.5` / `"a"`; for `raise` the number is a multiple of the facing wager); `MaterializedNode { path: OrdinalPath, street: Street, actor: String, actions: Vec<Action>, terminal_pots: Vec<Option<u32>> }`; `OrdinalPath = Vec<u8>`; `ChipPath = Vec<Action>`; all with `Clone`, `PartialEq`, `Debug`, serde |
-| `proto` | results | `DecisionIdentity`, `Coverage`, `ApproxReason`, `UnsupportedReason`, `Unavailable`, `ActionAdvice`, `Availability`, `EquityEstimate`, `EquityMethod::{Exact, MonteCarlo{samples, std_err}}`, `EquitySummary`, `PotShares`, `Assumptions`, `ExperimentalHu`, `Recommendation`, `Phase::{Fast, Provisional, Final}`, `RecommendationEvent` exactly as §4.4 |
-| `proto::worker` | messages | `EngineMessage::{Solve(SolveRequest), Lock(LockRequest), Cancel{id, target}, Shutdown{id}}` and `WorkerMessage::{Ready(Ready), Ack{id, status: AckStatus, reason: Option<String>, replaced: Option<bool>}, Progress{id, stage: Stage, iterations: u32, exploitability_chips: Option<f32>, elapsed_ms: u32, memory_bytes: u64}, Result{id, status: ResultStatus, elapsed_ms: u32, solution: Option<StreetSolution>, error: Option<WorkerError>}}`, both `#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]`; `SolveRequest` with the §4.5 `solve` fields; `LockRequest { id, spot, locks: Vec<NodeLock> }`; `Ready { proto_version: u16, solver_commit: String, adapter_version: u16, threads: u8, build_features: Vec<String>, cpu_features: Vec<String>, capabilities: Vec<String> }`; `AckStatus::{Accepted, Staged, Rejected, AlreadyFinished, UnknownTarget}` and `ResultStatus::{Ok, BestSoFar, Cancelled, Error}` (`rename_all = "snake_case"`); `Stage::{Building, Solving, Extracting}`; `WorkerError`, `StreetSolution`, `NodeStrategy`, `NodeLock` as §4.5; constants `PROTO_VERSION: u16 = 3`, `SOLVER_COMMIT: &str`, `ADAPTER_VERSION: u16 = 1` |
-| `proto::worker` | validation | `validate_solution(sol: &StreetSolution, materialized: &[MaterializedNode]) -> Result<Vec<OrdinalPath>, String>` (the §4.5 matrix rules; returns the resolved ordinal path of every node in `nodes` order) |
-| `core-model` | state | `begin_hand(&HandConfig, BeginHand { button: Seat, hero: Seat, hero_cards: Option<[Card; 2]>, dealt: Vec<Seat>, stacks: Vec<u32> }) -> Result<HandState, RulesError>`, `apply_action(&HandState, Action) -> Result<HandState, RulesError>`, `set_board(&HandState, &[Card]) -> Result<HandState, RulesError>`, `derive(&HandState) -> Derived`, `street_root(&HandState) -> Result<StreetRootSnapshot, RootError>` with `RootError::{Multiway, ProjectionNotReproducing{step: usize}, NoDecision}`, `replay_root(&StreetRootSnapshot) -> Result<Derived, RulesError>`; `RulesError::FormatUnsupported{detail}` for two dealt seats |
-| `core-ranges` | ranges | `parse_range(&str) -> Result<Range1326, RangeError>`, `block_public(&mut Range1326, board: &[Card])`, `hero_conditioned(&Range1326, hero: [Card; 2]) -> Range1326`, `mass(&Range1326) -> f32`, `hash_scaled(&Range1326) -> [u8; 32]` |
+| `proto` | state | `GameConfig`, `SolverPrefs { threads: u8, target_bp: u16, flop_budget_s: u8 }` (`Default` = 16/50/10), `Rake::{PotRake{rate: f32, cap_mchips: u32, no_flop_no_drop: bool}, TimeCharge}`, `HandConfig` (+ `HandConfig::from_game(&GameConfig)`), `HandState`, `Derived`, `SolveInput { root, ranges: [Range1326; 2], tree: EffectiveTree, target_bp: u16 }`; `StreetRootSnapshot { street, board, oop, ip, pot_root, stack_oop_root, stack_ip_root, dead_this_street, projected_from, history, bb_chips: u32 }` — **`bb_chips` is a required field** (plan 1 dev 1 / spec S1 / cross-plan M9); the worker ignores it, `replay_root` needs it for the minimum bet |
+| `proto` | admission DTO | `proto::BeginHand { button: Seat, hero: Seat, dealt: Vec<Seat>, stacks: Vec<u32>, hero_cards: Option<[Card; 2]> }` (plan 1 Task 3, cross-plan M6/Or4, spec S16): the ID-free DTO of §5 step 2, `stacks` in dealt-seat order. This is what `Engine::begin_hand` takes; it is **not** `core_model::BeginHand` |
+| `proto` | tree | `EffectiveTree { rules_version: u16, template_id: String, root_street: Street, menus: BTreeMap<Street, PlayerMenus>, add_allin_threshold: f32, force_allin_threshold: f32, merging_threshold: f32, wager_cap: u8, inserted: Vec<(ChipPath, String, Action)>, materialized: Vec<MaterializedNode> }`; `PlayerMenus { oop: SideMenu, ip: SideMenu, donk: Option<Vec<MenuSize>> }` (`donk` serde default `None`); `SideMenu { bet: Vec<MenuSize>, raise: Vec<MenuSize> }`; `MenuSize::{Pot(f32), AllIn}` untagged (`0.5` / `"a"`; for `raise` the number is a multiple of the facing wager) — this is the type resolved by cross-plan M1, so `river_std_v1`'s spec §10.1 bet menu `0.33, 0.75 + a` is expressible; `MaterializedNode { path: OrdinalPath, street: Street, actor: String, actions: Vec<Action>, terminal_pots: Vec<Option<u32>> }`; `OrdinalPath = Vec<u8>`; `ChipPath = Vec<Action>`; `RULES_VERSION: u16 = 3`; `resolve_chip_path(materialized: &[MaterializedNode], path: &[Action]) -> Option<OrdinalPath>` (the single normative implementation of the §2 rule, cross-plan M21/D2 — this plan re-exports it and never reimplements it); all with `Clone`, `PartialEq`, `Debug`, serde |
+| `proto` | results | `DecisionIdentity`, `Coverage`, `ApproxReason` (incl. `AsymmetricStacks { stacks_bb: Vec<f32>, prominent: bool }`, spec S11), `UnsupportedReason`, `Unavailable`, `ActionAdvice`, `Availability`, `EquityEstimate`, `EquityMethod::{Exact, MonteCarlo{samples, std_err}}`, `EquitySummary`, `PotShares`, `Assumptions`, `ExperimentalHu`, `Recommendation`, `Phase::{Fast, Provisional, Final}`, `RecommendationEvent` exactly as §4.4 |
+| `proto::worker` | messages | `EngineMessage::{Solve(SolveRequest), Lock { id: String, spot: String, locks: Vec<NodeLock> }, Cancel{id, target}, Shutdown{id}}` — `Lock` is a **struct variant** (cross-plan M3); there is no `LockRequest` type. `WorkerMessage::{Ready(Ready), Ack{id, status: AckStatus, reason: Option<String>, replaced: Option<bool>}, Progress{id, stage: Stage, iterations: u32, exploitability_chips: Option<f32>, elapsed_ms: u32, memory_bytes: u64}, Result{id, status: ResultStatus, elapsed_ms: u32, solution: Option<StreetSolution>, error: Option<WorkerError>}}`, both `#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]`; `SolveRequest` with the 16 §4.5 `solve` fields; `Ready { proto_version: u16, solver_commit: String, adapter_version: u16, threads: u8, build_features: Vec<String>, cpu_features: Vec<String>, capabilities: Vec<String> }` — the struct is named **`Ready`** (cross-plan M4); `AckStatus::{Accepted, Staged, Rejected, AlreadyFinished, UnknownTarget}` and `ResultStatus::{Ok, BestSoFar, Cancelled, Error}` (`rename_all = "snake_case"`); `Stage::{Building, Solving, Extracting}`; `WorkerError { code, message, retryable, estimate_bytes: Option<u64> }`, `StreetSolution`, `NodeStrategy`, `NodeLock { path: Vec<Action>, actor: String, probs: Vec<Vec<f32>> }` as §4.5 |
+| `proto::worker` | constants | `pub use crate::PROTO_VERSION;` (= 3), `pub const SOLVER_COMMIT: &str = "9d1509fe5077d019825f833eed04b16d342dfda1";`, `pub const ADAPTER_VERSION: u16 = 1;`, `REQUEST_LINE_MAX = 1 << 20`, `RESULT_LINE_MAX = 16 << 20`, `MAX_EXPORTED_NODES = 100_000`, `FAILURE_CODES` (plan 1 Task 7, cross-plan M5/Or6). All three version constants live in `proto::worker`; this plan imports them from there and **defines none of them** (cross-plan m9) |
+| `proto::worker` | validation | `validate_solution(sol: &StreetSolution, materialized: &[MaterializedNode]) -> Result<Vec<OrdinalPath>, String>` (the §4.5 matrix rules; returns the resolved ordinal path of every node in `nodes` order); `validate_locks(&[NodeLock]) -> Result<(), String>` |
+| `core-model` | state | `core_model::BeginHand { hand_id: u64, button: Seat, hero: Seat, dealt: Vec<Seat>, stacks_start: Vec<u32>, hero_cards: Option<[Card; 2]> }` (**engine-assigned `hand_id`, field `stacks_start`**, cross-plan M6), `begin_hand(&HandConfig, BeginHand) -> Result<HandState, RulesError>`, `apply_action(&HandState, Action) -> Result<HandState, RulesError>`, `set_board(&HandState, &[Card]) -> Result<HandState, RulesError>`, `set_hero_cards(&HandState, [Card; 2]) -> Result<HandState, RulesError>`, `derive(&HandState) -> Derived`, `is_decision_point(&HandState) -> bool`, `street_root(&HandState) -> Result<StreetRootSnapshot, RootError>` with `RootError::{Multiway{pot_eligible: u8}, ProjectionNotReproducing{step: u32}, NoDecision, Preflop, Inconsistent{step: u32}}` (**five variants, `step` is `u32`**, cross-plan M7 / spec S2), `replay_root(&StreetRootSnapshot) -> Result<Derived, RulesError>`; `RulesError::FormatUnsupported{detail}` for two dealt seats. Per-seat `Derived` vectors have length 6 and are indexed by `Seat.0`; `HandState.stacks_start` is in `dealt` order (spec S6) |
+| `core-ranges` | ranges | `parse_range(&str) -> Result<Range1326, RangeError>`, `range_to_string(&Range1326) -> String`, `block_public(&mut Range1326, board: &[Card])`, `hero_conditioned(&Range1326, hero: [Card; 2]) -> Range1326`, `mass(&Range1326) -> f32`, `hash_scaled(&Range1326) -> [u8; 32]` |
 | `core-iso` | suits | `canonicalize(board: &[Card], ranges: &[&Range1326]) -> (CanonicalBoard, SuitPerm)`, `apply(&SuitPerm, Card) -> Card`, `apply_range(&SuitPerm, &Range1326) -> Range1326`, `inverse(&SuitPerm) -> SuitPerm` |
-| `core-eval` | equity | `equity(&EquityRequest, budget: Duration, cancel: &AtomicBool) -> EquityResult` with `EquityRequest { hero: Range1326 /* a fixed combo is weight 1 at one index */, opponents: Vec<Range1326>, board: Vec<Card>, mode: EquityMode::{Exact, MonteCarlo{seed: u64}} }` and `EquityResult { hero_equity: Option<f32> /* None when no compatible assignment exists */, method: EquityMethod, complete: bool }`. Only `crates/engine/src/equity.rs` touches this API; if plan 1's shape differs, that file alone is adjusted |
+| `core-eval` | equity | `PlayerRange { seat: Seat, range: Range1326 }` (a fixed hero combo is a range with one supported combo); `EquityMode::{Exact, MonteCarlo { seed: u64, max_samples: u32 }}` (spec S3); `PotEligibility { pot_index: u8, eligible: Vec<Seat> }`; `EquityRequest { board: Vec<Card>, players: Vec<PlayerRange>, mode: EquityMode, pots: Vec<PotEligibility> }` with `EquityRequest::single_pot(board, players, mode)` (empty `pots` = one pot, every player eligible); `EquityStatus::{Ready, Cancelled, BudgetExceeded, InvalidRanges}`; `EquityShare { pot_index: u8, seat: Seat, value: f32, std_err: f32 }`; `EquityResult { status: EquityStatus, method: Option<EquityMethod>, shares: Vec<EquityShare>, samples: u64, elapsed: Duration }`; `equity(&EquityRequest, budget: Duration, cancel: &AtomicBool) -> EquityResult`; `exact_cost(&EquityRequest) -> u64` — **the engine picks `EquityMode::Exact` iff `exact_cost(&req) <= 20_000_000`, never its own cost formula** (cross-plan M8); `per_combo_equity(hero: &Range1326, villain: &Range1326, board: &[Card]) -> [f32; 1326]`; `terminal_payoff(equity: f32, pot: u32, rake: &Rake) -> f32`. Only `crates/engine/src/equity.rs` and Task 18's `river_check_only_terminal_oracle` touch this API |
 
 ---
 
@@ -52,7 +59,7 @@ Plan 1 is written in parallel. Every name below is the spec's (§3.5, §4.1-4.6)
 
 | Path | Responsibility |
 |---|---|
-| `Cargo.toml` (modify) | add members `solver-worker`, `crates/engine`, `crates/bench`; `exclude = ["third_party/postflop-solver"]` |
+| `Cargo.toml` (modify) | Task 1 adds `exclude = ["third_party/postflop-solver"]`; Task 7 adds the member `"solver-worker"` and `[profile.dev.package.postflop-solver] opt-level = 3`. `crates/engine` and `crates/bench` are covered by plan 1's `members = ["crates/*"]` glob |
 | `third_party/postflop-solver/` | vendored library at the pinned commit with the two patches; `LICENSE`, `PINNED_COMMIT`, `PATCHES.md` |
 | `solver-worker/Cargo.toml`, `build.rs` | AGPL crate; AVX2 build check |
 | `solver-worker/src/main.rs` | argument parsing (`--threads N`), rayon pool, thread wiring, exit codes |
@@ -76,7 +83,9 @@ Plan 1 is written in parallel. Every name below is the spec's (§3.5, §4.1-4.6)
 | `crates/engine/src/lib.rs` | module wiring, `EngineError`, re-exports |
 | `crates/engine/src/clock.rs` | `Clock` trait, `SystemClock` |
 | `crates/engine/src/identity.rs` | `IdentityState`: hand/revision/decision counters, active identity, invalidation |
-| `crates/engine/src/tree/mod.rs`, `templates.rs`, `materialize.rs`, `effective.rs`, `signature.rs`, `resolve.rs` | §10.1 templates, §4.6 materializer, §10.2 exact insertion, `tree_signature`, chip-path resolution |
+| `crates/engine/src/tree/mod.rs`, `templates.rs`, `materialize.rs`, `effective.rs`, `signature.rs`, `resolve.rs` | §10.1 templates (plus the `cfg(any(test, feature = "test-templates"))` extension point plan 4 needs), §4.6 materializer, §10.2 exact insertion, `tree_signature`, `node_at`, and the re-export of `proto::resolve_chip_path` |
+| `crates/engine/src/bench_support.rs` | the only facade `bench` may use for range parsing and blocking (spec §3.2: `bench` depends on `proto` and `engine` only) |
+| `crates/engine/src/startup.rs` | `StartupReport`: worker features, bundle quarantine banners, cache state; rendered by plan 5 |
 | `crates/engine/src/worker/mod.rs`, `link.rs`, `process.rs`, `job_object.rs`, `ready.rs` | `WorkerLink`, `ProcessWorker` (spawn, pipes, stderr ring, restart, kill), Win32 job object, `ready` validation |
 | `crates/engine/src/testing.rs` | `FakeClock`, `FakeWorker`, `FakeReply`, `RecordingSink`, hand-state builders (`pub`, behind feature `testing` and `cfg(test)`) |
 | `crates/engine/src/deadline.rs` | `StreetBudget`, absolute deadline arithmetic, retry admission |
@@ -87,12 +96,12 @@ Plan 1 is written in parallel. Every name below is the spec's (§3.5, §4.1-4.6)
 | `crates/engine/src/allin.rs` | facing-all-in analytic fallback |
 | `crates/engine/src/assemble.rs` | `Recommendation` assembly, headline, reason accumulation, `Equity` merge |
 | `crates/engine/src/log.rs` | `DecisionLog` JSONL with rotation |
-| `crates/engine/src/snapshots.rs` | `SnapshotStore` of validated solutions keyed by identity (plan 3 wraps it into `StreetSnapshot`) |
+| `crates/engine/src/snapshots.rs` | `SnapshotStore` of validated `SolvedStreet`s keyed by identity: the **single** registration path (spec §9.2) that plan 3 Task 11 wraps into `core_replay::StreetSnapshot` |
 | `crates/engine/src/core.rs` | `EngineCore` (worker, clock, log, snapshots, identity, watchdog), `EventSink`, `serve_request` for river/turn |
 | `crates/engine/src/engine.rs` | public `Engine` API of §3.5 (threads `engine-main`, `fast-path`), request slot of depth 1 |
 | `crates/engine/tests/golden/*.json` | expected values for the §13.3 goldens |
 | `crates/engine/tests/{tree_builder,coverage,facing_allin,assembly,identity_race,final_delivery,worker_link}.rs` | engine tests |
-| `crates/bench/Cargo.toml`, `src/main.rs`, `src/suite.rs`, `src/runner.rs`, `src/report.rs`, `src/gen_spots.rs`, `src/materialize.rs` | `bench` CLI: `run`, `gen-spots`, `materialize` |
+| `crates/bench/Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/suite.rs`, `src/runner.rs`, `src/report.rs`, `src/gen_spots.rs`, `src/materialize.rs` | `bench` CLI: `run`, `gen-spots`, `materialize`. `lib.rs` re-exports the modules so plan 4's integration tests can link them (cross-plan D4); deps are `proto` and `engine` only, without `engine`'s `testing` feature |
 | `bench/spots/{river_std,river_min,turn_std,turn_min}.json` | generated spot files |
 | `tools/gen_worker_fixtures.py`, `tools/tests/test_gen_worker_fixtures.py` | `fixtures/worker/*.jsonl` generator and its tests |
 | `fixtures/worker/{river_two_combo,flop_cancel,flop_best_so_far,lock_river,materialization_cases}.jsonl` | generated wire fixtures |
@@ -141,13 +150,15 @@ and under `[features]` set `bincode = ["dep:bincode", "dep:bincode_derive"]` (th
 No other source change. `LICENSE` is upstream's, unchanged. Build with `-C target-feature=+avx2` (workspace `.cargo/config.toml`).
 ```
 
-- [ ] **Step 3: Wire the workspace**
+- [ ] **Step 3: Wire the workspace (exclude only)**
 
-In the root `Cargo.toml` add `"solver-worker"`, `"crates/engine"`, `"crates/bench"` to `members` (keep plan 1's entries) and add:
+The vendored tree has its own lockfile and dependency set and must not join the workspace. In the root `Cargo.toml`, inside the existing `[workspace]` table (plan 1 Task 1), add exactly one key and change nothing else:
 
 ```toml
 exclude = ["third_party/postflop-solver"]
 ```
+
+Do **not** add any `members` entry here. Plan 1's `members = ["crates/*"]` glob picks up `crates/engine` (Task 2) and `crates/bench` (Task 5) as soon as their manifests exist, and `"solver-worker"` is added by Task 7, which creates that crate. A `members` entry naming a directory without a manifest makes cargo refuse to load the workspace ("failed to load manifest for workspace member"), which would break every command from here to Task 7.
 
 - [ ] **Step 4: Write the smoke test**
 
@@ -175,6 +186,13 @@ fn river_tree_root_menu_matches_r8() {
 Run: `cargo test --manifest-path third_party/postflop-solver/Cargo.toml --release --test vendor_smoke`
 Expected: PASS; `cargo tree --manifest-path third_party/postflop-solver/Cargo.toml -i bincode` shows `bincode v2.0.0-rc.3`.
 
+Then confirm the workspace still loads and is green:
+
+Run: `cargo test --workspace --release`
+Expected: plan 1's tests pass, unchanged (the vendored tree is excluded and is not a member).
+
+This is also the task where plan 1's V1 toolchain check is consumed: if that check selected the GNU fallback for the solver (MSVC build failure, or more than 25% slower), prefix the two `--manifest-path` commands above and every later `-p solver-worker` command with `+stable-x86_64-pc-windows-gnu`. Record which branch was taken in `third_party/postflop-solver/PATCHES.md` under a `## Toolchain` heading (one line: the toolchain, the two measured `vendor_smoke --release` wall times, and the ratio). Do not add a second `rust-toolchain.toml`.
+
 - [ ] **Step 6: Commit**
 
 ```bash
@@ -194,18 +212,18 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `proto::{DecisionIdentity, Street, PlayerMenus, SideMenu, MenuSize}`.
-- Produces: `clock::Clock { fn now_ms(&self) -> u64; fn wait_until(&self, t_ms: u64); }`, `clock::SystemClock`; `identity::IdentityState::{new(), set_config() -> u32, begin_hand() -> (u64, u32), mutate() -> u32, next_decision(&mut self) -> Option<DecisionIdentity>, is_active(&DecisionIdentity) -> bool, invalidate_hand(), cancel_active()}`; `tree::templates::{TemplateSpec, Templates::get(&str) -> Option<&'static TemplateSpec>, Templates::ids() -> Vec<&'static str>, Templates::min_variant(&str) -> Option<&'static str>}`; `EngineError`.
+- Produces: `clock::Clock { fn now_ms(&self) -> u64; fn wait_until(&self, t_ms: u64); }`, `clock::SystemClock`; `identity::IdentityState::{new(), set_config() -> u32, begin_hand() -> (u64, u32), mutate() -> u32, next_decision(&mut self) -> Option<DecisionIdentity>, is_active(&DecisionIdentity) -> bool, invalidate_hand(), cancel_active()}`; `tree::templates::{TemplateSpec, Templates::get(&str) -> Option<&'static TemplateSpec>, Templates::ids() -> Vec<&'static str>, Templates::min_variant(&str) -> Option<&'static str>, Templates::with_extra(&[TemplateSpec])}` (the last one behind `cfg(any(test, feature = "test-templates"))`); `EngineError`.
 
 - [ ] **Step 1: Crate manifest and lib**
 
-`crates/engine/Cargo.toml`:
+`crates/engine/Cargo.toml` (every shared dependency comes from plan 1's `[workspace.dependencies]`; never a second `sha2` or `thiserror` major):
 
 ```toml
 [package]
 name = "engine"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 proto = { path = "../proto" }
@@ -213,15 +231,20 @@ core-model = { path = "../core-model" }
 core-ranges = { path = "../core-ranges" }
 core-iso = { path = "../core-iso" }
 core-eval = { path = "../core-eval" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-hex = "0.4"
-thiserror = "1"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
 
 [features]
+# Fake clock, fake worker and recording sink (Task 19). Never enabled by a release consumer.
 testing = []
+# Extra tree templates registered by a downstream test harness (plan 4 Task 8).
+test-templates = []
 ```
+
+`crates/engine` needs no `members` edit: plan 1's `members = ["crates/*"]` glob covers it from the moment this manifest exists.
 
 `crates/engine/src/lib.rs`:
 
@@ -360,7 +383,7 @@ Create `crates/engine/src/tree/mod.rs` with `pub mod templates;` and `crates/eng
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::{MenuSize, Street};
+    use proto::{MenuSize, PlayerMenus, SideMenu, Street};
     #[test]
     fn river_std_matches_spec_10_1() {
         let t = Templates::get("river_std_v1").unwrap();
@@ -371,6 +394,24 @@ mod tests {
         assert_eq!(Templates::get("flop_fast_v1").unwrap().menus[&Street::Turn].donk, Some(vec![]));
         assert_eq!(Templates::min_variant("turn_std_v1"), Some("turn_min_v1"));
         assert_eq!(Templates::min_variant("river_min_v1"), None);
+        // the seven §10.1 ids are present by name, plus this plan's two §13.2 test templates
+        for id in ["flop_fast_v1", "flop_full_v1", "flop_min_v1", "turn_std_v1", "turn_min_v1", "river_std_v1", "river_min_v1"] {
+            assert!(Templates::ids().contains(&id), "missing {id}");
+        }
+        assert_eq!(Templates::ids().len(), 9);
+    }
+
+    #[test]
+    fn extra_templates_register_and_do_not_disturb_the_production_set() {
+        // plan 4 Task 8 registers `check_jam_test_v1`, `menu_round_test_v1` and `check_only_test_v1` through this seam
+        let extra = [TemplateSpec { id: "check_only_test_v1", root_street: Street::River,
+            menus: std::collections::BTreeMap::from([(Street::River, PlayerMenus { oop: SideMenu { bet: vec![], raise: vec![] }, ip: SideMenu { bet: vec![], raise: vec![] }, donk: None })]),
+            add_allin_threshold: 0.0, force_allin_threshold: 0.0, merging_threshold: 0.0, wager_cap: 1 }];
+        Templates::with_extra(&extra);
+        assert_eq!(Templates::get("check_only_test_v1").unwrap().wager_cap, 1);
+        assert_eq!(Templates::get("river_std_v1").unwrap().wager_cap, 3);
+        assert!(Templates::ids().len() >= 10 && Templates::min_variant("check_only_test_v1").is_none());
+        Templates::with_extra(&[]);   // idempotent reset so test order never matters
         assert_eq!(Templates::ids().len(), 9);
     }
 }
@@ -406,7 +447,10 @@ const A: MenuSize = MenuSize::AllIn;
 fn spec(id: &'static str, root: Street, streets: &[(Street, &[MenuSize])], raise: &[MenuSize], add: f32, force: f32, cap: u8) -> TemplateSpec {
     let mut menus = BTreeMap::new();
     for (s, bets) in streets {
-        // donk menus: None on the root street (no donk node exists there), the explicit empty list after it (§4.6)
+        // Donk menus (§4.6): `None` on the root street, the explicit empty list on every later street.
+        // A root-street `None` is legal and is never sent to the library: upstream ignores `turn_donk_sizes`
+        // at a turn root because `prev_action` is `None` there, so no donk node exists to size. Only a LATER
+        // street's `None` is a defect, and Tasks 8 and 13 reject exactly that. Recorded as a deviation.
         let donk = if *s == root { None } else { Some(vec![]) };
         menus.insert(*s, pm(bets, raise, donk));
     }
@@ -431,11 +475,37 @@ fn build() -> Vec<TemplateSpec> {
     ]
 }
 
+/// Registry of the §10.1 production templates plus this plan's two §13.2 test templates.
+/// `with_extra` is the single seam a downstream test harness uses to add its own templates
+/// (plan 4 Task 8 registers `check_jam_test_v1`, `menu_round_test_v1`, `check_only_test_v1`);
+/// it is compiled out of release builds, so the production registry is always exactly 9 ids.
 pub struct Templates;
+
+#[cfg(any(test, feature = "test-templates"))]
+static EXTRA: std::sync::RwLock<Vec<&'static TemplateSpec>> = std::sync::RwLock::new(Vec::new());
+
 impl Templates {
-    fn all() -> &'static [TemplateSpec] { static T: OnceLock<Vec<TemplateSpec>> = OnceLock::new(); T.get_or_init(build) }
-    pub fn get(id: &str) -> Option<&'static TemplateSpec> { Self::all().iter().find(|t| t.id == id) }
-    pub fn ids() -> Vec<&'static str> { Self::all().iter().map(|t| t.id).collect() }
+    fn base() -> &'static [TemplateSpec] { static T: OnceLock<Vec<TemplateSpec>> = OnceLock::new(); T.get_or_init(build) }
+    /// Replaces the extra registrations with `extra` (pass `&[]` to clear). Each entry is leaked once so
+    /// `get` can keep returning `&'static`; test harnesses call this a handful of times per process.
+    #[cfg(any(test, feature = "test-templates"))]
+    pub fn with_extra(extra: &[TemplateSpec]) {
+        let leaked: Vec<&'static TemplateSpec> = extra.iter().cloned().map(|t| &*Box::leak(Box::new(t))).collect();
+        *EXTRA.write().unwrap() = leaked;
+    }
+    #[cfg(any(test, feature = "test-templates"))]
+    fn extra() -> Vec<&'static TemplateSpec> { EXTRA.read().unwrap().clone() }
+    #[cfg(not(any(test, feature = "test-templates")))]
+    fn extra() -> Vec<&'static TemplateSpec> { Vec::new() }
+    /// Extra registrations shadow the base set, so a harness can also override a production template.
+    pub fn get(id: &str) -> Option<&'static TemplateSpec> {
+        Self::extra().into_iter().find(|t| t.id == id).or_else(|| Self::base().iter().find(|t| t.id == id))
+    }
+    pub fn ids() -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = Self::base().iter().map(|t| t.id).collect();
+        for t in Self::extra() { if !v.contains(&t.id) { v.push(t.id); } }
+        v
+    }
     /// The crash/timeout/TreeTooLarge retry template of §10.1 (`_min` of the same street); None for a `_min` or test template.
     pub fn min_variant(id: &str) -> Option<&'static str> {
         match id { "flop_fast_v1" | "flop_full_v1" => Some("flop_min_v1"), "turn_std_v1" => Some("turn_min_v1"), "river_std_v1" => Some("river_min_v1"), _ => None }
@@ -445,11 +515,11 @@ impl Templates {
 
 - [ ] **Step 7: Run and commit**
 
-Run: `cargo test -p engine`
-Expected: 2 passed.
+Run: `cargo test -p engine` then `cargo test --workspace --release`
+Expected: 3 passed in `engine` (`mutation_invalidates_and_revisions_never_repeat`, `river_std_matches_spec_10_1`, `extra_templates_register_and_do_not_disturb_the_production_set`); the workspace stays green.
 
 ```bash
-git add crates/engine Cargo.toml
+git add crates/engine
 git commit -m "feat(engine): crate skeleton with clock, identity counters and the section 10.1 templates
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -771,8 +841,8 @@ fn walk(inp: &MaterializeInput, p: i64, w: &Walk, path: &mut OrdinalPath, chip: 
 
 - [ ] **Step 4: Run and commit**
 
-Run: `cargo test -p engine materialize`
-Expected: 5 passed (every boundary of §4.6 as listed in `tree_materialization_matches_library`).
+Run: `cargo test -p engine materialize` then `cargo test --workspace --release`
+Expected: 5 passed (every boundary of §4.6 as listed in `tree_materialization_matches_library`); the workspace stays green.
 
 ```bash
 git add crates/engine/src/tree
@@ -791,7 +861,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `materialize` (Task 3), `Templates` (Task 2); `proto::{StreetRootSnapshot, EffectiveTree, Seat, Action, MaterializedNode, OrdinalPath, UnsupportedReason}`, `proto::worker::validate_solution`.
-- Produces: `tree::TemplateSelection { template_id: String, observed: Vec<(Seat, Action)> }` with `from_history(template_id: &str, history: &[(Seat, Action)]) -> Self`; `tree::TreeBuild { tree: EffectiveTree, history: Vec<Action>, decision_path: OrdinalPath, pot: u32, eff: u32 }`; `tree::build_tree_full(&StreetRootSnapshot, &TemplateSelection) -> Result<TreeBuild, UnsupportedReason>`; `tree::build_effective_tree(&StreetRootSnapshot, &TemplateSelection) -> Result<EffectiveTree, UnsupportedReason>`; `tree::materialize_at(template: &TemplateSpec, pot: u32, eff: u32, prefix: &[(usize, Action)]) -> Result<TreeBuild, UnsupportedReason>`; `tree::tree_signature(&EffectiveTree, p: u32) -> String`; `tree::resolve_chip_path(&[MaterializedNode], &[Action]) -> Option<OrdinalPath>`; `tree::node_at(&[MaterializedNode], &[u8]) -> Option<&MaterializedNode>`.
+- Produces: `tree::TemplateSelection { template_id: String, observed: Vec<(Seat, Action)> }` with `from_history(template_id: &str, history: &[(Seat, Action)]) -> Self`; `tree::TreeBuild { tree: EffectiveTree, history: Vec<Action>, decision_path: OrdinalPath, pot: u32, eff: u32 }`; `tree::build_tree_full(&StreetRootSnapshot, &TemplateSelection) -> Result<TreeBuild, UnsupportedReason>`; `tree::build_effective_tree(&StreetRootSnapshot, &TemplateSelection) -> Result<EffectiveTree, UnsupportedReason>`; `tree::materialize_at(template: &TemplateSpec, pot: u32, eff: u32, prefix: &[(usize, Action)]) -> Result<TreeBuild, UnsupportedReason>`; `tree::tree_signature(&EffectiveTree, p: u32) -> String`; `tree::node_at(&[MaterializedNode], &[u8]) -> Option<&MaterializedNode>`; and the re-export `pub use proto::resolve_chip_path;` — the §2 chip-path rule has exactly one implementation, in `proto` (cross-plan M21/D2). This plan never writes a second one.
 
 - [ ] **Step 1: Failing test `crates/engine/tests/tree_builder.rs`**
 
@@ -802,7 +872,7 @@ use proto::{Action, MaterializedNode, Seat, Street, StreetRootSnapshot, Unsuppor
 
 fn snap(pot: u32, oop_stack: u32, ip_stack: u32, history: Vec<(Seat, Action)>) -> StreetRootSnapshot {
     StreetRootSnapshot { street: Street::Flop, board: vec![proto::Card::parse("Kh").unwrap(), proto::Card::parse("7d").unwrap(), proto::Card::parse("2c").unwrap()],
-        oop: Seat(2), ip: Seat(0), pot_root: pot, stack_oop_root: oop_stack, stack_ip_root: ip_stack, dead_this_street: 0, projected_from: 2, history }
+        oop: Seat(2), ip: Seat(0), pot_root: pot, stack_oop_root: oop_stack, stack_ip_root: ip_stack, dead_this_street: 0, projected_from: 2, history, bb_chips: 2 }
 }
 fn bet(to: u32) -> Action { Action::Bet { to } }
 
@@ -818,6 +888,18 @@ fn tree_builder_golden() {
     assert_eq!(node_at(&a.tree.materialized, &[]).unwrap().actions, vec![Action::Check, bet(50), bet(73)]);
     assert_eq!(a.tree.inserted, vec![(vec![], "oop".to_string(), bet(73))]);
     assert_eq!(a.decision_path, vec![2]);
+    // duplicates merged (1): an observed size that lands exactly on a menu size inserts nothing and leaves one entry
+    let dup = build_tree_full(&snap(100, 500, 700, vec![(Seat(2), bet(50))]), &TemplateSelection::from_history("flop_fast_v1", &[(Seat(2), bet(50))])).unwrap();
+    let root = node_at(&dup.tree.materialized, &[]).unwrap();
+    assert!(dup.tree.inserted.is_empty());
+    assert_eq!(root.actions, vec![Action::Check, bet(50)]);
+    assert_eq!(root.actions.iter().filter(|x| **x == bet(50)).count(), 1);
+    // duplicates merged (2): at eff 340 facing_test_v1's menu raise 250 is force-collapsed onto the all-in that the
+    // add-threshold also lists; the clamp-force-dedupe order leaves exactly one AllIn(340) and no Raise
+    let coll = build_tree_full(&snap(100, 340, 340, vec![(Seat(2), bet(100))]), &TemplateSelection::from_history("facing_test_v1", &[(Seat(2), bet(100))])).unwrap();
+    let ip = node_at(&coll.tree.materialized, &[1]).unwrap();
+    assert_eq!(ip.actions, vec![Action::Fold, Action::Call, Action::AllIn { to: 340 }]);
+    assert_eq!(ip.actions.iter().filter(|x| matches!(x, Action::AllIn { .. })).count(), 1);
     // signature stability across chip scales: 100/500 + 73 versus 200/1000 + 146 (same reduced rational 73/100)
     let b = build_tree_full(&snap(200, 1000, 1400, vec![(Seat(2), bet(146))]), &TemplateSelection::from_history("flop_fast_v1", &[(Seat(2), bet(146))])).unwrap();
     assert_eq!(tree_signature(&a.tree, 100), tree_signature(&b.tree, 200));
@@ -887,35 +969,24 @@ pub use signature::tree_signature;
 pub use templates::{TemplateSpec, Templates};
 ```
 
-`crates/engine/src/tree/resolve.rs`:
+`crates/engine/src/tree/resolve.rs` — the §2 chip-path rule has one normative implementation, `proto::resolve_chip_path` (plan 1 Task 6). This module only re-exports it and adds the ordinal lookup, which `proto` does not provide:
 
 ```rust
-use proto::{Action, MaterializedNode, OrdinalPath};
-use std::collections::HashMap;
+use proto::MaterializedNode;
+
+/// The single implementation of the §2 chip-path rule lives in `proto`; every consumer re-exports it
+/// so cache, replay and worker can never disagree (cross-plan M21/D2).
+pub use proto::resolve_chip_path;
 
 pub fn node_at<'a>(materialized: &'a [MaterializedNode], path: &[u8]) -> Option<&'a MaterializedNode> {
     materialized.iter().find(|n| n.path.as_slice() == path)
-}
-
-/// §2: a wire chip path becomes an ordinal path by walking the betting skeleton; the target must be a decision node.
-pub fn resolve_chip_path(materialized: &[MaterializedNode], chip: &[Action]) -> Option<OrdinalPath> {
-    let index: HashMap<&[u8], &MaterializedNode> = materialized.iter().map(|n| (n.path.as_slice(), n)).collect();
-    let mut path: OrdinalPath = Vec::with_capacity(chip.len());
-    for a in chip {
-        let node = index.get(path.as_slice())?;
-        let i = node.actions.iter().position(|x| x == a)?;
-        path.push(i as u8);
-    }
-    index.get(path.as_slice())?;
-    Some(path)
 }
 ```
 
 `crates/engine/src/tree/signature.rs`:
 
 ```rust
-use super::resolve::resolve_chip_path;
-use proto::{Action, EffectiveTree, MenuSize};
+use proto::{resolve_chip_path, Action, EffectiveTree, MenuSize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
@@ -950,7 +1021,8 @@ use super::materialize::{materialize, MaterializeInput, Materialized};
 use super::templates::{TemplateSpec, Templates};
 use proto::{Action, EffectiveTree, OrdinalPath, Seat, StreetRootSnapshot, UnsupportedReason};
 
-pub const RULES_VERSION: u16 = 3;
+/// §4.6 `rules_version`; owned by `proto` (plan 1 Task 6) and re-exported so there is one value in the workspace.
+pub use proto::RULES_VERSION;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TemplateSelection { pub template_id: String, pub observed: Vec<(Seat, Action)> }
@@ -1000,7 +1072,7 @@ pub fn build_effective_tree(root: &StreetRootSnapshot, sel: &TemplateSelection) 
 
 - [ ] **Step 4: Run, hand-check, record the golden**
 
-Run: `cargo test -p engine --test tree_builder`
+Run: `cargo test -p engine --test tree_builder` then `cargo test --workspace --release`
 Expected: PASS; the first run writes `crates/engine/tests/golden/tree_builder_golden.json`. Hand-check it against §4.5: the `river_oracle` entry must be exactly the three nodes of the wire example (`[]` oop `[check]` `[null]`; `[0]` ip `[check, allin 100]` `[100, null]`; `[0,1]` oop `[fold, call]` `[100, 300]`), and in `flop_fast_73` the root must be `[check, bet 50, bet 73]` with `[null, null, null]` and the node `[2]` (ip facing 73: `to_call = 73`, `pot = 246`, `max = 500`, `min = 146`) must be `[fold, call, raise 183]` with terminal pots `[100, null, null]`: `round(2.5 * 73) = 183` (182.5 rounds away from zero), the force test `500 <= 183 + round((246 + 220) * 0.15) = 253` fails and the add test `500 <= 73 + round(246 * 1.0) = 319` fails, so no all-in is listed. Fix the code, not the file, if either differs; then commit the file.
 
 - [ ] **Step 5: Commit**
@@ -1017,12 +1089,15 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ## Task 5: `bench` crate skeleton: spot format, `gen-spots`, `materialize`
 
 **Files:**
-- Create: `crates/bench/Cargo.toml`, `crates/bench/src/main.rs`, `crates/bench/src/suite.rs`, `crates/bench/src/gen_spots.rs`, `crates/bench/src/materialize.rs`
-- Test: unit tests in `suite.rs` and `gen_spots.rs`; CLI smoke in step 5
+- Create: `crates/bench/Cargo.toml`, `crates/bench/src/lib.rs`, `crates/bench/src/main.rs`, `crates/bench/src/suite.rs`, `crates/bench/src/gen_spots.rs`, `crates/bench/src/materialize.rs`, `crates/engine/src/bench_support.rs`
+- Modify: `crates/engine/src/lib.rs` (add `pub mod bench_support;`)
+- Test: unit tests in `suite.rs`, `gen_spots.rs` and `bench_support.rs`; CLI smoke in step 6
 
 **Interfaces:**
-- Consumes: `engine::tree::{materialize_at, Templates}`; `proto::{Action, Card, Rake, Street}`.
-- Produces: `bench::suite::{Spot { id: String, template_id: String, root_street: Street, board: Vec<Card>, oop_range: String, ip_range: String, pot: u32, stack_oop: u32, stack_ip: u32, rake: Rake, history: Vec<Action>, target_bp: u16, range_source: String }, Suite { suite: String, spots: Vec<Spot> }, Suite::load(&Path) -> Result<Suite, String>, Suite::save(&self, &Path)}`; CLI `bench materialize --template ID --pot P --eff E [--prefix oop:bet:73,ip:raise:200]` printing `{"tree": EffectiveTree, "history": [Action], "decision_path": [u8]}` to stdout; `bench gen-spots --source r8 --out bench/spots`.
+- Consumes: `engine::tree::{materialize_at, Templates}`, `engine::bench_support::prepared_range`; `proto::{Action, Card, Rake, Range1326, Street}`.
+- Produces: `engine::bench_support::{prepared_range(text: &str, board: &[Card]) -> Result<Range1326, String>, range_mass(&Range1326) -> f32}` — the **only** way `bench` reaches range parsing and board blocking, because spec §3.2 fixes `bench`'s dependencies to `proto` and `engine` (cross-plan M17/R5). `bench::suite::{Spot { id: String, template_id: String, root_street: Street, board: Vec<Card>, oop_range: String, ip_range: String, pot: u32, stack_oop: u32, stack_ip: u32, rake: Rake, history: Vec<Action>, target_bp: u16, range_source: String }, Suite { suite: String, spots: Vec<Spot> }, Suite::load(&Path) -> Result<Suite, String>, Suite::save(&self, &Path)}`; `crates/bench/src/lib.rs` re-exporting `pub mod {suite, gen_spots, materialize}` so plan 4's integration tests can link them (cross-plan D4); CLI `bench materialize --template ID --pot P --eff E [--prefix oop:bet:73,ip:raise:200]` printing `{"tree": EffectiveTree, "history": [Action], "decision_path": [u8]}` to stdout; `bench gen-spots --source r8 --out bench/spots`.
+
+**Range source (spec §13.5, cross-plan Or8/R3, orchestrator decision 4):** §13.5 defines the six baseline suites on **chart-replay** ranges. This task can only emit the R8 uniform ranges, so `--source r8` writes `range_source: "r8_uniform"` into every spot and the resulting suites are an explicitly labelled **interim** set: any `docs/bench/*.md` section produced from them is a pre-baseline reference run and does not satisfy the V2/V22 gate. `--source chart` is added when plan 3's chart bundles are wired into `bench gen-spots`, and plan 4 Task 17 regenerates all six `bench/spots/*.json` from chart replay before the gate is claimed. `generate` therefore rejects every source other than `r8` with a message naming `chart`, so the interim status cannot be forgotten.
 
 - [ ] **Step 1: Failing tests**
 
@@ -1063,33 +1138,81 @@ mod tests {
             assert_eq!(boards.len(), 3);
             assert!(s.spots.iter().all(|x| x.template_id.starts_with(&suite[..suite.find('_').unwrap()])));
             assert!(s.spots.iter().all(|x| x.board.len() == if suite.starts_with("river") { 5 } else { 4 }));
+            assert!(s.spots.iter().all(|x| x.range_source == "r8_uniform"), "the interim source must be labelled in every spot");
         }
         assert!(generate("flop_fast", "r8").is_err());
+        // §13.5's chart-replay baseline is not available in this plan; the error names it so the gap stays explicit
+        let e = generate("river_std", "chart").unwrap_err();
+        assert!(e.contains("chart"), "{e}");
+    }
+}
+```
+
+`crates/engine/src/bench_support.rs` (tests only for now):
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto::Card;
+    #[test]
+    fn prepared_range_parses_and_blocks_the_board() {
+        let board: Vec<Card> = ["Kh", "7d", "2c"].iter().map(|s| Card::parse(s).unwrap()).collect();
+        let r = prepared_range("AA,KK", &board).unwrap();
+        assert_eq!((range_mass(&r) * 1000.0).round() as u32, 9000);   // 6 aces + 3 kings (Kh is on the board)
+        assert!(prepared_range("not a range", &board).is_err());
     }
 }
 ```
 
 - [ ] **Step 2: Run to see them fail**
 
-Run: `cargo test -p bench`
-Expected: FAIL to compile.
+Run: `cargo test -p engine bench_support` then `cargo test -p bench`
+Expected: FAIL to compile (`bench_support` and the `bench` crate do not exist).
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement the `engine::bench_support` facade**
 
-`crates/bench/Cargo.toml`:
+`bench` may depend on `proto` and `engine` only (spec §3.2). Everything it needs from `core-ranges` goes through this one file. Add `pub mod bench_support;` to `crates/engine/src/lib.rs` and create `crates/engine/src/bench_support.rs` above its test module:
+
+```rust
+//! The façade `bench` uses instead of depending on `core-*` directly (spec §3.2 dependency direction).
+//! Plan 4 extends this module; it never grows a second entry point.
+use proto::{Card, Range1326};
+
+/// Parses a Pio-style range string and applies board blocking, exactly as the engine does at a street root.
+pub fn prepared_range(text: &str, board: &[Card]) -> Result<Range1326, String> {
+    let mut r = core_ranges::parse_range(text).map_err(|e| format!("range {text:?}: {e}"))?;
+    core_ranges::block_public(&mut r, board);
+    Ok(r)
+}
+/// Total weight of a range, for report and sanity checks.
+pub fn range_mass(r: &Range1326) -> f32 { core_ranges::mass(r) }
+```
+
+- [ ] **Step 4: Implement the `bench` crate**
+
+`crates/bench/Cargo.toml` — note the absence of `features = ["testing"]`: feature unification would otherwise compile the fake clock and fake worker into every release build of the workspace, and `bench` uses no test double.
 
 ```toml
 [package]
 name = "bench"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 proto = { path = "../proto" }
-engine = { path = "../engine", features = ["testing"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+engine = { path = "../engine" }
+serde.workspace = true
+serde_json.workspace = true
+```
+
+`crates/bench/src/lib.rs` (so plan 4's integration tests can link the modules; `main.rs` keeps its own `mod` lines out of the binary's way by using the library):
+
+```rust
+pub mod gen_spots;
+pub mod materialize;
+pub mod suite;
 ```
 
 `crates/bench/src/suite.rs` (above the tests):
@@ -1104,7 +1227,7 @@ pub struct Spot {
     pub id: String, pub template_id: String, pub root_street: Street, pub board: Vec<Card>,
     pub oop_range: String, pub ip_range: String, pub pot: u32, pub stack_oop: u32, pub stack_ip: u32,
     pub rake: Rake, pub history: Vec<Action>, pub target_bp: u16,
-    /// "r8_uniform" (this plan) | "chart_replay" (plan 3) | "store_replay" (V9)
+    /// "r8_uniform" (this plan's labelled interim) | "chart_replay" (the §13.5 baseline, plan 3 bundles + plan 4 Task 17) | "store_replay" (V9)
     pub range_source: String,
 }
 
@@ -1129,7 +1252,10 @@ impl Suite {
 use crate::suite::{Spot, Suite};
 use proto::{Card, Rake, Street};
 
-// R8 addendum A.1 ranges (uniform weights); the chart-replay baseline replaces them in plan 3 (`--source file`).
+// R8 addendum A.1 ranges (uniform weights). INTERIM: spec §13.5's baseline set uses chart-replay ranges,
+// which arrive with plan 3's bundles (`--source chart`) and are regenerated for all six suites by plan 4 Task 17.
+// Note: A.1 publishes combo counts 646 / 804 for these two strings; the strings as published expand to 634 / 720
+// (recomputed in Task 6). The strings, not A.1's counts, are the definition here and in the fixture generator.
 pub const BTN_OPEN: &str = "22+,A2s+,K2s+,Q2s+,J3s+,T6s+,96s+,86s+,75s+,65s,54s,43s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o";
 pub const BB_DEFEND: &str = "JJ-22,AJs-A2s,K2s+,Q2s+,J2s+,T2s+,92s+,84s+,74s+,63s+,53s+,43s,32s,AJo-A2o,K5o+,Q7o+,J8o+,T8o+,98o,97o,87o,76o";
 pub const CO_CALL_3BET: &str = "QQ-22,AKs-ATs,A5s-A4s,KQs-KTs,QJs-QTs,JTs,J9s,T9s,T8s,98s,87s,76s,65s,54s,AQo-AJo,KQo,KJo";
@@ -1140,7 +1266,11 @@ const BOARDS: [(&str, &str); 3] = [("dry", "Kh7d2c4d9s"), ("wet", "Jh9h6c2d5s"),
 fn cards(s: &str, n: usize) -> Vec<Card> { s.as_bytes().chunks(2).take(n).map(|c| Card::parse(std::str::from_utf8(c).unwrap()).unwrap()).collect() }
 
 pub fn generate(suite: &str, source: &str) -> Result<Suite, String> {
-    if source != "r8" { return Err(format!("unknown source {source}; plan 3 adds chart replay")); }
+    // §13.5's baseline set is chart-replay; `r8` is the labelled interim of this plan. `chart` is accepted only
+    // once plan 3's bundles are wired in, and plan 4 Task 17 regenerates all six suites before the gate is claimed.
+    if source != "r8" {
+        return Err(format!("source {source:?} is not available in this plan: only \"r8\" (uniform R8 addendum A.1 ranges, interim) is implemented; the \"chart\" replay baseline of spec section 13.5 arrives with plan 3's bundles and is regenerated for all six suites by plan 4"));
+    }
     let (street, template, n) = match suite {
         "river_std" => (Street::River, "river_std_v1", 5), "river_min" => (Street::River, "river_min_v1", 5),
         "turn_std" => (Street::Turn, "turn_std_v1", 4), "turn_min" => (Street::Turn, "turn_min_v1", 4),
@@ -1193,9 +1323,7 @@ pub fn run(template: &str, pot: u32, eff: u32, prefix: &str) -> Result<String, S
 `crates/bench/src/main.rs`:
 
 ```rust
-mod gen_spots;
-mod materialize;
-mod suite;
+use bench::{gen_spots, materialize, suite};
 
 fn arg(args: &[String], name: &str) -> Option<String> { args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned()) }
 
@@ -1216,30 +1344,33 @@ fn main() {
             }
             code
         }
-        _ => { eprintln!("usage: bench materialize --template ID --pot P --eff E [--prefix ...] | bench gen-spots [--source r8] [--out DIR] | bench run ... (Task 22)"); 1 }
+        _ => { eprintln!("usage: bench materialize --template ID --pot P --eff E [--prefix ...] | bench gen-spots [--source r8] [--out DIR] | bench run ... (Task 30)"); 1 }
     };
     std::process::exit(code);
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [ ] **Step 5: Run tests**
 
-Run: `cargo test -p bench`
-Expected: 2 passed.
+Run: `cargo test -p bench` and `cargo test -p engine bench_support`
+Expected: 2 passed in `bench`, 1 passed in `engine`.
 
-- [ ] **Step 5: CLI smoke and spot files**
+- [ ] **Step 6: CLI smoke and spot files**
 
 Run: `cargo run -q -p bench -- materialize --template river_oracle_v1 --pot 100 --eff 100 --prefix oop:check`
 Expected: one JSON line whose `tree.materialized` has 3 nodes and `decision_path` is `[0]`.
 
 Run: `cargo run -q -p bench -- gen-spots --source r8 --out bench/spots`
-Expected: `bench/spots/{river_std,river_min,turn_std,turn_min}.json` written, 6 spots each.
+Expected: `bench/spots/{river_std,river_min,turn_std,turn_min}.json` written, 6 spots each, every spot's `range_source` `"r8_uniform"`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
+
+Run: `cargo test --workspace --release`
+Expected: green.
 
 ```bash
-git add crates/bench bench/spots
-git commit -m "feat(bench): spot format, r8 spot generator and the materialize subcommand
+git add crates/bench crates/engine bench/spots
+git commit -m "feat(bench): spot format, interim r8 spot generator, materialize subcommand and the engine bench_support facade
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -1254,7 +1385,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `bench materialize` (Task 5) through `subprocess`; the §4.5 definitions.
-- Produces: the five JSONL fixtures. Each fixture holds engine -> worker lines only; expectations live in the Rust tests. Line ids: `river_two_combo`: `solve 41`, `cancel 42 -> 41`, `shutdown 48`; `flop_cancel`: `solve 43`, `cancel 44 -> 43`; `flop_best_so_far`: `solve 45`; `lock_river`: `lock 47`, `solve 51` (same `spot`), `shutdown 52`; `materialization_cases`: one object per case `{"case", "template_id", "pot", "eff", "prefix": [[actor, action]], "tree", "history", "decision_path"}`.
+- Produces: the five JSONL fixtures. Each fixture holds engine -> worker lines only; expectations live in the Rust tests. Line ids: `river_two_combo`: `solve 41`, `cancel 42 -> 41`, `shutdown 48`; `flop_cancel`: `solve 43`, `cancel 44 -> 43`; `flop_best_so_far`: `solve 45`; `lock_river`: `lock 47`, `solve 51` (same `spot`), `shutdown 52`; `materialization_cases`: one object per case `{"case", "template_id", "pot", "eff", "prefix": [[actor, action]], "tree", "history", "decision_path"}` (43 cases).
+- This generator is the **single definition** of the two-combo river ranges (cross-plan D7): plan 1's `crates/proto/tests/wire_examples.rs` loads `fixtures/worker/river_two_combo.jsonl` rather than restating them in Rust, so the two can never drift. Nothing here re-derives them.
 
 - [ ] **Step 1: Failing Python tests `tools/tests/test_gen_worker_fixtures.py`**
 
@@ -1277,8 +1409,14 @@ def test_parse_range_counts():
     assert sum(1 for w in g.parse_range("96s+") if w > 0) == 12          # 96s, 97s, 98s
     assert sum(1 for w in g.parse_range("QQ-88") if w > 0) == 30         # five pairs
     assert sum(1 for w in g.parse_range("98o-65o") if w > 0) == 48       # four offsuit classes
-    assert sum(1 for w in g.parse_range(g.BTN_OPEN) if w > 0) == 646
-    assert sum(1 for w in g.parse_range(g.BB_DEFEND) if w > 0) == 804
+    # Recomputed from the strings themselves. R8 addendum A.1 publishes 646 / 804 for these two ranges, but the
+    # strings as published expand to 634 / 720 under this grammar (CO_CALL_3BET 194 and BTN_3BET 138 match A.1
+    # exactly, so the parser is right and A.1's two figures are not reproducible from its own strings).
+    # The strings are the definition; `crates/bench/src/gen_spots.rs` freezes the same two constants.
+    assert sum(1 for w in g.parse_range(g.BTN_OPEN) if w > 0) == 634
+    assert sum(1 for w in g.parse_range(g.BB_DEFEND) if w > 0) == 720
+    assert sum(1 for w in g.parse_range(g.CO_CALL_3BET) if w > 0) == 194
+    assert sum(1 for w in g.parse_range(g.BTN_3BET) if w > 0) == 138
 
 
 def test_river_two_combo_definition():
@@ -1301,7 +1439,8 @@ def test_write_all_with_stub_materializer(tmp_path):
     names = sorted(p.name for p in written)
     assert names == ["flop_best_so_far.jsonl", "flop_cancel.jsonl", "lock_river.jsonl", "materialization_cases.jsonl", "river_two_combo.jsonl"]
     cases = [json.loads(l) for l in (tmp_path / "materialization_cases.jsonl").read_text().splitlines()]
-    assert len(cases) == 7 * 5 + 7 + 1 + 1 + 1 + 1 + 1
+    #        6 phase-1 templates x 5 points, 1 flop_full point, 7 facing stacks, facing_350_full, cap1, cap3, insert_73, basic_turn_std
+    assert len(cases) == 6 * 5 + 1 + 7 + 1 + 1 + 1 + 1 + 1 == 43
     lock = [json.loads(l) for l in (tmp_path / "lock_river.jsonl").read_text().splitlines()]
     assert lock[0]["type"] == "lock" and lock[1]["type"] == "solve" and lock[0]["spot"] == lock[1]["spot"]
     rows = lock[0]["locks"][0]["probs"]
@@ -1335,8 +1474,11 @@ GIB = 1024 ** 3
 SPOT_RIVER = "3f9c0a7d2b1e4c6f8a9d0b2c4e6f8a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e1f"
 SPOT_FLOP = "5a1c9e3b7d2f4a6c8e0b1d3f5a7c9e2b4d6f8a0c1e3b5d7f9a2c4e6b8d0f1a3c"
 SPOT_LOCK = "9d0b2c4e6f8a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e1f3f9c0a7d2b1e4c6f8a"
+# R8 addendum A.1 range strings, copied verbatim; the same four constants are frozen in crates/bench/src/gen_spots.rs.
 BTN_OPEN = "22+,A2s+,K2s+,Q2s+,J3s+,T6s+,96s+,86s+,75s+,65s,54s,43s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o"
 BB_DEFEND = "JJ-22,AJs-A2s,K2s+,Q2s+,J2s+,T2s+,92s+,84s+,74s+,63s+,53s+,43s,32s,AJo-A2o,K5o+,Q7o+,J8o+,T8o+,98o,97o,87o,76o"
+CO_CALL_3BET = "QQ-22,AKs-ATs,A5s-A4s,KQs-KTs,QJs-QTs,JTs,J9s,T9s,T8s,98s,87s,76s,65s,54s,AQo-AJo,KQo,KJo"
+BTN_3BET = "TT+,AJs+,A5s-A2s,KJs+,QJs,JTs,T9s,76s,65s,54s,AQo+,KQo,KJo"
 BASIC_OOP = "66+,A8s+,A5s-A4s,AJo+,K9s+,KQo,QTs+,JTs,96s+,85s+,75s+,65s,54s"
 BASIC_IP = "QQ-22,AQs-A2s,ATo+,K5s+,KJo+,Q8s+,J8s+,T7s+,96s+,86s+,75s+,64s+,53s+"
 
@@ -1477,7 +1619,9 @@ def flop_lines(materializer):
     return cancel, best
 
 
-TEMPLATES = ["flop_fast_v1", "flop_full_v1", "flop_min_v1", "turn_std_v1", "turn_min_v1", "river_std_v1", "river_min_v1"]
+# flop_full_v1 is phase-2 only (spec section 10.1) and its (180, 910) skeleton is roughly 3,000 nodes, so it gets a
+# single small rules case instead of the five-point sweep the phase-1 templates get.
+TEMPLATES = ["flop_fast_v1", "flop_min_v1", "turn_std_v1", "turn_min_v1", "river_std_v1", "river_min_v1"]
 
 
 def materialization_cases(materializer):
@@ -1485,6 +1629,7 @@ def materialization_cases(materializer):
     for t in TEMPLATES:
         for pot, eff in [(100, 100), (100, 150), (180, 910), (100, 149), (100, 151)]:
             cases.append((f"{t}_{pot}_{eff}", t, pot, eff, []))
+    cases.append(("flop_full_v1_100_100", "flop_full_v1", 100, 100, []))
     for eff in [350, 400, 401, 340, 341, 240, 100]:
         cases.append((f"facing_{eff}", "facing_test_v1", 100, eff, [["oop", action("bet", 100)]]))
     cases.append(("facing_350_full", "facing_test_v1", 100, 350, []))
@@ -1523,9 +1668,12 @@ Run: `cd tools && python -m pytest tests/test_gen_worker_fixtures.py -q`
 Expected: 4 passed.
 
 Run (repo root, needs Task 5's `bench`): `python tools/gen_worker_fixtures.py`
-Expected: five files under `fixtures/worker/`; `river_two_combo.jsonl` is three lines; `materialization_cases.jsonl` has 47 lines; the `flop_*` solve lines carry a `flop_fast_v1` tree rooted at `flop` with `history: []`.
+Expected: five files under `fixtures/worker/`; `river_two_combo.jsonl` is three lines; `materialization_cases.jsonl` has 43 lines; the `flop_*` solve lines carry a `flop_fast_v1` tree rooted at `flop` with `history: []`.
 
 - [ ] **Step 5: Commit**
+
+Run: `cargo test --workspace --release`
+Expected: green (no Rust code changed; the fixtures are consumed from Task 8 on).
 
 ```bash
 git add tools/gen_worker_fixtures.py tools/tests/test_gen_worker_fixtures.py fixtures/worker
@@ -1543,8 +1691,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Test: `solver-worker/tests/startup.rs::ready_reports_features`, unit tests in `cards.rs`
 
 **Interfaces:**
-- Consumes: `proto::worker::{WorkerMessage, Ready, PROTO_VERSION, ADAPTER_VERSION}`, `proto::{Card, Range1326, ComboIndex, combo_index, combo_cards}`, `postflop_solver::{Card as LibCard, Range as LibRange, NOT_DEALT}`.
-- Produces: `solver_worker::{CAPABILITIES, SOLVER_COMMIT, build_features(), cpu_features(), ready_message(threads: u8) -> WorkerMessage}`; `cards::{to_lib(Card) -> LibCard, from_lib(LibCard) -> Card, range_to_lib(&Range1326) -> Result<LibRange, String>, lib_hand_to_combo((LibCard, LibCard)) -> ComboIndex, board_to_lib(&[Card]) -> Result<([LibCard; 3], LibCard, LibCard), String>}`; `win::{set_priority_class(below_normal: bool), peak_working_set_bytes() -> u64}`; test helper `common::Worker::{spawn(threads) -> Worker, send(&mut self, &str), recv(&self, Duration) -> Option<serde_json::Value>, recv_until(&self, Duration, impl Fn(&Value) -> bool) -> Option<Value>, close_stdin(&mut self), wait_exit(&mut self, Duration) -> Option<i32>, kill(&mut self)}`, `common::fixture_lines(name: &str) -> Vec<String>`.
+- Consumes: `proto::worker::{WorkerMessage, Ready, PROTO_VERSION, SOLVER_COMMIT, ADAPTER_VERSION}` (all three constants are produced by plan 1 Task 7; this crate defines none of them, cross-plan M5), `proto::{Card, Range1326, ComboIndex, combo_index, combo_cards}`, `postflop_solver::{Card as LibCard, Range as LibRange, NOT_DEALT}`.
+- Produces: `solver_worker::{CAPABILITIES, build_features(), cpu_features(), ready_message(threads: u8) -> WorkerMessage}` and the re-export `pub use proto::worker::SOLVER_COMMIT;`; `cards::{to_lib(Card) -> LibCard, from_lib(LibCard) -> Card, range_to_lib(&Range1326) -> Result<LibRange, String>, lib_hand_to_combo((LibCard, LibCard)) -> ComboIndex, board_to_lib(&[Card]) -> Result<([LibCard; 3], LibCard, LibCard), String>}`; `win::set_priority_class(below_normal: bool)`; test helper `common::Worker::{spawn(threads) -> Worker, send(&mut self, &str), recv(&self, Duration) -> Option<serde_json::Value>, recv_until(&self, Duration, impl Fn(&Value) -> bool) -> Option<Value>, close_stdin(&mut self), wait_exit(&mut self, Duration) -> Option<i32>, kill(&mut self)}`, `common::fixture_lines(name: &str) -> Vec<String>`.
+- No crate depends on `solver-worker` (spec §3.2): the engine reads `SOLVER_COMMIT` from `proto::worker`, never from here.
 
 - [ ] **Step 1: Failing integration test `solver-worker/tests/startup.rs`**
 
@@ -1638,15 +1787,28 @@ pub fn fixture_lines(name: &str) -> Vec<String> {
 Run: `cargo test -p solver-worker --test startup`
 Expected: FAIL (crate does not exist).
 
-- [ ] **Step 3: Crate, build check, library modules**
+- [ ] **Step 3: Workspace member, crate, build check, library modules**
 
-`solver-worker/Cargo.toml`:
+First add the member (it is outside `crates/`, so plan 1's glob does not cover it) and the debug profile override, in the root `Cargo.toml`:
+
+```toml
+[workspace]
+members = ["crates/*", "solver-worker"]
+exclude = ["third_party/postflop-solver"]
+
+# A debug test build of the workspace still exercises optimized solver code; the per-task green command
+# is `cargo test --workspace --release`, but an ad-hoc debug run must not take 30x as long.
+[profile.dev.package.postflop-solver]
+opt-level = 3
+```
+
+`solver-worker/Cargo.toml` — the one crate with an explicit `license` (AGPL boundary, spec §3.3); everything else comes from the workspace:
 
 ```toml
 [package]
 name = "solver-worker"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 license = "AGPL-3.0"
 build = "build.rs"
 
@@ -1657,8 +1819,8 @@ path = "src/main.rs"
 [dependencies]
 proto = { path = "../crates/proto" }
 postflop-solver = { path = "../third_party/postflop-solver", features = ["zstd"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde.workspace = true
+serde_json.workspace = true
 rayon = "1"
 ```
 
@@ -1683,8 +1845,21 @@ pub mod win;
 use proto::worker::{Ready, WorkerMessage, ADAPTER_VERSION, PROTO_VERSION};
 
 pub const CAPABILITIES: [&str; 5] = ["solve", "lock", "cancel", "street_export", "i16"];
-/// The commit actually vendored (read at build time from the vendored tree), reported in `ready`.
-pub const SOLVER_COMMIT: &str = include_str!("../../third_party/postflop-solver/PINNED_COMMIT");
+
+/// The pinned commit is owned by `proto::worker` (plan 1 Task 7) because the engine validates `ready`
+/// against it and may not depend on this crate (spec §3.2). Re-exported, never redefined.
+pub use proto::worker::SOLVER_COMMIT;
+
+/// What is actually vendored on disk, read at build time. A mismatch with `SOLVER_COMMIT` is a build error:
+/// the `ready` message must never claim a commit the binary was not built from.
+const VENDORED_COMMIT: &str = include_str!("../../third_party/postflop-solver/PINNED_COMMIT");
+const _: () = {
+    // `const` string comparison: same length and same bytes.
+    let (a, b) = (VENDORED_COMMIT.as_bytes(), SOLVER_COMMIT.as_bytes());
+    assert!(a.len() >= b.len(), "third_party/postflop-solver/PINNED_COMMIT is shorter than proto::worker::SOLVER_COMMIT");
+    let mut i = 0;
+    while i < b.len() { assert!(a[i] == b[i], "vendored commit differs from proto::worker::SOLVER_COMMIT"); i += 1; }
+};
 
 pub fn build_features() -> Vec<String> {
     let mut v = Vec::new();
@@ -1706,7 +1881,7 @@ pub fn cpu_features() -> Vec<String> {
 }
 
 pub fn ready_message(threads: u8) -> WorkerMessage {
-    WorkerMessage::Ready(Ready { proto_version: PROTO_VERSION, solver_commit: SOLVER_COMMIT.trim().to_string(), adapter_version: ADAPTER_VERSION, threads,
+    WorkerMessage::Ready(Ready { proto_version: PROTO_VERSION, solver_commit: SOLVER_COMMIT.to_string(), adapter_version: ADAPTER_VERSION, threads,
         build_features: build_features(), cpu_features: cpu_features(), capabilities: CAPABILITIES.iter().map(|s| s.to_string()).collect() })
 }
 ```
@@ -1769,33 +1944,24 @@ mod tests {
 `solver-worker/src/win.rs`:
 
 ```rust
+//! §3.4: the worker runs at BELOW_NORMAL while a `background: true` job is solving, NORMAL otherwise.
+//! The child's peak working set is measured by the ENGINE from the parent process
+//! (`crates/engine/src/worker/process.rs`), so the worker exposes no memory query of its own.
 #[cfg(windows)]
 mod imp {
-    #[repr(C)] #[allow(non_snake_case)]
-    struct ProcessMemoryCounters { cb: u32, PageFaultCount: u32, PeakWorkingSetSize: usize, WorkingSetSize: usize, QuotaPeakPagedPoolUsage: usize, QuotaPagedPoolUsage: usize, QuotaPeakNonPagedPoolUsage: usize, QuotaNonPagedPoolUsage: usize, PagefileUsage: usize, PeakPagefileUsage: usize }
     #[link(name = "kernel32")]
     extern "system" { fn GetCurrentProcess() -> isize; fn SetPriorityClass(h: isize, class: u32) -> i32; }
-    #[link(name = "psapi")]
-    extern "system" { fn GetProcessMemoryInfo(h: isize, p: *mut ProcessMemoryCounters, cb: u32) -> i32; }
     const NORMAL_PRIORITY_CLASS: u32 = 0x20;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x4000;
     pub fn set_priority_class(below_normal: bool) {
         unsafe { SetPriorityClass(GetCurrentProcess(), if below_normal { BELOW_NORMAL_PRIORITY_CLASS } else { NORMAL_PRIORITY_CLASS }); }
     }
-    pub fn peak_working_set_bytes() -> u64 {
-        unsafe {
-            let mut p: ProcessMemoryCounters = std::mem::zeroed();
-            p.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
-            if GetProcessMemoryInfo(GetCurrentProcess(), &mut p, p.cb) == 0 { 0 } else { p.PeakWorkingSetSize as u64 }
-        }
-    }
 }
 #[cfg(not(windows))]
 mod imp {
     pub fn set_priority_class(_below_normal: bool) {}
-    pub fn peak_working_set_bytes() -> u64 { 0 }
 }
-pub use imp::{peak_working_set_bytes, set_priority_class};
+pub use imp::set_priority_class;
 ```
 
 - [ ] **Step 4: `main.rs` (ready, EOF exit; the protocol loop arrives in Task 10)**
@@ -1827,15 +1993,10 @@ fn main() {
 
 - [ ] **Step 5: Run and commit**
 
-Run: `cargo test -p solver-worker --release`
-Expected: `named_combo_roundtrip` and `ready_reports_features` pass. (Use `--release` for every worker test in this plan: the library is 30x slower in debug and the timing assertions of §13.2 assume release.)
+Run: `cargo test -p solver-worker --release` then `cargo test --workspace --release`
+Expected: `named_combo_roundtrip` and `ready_reports_features` pass; the workspace stays green now that `solver-worker` is a member.
 
-Add to the root `Cargo.toml` (once) so debug test builds of the workspace still exercise optimized solver code:
-
-```toml
-[profile.dev.package.postflop-solver]
-opt-level = 3
-```
+(If plan 1's V1 check selected the GNU fallback, the first command is `cargo +stable-x86_64-pc-windows-gnu test -p solver-worker --release`; the workspace command stays MSVC and simply skips nothing, because `cargo test --workspace` builds `solver-worker` with the pinned toolchain and the AVX2 `build.rs` check is toolchain-independent.)
 
 ```bash
 git add solver-worker Cargo.toml
@@ -1856,6 +2017,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `cards` (Task 7); fixtures (Task 6); `postflop_solver::{Action as LibAction, ActionTree, BetSize, BetSizeOptions, BoardState, DonkSizeOptions, TreeConfig, PostFlopGame}`; `proto::{Action, EffectiveTree, MaterializedNode, MenuSize, SideMenu, Street}`.
 - Produces: `tree_build::{to_lib_action(&Action) -> LibAction, from_lib_action(LibAction) -> Option<Action>, board_state(Street) -> BoardState, tree_config(&EffectiveTree, pot: u32, eff: u32, rake_rate: f32, rake_cap_mchips: u32) -> Result<TreeConfig, String>, build(&EffectiveTree, pot, eff, rake_rate, rake_cap_mchips, history: &[Action]) -> Result<ActionTree, String>, apply_wager_cap(&mut ActionTree, cap: u8, history: &[LibAction]) -> Result<(), String>, enumerate(&mut ActionTree, root_street: Street, starting_pot: u32) -> Result<Vec<MaterializedNode>, String>, cross_check(lib: &[MaterializedNode], expected: &[MaterializedNode]) -> Result<(), String>}`; `history::{history_to_lib(&[Action]) -> Vec<LibAction>, indices_for(&mut PostFlopGame, &[Action]) -> Result<Vec<usize>, String>}`; `testutil::{solve_request(fixture: &str, line: usize) -> SolveRequest, cases() -> Vec<Case>}` with `Case { case, template_id, pot, eff, prefix: Vec<(String, Action)>, tree: EffectiveTree, history: Vec<Action>, decision_path: Vec<u8> }`.
+
+**Two recorded readings of the donk rule (both in the self-review deviations list):**
+1. A **root-street** `donk` of `None` is legal and is never sent to the library: upstream ignores `turn_donk_sizes` at a turn root because `prev_action` is `None` there. `tree_config` and `precheck` therefore require `Some(vec![])` only for streets strictly after the root. Spec §13.2's "a `None` donk option produces `result{error{tree_mismatch}}`" is read as being about a later street.
+2. For a **later** street's `None`, §13.2 lists the case twice: once under `tree_materialization_matches_library` as `result{error{tree_mismatch}}` and once under `protocol_rejections` as "a typed rejection with `reason`". The spec is self-inconsistent here. This plan picks the **cheap** answer: the structural check is in `precheck`, so it costs no work and the reply is `ack{rejected, reason: "... donk option must be the explicit empty list, never None"}`. `tree_config` keeps the same check as a defence in depth for callers that bypass `precheck` (the in-process tests below), where it surfaces as `tree_mismatch`.
 
 - [ ] **Step 1: Failing unit tests (bottom of `solver-worker/src/tree_build.rs`)**
 
@@ -1881,7 +2046,7 @@ mod tests {
     #[test]
     fn every_materialization_case_matches_library() {
         let all = cases();
-        assert_eq!(all.len(), 47);
+        assert_eq!(all.len(), 43);
         for c in &all {
             let mut tree = build(&c.tree, c.pot, c.eff, 0.0, 0, &c.history).unwrap_or_else(|e| panic!("{}: {e}", c.case));
             let lib = enumerate(&mut tree, c.tree.root_street, c.pot).unwrap();
@@ -2114,8 +2279,8 @@ pub fn cross_check(lib: &[MaterializedNode], expected: &[MaterializedNode]) -> R
 
 - [ ] **Step 4: Run and commit**
 
-Run: `cargo test -p solver-worker --release --lib`
-Expected: `tree_build` tests pass (46 cases cross-checked, including the equality boundaries and the cross-street operand of §4.6).
+Run: `cargo test -p solver-worker --release --lib` then `cargo test --workspace --release`
+Expected: `tree_build` tests pass (43 cases cross-checked, including the equality boundaries and the cross-street operand of §4.6); the workspace stays green.
 
 ```bash
 git add solver-worker
@@ -2126,16 +2291,16 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Task 9: Worker memory admission, solve loop, extraction, locks and the job runner
+## Task 9: Worker memory admission (§10.3) and the §7 stop rule
 
 **Files:**
-- Create: `solver-worker/src/memory.rs`, `solver-worker/src/solve_loop.rs`, `solver-worker/src/extract.rs`, `solver-worker/src/locks.rs`, `solver-worker/src/job.rs`
-- Modify: `solver-worker/src/lib.rs` (add the five modules)
-- Test: unit tests in `memory.rs` and `job.rs`
+- Create: `solver-worker/src/memory.rs`, `solver-worker/src/solve_loop.rs`
+- Modify: `solver-worker/src/lib.rs` (add `pub mod memory; pub mod solve_loop;`)
+- Test: unit tests in `memory.rs` and `solve_loop.rs`
 
 **Interfaces:**
-- Consumes: Tasks 7-8; `postflop_solver::{PostFlopGame, CardConfig, solve_step, compute_exploitability, finalize}`; `proto::worker::{SolveRequest, NodeLock, NodeStrategy, StreetSolution, WorkerError, WorkerMessage, ResultStatus, Stage, validate_solution}`.
-- Produces: `memory::{GIB, Admission { compressed: bool, estimate_bytes: u64, mode: &'static str }, admit(f32_bytes, i16_bytes, memory_limit_bytes) -> Result<Admission, WorkerError>}`; `solve_loop::{LoopParams { deadline_ms: u32, extraction_margin_ms: u32, target_chips: f32, started: Instant }, LoopOutcome { iterations: u32, exploitability: Option<f32>, reached_target: bool, cancelled: bool }, run(&PostFlopGame, &LoopParams, cancel: &AtomicBool, progress: impl FnMut(u32, Option<f32>)) -> LoopOutcome}`; `extract::{MAX_NODES, MAX_RESULT_BYTES, chip_path_of(&[MaterializedNode], &[u8]) -> Option<Vec<Action>>, extract_node(&mut PostFlopGame, &MaterializedNode, chip_path: &[Action]) -> Result<NodeStrategy, String>, street_solution(&mut PostFlopGame, &SolveRequest, meta: SolutionMeta, cancel: &AtomicBool) -> Result<Option<StreetSolution>, String>}` (`Ok(None)` = cancelled) with `SolutionMeta { exploitability_chips: f32, iterations: u32, memory_bytes: u64, mode: &'static str, locks_applied: u16 }`; `locks::{validate(&[NodeLock]) -> Result<(), String>, apply(&mut PostFlopGame, &NodeLock, &[MaterializedNode]) -> Result<(), String>}`; `job::{JobControl { cancel: Arc<AtomicBool>, progress: Box<dyn FnMut(Stage, u32, Option<f32>, u32, u64) + Send> }, JobOutcome::{Ok(StreetSolution), BestSoFar(StreetSolution), Cancelled, Error(WorkerError)}, JobResult { outcome: JobOutcome, elapsed_ms: u32 }, run(&SolveRequest, locks: Option<&[NodeLock]>, &mut JobControl) -> JobResult, error(code: &str, message: impl Into<String>, retryable: bool, estimate_bytes: Option<u64>) -> WorkerError}`.
+- Consumes: `proto::worker::WorkerError`; `postflop_solver::{PostFlopGame, solve_step, compute_exploitability}`.
+- Produces: `memory::{GIB, Admission { compressed: bool, estimate_bytes: u64, mode: &'static str }, admit(f32_bytes: u64, i16_bytes: u64, memory_limit_bytes: u64) -> Result<Admission, WorkerError>}`; `solve_loop::{LoopParams { deadline_ms: u32, extraction_margin_ms: u32, target_chips: f32, started: Instant }, LoopOutcome { iterations: u32, exploitability: Option<f32>, reached_target: bool, cancelled: bool }, should_stop(elapsed_ms: f64, max_iter_ms: f64, expl_due: bool, margin_ms: f64, deadline_ms: f64) -> bool, expl_due(next_iteration: u32, fits: f64) -> bool, run(&PostFlopGame, &LoopParams, cancel: &AtomicBool, progress: impl FnMut(u32, Option<f32>)) -> LoopOutcome}`.
 
 - [ ] **Step 1: Failing tests**
 
@@ -2159,61 +2324,41 @@ mod tests {
 }
 ```
 
-Bottom of `solver-worker/src/job.rs`:
+Bottom of `solver-worker/src/solve_loop.rs` — the §7 stop rule is arithmetic, so it is tested as arithmetic, without a solve:
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::solve_request;
-    use proto::worker::validate_solution;
-    use proto::{combo_index, Card};
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
-
-    fn ctl() -> JobControl { JobControl { cancel: Arc::new(AtomicBool::new(false)), progress: Box::new(|_, _, _, _, _| {}) } }
-    fn combo(a: &str, b: &str) -> usize { combo_index(Card::parse(a).unwrap(), Card::parse(b).unwrap()) as usize }
-
     #[test]
-    fn river_two_combo_solves_to_the_analytic_solution() {
-        let req = solve_request("river_two_combo", 0);
-        let r = run(&req, None, &mut ctl());
-        let sol = match r.outcome { JobOutcome::Ok(s) => s, other => panic!("{other:?}") };
-        // every decision node of the street is exported: [] oop, [check] ip, [check, allin] oop; the requested node is the one reached by history
-        assert_eq!((sol.nodes.len(), sol.requested, sol.mode.as_str(), sol.export.as_str()), (3, 1, "f32", "street"));
-        assert!(sol.exploitability_chips <= 0.1, "exploitability {}", sol.exploitability_chips);
-        validate_solution(&sol, &req.tree.materialized).unwrap();
-        let ip = &sol.nodes[1];
-        assert_eq!(ip.actor, "ip");
-        for qq in [combo("Qc", "Qd"), combo("Qc", "Qh"), combo("Qd", "Qh")] { assert!(ip.available[qq] && ip.probs[qq][1] > 0.97, "QQ bets: {:?}", ip.probs[qq]); }
-        let bluff = ip.probs[combo("5c", "4d")][1];
-        assert!((bluff - 0.5).abs() <= 0.03, "54o bluffs {bluff}");
-        let oop = &sol.nodes[2];
-        let call = oop.probs[combo("Ac", "Ad")][1];
-        assert!((call - 0.5).abs() <= 0.03, "AA calls {call}");
-        assert_eq!(oop.ev_chips[combo("Ac", "Ad")][0], 0.0);                  // fold = 0 by the identity of §10.3
-        assert!(!ip.available[combo("Ac", "Ad")] && ip.probs[combo("Ac", "Ad")] == vec![0.0, 0.0]);
+    fn stop_rule_of_section_7() {
+        // stop when elapsed + 1.5 * max_iteration + (exploitability pass if due) + margin > deadline
+        assert!(!should_stop(1000.0, 200.0, false, 200.0, 2000.0));            // 1000 + 300 + 200 = 1500 <= 2000
+        assert!(!should_stop(1500.0, 200.0, false, 200.0, 2000.0));            // 1500 + 300 + 200 = 2000, not strictly greater
+        assert!(should_stop(1501.0, 200.0, false, 200.0, 2000.0));
+        assert!(should_stop(1500.0, 200.0, true, 200.0, 2000.0));              // the due exploitability pass costs one iteration
+        assert!(!should_stop(0.0, 0.0, false, 200.0, 300.0));                  // before the first iteration only the margin counts
+        assert!(should_stop(0.0, 0.0, false, 600.0, 300.0));                   // margin alone exceeds the deadline: no_iteration
     }
-
     #[test]
-    fn cancel_before_building_and_no_iteration() {
-        let req = solve_request("river_two_combo", 0);
-        let mut c = ctl();
-        c.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(matches!(run(&req, None, &mut c).outcome, JobOutcome::Cancelled));
-        let mut short = req.clone();
-        short.deadline_ms = 300; short.extraction_margin_ms = 600;
-        match run(&short, None, &mut ctl()).outcome { JobOutcome::Error(e) => assert_eq!((e.code.as_str(), e.retryable), ("no_iteration", false)), other => panic!("{other:?}") }
+    fn exploitability_cadence() {
+        // every 10 iterations ...
+        assert!(expl_due(10, 1000.0) && expl_due(20, 1000.0) && !expl_due(11, 1000.0));
+        // ... and additionally whenever fewer than 10 iterations still fit
+        assert!(expl_due(3, 9.5) && expl_due(1, 0.0));
+        assert!(!expl_due(3, 10.0));
     }
 }
 ```
 
 - [ ] **Step 2: Run to see them fail**
 
-Run: `cargo test -p solver-worker --release --lib job memory`
-Expected: FAIL to compile.
+Run: `cargo test -p solver-worker --release --lib memory solve_loop`
+Expected: FAIL to compile (`admit`, `should_stop`, `expl_due` missing).
 
-- [ ] **Step 3: Implement the five modules**
+- [ ] **Step 3: Implement `memory.rs` and `solve_loop.rs`**
+
+Add `pub mod memory; pub mod solve_loop;` to `solver-worker/src/lib.rs`.
 
 `solver-worker/src/memory.rs`:
 
@@ -2237,7 +2382,7 @@ pub fn admit(f32_bytes: u64, i16_bytes: u64, memory_limit_bytes: u64) -> Result<
 }
 ```
 
-`solver-worker/src/solve_loop.rs`:
+`solver-worker/src/solve_loop.rs` (above the tests):
 
 ```rust
 use postflop_solver::{compute_exploitability, solve_step, PostFlopGame};
@@ -2248,26 +2393,33 @@ pub struct LoopParams { pub deadline_ms: u32, pub extraction_margin_ms: u32, pub
 #[derive(Debug, Clone, Copy)]
 pub struct LoopOutcome { pub iterations: u32, pub exploitability: Option<f32>, pub reached_target: bool, pub cancelled: bool }
 
-/// §7 stop rule: between iterations stop when `elapsed + 1.5 * max_iteration_so_far + (exploitability pass if due)
-/// + extraction_margin_ms > deadline_ms`; exploitability every 10 iterations and whenever fewer than 10 iterations fit.
+/// §7 stop rule, as pure arithmetic so it can be tested without a solve: stop when
+/// `elapsed + 1.5 * max_iteration_so_far + (one more iteration if an exploitability pass is due) + margin > deadline`.
+/// `compute_exploitability` costs about one iteration (measured, R8).
+pub fn should_stop(elapsed_ms: f64, max_iter_ms: f64, expl_due: bool, margin_ms: f64, deadline_ms: f64) -> bool {
+    elapsed_ms + 1.5 * max_iter_ms + if expl_due { max_iter_ms } else { 0.0 } + margin_ms > deadline_ms
+}
+/// §7 cadence: every 10 iterations, and additionally whenever fewer than 10 iterations still fit before the stop point.
+pub fn expl_due(next_iteration: u32, fits: f64) -> bool { next_iteration % 10 == 0 || fits < 10.0 }
+
 pub fn run(game: &PostFlopGame, p: &LoopParams, cancel: &AtomicBool, mut progress: impl FnMut(u32, Option<f32>)) -> LoopOutcome {
     let deadline = p.deadline_ms as f64;
     let margin = p.extraction_margin_ms as f64;
     let elapsed = || p.started.elapsed().as_secs_f64() * 1000.0;
+    let fits_now = |max_iter_ms: f64| if max_iter_ms > 0.0 { (deadline - elapsed() - margin) / max_iter_ms } else { f64::INFINITY };
     let mut iters = 0u32;
     let mut max_iter_ms = 0.0f64;
     let mut expl: Option<f32> = None;
     let mut last_progress = Instant::now();
     loop {
         if cancel.load(Ordering::SeqCst) { return LoopOutcome { iterations: iters, exploitability: expl, reached_target: false, cancelled: true }; }
-        let expl_cost = if (iters + 1) % 10 == 0 { max_iter_ms } else { 0.0 };
-        if elapsed() + 1.5 * max_iter_ms + expl_cost + margin > deadline { break; }
+        let due = expl_due(iters + 1, fits_now(max_iter_ms));
+        if should_stop(elapsed(), max_iter_ms, due, margin, deadline) { break; }
         let t = Instant::now();
         solve_step(game, iters);
         iters += 1;
         max_iter_ms = max_iter_ms.max(t.elapsed().as_secs_f64() * 1000.0);
-        let fits = if max_iter_ms > 0.0 { (deadline - elapsed() - margin) / max_iter_ms } else { f64::INFINITY };
-        if iters % 10 == 0 || fits < 10.0 {
+        if expl_due(iters, fits_now(max_iter_ms)) {
             let e = compute_exploitability(game);
             expl = Some(e);
             if e <= p.target_chips { progress(iters, expl); return LoopOutcome { iterations: iters, exploitability: expl, reached_target: true, cancelled: false }; }
@@ -2278,7 +2430,102 @@ pub fn run(game: &PostFlopGame, p: &LoopParams, cancel: &AtomicBool, mut progres
 }
 ```
 
-`solver-worker/src/extract.rs`:
+- [ ] **Step 4: Run and commit**
+
+Run: `cargo test -p solver-worker --release --lib memory solve_loop` then `cargo test --workspace --release`
+Expected: 3 passed (`admission_rule_of_section_10_3`, `stop_rule_of_section_7`, `exploitability_cadence`); the workspace stays green.
+
+```bash
+git add solver-worker
+git commit -m "feat(solver-worker): section 10.3 memory admission and the section 7 stop rule
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 10: Worker extraction and lock application
+
+**Files:**
+- Create: `solver-worker/src/extract.rs`, `solver-worker/src/locks.rs`
+- Modify: `solver-worker/src/lib.rs` (add `pub mod extract; pub mod locks;`)
+- Test: unit tests in `extract.rs` and `locks.rs` over `fixtures/worker/{materialization_cases,lock_river}.jsonl`
+
+**Interfaces:**
+- Consumes: `cards`, `history`, `tree_build` (Tasks 7-8), `testutil::fixture_lines` (Task 8); `postflop_solver::PostFlopGame`; `proto::worker::{SolveRequest, NodeLock, NodeStrategy, StreetSolution, ResultStatus, WorkerMessage, MAX_EXPORTED_NODES, RESULT_LINE_MAX}`.
+- Produces: `extract::{chip_path_of(&[MaterializedNode], &[u8]) -> Option<Vec<Action>>, extract_node(&mut PostFlopGame, &MaterializedNode, chip_path: &[Action]) -> Result<NodeStrategy, String>, SolutionMeta { exploitability_chips: f32, iterations: u32, memory_bytes: u64, mode: &'static str, locks_applied: u16 }, street_solution(&mut PostFlopGame, &SolveRequest, meta: SolutionMeta, cancel: &AtomicBool) -> Result<Option<StreetSolution>, String>}` (`Ok(None)` = cancelled between nodes); `locks::{validate(&[NodeLock]) -> Result<(), String>, apply(&mut PostFlopGame, &NodeLock, &[MaterializedNode]) -> Result<(), String>}`.
+- The export limits are **imported**, never redefined: `proto::worker::MAX_EXPORTED_NODES` (100,000) and `proto::worker::RESULT_LINE_MAX` (16 MiB) come from plan 1 Task 7 (cross-plan m9).
+
+- [ ] **Step 1: Failing tests**
+
+Bottom of `solver-worker/src/extract.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::cases;
+    #[test]
+    fn ordinal_paths_become_chip_paths() {
+        let c = cases().into_iter().find(|c| c.case == "insert_73").unwrap();
+        let m = &c.tree.materialized;
+        assert_eq!(chip_path_of(m, &[]), Some(vec![]));
+        assert_eq!(chip_path_of(m, &[2]), Some(vec![Action::Bet { to: 73 }]));
+        assert_eq!(chip_path_of(m, &[1]), Some(vec![Action::Bet { to: 50 }]));
+        assert_eq!(chip_path_of(m, &[9]), None);              // ordinal outside the menu
+        let r = cases().into_iter().find(|c| c.case == "river_std_v1_100_100").unwrap();
+        let root = r.tree.materialized.iter().find(|n| n.path.is_empty()).unwrap();
+        assert_eq!(chip_path_of(&r.tree.materialized, &[0]), Some(vec![root.actions[0].clone()]));
+    }
+}
+```
+
+Bottom of `solver-worker/src/locks.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::fixture_lines;
+    use proto::worker::EngineMessage;
+
+    fn staged() -> Vec<NodeLock> {
+        match serde_json::from_str::<EngineMessage>(&fixture_lines("lock_river")[0]).unwrap() {
+            EngineMessage::Lock { locks, .. } => locks,
+            other => panic!("line 0 of lock_river is not a lock: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lock_matrix_rules_of_section_4_5() {
+        let ok = staged();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].probs.len(), 1326);
+        validate(&ok).unwrap();                                    // all-zero rows are the free-combo sentinel
+        let mut wrong_sum = ok.clone(); wrong_sum[0].probs[0] = vec![0.1, 0.3];
+        assert!(validate(&wrong_sum).unwrap_err().contains("sums to"));
+        let mut out_of_range = ok.clone(); out_of_range[0].probs[0] = vec![-0.1, 1.1];
+        assert!(validate(&out_of_range).unwrap_err().contains("outside"));
+        let mut ragged = ok.clone(); ragged[0].probs[5] = vec![1.0];
+        assert!(validate(&ragged).unwrap_err().contains("entries"));
+        let mut short = ok.clone(); short[0].probs.pop();
+        assert!(validate(&short).unwrap_err().contains("1326"));
+        let mut actor = ok.clone(); actor[0].actor = "hero".into();
+        assert!(validate(&actor).unwrap_err().contains("actor"));
+    }
+}
+```
+
+- [ ] **Step 2: Run to see them fail**
+
+Run: `cargo test -p solver-worker --release --lib extract locks`
+Expected: FAIL to compile.
+
+- [ ] **Step 3: Implement `extract.rs` and `locks.rs`**
+
+Add `pub mod extract; pub mod locks;` to `solver-worker/src/lib.rs`.
+
+`solver-worker/src/extract.rs` (above the tests):
 
 ```rust
 use crate::cards::lib_hand_to_combo;
@@ -2289,8 +2536,9 @@ use proto::worker::{NodeStrategy, ResultStatus, SolveRequest, StreetSolution, Wo
 use proto::{Action, MaterializedNode};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub const MAX_NODES: usize = 100_000;
-pub const MAX_RESULT_BYTES: usize = 16 << 20;
+/// §4.5 limits, owned by `proto::worker` (plan 1 Task 7). Re-exported so `job.rs` and `protocol.rs`
+/// read the same numbers `validate_solution` enforces; never redefined here.
+pub use proto::worker::{MAX_EXPORTED_NODES, RESULT_LINE_MAX};
 
 pub fn chip_path_of(materialized: &[MaterializedNode], ordinal: &[u8]) -> Option<Vec<Action>> {
     let mut chip = Vec::with_capacity(ordinal.len());
@@ -2348,7 +2596,7 @@ pub fn street_solution(game: &mut PostFlopGame, req: &SolveRequest, meta: Soluti
     let street: Vec<&MaterializedNode> = req.tree.materialized.iter().filter(|n| n.street == req.tree.root_street).collect();
     let paths: Vec<Vec<Action>> = street.iter().map(|n| chip_path_of(&req.tree.materialized, &n.path).ok_or("unresolvable ordinal path")).collect::<Result<_, _>>()?;
     let requested = paths.iter().position(|p| *p == req.history).ok_or("history is not a decision node of the street")?;
-    let truncated = street.len() > MAX_NODES;
+    let truncated = street.len() > MAX_EXPORTED_NODES;
     let order: Vec<usize> = if truncated { vec![requested] } else { (0..street.len()).collect() };
     let mut nodes = Vec::with_capacity(order.len());
     for &i in &order {
@@ -2357,7 +2605,7 @@ pub fn street_solution(game: &mut PostFlopGame, req: &SolveRequest, meta: Soluti
     }
     let requested_index = if truncated { 0 } else { requested } as u32;
     let sol = assemble(nodes, requested_index, if truncated { "truncated" } else { "street" }, &meta);
-    if result_len(&sol, &req.id) > MAX_RESULT_BYTES {
+    if result_len(&sol, &req.id) > RESULT_LINE_MAX {
         let only = sol.nodes.into_iter().nth(requested_index as usize).ok_or("requested node missing")?;
         return Ok(Some(assemble(vec![only], 0, "truncated", &meta)));
     }
@@ -2365,7 +2613,7 @@ pub fn street_solution(game: &mut PostFlopGame, req: &SolveRequest, meta: Soluti
 }
 ```
 
-`solver-worker/src/locks.rs`:
+`solver-worker/src/locks.rs` (above the tests):
 
 ```rust
 use crate::cards::lib_hand_to_combo;
@@ -2413,7 +2661,90 @@ pub fn apply(game: &mut PostFlopGame, lock: &NodeLock, materialized: &[Materiali
 }
 ```
 
-`solver-worker/src/job.rs`:
+- [ ] **Step 4: Run and commit**
+
+Run: `cargo test -p solver-worker --release --lib` then `cargo test --workspace --release`
+Expected: `ordinal_paths_become_chip_paths` and `lock_matrix_rules_of_section_4_5` pass alongside the Task 8 and Task 9 tests; the workspace stays green.
+
+```bash
+git add solver-worker
+git commit -m "feat(solver-worker): per-node extraction with the section 4.5 export limits and lock matrix handling
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 11: Worker job runner: Building -> Solving -> Extracting with cancel checkpoints
+
+**Files:**
+- Create: `solver-worker/src/job.rs`
+- Modify: `solver-worker/src/lib.rs` (add `pub mod job;`)
+- Test: unit tests in `job.rs`
+
+**Interfaces:**
+- Consumes: `cards`, `tree_build`, `win` (Task 7-8), `memory`, `solve_loop` (Task 9), `extract`, `locks` (Task 10); `postflop_solver::{PostFlopGame, CardConfig, finalize}`; `proto::worker::{SolveRequest, NodeLock, StreetSolution, WorkerError, Stage, validate_solution}`.
+- Produces: `job::{JobControl { cancel: Arc<AtomicBool>, progress: Box<dyn FnMut(Stage, u32, Option<f32>, u32, u64) + Send> }, JobOutcome::{Ok(StreetSolution), BestSoFar(StreetSolution), Cancelled, Error(WorkerError)}, JobResult { outcome: JobOutcome, elapsed_ms: u32 }, run(&SolveRequest, staged: Option<&[NodeLock]>, &mut JobControl) -> JobResult, error(code: &str, message: impl Into<String>, retryable: bool, estimate_bytes: Option<u64>) -> WorkerError}`.
+
+- [ ] **Step 1: Failing tests (bottom of `solver-worker/src/job.rs`)**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::solve_request;
+    use proto::worker::validate_solution;
+    use proto::{combo_index, Card};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn ctl() -> JobControl { JobControl { cancel: Arc::new(AtomicBool::new(false)), progress: Box::new(|_, _, _, _, _| {}) } }
+    fn combo(a: &str, b: &str) -> usize { combo_index(Card::parse(a).unwrap(), Card::parse(b).unwrap()) as usize }
+
+    #[test]
+    fn river_two_combo_solves_to_the_analytic_solution() {
+        let req = solve_request("river_two_combo", 0);
+        let r = run(&req, None, &mut ctl());
+        let sol = match r.outcome { JobOutcome::Ok(s) => s, other => panic!("{other:?}") };
+        // every decision node of the street is exported: [] oop, [check] ip, [check, allin] oop; the requested node is the one reached by history
+        assert_eq!((sol.nodes.len(), sol.requested, sol.mode.as_str(), sol.export.as_str()), (3, 1, "f32", "street"));
+        assert!(sol.exploitability_chips <= 0.1, "exploitability {}", sol.exploitability_chips);
+        validate_solution(&sol, &req.tree.materialized).unwrap();
+        let ip = &sol.nodes[1];
+        assert_eq!(ip.actor, "ip");
+        for qq in [combo("Qc", "Qd"), combo("Qc", "Qh"), combo("Qd", "Qh")] { assert!(ip.available[qq] && ip.probs[qq][1] > 0.97, "QQ bets: {:?}", ip.probs[qq]); }
+        let bluff = ip.probs[combo("5c", "4d")][1];
+        assert!((bluff - 0.5).abs() <= 0.03, "54o bluffs {bluff}");
+        let oop = &sol.nodes[2];
+        let call = oop.probs[combo("Ac", "Ad")][1];
+        assert!((call - 0.5).abs() <= 0.03, "AA calls {call}");
+        assert_eq!(oop.ev_chips[combo("Ac", "Ad")][0], 0.0);                  // fold = 0 by the identity of §10.3
+        assert!(!ip.available[combo("Ac", "Ad")] && ip.probs[combo("Ac", "Ad")] == vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn cancel_before_building_and_no_iteration() {
+        let req = solve_request("river_two_combo", 0);
+        let mut c = ctl();
+        c.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(run(&req, None, &mut c).outcome, JobOutcome::Cancelled));
+        let mut short = req.clone();
+        short.deadline_ms = 300; short.extraction_margin_ms = 600;
+        match run(&short, None, &mut ctl()).outcome { JobOutcome::Error(e) => assert_eq!((e.code.as_str(), e.retryable), ("no_iteration", false)), other => panic!("{other:?}") }
+    }
+}
+```
+
+- [ ] **Step 2: Run to see them fail**
+
+Run: `cargo test -p solver-worker --release --lib job`
+Expected: FAIL to compile (`job::run` missing).
+
+- [ ] **Step 3: Implement `job.rs`**
+
+Add `pub mod job;` to `solver-worker/src/lib.rs`.
+
+`solver-worker/src/job.rs` (above the tests):
 
 ```rust
 use crate::{cards, extract, locks, memory, solve_loop, tree_build, win};
@@ -2451,7 +2782,7 @@ pub fn run(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl
     if let Err(e) = tree_build::cross_check(&lib, &req.tree.materialized) { return done(JobOutcome::Error(error("tree_mismatch", e, false, None))); }
     checkpoint!();
     let street_nodes = req.tree.materialized.iter().filter(|n| n.street == req.tree.root_street).count();
-    if street_nodes > extract::MAX_NODES { return done(invalid(format!("{street_nodes} street nodes exceed the export limit"))); }
+    if street_nodes > extract::MAX_EXPORTED_NODES { return done(invalid(format!("{street_nodes} street nodes exceed the export limit"))); }
     let expected_cards = match req.tree.root_street { Street::Flop => 3, Street::Turn => 4, Street::River => 5, Street::Preflop => 0 };
     if req.board.len() != expected_cards { return done(invalid(format!("{} board cards for a {:?} root", req.board.len(), req.tree.root_street))); }
     let (flop, turn, river) = match cards::board_to_lib(&req.board) { Ok(b) => b, Err(e) => return done(invalid(e)) };
@@ -2490,194 +2821,115 @@ pub fn run(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl
 
 - [ ] **Step 4: Run and commit**
 
-Run: `cargo test -p solver-worker --release --lib`
+Run: `cargo test -p solver-worker --release --lib` then `cargo test --workspace --release`
 Expected: all pass, including the analytic polarized-versus-bluffcatcher solution (IP bets QQ 100%, 54o 50 +- 3 pp; OOP calls 50 +- 3 pp).
 
 ```bash
 git add solver-worker
-git commit -m "feat(solver-worker): memory admission, section 7 solve loop, extraction, locks and the job runner
+git commit -m "feat(solver-worker): job runner with the Building/Solving/Extracting pipeline and cancel checkpoints
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-## Task 10: Worker protocol: `control`/`writer`/`executor` threads, state machine, cancel, shutdown, locks
+## Task 12: Worker stdout writer, bounded line reading and the three-thread wiring
 
 **Files:**
-- Create: `solver-worker/src/protocol.rs`, `solver-worker/src/writer.rs`, `solver-worker/tests/protocol.rs`
-- Modify: `solver-worker/src/main.rs` (replace the drain loop), `solver-worker/src/lib.rs` (add `pub mod protocol; pub mod writer;`)
-- Test: `solver-worker/tests/protocol.rs::{protocol_rejections, cancel_between_iterations, lock_lifecycle}`
+- Create: `solver-worker/src/writer.rs`, `solver-worker/tests/lines.rs`
+- Modify: `solver-worker/src/main.rs` (replace the drain loop with the `control`/`writer`/`executor` wiring), `solver-worker/src/protocol.rs` (created here with only the shared state, `read_line` and the executor loop), `solver-worker/src/lib.rs` (add `pub mod protocol; pub mod writer;`)
+- Test: unit tests in `protocol.rs` for `read_line`; `solver-worker/tests/lines.rs::{oversized_request_line_is_rejected_and_the_worker_survives, eof_exits_zero}`
 
 **Interfaces:**
-- Consumes: `job` (Task 9), `locks::validate`, fixtures.
-- Produces: `writer::{Out::{Msg(WorkerMessage), Exit(i32)}, spawn_writer() -> Sender<Out>}`; `protocol::{WorkerState, Proto, Shared { proto: Mutex<Proto>, out: Sender<Out>, jobs: Sender<Job> }, Job { req: SolveRequest, locks: Option<Vec<NodeLock>>, cancel: Arc<AtomicBool> }, MAX_REQUEST_LINE, Incoming::{Line(String), TooLong, Eof}, read_line(&mut impl BufRead) -> io::Result<Incoming>, handle_line(&Shared, &str), handle_eof(&Shared), executor_loop(Arc<Shared>, Receiver<Job>)}`.
+- Consumes: `job` (Task 11); `proto::worker::{AckStatus, EngineMessage, NodeLock, SolveRequest, Stage, WorkerMessage, REQUEST_LINE_MAX}`.
+- Produces: `writer::{Out::{Msg(WorkerMessage), Exit(i32)}, spawn_writer() -> SyncSender<Out>}`; `protocol::{WorkerState::{Idle, Building, Solving, Extracting, Stopping}, LiveJob { id: String, cancel: Arc<AtomicBool> }, Job { req: SolveRequest, locks: Option<Vec<NodeLock>>, cancel: Arc<AtomicBool> }, Proto { state, live, finished, staged, stopping }, Shared { proto: Mutex<Proto>, out: SyncSender<Out>, jobs: Sender<Job> }, Incoming::{Line(String), TooLong, Eof}, read_line(&mut impl BufRead) -> io::Result<Incoming>, executor_loop(Arc<Shared>, Receiver<Job>), terminal(&Shared, id: &str, JobOutcome, elapsed_ms: u32)}`. `MAX_REQUEST_LINE` is **not** defined here: `protocol.rs` re-exports `proto::worker::REQUEST_LINE_MAX` (cross-plan m9).
+- `handle_line` / `handle_message` arrive in Task 13; until then `main.rs` answers every well-formed line with `ack{rejected, reason: "not implemented yet"}`, which is what `lines.rs` asserts.
 
-- [ ] **Step 1: Failing integration tests `solver-worker/tests/protocol.rs`**
+- [ ] **Step 1: Failing tests**
+
+Bottom of `solver-worker/src/protocol.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufReader;
+    fn read_all(input: &[u8]) -> Vec<String> {
+        let mut r = BufReader::with_capacity(64, input);
+        let mut out = Vec::new();
+        loop {
+            match read_line(&mut r).unwrap() {
+                Incoming::Line(l) => out.push(l),
+                Incoming::TooLong => out.push("<too long>".into()),
+                Incoming::Eof => return out,
+            }
+        }
+    }
+    #[test]
+    fn bounded_line_reading() {
+        assert_eq!(read_all(b"{\"a\":1}\n{\"b\":2}\n"), vec!["{\"a\":1}", "{\"b\":2}"]);
+        assert_eq!(read_all(b"{\"a\":1}\r\n"), vec!["{\"a\":1}"]);      // CRLF is trimmed
+        assert_eq!(read_all(b"{\"a\":1}"), vec!["{\"a\":1}"]);          // a final line without a newline still arrives
+        assert_eq!(read_all(b"\n\n"), vec!["", ""]);                    // blank lines are lines; handle_line ignores them
+        let over = format!("{}\n{{\"b\":2}}\n", "x".repeat(MAX_REQUEST_LINE + 1));
+        assert_eq!(read_all(over.as_bytes()), vec!["<too long>", "{\"b\":2}"]);   // the oversized line is consumed to its newline
+    }
+}
+```
+
+`solver-worker/tests/lines.rs`:
 
 ```rust
 mod common;
-use common::{fixture_lines, Worker};
-use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use common::Worker;
+use serde_json::Value;
+use std::time::Duration;
 
-fn edit(line: &str, f: impl FnOnce(&mut Value)) -> String { let mut v: Value = serde_json::from_str(line).unwrap(); f(&mut v); v.to_string() }
-fn with_id(line: &str, id: &str) -> String { edit(line, |v| v["id"] = json!(id)) }
-fn ack_of(w: &Worker, id: &str) -> Value { w.recv_until(Duration::from_secs(5), |m| m["type"] == "ack" && m["id"] == id).unwrap_or_else(|| panic!("no ack for {id}")) }
-fn result_of(w: &Worker, id: &str, t: Duration) -> Value { w.recv_until(t, |m| m["type"] == "result" && m["id"] == id).unwrap_or_else(|| panic!("no result for {id}")) }
 const S: Duration = Duration::from_secs(1);
 
 #[test]
-fn protocol_rejections() {
+fn oversized_request_line_is_rejected_and_the_worker_survives() {
     let mut w = Worker::spawn(4);
     assert_eq!(w.recv(5 * S).unwrap()["type"], "ready");
-    let river = fixture_lines("river_two_combo");
-    let flop = fixture_lines("flop_cancel");
-    let lock = fixture_lines("lock_river");
-    w.send(r#"{"type":"bogus","id":"1"}"#);
-    assert_eq!(ack_of(&w, "1")["status"], "rejected");
-    w.send(r#"{"type":"cancel","id":"2","target":"x","extra":1}"#);
-    assert_eq!(ack_of(&w, "2")["status"], "rejected");
-    w.send(&edit(&with_id(&river[0], "3"), |v| { v["oop_range"].as_array_mut().unwrap().pop(); }));
-    assert_eq!(ack_of(&w, "3")["status"], "rejected");
-    w.send(&with_id(&river[0], "4").replacen("\"pot\":100", "\"pot\":NaN", 1));
-    assert_eq!(ack_of(&w, "4")["status"], "rejected");
-    w.send(&edit(&with_id(&flop[0], "5"), |v| v["tree"]["menus"]["turn"]["donk"] = Value::Null));
-    let a = ack_of(&w, "5");
-    assert_eq!(a["status"], "rejected");
-    assert!(a["reason"].as_str().unwrap().contains("donk"));
     let big = format!(r#"{{"type":"cancel","id":"6","target":"{}"}}"#, "x".repeat(1_100_000));
     w.send(&big);
-    let a = w.recv_until(5 * S, |m| m["type"] == "ack").unwrap();
+    let a = w.recv_until(5 * S, |m: &Value| m["type"] == "ack").unwrap();
     assert_eq!(a["status"], "rejected");
-    // lock validation: a row summing to 0.4, a row [-0.1, 1.1]; an all-zero row is the free-combo sentinel; a second lock replaces
-    w.send(&edit(&with_id(&lock[0], "7"), |v| v["locks"][0]["probs"][0] = json!([0.1, 0.3])));
-    assert_eq!(ack_of(&w, "7")["status"], "rejected");
-    w.send(&edit(&with_id(&lock[0], "8"), |v| v["locks"][0]["probs"][0] = json!([-0.1, 1.1])));
-    assert_eq!(ack_of(&w, "8")["status"], "rejected");
-    w.send(&with_id(&lock[0], "9"));
-    let a = ack_of(&w, "9");
-    assert_eq!((a["status"].as_str(), a["replaced"].as_bool()), (Some("staged"), Some(false)));
-    w.send(&with_id(&lock[0], "10"));
-    assert_eq!(ack_of(&w, "10")["replaced"], true);
-    // busy: a long flop solve, then a river solve is rejected "busy"; a duplicate id of the live job is "duplicate"
-    w.send(&with_id(&flop[0], "11"));
-    assert_eq!(ack_of(&w, "11")["status"], "accepted");
-    w.send(&with_id(&river[0], "12"));
-    let a = ack_of(&w, "12");
-    assert_eq!((a["status"].as_str(), a["reason"].as_str()), (Some("rejected"), Some("busy")));
-    w.send(&with_id(&flop[0], "11"));
-    assert_eq!(ack_of(&w, "11")["reason"], "duplicate");
-    w.send(r#"{"type":"cancel","id":"13","target":"11"}"#);
-    assert_eq!(ack_of(&w, "13")["status"], "accepted");
-    assert_eq!(result_of(&w, "11", 5 * S)["status"], "cancelled");
-    // a valid river solve: progress during building carries exploitability_chips null; the staged lock (other spot) is a lock_mismatch
-    w.send(&with_id(&river[0], "14"));
-    assert_eq!(ack_of(&w, "14")["status"], "accepted");
-    let r = result_of(&w, "14", 5 * S);
-    assert_eq!((r["status"].as_str(), r["error"]["code"].as_str()), (Some("error"), Some("lock_mismatch")));
-    w.send(&with_id(&river[0], "15"));
-    let p = w.recv_until(5 * S, |m| m["type"] == "progress" && m["id"] == "15").unwrap();
-    assert!(p["stage"] == "building" && p["exploitability_chips"].is_null());
-    assert_eq!(result_of(&w, "15", 5 * S)["status"], "ok");
-    w.send(r#"{"type":"cancel","id":"16","target":"nope"}"#);
-    assert_eq!(ack_of(&w, "16")["status"], "unknown_target");        // still alive after every rejection
-    w.close_stdin();
-    assert_eq!(w.wait_exit(2 * S), Some(0));
+    assert!(a["reason"].as_str().unwrap().contains("1 MiB"));
+    // the worker is still reading: a following well-formed line is answered, not swallowed
+    w.send(r#"{"type":"cancel","id":"7","target":"nope"}"#);
+    assert_eq!(w.recv_until(5 * S, |m: &Value| m["id"] == "7").unwrap()["type"], "ack");
 }
 
 #[test]
-fn cancel_between_iterations() {
-    let mut w = Worker::spawn(8);
-    assert_eq!(w.recv(5 * S).unwrap()["type"], "ready");
-    let flop = fixture_lines("flop_cancel");
-    // Solving: ack <= 50 ms, result{cancelled} within one iteration plus one exploitability pass (<= 1.0 s), never a second terminal
-    w.send(&flop[0]);
-    assert_eq!(ack_of(&w, "43")["status"], "accepted");
-    w.recv_until(20 * S, |m| m["type"] == "progress" && m["stage"] == "solving" && m["iterations"].as_u64().unwrap() >= 1).expect("solving progress");
-    let t = Instant::now();
-    w.send(&flop[1]);
-    assert_eq!(ack_of(&w, "44")["status"], "accepted");
-    assert!(t.elapsed() <= Duration::from_millis(50), "ack took {:?}", t.elapsed());
-    let r = result_of(&w, "43", S);
-    assert_eq!(r["status"], "cancelled");
-    assert!(w.recv_until(Duration::from_millis(300), |m| m["type"] == "result").is_none());
-    w.send(r#"{"type":"cancel","id":"45","target":"43"}"#);
-    assert_eq!(ack_of(&w, "45")["status"], "already_finished");
-    // Building: cancel sent right after the solve is confirmed within one build step
-    w.send(&with_id(&flop[0], "46"));
-    w.send(r#"{"type":"cancel","id":"47","target":"46"}"#);
-    assert_eq!(ack_of(&w, "46")["status"], "accepted");
-    assert_eq!(ack_of(&w, "47")["status"], "accepted");
-    assert_eq!(result_of(&w, "46", 2 * S)["status"], "cancelled");
-    // Extracting: a cancel after `finalize` yields exactly one terminal (cancelled, or the racing completion)
-    w.send(&edit(&with_id(&flop[0], "48"), |v| { v["deadline_ms"] = json!(1500); v["extraction_margin_ms"] = json!(600); v["target_bp"] = json!(1); }));
-    w.recv_until(10 * S, |m| m["type"] == "progress" && m["stage"] == "extracting").expect("extracting progress");
-    w.send(r#"{"type":"cancel","id":"49","target":"48"}"#);
-    let r = result_of(&w, "48", 5 * S);
-    assert!(["cancelled", "best_so_far", "ok"].contains(&r["status"].as_str().unwrap()));
-    assert!(w.recv_until(Duration::from_millis(500), |m| m["type"] == "result").is_none());
-}
-
-#[test]
-fn lock_lifecycle() {
+fn eof_exits_zero() {
     let mut w = Worker::spawn(4);
     assert_eq!(w.recv(5 * S).unwrap()["type"], "ready");
-    let lock = fixture_lines("lock_river");
-    let flop = fixture_lines("flop_cancel");
-    let qq = proto::combo_index(proto::Card::parse("Qc").unwrap(), proto::Card::parse("Qd").unwrap()) as usize;
-    let o54 = proto::combo_index(proto::Card::parse("5c").unwrap(), proto::Card::parse("4d").unwrap()) as usize;
-    let aa = proto::combo_index(proto::Card::parse("Ac").unwrap(), proto::Card::parse("Ad").unwrap()) as usize;
-    // unlocked reference: AA calls about 50%
-    w.send(&edit(&lock[1], |v| { v["id"] = json!("60"); v["spot"] = json!("ffff"); }));
-    let free = result_of(&w, "60", 5 * S);
-    let free_call = free["solution"]["nodes"][2]["probs"][aa][1].as_f64().unwrap();   // nodes: [] oop, [check] ip, [check, allin] oop
-    assert!((free_call - 0.5).abs() < 0.1);
-    // lock then the matching solve: locked rows unchanged, locks_applied 1, hero's response differs (AA folds against the 20% bluff frequency)
-    w.send(&lock[0]);
-    assert_eq!(ack_of(&w, "47")["status"], "staged");
-    w.send(&lock[1]);
-    let r = result_of(&w, "51", 5 * S);
-    assert_eq!(r["status"], "ok");
-    assert_eq!(r["solution"]["locks_applied"], 1);
-    let ip = &r["solution"]["nodes"][1];
-    assert_eq!(ip["probs"][qq], json!([0.0, 1.0]));
-    assert!((ip["probs"][o54][1].as_f64().unwrap() - 0.2).abs() < 1e-3);
-    assert!(r["solution"]["nodes"][2]["probs"][aa][1].as_f64().unwrap() < 0.05);
-    // a lock with another spot: the next solve with the fixture spot is lock_mismatch and the lock is discarded
-    w.send(&edit(&lock[0], |v| { v["id"] = json!("61"); v["spot"] = json!("abcd"); }));
-    assert_eq!(ack_of(&w, "61")["status"], "staged");
-    w.send(&with_id(&lock[1], "62"));
-    assert_eq!(result_of(&w, "62", 5 * S)["error"]["code"], "lock_mismatch");
-    w.send(&with_id(&lock[1], "63"));
-    assert_eq!(result_of(&w, "63", 5 * S)["solution"]["locks_applied"], 0);
-    // lock during Solving is rejected; a lock consumed by a cancelled solve is gone
-    w.send(&with_id(&flop[0], "64"));
-    assert_eq!(ack_of(&w, "64")["status"], "accepted");
-    w.send(&with_id(&lock[0], "65"));
-    assert_eq!(ack_of(&w, "65")["reason"], "solve_in_progress");
-    w.send(r#"{"type":"cancel","id":"66","target":"64"}"#);
-    assert_eq!(result_of(&w, "64", 5 * S)["status"], "cancelled");
-    w.send(&with_id(&lock[0], "67"));
-    assert_eq!(ack_of(&w, "67")["status"], "staged");
-    w.send(&edit(&with_id(&flop[0], "68"), |v| v["spot"] = lock_spot(&lock[0])));
-    w.send(r#"{"type":"cancel","id":"69","target":"68"}"#);
-    assert_eq!(result_of(&w, "68", 5 * S)["status"], "cancelled");
-    w.send(&with_id(&lock[1], "70"));
-    assert_eq!(result_of(&w, "70", 5 * S)["solution"]["locks_applied"], 0);
-    w.send(r#"{"type":"shutdown","id":"71"}"#);
-    assert_eq!(ack_of(&w, "71")["status"], "accepted");
-    assert_eq!(w.wait_exit(2 * S), Some(0));
+    w.close_stdin();
+    assert_eq!(w.wait_exit(2 * S), Some(0));   // §4.5: EOF behaves like shutdown without the ack
 }
-fn lock_spot(line: &str) -> Value { serde_json::from_str::<Value>(line).unwrap()["spot"].clone() }
 ```
 
 - [ ] **Step 2: Run to see them fail**
 
-Run: `cargo test -p solver-worker --release --test protocol`
-Expected: FAIL (the Task 7 main only drains stdin).
+Run: `cargo test -p solver-worker --release --lib protocol` and `cargo test -p solver-worker --release --test lines`
+Expected: FAIL to compile.
 
-- [ ] **Step 3: Implement `writer.rs` and `protocol.rs`**
+- [ ] **Step 3: Implement `writer.rs` and the shared state of `protocol.rs`**
+
+`writer.rs` is complete here and never changes again. For `protocol.rs`, write only the items in this task's Produces block — the `use` block, `MAX_REQUEST_LINE`, `WorkerState`, `LiveJob`, `Job`, `Proto`, `Shared`, `Incoming`, `read_line`, `send`/`ack`/`rejected`, `terminal` and `executor_loop`, copied verbatim from the full `protocol.rs` listing in Task 13 Step 3 — plus this placeholder in place of Task 13's `handle_line` / `handle_message` / `handle_eof`:
+
+```rust
+/// Task 13 replaces this with the §4.5 state machine.
+pub fn handle_line(shared: &Shared, line: &str) {
+    if line.trim().is_empty() { return; }
+    let id = serde_json::from_str::<serde_json::Value>(line).ok()
+        .and_then(|v| v.get("id").and_then(|i| i.as_str().map(String::from))).unwrap_or_else(|| "unknown".into());
+    rejected(shared, &id, "not implemented yet");
+}
+/// stdin EOF: exit 0 without an ack (§4.5). Task 13 replaces this with `begin_stop`.
+pub fn handle_eof(shared: &Shared) { let _ = shared.out.send(Out::Exit(0)); }
+```
 
 `solver-worker/src/writer.rs`:
 
@@ -2706,11 +2958,110 @@ pub fn spawn_writer() -> SyncSender<Out> {
 }
 ```
 
-`solver-worker/src/protocol.rs`:
+- [ ] **Step 4: Wire the three threads in `main.rs`**
+
+Use the `main.rs` of Task 13 Step 4 verbatim. It is written once, there, and does not change again.
+
+- [ ] **Step 5: Run and commit**
+
+Run: `cargo test -p solver-worker --release` then `cargo test --workspace --release`
+Expected: `bounded_line_reading`, `oversized_request_line_is_rejected_and_the_worker_survives` and `eof_exits_zero` pass; `startup::ready_reports_features` still passes.
+
+```bash
+git add solver-worker
+git commit -m "feat(solver-worker): serialized stdout writer, bounded line reading and the control/writer/executor wiring
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 13: Worker state machine: admission, `ack` rules, cancel, shutdown
+
+**Files:**
+- Modify: `solver-worker/src/protocol.rs` (add `precheck`, `lenient_id`, `handle_message`, `handle_eof`, `begin_stop`), `solver-worker/src/main.rs`
+- Create: `solver-worker/tests/protocol.rs`
+- Test: `solver-worker/tests/protocol.rs::protocol_rejections`
+
+**Interfaces:**
+- Consumes: Task 12's `protocol` scaffolding, `job` (Task 11), fixtures (Task 6).
+- Produces: `protocol::{MAX_REQUEST_LINE (re-export of proto::worker::REQUEST_LINE_MAX), lenient_id(&str) -> String, precheck(&SolveRequest) -> Result<(), String>, handle_line(&Shared, &str), handle_message(&Shared, EngineMessage), handle_eof(&Shared)}`.
+
+**Ack ordering (§4.5, review M1):** the duplicate test must come **before** the busy test. A duplicate id of a *live* request implies `state != Idle`, so a busy-first ordering makes `reason: "duplicate"` unreachable. The order is: `stopping` -> `duplicate` (live id or a remembered finished id) -> `busy` (`state != Idle`) -> `precheck`.
+
+**Id recovery (§4.5, review M2):** `lenient_id` must recover the id from a line that is *not* valid JSON (`"pot":NaN` is the case §13.2 names), because the ack has to carry the sender's id. A `serde_json` parse is tried first; on failure a byte scan finds `"id"` and takes the next quoted string.
+
+- [ ] **Step 1: Failing integration test `solver-worker/tests/protocol.rs`**
+
+```rust
+mod common;
+use common::{fixture_lines, Worker};
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
+
+fn edit(line: &str, f: impl FnOnce(&mut Value)) -> String { let mut v: Value = serde_json::from_str(line).unwrap(); f(&mut v); v.to_string() }
+fn with_id(line: &str, id: &str) -> String { edit(line, |v| v["id"] = json!(id)) }
+fn ack_of(w: &Worker, id: &str) -> Value { w.recv_until(Duration::from_secs(5), |m| m["type"] == "ack" && m["id"] == id).unwrap_or_else(|| panic!("no ack for {id}")) }
+fn result_of(w: &Worker, id: &str, t: Duration) -> Value { w.recv_until(t, |m| m["type"] == "result" && m["id"] == id).unwrap_or_else(|| panic!("no result for {id}")) }
+const S: Duration = Duration::from_secs(1);
+
+#[test]
+fn protocol_rejections() {
+    let mut w = Worker::spawn(4);
+    assert_eq!(w.recv(5 * S).unwrap()["type"], "ready");
+    let river = fixture_lines("river_two_combo");
+    let flop = fixture_lines("flop_cancel");
+    w.send(r#"{"type":"bogus","id":"1"}"#);
+    assert_eq!(ack_of(&w, "1")["status"], "rejected");
+    w.send(r#"{"type":"cancel","id":"2","target":"x","extra":1}"#);
+    assert_eq!(ack_of(&w, "2")["status"], "rejected");
+    w.send(&edit(&with_id(&river[0], "3"), |v| { v["oop_range"].as_array_mut().unwrap().pop(); }));
+    assert_eq!(ack_of(&w, "3")["status"], "rejected");
+    // `NaN` is not valid JSON, so the id can only come from `lenient_id`'s byte scan
+    w.send(&with_id(&river[0], "4").replacen("\"pot\":100", "\"pot\":NaN", 1));
+    assert_eq!(ack_of(&w, "4")["status"], "rejected");
+    w.send(&edit(&with_id(&flop[0], "5"), |v| v["tree"]["menus"]["turn"]["donk"] = Value::Null));
+    let a = ack_of(&w, "5");
+    assert_eq!(a["status"], "rejected");
+    assert!(a["reason"].as_str().unwrap().contains("donk"));
+    // busy: a long flop solve, then a river solve is rejected "busy"; a duplicate id of the live job is "duplicate"
+    w.send(&with_id(&flop[0], "11"));
+    assert_eq!(ack_of(&w, "11")["status"], "accepted");
+    w.send(&with_id(&river[0], "12"));
+    let a = ack_of(&w, "12");
+    assert_eq!((a["status"].as_str(), a["reason"].as_str()), (Some("rejected"), Some("busy")));
+    w.send(&with_id(&flop[0], "11"));
+    assert_eq!(ack_of(&w, "11")["reason"], "duplicate");
+    w.send(r#"{"type":"cancel","id":"13","target":"11"}"#);
+    assert_eq!(ack_of(&w, "13")["status"], "accepted");
+    assert_eq!(result_of(&w, "11", 5 * S)["status"], "cancelled");
+    // a finished id is still remembered: re-sending it is a duplicate, not a fresh admission
+    w.send(&with_id(&flop[0], "11"));
+    assert_eq!(ack_of(&w, "11")["reason"], "duplicate");
+    // a valid river solve: progress during building carries exploitability_chips null
+    w.send(&with_id(&river[0], "15"));
+    let p = w.recv_until(5 * S, |m| m["type"] == "progress" && m["id"] == "15").unwrap();
+    assert!(p["stage"] == "building" && p["exploitability_chips"].is_null());
+    assert_eq!(result_of(&w, "15", 5 * S)["status"], "ok");
+    w.send(r#"{"type":"cancel","id":"16","target":"nope"}"#);
+    assert_eq!(ack_of(&w, "16")["status"], "unknown_target");        // still alive after every rejection
+    w.send(r#"{"type":"shutdown","id":"17"}"#);
+    assert_eq!(ack_of(&w, "17")["status"], "accepted");
+    assert_eq!(w.wait_exit(2 * S), Some(0));
+}
+```
+
+- [ ] **Step 2: Run to see it fail**
+
+Run: `cargo test -p solver-worker --release --test protocol`
+Expected: FAIL (Task 12's `handle_line` rejects everything with "not implemented yet").
+
+- [ ] **Step 3: Complete `protocol.rs`**
+
+`solver-worker/src/writer.rs` is unchanged from Task 12. `solver-worker/src/protocol.rs` reaches this shape (the `EngineMessage::Lock` arm and the staged-lock consumption stay stubbed until Task 14):
 
 ```rust
 use crate::job::{self, JobControl, JobOutcome};
-use crate::locks;
 use crate::writer::Out;
 use proto::worker::{AckStatus, EngineMessage, NodeLock, ResultStatus, SolveRequest, Stage, WorkerMessage};
 use proto::Street;
@@ -2721,7 +3072,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 
-pub const MAX_REQUEST_LINE: usize = 1 << 20;
+/// §4.5's 1 MiB request-line limit, owned by `proto::worker` (plan 1 Task 7); re-exported, never redefined.
+pub use proto::worker::REQUEST_LINE_MAX as MAX_REQUEST_LINE;
 const FINISHED_IDS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2751,8 +3103,35 @@ pub fn read_line(reader: &mut impl BufRead) -> io::Result<Incoming> {
     }
 }
 
+/// The ack must carry the sender's id even when the line is not valid JSON (§13.2's `"pot":NaN` case), so a
+/// failed parse falls back to a byte scan: find the key `"id"`, skip the colon and whitespace, take the next
+/// quoted string. Only used for rejections, so a wrong guess costs an unmatched ack, never a wrong admission.
 fn lenient_id(line: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(line).ok().and_then(|v| v.get("id").and_then(|i| i.as_str().map(String::from))).unwrap_or_else(|| "unknown".into())
+    if let Some(id) = serde_json::from_str::<serde_json::Value>(line).ok().and_then(|v| v.get("id").and_then(|i| i.as_str().map(String::from))) { return id; }
+    scan_id(line).unwrap_or_else(|| "unknown".into())
+}
+fn scan_id(line: &str) -> Option<String> {
+    let b = line.as_bytes();
+    let key = br#""id""#;
+    let mut i = 0;
+    while i + key.len() <= b.len() {
+        if &b[i..i + key.len()] == key {
+            let mut j = i + key.len();
+            while j < b.len() && (b[j] as char).is_whitespace() { j += 1; }
+            if j < b.len() && b[j] == b':' {
+                j += 1;
+                while j < b.len() && (b[j] as char).is_whitespace() { j += 1; }
+                if j < b.len() && b[j] == b'"' {
+                    let start = j + 1;
+                    let mut k = start;
+                    while k < b.len() && b[k] != b'"' { if b[k] == b'\\' { k += 1; } k += 1; }
+                    if k <= b.len() { return Some(line[start..k.min(line.len())].to_string()); }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 fn send(shared: &Shared, m: WorkerMessage) { let _ = shared.out.send(Out::Msg(m)); }
 fn ack(shared: &Shared, id: &str, status: AckStatus, reason: Option<String>, replaced: Option<bool>) {
@@ -2770,7 +3149,7 @@ fn precheck(req: &SolveRequest) -> Result<(), String> {
             match t.menus.get(&s).and_then(|m| m.donk.as_ref()) { Some(d) if d.is_empty() => {}, Some(_) => return Err(format!("{s:?} donk sizes must be empty")), None => return Err(format!("{s:?} donk option must be the explicit empty list, never None")) }
         }
     }
-    if t.materialized.iter().filter(|n| n.street == t.root_street).count() > crate::extract::MAX_NODES { return Err("street node count exceeds 100000".into()); }
+    if t.materialized.iter().filter(|n| n.street == t.root_street).count() > crate::extract::MAX_EXPORTED_NODES { return Err("street node count exceeds 100000".into()); }
     let mut seen = std::collections::HashSet::new();
     if !(3..=5).contains(&req.board.len()) || !req.board.iter().all(|c| seen.insert(c.0)) { return Err("board must be 3 to 5 distinct cards".into()); }
     if req.pot == 0 || req.stack_oop == 0 || req.stack_ip == 0 { return Err("pot and stacks must be positive".into()); }
@@ -2791,28 +3170,20 @@ pub fn handle_message(shared: &Shared, msg: EngineMessage) {
         EngineMessage::Solve(req) => {
             let mut p = shared.proto.lock().unwrap();
             if p.stopping { drop(p); return rejected(shared, &req.id, "stopping"); }
+            // §4.5 ack order: DUPLICATE IS TESTED BEFORE BUSY. A duplicate id of a live request always implies
+            // `state != Idle`, so a busy-first order would make `reason: "duplicate"` unreachable.
+            if p.live.as_ref().is_some_and(|l| l.id == req.id) || p.finished.contains(&req.id) { drop(p); return rejected(shared, &req.id, "duplicate"); }
             if p.state != WorkerState::Idle { drop(p); return rejected(shared, &req.id, "busy"); }
-            if p.live.as_ref().map(|l| l.id == req.id).unwrap_or(false) || p.finished.contains(&req.id) { drop(p); return rejected(shared, &req.id, "duplicate"); }
             if let Err(e) = precheck(&req) { drop(p); return rejected(shared, &req.id, e); }
             let cancel = Arc::new(AtomicBool::new(false));
             p.state = WorkerState::Building;
             p.live = Some(LiveJob { id: req.id.clone(), cancel: cancel.clone() });
-            let staged = p.staged.take();
             drop(p);
             ack(shared, &req.id, AckStatus::Accepted, None, None);
-            match staged {
-                Some((spot, _)) if spot != req.spot => terminal(shared, &req.id, JobOutcome::Error(job::error("lock_mismatch", "staged lock belongs to another spot", false, None)), 0),
-                staged => { let _ = shared.jobs.send(Job { req, locks: staged.map(|(_, l)| l), cancel }); }
-            }
+            let _ = shared.jobs.send(Job { req, locks: None, cancel });   // Task 14 consumes `p.staged` here
         }
-        EngineMessage::Lock(l) => {
-            let mut p = shared.proto.lock().unwrap();
-            if p.state != WorkerState::Idle { drop(p); return rejected(shared, &l.id, "solve_in_progress"); }
-            if let Err(e) = locks::validate(&l.locks) { drop(p); return rejected(shared, &l.id, e); }
-            let replaced = p.staged.replace((l.spot.clone(), l.locks)).is_some();
-            drop(p);
-            ack(shared, &l.id, AckStatus::Staged, None, Some(replaced));
-        }
+        // Task 14 replaces this arm with lock staging.
+        EngineMessage::Lock { id, .. } => rejected(shared, &id, "lock staging arrives in Task 14"),
         EngineMessage::Cancel { id, target } => {
             let p = shared.proto.lock().unwrap();
             if let Some(live) = p.live.as_ref().filter(|l| l.id == target) { live.cancel.store(true, Ordering::SeqCst); drop(p); ack(shared, &id, AckStatus::Accepted, None, None); }
@@ -2909,31 +3280,274 @@ fn main() {
 
 - [ ] **Step 5: Run and commit**
 
-Run: `cargo test -p solver-worker --release`
-Expected: `startup`, `protocol` (3 tests) and the lib tests pass. If `cancel_between_iterations` shows an ack above 50 ms, the control thread is being starved by the rayon pool: launch the test with `--threads 8` (as written) and confirm the writer channel is not full (256 messages); the `ack` path never touches the executor.
+Run: `cargo test -p solver-worker --release --test protocol` then `cargo test --workspace --release`
+Expected: `protocol_rejections` passes together with `startup`, `lines` and the lib tests; the workspace stays green.
 
 ```bash
 git add solver-worker
-git commit -m "feat(solver-worker): control, writer and executor threads with the section 4.5 state machine
+git commit -m "feat(solver-worker): section 4.5 state machine with duplicate-before-busy ack ordering and lenient id recovery
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-## Task 11: Worker contract tests: river analytic, EV convention, conservation, rake cap, two named combos
+## Task 14: Worker lock staging and the cancel lifecycle
 
 **Files:**
-- Create: `solver-worker/tests/contract_river.rs`
+- Modify: `solver-worker/src/protocol.rs` (the `EngineMessage::Lock` arm and the staged-lock consumption in the `Solve` arm)
+- Create: `solver-worker/tests/locks_and_cancel.rs`
+- Test: `solver-worker/tests/locks_and_cancel.rs::{lock_staging_rejections, cancel_between_iterations, lock_lifecycle}`
+
+**Interfaces:**
+- Consumes: Task 13's `protocol`, `locks::validate` (Task 10), fixtures.
+- Produces: no new names; `Proto.staged: Option<(String, Vec<NodeLock>)>` becomes live (staged on `lock`, taken by the next `solve`, `lock_mismatch` when the spot differs, discarded either way).
+
+- [ ] **Step 1: Failing integration tests `solver-worker/tests/locks_and_cancel.rs`**
+
+```rust
+mod common;
+use common::{fixture_lines, Worker};
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
+
+fn edit(line: &str, f: impl FnOnce(&mut Value)) -> String { let mut v: Value = serde_json::from_str(line).unwrap(); f(&mut v); v.to_string() }
+fn with_id(line: &str, id: &str) -> String { edit(line, |v| v["id"] = json!(id)) }
+fn ack_of(w: &Worker, id: &str) -> Value { w.recv_until(Duration::from_secs(5), |m| m["type"] == "ack" && m["id"] == id).unwrap_or_else(|| panic!("no ack for {id}")) }
+fn result_of(w: &Worker, id: &str, t: Duration) -> Value { w.recv_until(t, |m| m["type"] == "result" && m["id"] == id).unwrap_or_else(|| panic!("no result for {id}")) }
+const S: Duration = Duration::from_secs(1);
+
+#[test]
+fn lock_staging_rejections() {
+    let mut w = Worker::spawn(4);
+    assert_eq!(w.recv(5 * S).unwrap()["type"], "ready");
+    let river = fixture_lines("river_two_combo");
+    let lock = fixture_lines("lock_river");
+    // a row summing to 0.4 and a row [-0.1, 1.1] are rejected; an all-zero row is the free-combo sentinel
+    w.send(&edit(&with_id(&lock[0], "7"), |v| v["locks"][0]["probs"][0] = json!([0.1, 0.3])));
+    assert_eq!(ack_of(&w, "7")["status"], "rejected");
+    w.send(&edit(&with_id(&lock[0], "8"), |v| v["locks"][0]["probs"][0] = json!([-0.1, 1.1])));
+    assert_eq!(ack_of(&w, "8")["status"], "rejected");
+    w.send(&with_id(&lock[0], "9"));
+    let a = ack_of(&w, "9");
+    assert_eq!((a["status"].as_str(), a["replaced"].as_bool()), (Some("staged"), Some(false)));
+    w.send(&with_id(&lock[0], "10"));
+    assert_eq!(ack_of(&w, "10")["replaced"], true);
+    // a staged lock belonging to another spot fails the next solve with lock_mismatch and is discarded
+    w.send(&with_id(&river[0], "14"));
+    assert_eq!(ack_of(&w, "14")["status"], "accepted");
+    let r = result_of(&w, "14", 5 * S);
+    assert_eq!((r["status"].as_str(), r["error"]["code"].as_str()), (Some("error"), Some("lock_mismatch")));
+    w.send(&with_id(&river[0], "15"));
+    assert_eq!(result_of(&w, "15", 5 * S)["status"], "ok");
+    w.close_stdin();
+    assert_eq!(w.wait_exit(2 * S), Some(0));
+}
+
+#[test]
+fn cancel_between_iterations() {
+    let mut w = Worker::spawn(8);
+    assert_eq!(w.recv(5 * S).unwrap()["type"], "ready");
+    let flop = fixture_lines("flop_cancel");
+    // Solving: ack <= 50 ms, result{cancelled} within one iteration plus one exploitability pass (<= 1.0 s), never a second terminal
+    w.send(&flop[0]);
+    assert_eq!(ack_of(&w, "43")["status"], "accepted");
+    w.recv_until(20 * S, |m| m["type"] == "progress" && m["stage"] == "solving" && m["iterations"].as_u64().unwrap() >= 1).expect("solving progress");
+    let t = Instant::now();
+    w.send(&flop[1]);
+    assert_eq!(ack_of(&w, "44")["status"], "accepted");
+    assert!(t.elapsed() <= Duration::from_millis(50), "ack took {:?}", t.elapsed());
+    let r = result_of(&w, "43", S);
+    assert_eq!(r["status"], "cancelled");
+    assert!(w.recv_until(Duration::from_millis(300), |m| m["type"] == "result").is_none());
+    w.send(r#"{"type":"cancel","id":"45","target":"43"}"#);
+    assert_eq!(ack_of(&w, "45")["status"], "already_finished");
+    // Building: cancel sent right after the solve is confirmed within one build step
+    w.send(&with_id(&flop[0], "46"));
+    w.send(r#"{"type":"cancel","id":"47","target":"46"}"#);
+    assert_eq!(ack_of(&w, "46")["status"], "accepted");
+    assert_eq!(ack_of(&w, "47")["status"], "accepted");
+    assert_eq!(result_of(&w, "46", 2 * S)["status"], "cancelled");
+    // Extracting: a cancel after `finalize` yields exactly one terminal (cancelled, or the racing completion)
+    w.send(&edit(&with_id(&flop[0], "48"), |v| { v["deadline_ms"] = json!(1500); v["extraction_margin_ms"] = json!(600); v["target_bp"] = json!(1); }));
+    w.recv_until(10 * S, |m| m["type"] == "progress" && m["stage"] == "extracting").expect("extracting progress");
+    w.send(r#"{"type":"cancel","id":"49","target":"48"}"#);
+    let r = result_of(&w, "48", 5 * S);
+    assert!(["cancelled", "best_so_far", "ok"].contains(&r["status"].as_str().unwrap()));
+    assert!(w.recv_until(Duration::from_millis(500), |m| m["type"] == "result").is_none());
+}
+
+#[test]
+fn lock_lifecycle() {
+    let mut w = Worker::spawn(4);
+    assert_eq!(w.recv(5 * S).unwrap()["type"], "ready");
+    let lock = fixture_lines("lock_river");
+    let flop = fixture_lines("flop_cancel");
+    let qq = proto::combo_index(proto::Card::parse("Qc").unwrap(), proto::Card::parse("Qd").unwrap()) as usize;
+    let o54 = proto::combo_index(proto::Card::parse("5c").unwrap(), proto::Card::parse("4d").unwrap()) as usize;
+    let aa = proto::combo_index(proto::Card::parse("Ac").unwrap(), proto::Card::parse("Ad").unwrap()) as usize;
+    // unlocked reference: AA calls about 50%
+    w.send(&edit(&lock[1], |v| { v["id"] = json!("60"); v["spot"] = json!("ffff"); }));
+    let free = result_of(&w, "60", 5 * S);
+    let free_call = free["solution"]["nodes"][2]["probs"][aa][1].as_f64().unwrap();   // nodes: [] oop, [check] ip, [check, allin] oop
+    assert!((free_call - 0.5).abs() < 0.1);
+    // lock then the matching solve: locked rows unchanged, locks_applied 1, hero's response differs (AA folds against the 20% bluff frequency)
+    w.send(&lock[0]);
+    assert_eq!(ack_of(&w, "47")["status"], "staged");
+    w.send(&lock[1]);
+    let r = result_of(&w, "51", 5 * S);
+    assert_eq!(r["status"], "ok");
+    assert_eq!(r["solution"]["locks_applied"], 1);
+    let ip = &r["solution"]["nodes"][1];
+    assert_eq!(ip["probs"][qq], json!([0.0, 1.0]));
+    assert!((ip["probs"][o54][1].as_f64().unwrap() - 0.2).abs() < 1e-3);
+    assert!(r["solution"]["nodes"][2]["probs"][aa][1].as_f64().unwrap() < 0.05);
+    // a lock with another spot: the next solve with the fixture spot is lock_mismatch and the lock is discarded
+    w.send(&edit(&lock[0], |v| { v["id"] = json!("61"); v["spot"] = json!("abcd"); }));
+    assert_eq!(ack_of(&w, "61")["status"], "staged");
+    w.send(&with_id(&lock[1], "62"));
+    assert_eq!(result_of(&w, "62", 5 * S)["error"]["code"], "lock_mismatch");
+    w.send(&with_id(&lock[1], "63"));
+    assert_eq!(result_of(&w, "63", 5 * S)["solution"]["locks_applied"], 0);
+    // lock during Solving is rejected; a lock consumed by a cancelled solve is gone
+    w.send(&with_id(&flop[0], "64"));
+    assert_eq!(ack_of(&w, "64")["status"], "accepted");
+    w.send(&with_id(&lock[0], "65"));
+    assert_eq!(ack_of(&w, "65")["reason"], "solve_in_progress");
+    w.send(r#"{"type":"cancel","id":"66","target":"64"}"#);
+    assert_eq!(result_of(&w, "64", 5 * S)["status"], "cancelled");
+    w.send(&with_id(&lock[0], "67"));
+    assert_eq!(ack_of(&w, "67")["status"], "staged");
+    w.send(&edit(&with_id(&flop[0], "68"), |v| v["spot"] = lock_spot(&lock[0])));
+    w.send(r#"{"type":"cancel","id":"69","target":"68"}"#);
+    assert_eq!(result_of(&w, "68", 5 * S)["status"], "cancelled");
+    w.send(&with_id(&lock[1], "70"));
+    assert_eq!(result_of(&w, "70", 5 * S)["solution"]["locks_applied"], 0);
+    w.send(r#"{"type":"shutdown","id":"71"}"#);
+    assert_eq!(ack_of(&w, "71")["status"], "accepted");
+    assert_eq!(w.wait_exit(2 * S), Some(0));
+}
+fn lock_spot(line: &str) -> Value { serde_json::from_str::<Value>(line).unwrap()["spot"].clone() }
+```
+
+- [ ] **Step 2: Run to see them fail**
+
+Run: `cargo test -p solver-worker --release --test locks_and_cancel`
+Expected: FAIL — Task 13's `handle_message` answers every `lock` line `ack{rejected, reason: "lock staging arrives in Task 14"}`.
+
+- [ ] **Step 3: Add the lock-staging arm to `protocol.rs`**
+
+Replace the placeholder `EngineMessage::Lock` arm and the `Solve` arm's staged-lock handling with:
+
+```rust
+        EngineMessage::Solve(req) => {
+            let mut p = shared.proto.lock().unwrap();
+            if p.stopping { drop(p); return rejected(shared, &req.id, "stopping"); }
+            // §4.5 ack order: duplicate BEFORE busy. A duplicate id of a live request always implies
+            // `state != Idle`, so testing busy first would make `reason: "duplicate"` unreachable.
+            if p.live.as_ref().is_some_and(|l| l.id == req.id) || p.finished.contains(&req.id) { drop(p); return rejected(shared, &req.id, "duplicate"); }
+            if p.state != WorkerState::Idle { drop(p); return rejected(shared, &req.id, "busy"); }
+            if let Err(e) = precheck(&req) { drop(p); return rejected(shared, &req.id, e); }
+            let cancel = Arc::new(AtomicBool::new(false));
+            p.state = WorkerState::Building;
+            p.live = Some(LiveJob { id: req.id.clone(), cancel: cancel.clone() });
+            // A staged lock lives for exactly one solve and is consumed here, whatever the outcome.
+            let staged = p.staged.take();
+            drop(p);
+            ack(shared, &req.id, AckStatus::Accepted, None, None);
+            match staged {
+                Some((spot, _)) if spot != req.spot => terminal(shared, &req.id, JobOutcome::Error(job::error("lock_mismatch", "staged lock belongs to another spot", false, None)), 0),
+                staged => { let _ = shared.jobs.send(Job { req, locks: staged.map(|(_, l)| l), cancel }); }
+            }
+        }
+        EngineMessage::Lock { id, spot, locks } => {
+            let mut p = shared.proto.lock().unwrap();
+            if p.state != WorkerState::Idle { drop(p); return rejected(shared, &id, "solve_in_progress"); }
+            if let Err(e) = locks::validate(&locks) { drop(p); return rejected(shared, &id, e); }
+            let replaced = p.staged.replace((spot, locks)).is_some();
+            drop(p);
+            ack(shared, &id, AckStatus::Staged, None, Some(replaced));
+        }
+```
+
+and add `use crate::locks;` to the imports. `begin_stop` already clears `p.staged`, so a shutdown or EOF never leaves a lock behind.
+
+- [ ] **Step 4: Run and commit**
+
+Run: `cargo test -p solver-worker --release` then `cargo test --workspace --release`
+Expected: `lock_staging_rejections`, `cancel_between_iterations` and `lock_lifecycle` pass alongside `startup`, `lines`, `protocol` and the lib tests. If `cancel_between_iterations` shows an ack above 50 ms, the control thread is being starved by the rayon pool: launch the test with `--threads 8` (as written) and confirm the writer channel is not full (256 messages); the `ack` path never touches the executor.
+
+```bash
+git add solver-worker
+git commit -m "feat(solver-worker): lock staging and the cancel lifecycle across Building, Solving and Extracting
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 15: The pinned V1 fixture and the worker's river contract tests
+
+**Files:**
+- Create: `solver-worker/examples/gen_basic_fixture.rs`, `fixtures/solver/basic_0p3.json` (generated), `fixtures/worker/basic_turn_std_request.jsonl` (generated), `solver-worker/tests/contract_river.rs`
 - Test: `river_polarized_vs_bluffcatcher_analytic`, `ev_convention_non_root_payoffs`, `ev_conservation`, `rake_cap_applied`, `combo_matrix_two_named`
 
 **Interfaces:**
-- Consumes: `common::{Worker, fixture_lines}` (Task 7), `solver_worker::{tree_build, cards}` and `postflop_solver` for the in-process conservation check, fixtures.
-- Produces: nothing new; these tests gate V1/V4. Note: `river_check_only_terminal_oracle` needs `core-eval` and therefore lives in `crates/engine/tests/worker_link.rs` (Task 14), which spawns the same binary.
+- Consumes: `common::{Worker, fixture_lines}` (Task 7), `solver_worker::{tree_build, cards, extract}` and `postflop_solver` for the in-process conservation check and the fixture generator, fixtures (Task 6).
+- Produces: `fixtures/solver/basic_0p3.json` (the V1 regression solution) and `fixtures/worker/basic_turn_std_request.jsonl` (its `solve` request line), consumed by `ev_convention_non_root_payoffs` here and by Tasks 16 and 17. Note: `river_check_only_terminal_oracle` needs `core-eval` and therefore lives in `crates/engine/tests/worker_link.rs` (Task 18), which spawns the same binary.
 
-**Spec deviation, recorded here and in the self-review:** §13.2 `ev_convention_non_root_payoffs` names OOP's nut hand `AA` with equity 1 against the locked betting range, but on `Qs Jd 7h 3c 2d` three queens beat aces (the same fact makes AA the bluff-catcher of the analytic test). The stated numbers (`+200` with equity 1, `-50` with equity `0.6 / 3.6`) are reproduced exactly with OOP = `QQ` (each OOP QQ combo removes every IP QQ combo, so the locked betting range against it is 54o at 20%) and `66`; the test uses `QQ,66`.
+**Why the generator is in this task (review M9a):** `ev_convention_non_root_payoffs` reads `fixtures/worker/basic_turn_std_request.jsonl`. Generating that file in a later task would leave a failing test in the tree for one commit and force a `--skip`, which the per-task green command forbids. The example binary is therefore step 1 here.
 
-- [ ] **Step 1: Write the tests**
+**Spec deviation, recorded here and in the self-review (spec S7 applies it to §13.2):** §13.2 `ev_convention_non_root_payoffs` names OOP's nut hand `AA` with equity 1 against the locked betting range, but on `Qs Jd 7h 3c 2d` three queens beat aces (the same fact makes AA the bluff-catcher of the analytic test). The stated numbers (`+200` with equity 1, `-50` with equity `0.6 / 3.6`) are reproduced exactly with OOP = `QQ` (each OOP QQ combo removes every IP QQ combo, so the locked betting range against it is 54o at 20%) and `66`; the test uses `QQ,66`. Spec revision 6 carries this correction.
+
+- [ ] **Step 1: Write and run the V1 fixture generator**
+
+`solver-worker/examples/gen_basic_fixture.rs` (V1: the library's own `solve()` on the `examples/basic.rs` ranges and board, `turn_std_v1` at pot 200 / stack 900, target 0.3%):
+
+```rust
+use postflop_solver::*;
+use proto::worker::{EngineMessage, SolveRequest, StreetSolution};
+use proto::{Card, EffectiveTree, Range1326};
+use solver_worker::{cards, extract, tree_build};
+use std::sync::atomic::AtomicBool;
+
+fn to_range1326(r: &Range) -> Range1326 {
+    let mut out = Range1326([0.0; 1326]);
+    let (hands, weights) = r.get_hands_weights(0);
+    for (h, w) in hands.iter().zip(weights) { out.0[cards::lib_hand_to_combo(*h) as usize] = w; }
+    out
+}
+
+fn main() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let case: serde_json::Value = std::fs::read_to_string(root.join("fixtures/worker/materialization_cases.jsonl")).unwrap().lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|c| c["case"] == "basic_turn_std").expect("basic_turn_std case");
+    let tree: EffectiveTree = serde_json::from_value(case["tree"].clone()).unwrap();
+    let oop: Range = "66+,A8s+,A5s-A4s,AJo+,K9s+,KQo,QTs+,JTs,96s+,85s+,75s+,65s,54s".parse().unwrap();
+    let ip: Range = "QQ-22,AQs-A2s,ATo+,K5s+,KJo+,Q8s+,J8s+,T7s+,96s+,86s+,75s+,64s+,53s+".parse().unwrap();
+    let board: Vec<Card> = ["Td", "9d", "6h", "Qc"].iter().map(|s| Card::parse(s).unwrap()).collect();
+    let (mut oop_v, mut ip_v) = (to_range1326(&oop), to_range1326(&ip));
+    for i in 0..1326 { let [a, b] = proto::combo_cards(i as u16); if board.contains(&a) || board.contains(&b) { oop_v.0[i] = 0.0; ip_v.0[i] = 0.0; } }
+    let req = SolveRequest { id: "basic".into(), spot: "b".repeat(64), board: board.clone(), oop_range: oop_v.clone(), ip_range: ip_v.clone(), pot: 200, stack_oop: 900, stack_ip: 900,
+        rake_rate: 0.0, rake_cap_mchips: 0, tree: tree.clone(), history: vec![], target_bp: 30, deadline_ms: 20000, extraction_margin_ms: 200, memory_limit_bytes: 10 << 30, background: false };
+    let action_tree = tree_build::build(&tree, 200, 900, 0.0, 0, &[]).unwrap();
+    let (flop, turn, river) = cards::board_to_lib(&board).unwrap();
+    let mut game = PostFlopGame::with_config(CardConfig { range: [cards::range_to_lib(&oop_v).unwrap(), cards::range_to_lib(&ip_v).unwrap()], flop, turn, river }, action_tree).unwrap();
+    game.allocate_memory(false);
+    let expl = solve(&mut game, 1000, 200.0 * 0.003, false);
+    let meta = extract::SolutionMeta { exploitability_chips: expl, iterations: 0, memory_bytes: game.memory_usage().0, mode: "f32", locks_applied: 0 };
+    let sol: StreetSolution = extract::street_solution(&mut game, &req, meta, &AtomicBool::new(false)).unwrap().unwrap();
+    std::fs::create_dir_all(root.join("fixtures/solver")).unwrap();
+    std::fs::write(root.join("fixtures/solver/basic_0p3.json"), serde_json::to_string(&sol).unwrap()).unwrap();
+    std::fs::write(root.join("fixtures/worker/basic_turn_std_request.jsonl"), format!("{}\n", serde_json::to_string(&EngineMessage::Solve(req)).unwrap())).unwrap();
+    println!("exploitability {expl:.4} chips, {} nodes", sol.nodes.len());
+}
+```
+
+Run: `cargo run --release -p solver-worker --example gen_basic_fixture`
+Expected: `fixtures/solver/basic_0p3.json` and `fixtures/worker/basic_turn_std_request.jsonl` written; exploitability <= 0.6 chips.
+
+- [ ] **Step 2: Write the tests**
 
 ```rust
 mod common;
@@ -3080,77 +3694,34 @@ fn combo_matrix_two_named() {
 }
 ```
 
-`basic_turn_std_request` is a one-line fixture written by Task 12's `gen_basic_fixture` (the `solve` request of the pinned example spot); run Task 12's step 3 before running `ev_convention_non_root_payoffs`, or run the other four tests first with `cargo test -p solver-worker --release --test contract_river -- --skip ev_convention`.
+`basic_turn_std_request` is the one-line fixture written by step 1 of this task, so all five tests run in one pass and nothing is skipped.
 
-- [ ] **Step 2: Run and commit**
+- [ ] **Step 3: Run and commit**
 
-Run: `cargo test -p solver-worker --release --test contract_river -- --skip ev_convention`
-Expected: 4 passed. (`ev_convention_non_root_payoffs` passes after Task 12 step 3.)
+Run: `cargo test -p solver-worker --release --test contract_river` then `cargo test --workspace --release`
+Expected: 5 passed; the workspace stays green with no `--skip`.
 
 ```bash
-git add solver-worker/tests/contract_river.rs
-git commit -m "test(solver-worker): river analytic, EV convention, conservation, rake cap and combo matrix contracts
+git add solver-worker fixtures/solver fixtures/worker
+git commit -m "test(solver-worker): pinned V1 fixture plus river analytic, EV convention, conservation, rake cap and combo matrix contracts
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-## Task 12: Worker contract tests: materialization mismatch, wager cap, exact insertion, suit permutation, pinned example
+## Task 16: Worker contract tests: materialization mismatch, wager cap, exact insertion, suit permutation, pinned example
 
 **Files:**
-- Create: `solver-worker/examples/gen_basic_fixture.rs`, `solver-worker/tests/contract_tree.rs`, `fixtures/solver/basic_0p3.json` (generated), `fixtures/worker/basic_turn_std_request.jsonl` (generated)
-- Modify: nothing in `tools/` (the case `("basic_turn_std", "turn_std_v1", 200, 900, [])` is already in Task 6's generator; 47 cases)
+- Create: `solver-worker/tests/contract_tree.rs`
+- Modify: nothing in `tools/` (the case `("basic_turn_std", "turn_std_v1", 200, 900, [])` is already in Task 6's generator; 43 cases)
 - Test: `tree_materialization_matches_library`, `wager_cap_remove_lines`, `exact_size_insertion_no_prune`, `suit_permutation_metamorphic`, `pinned_example_fixture`
 
-- [ ] **Step 1: Write the example binary**
+**Interfaces:**
+- Consumes: `common::{Worker, fixture_lines}` (Task 7), `solver_worker::{history, tree_build}` (Task 8), `fixtures/solver/basic_0p3.json` and `fixtures/worker/basic_turn_std_request.jsonl` (Task 15), `fixtures/worker/materialization_cases.jsonl` (Task 6).
+- Produces: nothing new; these tests gate the §4.6 wire behaviour.
 
-`solver-worker/examples/gen_basic_fixture.rs` (V1: the library's own `solve()` on the `examples/basic.rs` ranges and board, `turn_std_v1` at pot 200 / stack 900, target 0.3%):
-
-```rust
-use postflop_solver::*;
-use proto::worker::{EngineMessage, SolveRequest, StreetSolution};
-use proto::{Card, EffectiveTree, Range1326};
-use solver_worker::{cards, extract, tree_build};
-use std::sync::atomic::AtomicBool;
-
-fn to_range1326(r: &Range) -> Range1326 {
-    let mut out = Range1326([0.0; 1326]);
-    let (hands, weights) = r.get_hands_weights(0);
-    for (h, w) in hands.iter().zip(weights) { out.0[cards::lib_hand_to_combo(*h) as usize] = w; }
-    out
-}
-
-fn main() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let case: serde_json::Value = std::fs::read_to_string(root.join("fixtures/worker/materialization_cases.jsonl")).unwrap().lines()
-        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|c| c["case"] == "basic_turn_std").expect("basic_turn_std case");
-    let tree: EffectiveTree = serde_json::from_value(case["tree"].clone()).unwrap();
-    let oop: Range = "66+,A8s+,A5s-A4s,AJo+,K9s+,KQo,QTs+,JTs,96s+,85s+,75s+,65s,54s".parse().unwrap();
-    let ip: Range = "QQ-22,AQs-A2s,ATo+,K5s+,KJo+,Q8s+,J8s+,T7s+,96s+,86s+,75s+,64s+,53s+".parse().unwrap();
-    let board: Vec<Card> = ["Td", "9d", "6h", "Qc"].iter().map(|s| Card::parse(s).unwrap()).collect();
-    let (mut oop_v, mut ip_v) = (to_range1326(&oop), to_range1326(&ip));
-    for i in 0..1326 { let [a, b] = proto::combo_cards(i as u16); if board.contains(&a) || board.contains(&b) { oop_v.0[i] = 0.0; ip_v.0[i] = 0.0; } }
-    let req = SolveRequest { id: "basic".into(), spot: "b".repeat(64), board: board.clone(), oop_range: oop_v.clone(), ip_range: ip_v.clone(), pot: 200, stack_oop: 900, stack_ip: 900,
-        rake_rate: 0.0, rake_cap_mchips: 0, tree: tree.clone(), history: vec![], target_bp: 30, deadline_ms: 20000, extraction_margin_ms: 200, memory_limit_bytes: 10 << 30, background: false };
-    let action_tree = tree_build::build(&tree, 200, 900, 0.0, 0, &[]).unwrap();
-    let (flop, turn, river) = cards::board_to_lib(&board).unwrap();
-    let mut game = PostFlopGame::with_config(CardConfig { range: [cards::range_to_lib(&oop_v).unwrap(), cards::range_to_lib(&ip_v).unwrap()], flop, turn, river }, action_tree).unwrap();
-    game.allocate_memory(false);
-    let expl = solve(&mut game, 1000, 200.0 * 0.003, false);
-    let meta = extract::SolutionMeta { exploitability_chips: expl, iterations: 0, memory_bytes: game.memory_usage().0, mode: "f32", locks_applied: 0 };
-    let sol: StreetSolution = extract::street_solution(&mut game, &req, meta, &AtomicBool::new(false)).unwrap().unwrap();
-    std::fs::create_dir_all(root.join("fixtures/solver")).unwrap();
-    std::fs::write(root.join("fixtures/solver/basic_0p3.json"), serde_json::to_string(&sol).unwrap()).unwrap();
-    std::fs::write(root.join("fixtures/worker/basic_turn_std_request.jsonl"), format!("{}\n", serde_json::to_string(&EngineMessage::Solve(req)).unwrap())).unwrap();
-    println!("exploitability {expl:.4} chips, {} nodes", sol.nodes.len());
-}
-```
-
-Run: `cargo run --release -p solver-worker --example gen_basic_fixture`
-Expected: `fixtures/solver/basic_0p3.json` and `fixtures/worker/basic_turn_std_request.jsonl` written; exploitability <= 0.6 chips.
-
-- [ ] **Step 2: Write `solver-worker/tests/contract_tree.rs`**
+- [ ] **Step 1: Write `solver-worker/tests/contract_tree.rs`**
 
 ```rust
 mod common;
@@ -3168,7 +3739,7 @@ fn case(name: &str) -> Value { cases().into_iter().find(|c| c["case"] == name).u
 
 #[test]
 fn tree_materialization_matches_library() {
-    // equality is checked in-process for all 47 cases (Task 8); here every disagreement is result{error{tree_mismatch}} on the wire
+    // equality is checked in-process for all 43 cases (Task 8); here every disagreement is result{error{tree_mismatch}} on the wire
     let mut w = Worker::spawn(4); ready(&w);
     let river = &fixture_lines("river_two_combo")[0];
     w.send(&edit(river, |v| { v["id"] = json!("100"); v["tree"]["materialized"][2]["terminal_pots"][1] = json!(299); }));
@@ -3200,9 +3771,14 @@ fn wager_cap_remove_lines() {
         let mut t = build(&tree, c["pot"].as_u64().unwrap() as u32, c["eff"].as_u64().unwrap() as u32, 0.0, 0, &history).unwrap();
         t.apply_history(&history_to_lib(&history)).unwrap();
         assert_eq!(t.available_actions(), &expected_after_prefix[..], "{name}");
-        // every node at or past the cap offers fold/call/all-in only; the observed prefix survives
+        // The observed prefix survives the cap: at the node BEFORE each observed action, that action is still offered.
+        // (Applying the whole line first would put the tree at the child AFTER the action, whose menu never contains it.)
         let mut line = history_to_lib(&history);
-        while !line.is_empty() { t.apply_history(&line).unwrap(); assert!(t.available_actions().contains(&line[line.len() - 1])); line.pop(); }
+        while !line.is_empty() {
+            let last = line.pop().unwrap();
+            t.apply_history(&line).unwrap();
+            assert!(t.available_actions().contains(&last), "{name}: {last:?} was removed by the cap at {line:?}");
+        }
     }
 }
 
@@ -3284,13 +3860,13 @@ fn pinned_example_fixture() {
 }
 ```
 
-- [ ] **Step 3: Run and commit**
+- [ ] **Step 2: Run and commit**
 
-Run: `cargo test -p solver-worker --release --test contract_tree` then `cargo test -p solver-worker --release --test contract_river`
+Run: `cargo test -p solver-worker --release --test contract_tree` then `cargo test --workspace --release`
 Expected: all pass (the EV tolerance of the pinned fixture is 1e-3 of the pot, i.e. 0.2 chips, because rayon summation order is not deterministic across runs; probabilities within 1e-3).
 
 ```bash
-git add solver-worker fixtures/solver fixtures/worker tools
+git add solver-worker
 git commit -m "test(solver-worker): materialization mismatch, wager cap, exact insertion, suit permutation and pinned example contracts
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -3298,11 +3874,15 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Task 13: Worker deadline and memory contracts
+## Task 17: Worker deadline and memory contracts
 
 **Files:**
 - Create: `solver-worker/tests/contract_deadline.rs`
 - Test: `deadline_best_so_far_bounded`, `deadline_no_iteration`, `memory_admission`
+
+**Interfaces:**
+- Consumes: `common::{Worker, fixture_lines}` (Task 7); `fixtures/worker/{basic_turn_std_request,flop_cancel,flop_best_so_far}.jsonl` (Tasks 6 and 15); `proto::worker::validate_solution`.
+- Produces: nothing new. `flop_best_so_far.jsonl` is consumed here as the second case of `deadline_best_so_far_bounded`, so §13.0's fixture inventory has a reader in this plan.
 
 - [ ] **Step 1: Write the tests**
 
@@ -3327,6 +3907,19 @@ fn deadline_best_so_far_bounded() {
     let expl = r["solution"]["exploitability_chips"].as_f64().unwrap();
     match r["status"].as_str().unwrap() { "ok" => assert!(expl <= 0.02), "best_so_far" => assert!(expl > 0.02 && expl.is_finite()), other => panic!("{other}") }
     let tree: proto::EffectiveTree = serde_json::from_value(serde_json::from_str::<Value>(req).unwrap()["tree"].clone()).unwrap();
+    let sol: proto::worker::StreetSolution = serde_json::from_value(r["solution"].clone()).unwrap();
+    proto::worker::validate_solution(&sol, &tree.materialized).unwrap();
+
+    // Second case, §13.0's `flop_best_so_far` fixture: a flop spot at target 1 bp that cannot reach target inside
+    // 2 s, so `best_so_far` carries a measured exploitability and a validated street export.
+    let flop = &fixture_lines("flop_best_so_far")[0];
+    w.send(&edit(flop, |v| { v["id"] = json!("133"); v["deadline_ms"] = json!(2000); v["extraction_margin_ms"] = json!(600); v["target_bp"] = json!(1); }));
+    let r = w.recv_until(15 * S, |m| m["type"] == "result" && m["id"] == "133").unwrap();
+    assert_eq!(r["status"], "best_so_far", "{r}");
+    assert!(r["elapsed_ms"].as_u64().unwrap() <= 2000, "elapsed {}", r["elapsed_ms"]);
+    let expl = r["solution"]["exploitability_chips"].as_f64().unwrap();
+    assert!(expl.is_finite() && expl > 0.0);
+    let tree: proto::EffectiveTree = serde_json::from_value(serde_json::from_str::<Value>(flop).unwrap()["tree"].clone()).unwrap();
     let sol: proto::worker::StreetSolution = serde_json::from_value(r["solution"].clone()).unwrap();
     proto::worker::validate_solution(&sol, &tree.materialized).unwrap();
 }
@@ -3360,8 +3953,8 @@ fn memory_admission() {
 
 - [ ] **Step 2: Run and commit**
 
-Run: `cargo test -p solver-worker --release --test contract_deadline`
-Expected: 3 passed.
+Run: `cargo test -p solver-worker --release --test contract_deadline` then `cargo test --workspace --release`
+Expected: 3 passed; the workspace stays green.
 
 ```bash
 git add solver-worker/tests/contract_deadline.rs
@@ -3372,7 +3965,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Task 14: Engine worker link: `WorkerLink`, `ProcessWorker`, `ready` validation, job object
+## Task 18: Engine worker link: `WorkerLink`, `ProcessWorker`, `ready` validation, job object
 
 **Files:**
 - Create: `crates/engine/src/worker/mod.rs`, `crates/engine/src/worker/link.rs`, `crates/engine/src/worker/ready.rs`, `crates/engine/src/worker/process.rs`, `crates/engine/src/worker/job_object.rs`, `crates/engine/tests/worker_link.rs`
@@ -3380,7 +3973,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Test: `worker_link.rs::{process_worker_spawns_validates_ready_and_restarts, ready_validation_rules, river_check_only_terminal_oracle}`
 
 **Interfaces:**
-- Consumes: `proto::worker::{EngineMessage, WorkerMessage, Ready, PROTO_VERSION, SOLVER_COMMIT, ADAPTER_VERSION}`; `core_eval::equity` (oracle test only).
+- Consumes: `proto::worker::{EngineMessage, WorkerMessage, Ready, PROTO_VERSION, SOLVER_COMMIT, ADAPTER_VERSION}`; `core_eval::{equity, exact_cost, EquityRequest, EquityMode, EquityStatus, PlayerRange}` (oracle test only, using plan 1's resolved shape).
+- **Workspace-green rule (review M9b):** the oracle and process tests need `target/release/solver-worker.exe`, which no cargo dependency builds. They discover it through `POKERAI_WORKER` or the workspace target directory and return early with a printed reason when it is absent, so `cargo test --workspace --release` is green either way. CI and the task's own run step build it first.
 - Produces: `worker::link::{WorkerLinkError::{Eof, Protocol(String), LineTooLong(usize), Spawn(String), Exit{code: i32}}, WorkerLink}` with `fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError>; fn recv(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError>; fn restart(&mut self) -> Result<(), WorkerLinkError>; fn kill(&mut self); fn ready(&self) -> Option<&Ready>; fn peak_working_set_bytes(&self) -> u64 { 0 }`; `worker::ready::{validate_ready(&Ready, threads: u8) -> Result<(), String>, cpu_lacks_avx2(&Ready) -> bool}`; `worker::process::{ProcessWorker::spawn(exe: &Path, threads: u8) -> Result<ProcessWorker, WorkerLinkError>, MAX_RESULT_LINE, STDERR_RING}`; `worker::job_object::assign(child: &Child) -> Result<JobHandle, String>` (16 GiB process memory limit, kill on close); `EventSink` trait in `lib.rs`: `pub trait EventSink: Send { fn emit(&mut self, ev: RecommendationEvent); }`.
 
 - [ ] **Step 1: Failing tests `crates/engine/tests/worker_link.rs`**
@@ -3393,11 +3987,27 @@ use proto::worker::{EngineMessage, Ready, WorkerMessage, PROTO_VERSION, SOLVER_C
 use std::path::PathBuf;
 use std::time::Duration;
 
-fn exe() -> PathBuf {
-    // built by `cargo build --release -p solver-worker`; the engine never links the worker (§3.2)
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/solver-worker.exe");
-    assert!(p.exists(), "build the worker first: cargo build --release -p solver-worker ({})", p.display());
-    p
+/// The engine never links the worker (§3.2), so the binary is discovered, not built by this crate.
+/// Order: `POKERAI_WORKER`, then the release build next to this test's target directory, then the debug one.
+/// `None` means "not built in this run" and the caller `#[ignore]`s itself, so `cargo test --workspace --release`
+/// is green whether or not `cargo build --release -p solver-worker` has run.
+fn worker_exe() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("POKERAI_WORKER") { let p = PathBuf::from(p); if p.exists() { return Some(p); } }
+    let name = if cfg!(windows) { "solver-worker.exe" } else { "solver-worker" };
+    // CARGO_MANIFEST_DIR is crates/engine; the workspace target dir is ../../target
+    let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    for profile in ["release", "debug"] {
+        let p = target.join(profile).join(name);
+        if p.exists() { return Some(p); }
+    }
+    None
+}
+/// Returns the path or prints why the test is skipped. Used as `let Some(exe) = require_exe() else { return; };`.
+fn require_exe() -> Option<PathBuf> {
+    match worker_exe() {
+        Some(p) => Some(p),
+        None => { eprintln!("skipping: solver-worker binary not found; run `cargo build --release -p solver-worker` or set POKERAI_WORKER"); None }
+    }
 }
 
 #[test]
@@ -3415,7 +4025,8 @@ fn ready_validation_rules() {
 
 #[test]
 fn process_worker_spawns_validates_ready_and_restarts() {
-    let mut w = ProcessWorker::spawn(&exe(), 4).unwrap();
+    let Some(exe) = require_exe() else { return; };
+    let mut w = ProcessWorker::spawn(&exe, 4).unwrap();
     assert_eq!(w.ready().unwrap().threads, 4);
     w.send(&EngineMessage::Cancel { id: "1".into(), target: "none".into() }).unwrap();
     match w.recv(Duration::from_secs(2)).unwrap() { Some(WorkerMessage::Ack { id, .. }) => assert_eq!(id, "1"), other => panic!("{other:?}") }
@@ -3429,10 +4040,13 @@ fn process_worker_spawns_validates_ready_and_restarts() {
 
 #[test]
 fn river_check_only_terminal_oracle() {
-    // §13.2: check-check only, pot 100, stacks 100, no all-in: EV(check) per combo equals equity_actual_combo * 100 within 1e-3 (core-eval exact); swapping seats leaves every value unchanged
-    use core_eval::{equity, EquityMode, EquityRequest};
-    use proto::{combo_cards, combo_index, Action, Card, EffectiveTree, MaterializedNode, MenuSize, PlayerMenus, Range1326, SideMenu, Street};
+    // §13.2 (spec S8: this test lives here because its oracle is `core-eval`, which `solver-worker` may not depend on).
+    // Check-check only, pot 100, stacks 100, no all-in: EV(check) per combo equals equity_actual_combo * 100 within 1e-3;
+    // swapping seats leaves every value unchanged.
+    use core_eval::{equity, exact_cost, EquityMode, EquityRequest, EquityStatus, PlayerRange};
+    use proto::{combo_cards, combo_index, Action, Card, EffectiveTree, MaterializedNode, PlayerMenus, Range1326, Seat, SideMenu, Street};
     use proto::worker::SolveRequest;
+    let Some(exe) = require_exe() else { return; };
     let board: Vec<Card> = ["Qs", "Jd", "7h", "3c", "2d"].iter().map(|s| Card::parse(s).unwrap()).collect();
     let mut oop = Range1326([0.0; 1326]); let mut ip = Range1326([0.0; 1326]);
     for (a, b) in [("Ac", "Ad"), ("Ah", "As"), ("6c", "6d"), ("Kc", "Kd")] { oop.0[combo_index(Card::parse(a).unwrap(), Card::parse(b).unwrap()) as usize] = 1.0; }
@@ -3442,24 +4056,32 @@ fn river_check_only_terminal_oracle() {
         add_allin_threshold: 0.0, force_allin_threshold: 0.0, merging_threshold: 0.0, wager_cap: 1, inserted: vec![],
         materialized: vec![MaterializedNode { path: vec![], street: Street::River, actor: "oop".into(), actions: vec![Action::Check], terminal_pots: vec![None] },
                            MaterializedNode { path: vec![0], street: Street::River, actor: "ip".into(), actions: vec![Action::Check], terminal_pots: vec![Some(100)] }] };
-    let _ = MenuSize::AllIn;
-    let mut w = ProcessWorker::spawn(&exe(), 4).unwrap();
+    let mut w = ProcessWorker::spawn(&exe, 4).unwrap();
     let mut run = |id: &str, oop: &Range1326, ip: &Range1326| -> proto::worker::StreetSolution {
         w.send(&EngineMessage::Solve(SolveRequest { id: id.into(), spot: "c".repeat(64), board: board.clone(), oop_range: oop.clone(), ip_range: ip.clone(), pot: 100, stack_oop: 100, stack_ip: 100,
             rake_rate: 0.0, rake_cap_mchips: 0, tree: tree.clone(), history: vec![], target_bp: 1, deadline_ms: 2000, extraction_margin_ms: 200, memory_limit_bytes: 10 << 30, background: false })).unwrap();
         loop { if let Some(WorkerMessage::Result { solution, status, .. }) = w.recv(Duration::from_secs(5)).unwrap() { assert_eq!(status, proto::worker::ResultStatus::Ok); return solution.unwrap(); } }
     };
+    // `core-eval`'s shape (plan 1 Task 20): players are seat-tagged ranges, the result carries per-seat shares.
+    // A fixed hero combo is a range with one supported combo; hero is seat 0 and the villain seat 1 in every query.
+    let hero_equity = |hero_combo: usize, villain: &Range1326| -> f32 {
+        let mut fixed = Range1326([0.0; 1326]); fixed.0[hero_combo] = 1.0;
+        let mut opp = villain.clone();
+        let [x, y] = combo_cards(hero_combo as u16);
+        for j in 0..1326 { let [p, q] = combo_cards(j as u16); if [p, q].iter().any(|c| *c == x || *c == y) { opp.0[j] = 0.0; } }
+        let req = EquityRequest::single_pot(board.clone(), vec![PlayerRange { seat: Seat(0), range: fixed }, PlayerRange { seat: Seat(1), range: opp }], EquityMode::Exact);
+        assert!(exact_cost(&req) <= 20_000_000, "the §7 rule admits exact enumeration for this request");
+        let res = equity(&req, Duration::from_secs(5), &std::sync::atomic::AtomicBool::new(false));
+        assert_eq!(res.status, EquityStatus::Ready);
+        res.shares.iter().find(|s| s.pot_index == 0 && s.seat == Seat(0)).expect("hero share").value
+    };
     let a = run("1", &oop, &ip);
     let b = run("2", &ip, &oop);
-    for (sol, hero, villain, node_index) in [(&a, &oop, &ip, 0usize), (&b, &ip, &oop, 0usize)] {
-        let node = &sol.nodes[node_index];
+    for (sol, hero, villain) in [(&a, &oop, &ip), (&b, &ip, &oop)] {
+        let node = &sol.nodes[0];
         for i in 0..1326 {
             if hero.0[i] == 0.0 { continue; }
-            let mut fixed = Range1326([0.0; 1326]); fixed.0[i] = 1.0;
-            let mut opp = villain.clone();
-            let [x, y] = combo_cards(i as u16);
-            for j in 0..1326 { let [p, q] = combo_cards(j as u16); if [p, q].iter().any(|c| *c == x || *c == y) { opp.0[j] = 0.0; } }
-            let eq = equity(&EquityRequest { hero: fixed, opponents: vec![opp], board: board.clone(), mode: EquityMode::Exact }, Duration::from_secs(5), &std::sync::atomic::AtomicBool::new(false)).hero_equity.unwrap();
+            let eq = hero_equity(i, villain);
             assert!((node.ev_chips[i][0] - eq * 100.0).abs() <= 1e-3, "combo {i}: ev {} vs equity*100 {}", node.ev_chips[i][0], eq * 100.0);
         }
     }
@@ -3712,8 +4334,8 @@ fn peak_ws(_child: Option<&Child>) -> u64 { 0 }
 
 - [ ] **Step 4: Run and commit**
 
-Run: `cargo build --release -p solver-worker && cargo test -p engine --test worker_link`
-Expected: 3 passed (the oracle test compares the worker's terminal EVs with `core-eval`'s exact enumeration on 4 x 4 combos).
+Run: `cargo build --release -p solver-worker && cargo test -p engine --test worker_link`, then `cargo test --workspace --release`
+Expected: 3 passed (the oracle test compares the worker's terminal EVs with `core-eval`'s exact enumeration on 4 x 4 combos); the workspace stays green, and stays green in a clean tree where the two spawning tests skip themselves.
 
 ```bash
 git add crates/engine
@@ -3724,7 +4346,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Task 15: Engine test doubles: `FakeClock`, `FakeWorker`, `RecordingSink`, solution builder
+## Task 19: Engine test doubles: `FakeClock`, `FakeWorker`, `RecordingSink`, solution builder
 
 **Files:**
 - Create: `crates/engine/src/testing.rs`
@@ -3795,6 +4417,9 @@ pub enum FakeReply {
     Result { id: IdRef, status: ResultStatus, solution: Option<StreetSolution>, error: Option<WorkerError>, elapsed_ms: u32 },
     Delay { ms: u64 }, Eof, Malformed(String), Oversized(usize), Hang,
     /// Simulates a mutation arriving while the solve is live: the active identity is cancelled.
+    /// `recv` consumes it and continues to the next scripted item in the SAME call, so a script that wants the
+    /// client to observe the invalidation before the next reply must write `InvalidateIdentity, Delay { ms: 1 }, ...`;
+    /// the `Delay` makes `recv` return `Ok(None)` and the receive loop re-check the identity (see Task 28).
     InvalidateIdentity,
 }
 #[derive(Debug, Default)]
@@ -3880,8 +4505,8 @@ pub fn uniform_solution(tree: &EffectiveTree, requested: &[Action], exploitabili
 
 - [ ] **Step 3: Run and commit**
 
-Run: `cargo test -p engine testing`
-Expected: PASS.
+Run: `cargo test -p engine testing` then `cargo test --workspace --release`
+Expected: PASS; the workspace stays green.
 
 ```bash
 git add crates/engine

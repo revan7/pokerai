@@ -4,11 +4,11 @@
 
 **Goal:** Stand up the Cargo workspace and the five foundation crates (`proto`, `core-model`, `core-ranges`, `core-iso`, `core-eval`) with every §13.1 test for them green, plus the Python `tools/` oracles that generate `fixtures/hands` (PokerKit) and `fixtures/eval` (phevaluator).
 
-**Architecture:** `proto` is the single source of truth for every serde type of spec §4.1-4.6 (cards, config, hand state, ranges, recommendation, effective tree, worker wire messages and `validate_solution`); it depends only on `serde`/`thiserror`/`sha2`. `core-model` replays a `HandState` from its action list through one betting-round engine (`betting::Round`) shared by the full hand lifecycle (`lifecycle::simulate`) and by the HU street-root replay (`street_root::replay_root`), so the §10.2 projection check compares two runs of the same code. `core-ranges`, `core-iso` and `core-eval` are pure libraries over `proto::Range1326`; `core-eval` wraps the b-inary evaluator behind a small `Evaluator` trait and implements exact and Monte Carlo joint-disjoint equity in-house (the `pokers` crate only accepts integer-percent weights, so it cannot represent `Range1326`; it is not linked).
+**Architecture:** `proto` is the single source of truth for every serde type of spec §4.1-4.6 (cards, config, hand state, ranges, recommendation, effective tree, worker wire messages and `validate_solution`); it depends only on `serde`/`thiserror` (`sha2` belongs to `core-ranges`, which owns the hashing). `core-model` replays a `HandState` from its action list through one betting-round engine (`betting::Round`) shared by the full hand lifecycle (`lifecycle::simulate`) and by the HU street-root replay (`street_root::replay_root`), so the §10.2 projection check compares two runs of the same code. `core-ranges`, `core-iso` and `core-eval` are pure libraries over `proto::Range1326`; `core-eval` wraps the b-inary evaluator behind a small `Evaluator` trait and implements exact and Monte Carlo joint-disjoint equity in-house (the `pokers` crate only accepts integer-percent weights, so it cannot represent `Range1326`; it is not linked).
 
-**Tech Stack:** Rust 2021 on `stable-x86_64-pc-windows-msvc` (1.95; the MSVC C++ tools are installed, the user's global default stays GNU), `serde 1.0` + `serde_json 1.0`, `thiserror 2.0`, `sha2 0.11`, `holdem-hand-evaluator` (git, commit `d7b2a5bba4015f96855d5cd66d21f781d3cbcf9b`, MIT), Python 3.12 with `pokerkit==0.7.5`, `phevaluator==0.6.0`, `pytest`.
+**Tech Stack:** Rust 2021 on `stable-x86_64-pc-windows-msvc` (1.95; the MSVC C++ tools are installed, the user's global default stays GNU), `serde 1.0` + `serde_json 1.0`, `thiserror 2.0`, `sha2 0.10.9`, `holdem-hand-evaluator` (git, commit `d7b2a5bba4015f96855d5cd66d21f781d3cbcf9b`, MIT), Python 3.12 with `pokerkit==0.7.5`, `phevaluator==0.6.0`, `pytest`.
 
-**Spec:** `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md` (revision 5), sections 2, 3.2, 3.5, 3.7, 4.1-4.6, 10.2, 13.0, 13.1. Decisions: `docs/design/2026-09-10-design-outline.md` §0b. Library facts: `docs/research/R3-libraries.md`.
+**Spec:** `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md` (revision 6), sections 2, 3.2, 3.5, 3.6, 3.7, 4.1-4.6, 10.2, 13.0, 13.1. Decisions: `docs/design/2026-09-10-design-outline.md` §0b. Library facts: `docs/research/R3-libraries.md`. Cross-plan interface resolutions: `docs/research/REVIEW-cross-plan.md` §1-§2.
 
 ## Global Constraints
 
@@ -24,15 +24,17 @@
 - Canonical board (§2): the flop as an unordered set under the 24 suit permutations; turn and river appended in dealt order; among permutations giving the same canonical board, the one producing the lexicographically minimal serialized `(oop, ip)` range tuple, then the lexicographically minimal permutation.
 - Worker wire (§4.5): UTF-8 JSON Lines, `#[serde(tag = "type")]`, lowercase tags, unknown fields rejected, ids as decimal strings; limits request line <= 1 MiB, result line <= 16 MiB, <= 100,000 exported nodes; matrix validation: `probs` and `ev_chips` exactly `[1326][actions.len()]`, finite, every probability in `[0, 1]`, available rows sum to `1 +- 1e-3`, unavailable rows all zero, `requested < nodes.len()`, `covered_paths[k] == nodes[k].path`, every chip path resolves against the materialized tree.
 - Build flags (§3.7): `.cargo/config.toml` sets `rustflags = ["-C", "target-feature=+avx2"]` for `x86_64-pc-windows-gnu` and `x86_64-pc-windows-msvc`.
+- Toolchain (§3.6, repo-wide): `rust-toolchain.toml` pins `stable-x86_64-pc-windows-msvc` for the **whole repository**, including `solver-worker` and `bench` in plans 2-5 (Tauri needs the MSVC target and a hello-world with the git evaluator, `serde` and `+avx2` was verified to build and link under MSVC on this machine). R8's solver figures were measured on GNU, so **V1 in plan 2 must re-verify them**: build and run the pinned-solver example on MSVC with `+avx2` and compare its FLOP-FAST time with the GNU figure in R8 §5. If the MSVC build fails or is more than 25% slower, the `solver-worker` binary **alone** is built with `cargo +stable-x86_64-pc-windows-gnu` through the documented target `scripts/build-worker-gnu.ps1` (Task 1), while the rest of the workspace stays MSVC. No timing is compared with R8 before that check runs.
+- Dependency versions: the root `[workspace.dependencies]` table is the single source for `serde`, `serde_json`, `thiserror`, `sha2` and `holdem-hand-evaluator`. Every crate of this plan and of plans 2-5 writes `sha2.workspace = true`, `thiserror.workspace = true`, `serde.workspace = true` (never its own version), and `version.workspace = true` / `edition.workspace = true` / `license.workspace = true` in `[package]`. `sha2 = "0.10.9"` (the version plan 4 verified for the cache-key digest) and `thiserror = "2.0"` are pinned once here so `hash_scaled` and the cache key use one `Digest` trait.
 - Tests: `cargo test --workspace` green after every task; exhaustive suites behind `--features exhaustive`; Python tests with `pytest`. Commits: one per task, `feat(<crate>): ...` / `test(<crate>): ...` / `chore: ...`, trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 
 ## Verified environment and library facts (2026-09-10)
 
-- `rust-toolchain.toml` with `channel = "stable-x86_64-pc-windows-msvc"` is honoured by rustup on this machine; a scratch crate with the git evaluator dependency, `sha2 0.11`, `serde` internally tagged enums with `deny_unknown_fields` and `+avx2` builds and passes tests under MSVC in 6.5 s.
-- `holdem-hand-evaluator`: `Hand::new()`, `Hand::from_slice(&[usize])`, `add_card(usize)`, `evaluate() -> u16` (higher is stronger; category = `rank >> 12`, 8 = straight flush), 5-7 cards only, card ids `0 = 2c .. 51 = As`. Not on crates.io: git dependency pinned to `d7b2a5bba4015f96855d5cd66d21f781d3cbcf9b` (2022-06-02, MIT).
+- `rust-toolchain.toml` with `channel = "stable-x86_64-pc-windows-msvc"` is honoured by rustup on this machine; a scratch crate with the git evaluator dependency, `sha2`, `serde` internally tagged enums with `deny_unknown_fields` and `+avx2` builds, links and passes tests under MSVC in 6.5 s. An explicit `cargo +<toolchain>` on the command line still overrides the file, which is what the `solver-worker`-only GNU fallback of §3.6 relies on.
+- `holdem-hand-evaluator`: `Hand::new()`, `Hand::from_slice(&[usize])`, `add_card(usize) -> Hand` (returns a new hand; `Hand` is `Copy`), `len() -> usize`, `evaluate() -> u16` (higher is stronger; category = `rank >> 12`, 8 = straight flush), 5-7 cards only, card ids `0 = 2c .. 51 = As`. Not on crates.io: git dependency pinned to `d7b2a5bba4015f96855d5cd66d21f781d3cbcf9b` (2022-06-02, MIT).
 - `pokers 0.10.0` (MIT) stores combo weights as `u8` percent (`Combo(u8, u8, u8)`, `QQ@50`); it cannot carry `Range1326` weights and is therefore not used. `rs_poker 5.1.0` stays the named contingency for the evaluator only (§3.2).
-- crates.io versions: `serde 1.0.229`, `serde_json 1.0.151`, `thiserror 2.0.20`, `sha2 0.11.0`. PyPI: `pokerkit 0.7.5` (pure Python), `phevaluator 0.6.0` (`cp312-win_amd64` wheel), `pytest 9.1.1`. phevaluator ranks: lower is stronger, `1` = royal flush, `7462` = worst high card.
-- PokerKit facts used by `tools/gen_fixtures.py` (probed): player index 0 posts the SB, the last index is the button; `raw_blinds_or_straddles=(1, 2, 4, 0, 0, 0)` makes index 2 the straddler and index 3 (HJ) the preflop opener; PokerKit's minimum open over a straddle is `S + min_bet` (6 at 1/2/4), so the generator sets `state.completion_betting_or_raising_amount = S` **after hole dealing** to obtain the standard `2S` (verified: min raise-to 8, then 12 after a raise to 8); PokerKit implements the cumulative short-all-in reopening rule (raise to 10, all-ins 14 and 17: the raiser cannot re-raise; 15 and 19: the raiser can, minimum 27); it returns uncalled portions at bet collection; at a fold-out it leaves the survivor's whole street bet uncollected in `bets` (the generator normalizes this, Task 13); `Mode.CASH_GAME` lets `can_fold()` return true when no wager is pending (the generator records fold as legal only when facing a wager). The one PokerKit divergence from the spec rule (a full all-in raise followed by a short all-in raise lets a player who acted in between re-raise) is detected by the generator and the hand is dropped (1 of 201 seeds).
+- crates.io versions: `serde 1.0.229`, `serde_json 1.0.151`, `thiserror 2.0.20`, `sha2 0.10.9` (0.11.0 exists; 0.10.9 is pinned workspace-wide because plan 4's cache-key digest was verified on it and two `sha2` majors would give `hash_scaled` and the cache key two different `Digest` traits). PyPI: `pokerkit 0.7.5` (pure Python), `phevaluator 0.6.0` (`cp312-win_amd64` wheel), `pytest 9.1.1`. phevaluator ranks: lower is stronger, `1` = royal flush, `7462` = worst high card.
+- PokerKit facts used by `tools/gen_fixtures.py` (probed): player index 0 posts the SB, the last index is the button; `raw_blinds_or_straddles=(1, 2, 4, 0, 0, 0)` makes index 2 the straddler and index 3 (HJ) the preflop opener; PokerKit's minimum open over a straddle is `S + min_bet` (6 at 1/2/4), so the generator sets `state.completion_betting_or_raising_amount = S` **after hole dealing** to obtain the standard `2S` (verified: min raise-to 8, then 12 after a raise to 8); PokerKit implements the cumulative short-all-in reopening rule (raise to 10, all-ins 14 and 17: the raiser cannot re-raise; 15 and 19: the raiser can, minimum 27); it returns uncalled portions at bet collection; at a fold-out it leaves the survivor's whole street bet uncollected in `bets` (the generator normalizes this, Task 16); `Mode.CASH_GAME` lets `can_fold()` return true when no wager is pending (the generator records fold as legal only when facing a wager). The one PokerKit divergence from the spec rule (a full all-in raise followed by a short all-in raise lets a player who acted in between re-raise) is detected by the generator and the hand is dropped (1 of 201 seeds).
 
 ---
 
@@ -44,14 +46,15 @@
 | `rust-toolchain.toml` | Pins `stable-x86_64-pc-windows-msvc` for this repo only |
 | `.cargo/config.toml` | `+avx2` rustflags for both Windows targets (§3.7) |
 | `.gitignore` | `target/`, `tools/.venv/`, Python caches, the optional 10M-sample oracle |
+| `scripts/build-worker-gnu.ps1` | Documented §3.6 fallback: build `solver-worker` alone with the GNU toolchain if plan 2's V1 check rejects MSVC |
 | `crates/proto/src/lib.rs` | Module list, re-exports, `PROTO_VERSION = 3` |
-| `crates/proto/src/cards.rs` | `Card`, parsing/display/serde, `ComboIndex`, `combo_index`, `combo_cards`, `class_of`, `class_combos` |
+| `crates/proto/src/cards.rs` | `Card` (incl. `Card::parse`), parsing/display/serde, `ComboIndex`, `combo_index`, `combo_cards`, `class_of`, `class_combos` |
 | `crates/proto/src/game.rs` | `GameConfig`, `HandConfig`, `UtgStraddle`, `Rake`, `SeatConfig`, `SeatTag`, `QuickFact`, `SolverPrefs` (§4.2) |
-| `crates/proto/src/hand.rs` | `Seat`, `Position`, `Street`, `Action`, `TakenAction`, `HandPhase`, `CompleteReason`, `HandState`, `Derived`, `Pot`, `LegalAction`, `StreetRootSnapshot`, `SolveInput` (§4.3) |
+| `crates/proto/src/hand.rs` | `Seat`, `Position`, `Street`, `Action`, `TakenAction`, `HandPhase`, `CompleteReason`, `HandState`, `Derived`, `Pot`, `LegalAction`, `StreetRootSnapshot`, `BeginHand` (admission DTO), `SolveInput` (§4.3) |
 | `crates/proto/src/range.rs` | `Range1326` with manual serde (exactly 1326 finite weights in `[0, 1]`) |
 | `crates/proto/src/recommendation.rs` | `DecisionIdentity`, `Coverage`, `ApproxReason`, `UnsupportedReason`, `Unavailable`, `ActionAdvice`, `Availability`, `EquityMethod`, `EquityEstimate`, `EquitySummary`, `PotShares`, `Assumptions`, `ExperimentalHu`, `ExploitAdvice`, `Phase`, `Recommendation`, `RecommendationEvent` (§4.4, §11) |
-| `crates/proto/src/tree.rs` | `EffectiveTree`, `PlayerMenus`, `Menu`, `RaiseSize`, `ChipPath`, `OrdinalPath`, `MaterializedNode`, `resolve_chip_path` (§4.6, §2) |
-| `crates/proto/src/worker.rs` | `EngineMessage`, `WorkerMessage`, `SolveRequest`, `ReadyInfo`, `NodeLock`, `AckStatus`, `Stage`, `ResultStatus`, `WorkerError`, `StreetSolution`, `NodeStrategy`, limits, `validate_solution`, `validate_locks` (§4.5) |
+| `crates/proto/src/tree.rs` | `EffectiveTree`, `PlayerMenus`, `SideMenu`, `MenuSize`, `ChipPath`, `OrdinalPath`, `MaterializedNode`, `resolve_chip_path` (§4.6, §2) |
+| `crates/proto/src/worker.rs` | `EngineMessage`, `WorkerMessage`, `SolveRequest`, `Ready`, `NodeLock`, `AckStatus`, `Stage`, `ResultStatus`, `WorkerError`, `StreetSolution`, `NodeStrategy`, limits, `PROTO_VERSION`/`SOLVER_COMMIT`/`ADAPTER_VERSION`, `validate_solution`, `validate_locks` (§4.5) |
 | `crates/proto/tests/wire_examples.rs` | §4.5 wire example round-trips, unknown tag/field rejection |
 | `crates/proto/tests/validate_solution.rs` | §4.5 matrix validation tests |
 | `crates/core-model/src/lib.rs` | Module list and re-exports of the §3.5 interface |
@@ -75,7 +78,7 @@
 | `crates/core-eval/src/equity.rs` | Request/result types, `equity`, `exact_cost`, exact enumeration, `per_combo_equity`, `terminal_payoff` |
 | `crates/core-eval/src/mc.rs` | `Xoshiro256` PRNG, joint disjoint sampling, Monte Carlo |
 | `crates/core-eval/tests/{oracle,equity}.rs` | §13.1 core-eval rows |
-| `tools/pyproject.toml`, `tools/requirements.txt`, `tools/tests/conftest.py` | Python project metadata, pinned dependencies, pytest path setup |
+| `tools/pyproject.toml`, `tools/requirements.txt`, `tools/tests/conftest.py`, `tools/tests/test_environment.py` | Python project metadata, pinned dependencies, pytest path setup, pinned-version smoke test |
 | `tools/gen_fixtures.py`, `tools/tests/test_gen_fixtures.py` | 200 PokerKit hands -> `fixtures/hands/h0001..h0200.json` |
 | `tools/gen_eval_oracle.py`, `tools/tests/test_gen_eval_oracle.py` | phevaluator oracle -> `fixtures/eval/phevaluator_5card.bin`, `fixtures/eval/phevaluator_7card_200k.bin` |
 | `fixtures/hands/*.json`, `fixtures/eval/*.bin` | Committed fixtures (§13.0) |
@@ -85,11 +88,11 @@
 ### Task 1: Workspace skeleton
 
 **Files:**
-- Create: `Cargo.toml`, `rust-toolchain.toml`, `.cargo/config.toml`, `.gitignore`, `crates/proto/Cargo.toml`, `crates/proto/src/lib.rs`
+- Create: `Cargo.toml`, `rust-toolchain.toml`, `.cargo/config.toml`, `.gitignore`, `scripts/build-worker-gnu.ps1`, `crates/proto/Cargo.toml`, `crates/proto/src/lib.rs`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: the workspace every later crate joins by creating a directory under `crates/`; `proto::PROTO_VERSION: u16 = 3`.
+- Produces: the workspace every later crate joins by creating a directory under `crates/`; `proto::PROTO_VERSION: u16 = 3`; the `[workspace.dependencies]` table that every crate of plans 1-5 inherits with `.workspace = true` (`serde 1.0`, `serde_json 1.0`, `thiserror 2.0`, `sha2 0.10.9`, `holdem-hand-evaluator` at the pinned rev); `scripts/build-worker-gnu.ps1`, the §3.6 fallback target plan 2's V1 check may activate. Plan 2 extends the root manifest with `"solver-worker"` in `members` and `exclude = ["third_party/postflop-solver"]`; `crates/*` already covers `crates/engine` and `crates/bench`, which plan 2 must not re-add.
 
 - [ ] **Step 1: Write the workspace files**
 
@@ -109,7 +112,7 @@ rust-version = "1.95"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-sha2 = "0.11"
+sha2 = "0.10.9"
 holdem-hand-evaluator = { git = "https://github.com/b-inary/holdem-hand-evaluator", rev = "d7b2a5bba4015f96855d5cd66d21f781d3cbcf9b" }
 
 [profile.dev]
@@ -122,7 +125,7 @@ opt-level = 3
 opt-level = 3
 ```
 
-`rust-toolchain.toml`:
+`rust-toolchain.toml` (repo-wide pin; Tauri needs the MSVC target and plans 2-5 assume it — see Global Constraints for the V1 re-verification and the `solver-worker`-only GNU fallback):
 ```toml
 [toolchain]
 channel = "stable-x86_64-pc-windows-msvc"
@@ -159,11 +162,13 @@ description = "Shared serde types of the PokerAI assistant (spec section 4)"
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 ```
+
+(`serde_json` is a dev-dependency: only `#[cfg(test)]` code inside the library and the two integration tests use it, and unit tests inside a lib may use dev-dependencies.)
 
 `crates/proto/src/lib.rs`:
 ```rust
@@ -187,10 +192,36 @@ mod tests {
 Run: `rustup show active-toolchain` then `cargo test --workspace`
 Expected: the active toolchain line names `stable-x86_64-pc-windows-msvc (overridden by ... rust-toolchain.toml)`; 1 test passes.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Write the §3.6 GNU fallback target for `solver-worker`**
+
+The pin above is repo-wide, but R8's solver numbers (vendored solver, `zstd-sys`, the ~2x AVX2 gain) were all measured on `stable-x86_64-pc-windows-gnu`. The **V1 check in plan 2** must therefore build and run the pinned-solver example on MSVC with `+avx2` and compare its FLOP-FAST time with the GNU figure in R8 §5. **If the MSVC build fails or is more than 25% slower, the `solver-worker` binary alone is built with `cargo +stable-x86_64-pc-windows-gnu` through this script, while the rest of the workspace stays MSVC.** No solver timing is compared with R8 before that check has run. Create the target now so plan 2 has one documented command, not an improvised one.
+
+`scripts/build-worker-gnu.ps1`:
+```powershell
+# Spec 3.6 fallback: build solver-worker alone with the GNU toolchain.
+# Run ONLY when plan 2's V1 check rejects MSVC for the vendored solver
+# (build failure, or FLOP-FAST more than 25% slower than the GNU figure in R8 section 5).
+# An explicit `+toolchain` on the command line overrides rust-toolchain.toml, so the rest
+# of the workspace keeps building with stable-x86_64-pc-windows-msvc.
+$ErrorActionPreference = "Stop"
+
+rustup toolchain install stable-x86_64-pc-windows-gnu --no-self-update
+cargo +stable-x86_64-pc-windows-gnu build --release -p solver-worker --target x86_64-pc-windows-gnu
+
+$built = "target\x86_64-pc-windows-gnu\release\solver-worker.exe"
+if (-not (Test-Path $built)) { throw "GNU build produced no $built" }
+New-Item -ItemType Directory -Force -Path "target\release" | Out-Null
+Copy-Item $built "target\release\solver-worker.exe" -Force
+Write-Host "solver-worker.exe built with stable-x86_64-pc-windows-gnu and staged in target\release"
+```
+
+Run: `powershell -NoProfile -File scripts/build-worker-gnu.ps1 -WhatIf` is **not** run in this task — `solver-worker` does not exist until plan 2 Task 1. Verify only that the file is written and that `rustup toolchain list` shows `stable-x86_64-pc-windows-gnu` (installed or installable).
+Expected: the file exists; `cargo test --workspace` is unaffected.
+
+- [ ] **Step 4: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock rust-toolchain.toml .cargo/config.toml .gitignore crates/proto
+git add Cargo.toml Cargo.lock rust-toolchain.toml .cargo/config.toml .gitignore scripts/build-worker-gnu.ps1 crates/proto
 git commit -m "chore: workspace skeleton" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
@@ -203,7 +234,7 @@ git commit -m "chore: workspace skeleton" -m "Co-Authored-By: Claude Fable 5.1 <
 - Modify: `crates/proto/src/lib.rs`
 
 **Interfaces:**
-- Produces: `Card(pub u8)` with `Card::new(rank: u8, suit: u8)`, `rank()`, `suit()`, `Card::all()`, `FromStr`, `Display` ("As"), serde as a two-character string; `CardParseError`; `ComboIndex = u16`; `COMBOS = 1326`; `CLASSES = 169`; `combo_index(a: Card, b: Card) -> ComboIndex`; `combo_cards(i: ComboIndex) -> [Card; 2]` (lo, hi); `class_of(i: ComboIndex) -> u8`; `class_combos(class: u8) -> Vec<ComboIndex>`.
+- Produces: `Card(pub u8)` with `Card::new(rank: u8, suit: u8)`, `rank()`, `suit()`, `Card::all()`, `Card::parse(&str) -> Result<Card, CardParseError>` (the inherent form plans 2-5 call; `FromStr` is the implementation), `FromStr`, `Display` ("As"), serde as a two-character string; `CardParseError` (there is no `ProtoError` in the workspace — the error type of every `proto` card parse is `CardParseError`); `ComboIndex = u16`; `COMBOS = 1326`; `CLASSES = 169`; `combo_index(a: Card, b: Card) -> ComboIndex`; `combo_cards(i: ComboIndex) -> [Card; 2]` (lo, hi); `class_of(i: ComboIndex) -> u8`; `class_combos(class: u8) -> Vec<ComboIndex>`.
 
 - [ ] **Step 1: Write the failing tests** (inside `cards.rs`)
 
@@ -217,6 +248,9 @@ mod tests {
         assert_eq!("2c".parse::<Card>().unwrap(), Card(0));
         assert_eq!("As".parse::<Card>().unwrap(), Card(51));
         assert_eq!("Td".parse::<Card>().unwrap(), Card(8 * 4 + 1));
+        assert_eq!(Card::parse("Kh").unwrap(), Card(11 * 4 + 2));
+        assert_eq!(Card::parse("As").unwrap(), "As".parse::<Card>().unwrap());
+        assert!(Card::parse("Zz").is_err());
         assert_eq!(Card(51).to_string(), "As");
         assert!("1s".parse::<Card>().is_err());
         assert!("Ax".parse::<Card>().is_err());
@@ -311,6 +345,8 @@ impl Card {
     pub fn checked(id: u8) -> Result<Card, CardParseError> {
         if id < 52 { Ok(Card(id)) } else { Err(CardParseError::Id(id)) }
     }
+    /// Inherent parse form used across the workspace; identical to `s.parse::<Card>()`.
+    pub fn parse(s: &str) -> Result<Card, CardParseError> { s.parse() }
 }
 
 impl FromStr for Card {
@@ -398,7 +434,7 @@ git commit -m "feat(proto): cards, combo index and 169-class order" -m "Co-Autho
 
 **Interfaces:**
 - Consumes: `Card` (Task 2).
-- Produces (all `Serialize + Deserialize + Clone + Debug + PartialEq`): `GameConfig`, `HandConfig` (+ `HandConfig::from_game(&GameConfig)`), `UtgStraddle { amount_chips: u32 }`, `Rake::{PotRake { rate: f32, cap_mchips: u32, no_flop_no_drop: bool }, TimeCharge}`, `SeatConfig`, `SeatTag`, `QuickFact`, `SolverPrefs { threads: u8, target_bp: u16, flop_budget_s: u8 }` (`Default` = 16/50/10); `Seat(pub u8)`, `Position::{Btn, Sb, Bb, Utg, Hj, Co}` (serde "BTN".."CO"), `Street::{Preflop, Flop, Turn, River}` (serde lowercase) with `Street::next(self) -> Option<Street>`, `Street::board_len(self) -> usize`, `Street::index(self) -> usize`; `Action::{Fold, Check, Call, Bet { to }, Raise { to }, AllIn { to }}` (serde `tag = "kind"`, lowercase: `{"kind":"allin","to":100}`); `TakenAction { seat, street, action, paid }`; `HandPhase::{Betting { street }, AwaitingBoard { street }, Complete { reason }, Abandoned}`; `CompleteReason::{FoldedOut, AllInRunout, ShowdownReached}`; `HandState`; `Derived` (`Default`); `Pot { amount: u32, eligible: Vec<Seat> }`; `LegalAction::{Fold, Check, Call { cost }, Bet { min_to, max_to }, Raise { min_to, max_to }, AllIn { to }}`; `StreetRootSnapshot` (spec fields plus `bb_chips: u32`, needed by `replay_root` for the minimum bet; the worker ignores it).
+- Produces (all `Serialize + Deserialize + Clone + Debug + PartialEq`): `GameConfig`, `HandConfig` (+ `HandConfig::from_game(&GameConfig)`), `UtgStraddle { amount_chips: u32 }`, `Rake::{PotRake { rate: f32, cap_mchips: u32, no_flop_no_drop: bool }, TimeCharge}`, `SeatConfig`, `SeatTag`, `QuickFact`, `SolverPrefs { threads: u8, target_bp: u16, flop_budget_s: u8 }` (`Default` = 16/50/10); `Seat(pub u8)`, `Position::{Btn, Sb, Bb, Utg, Hj, Co}` (serde "BTN".."CO"), `Street::{Preflop, Flop, Turn, River}` (serde lowercase) with `Street::next(self) -> Option<Street>`, `Street::board_len(self) -> usize`, `Street::index(self) -> usize`; `Action::{Fold, Check, Call, Bet { to }, Raise { to }, AllIn { to }}` (serde `tag = "kind"`, lowercase: `{"kind":"allin","to":100}`); `TakenAction { seat, street, action, paid }`; `HandPhase::{Betting { street }, AwaitingBoard { street }, Complete { reason }, Abandoned}`; `CompleteReason::{FoldedOut, AllInRunout, ShowdownReached}`; `HandState`; `Derived` (`Default`); `Pot { amount: u32, eligible: Vec<Seat> }`; `LegalAction::{Fold, Check, Call { cost }, Bet { min_to, max_to }, Raise { min_to, max_to }, AllIn { to }}`; `StreetRootSnapshot` (spec §4.3 rev 6 verbatim, **including `bb_chips: u32`** — the minimum bet `replay_root` needs to reproduce the legal set of an unopened street; the worker ignores it, but it is a **required** field of every `StreetRootSnapshot { .. }` literal, so plan 2's two construction sites must supply it); `BeginHand { button: Seat, hero: Seat, dealt: Vec<Seat>, stacks: Vec<u32>, hero_cards: Option<[Card; 2]> }` — the spec §4.3 / §5-step-2 **admission DTO**, id-free, `stacks` in dealt-seat order. It is distinct from `core_model::BeginHand` (Task 13), which additionally carries the engine-assigned `hand_id` and names the field `stacks_start`; plan 2's `Engine::begin_hand` takes `proto::BeginHand`, assigns `hand_id` and converts. Plan 5 must **not** add a second DTO.
 
 - [ ] **Step 1: Write the failing test** (`crates/proto/src/hand.rs`, bottom)
 
@@ -422,6 +458,16 @@ mod tests {
         let d = Derived::default();
         assert_eq!(d.stacks_remaining.len(), 6);
         assert!(d.folded.iter().all(|f| *f));
+    }
+
+    #[test]
+    fn begin_hand_dto_is_id_free_and_roundtrips() {
+        let dto = BeginHand { button: Seat(5), hero: Seat(0), dealt: vec![Seat(5), Seat(0), Seat(1)], stacks: vec![200, 100, 150], hero_cards: None };
+        let text = serde_json::to_string(&dto).unwrap();
+        assert!(!text.contains("hand_id"), "the engine assigns hand_id (spec 4.3): {text}");
+        assert!(text.contains(r#""stacks":[200,100,150]"#), "{text}");
+        assert_eq!(serde_json::from_str::<BeginHand>(&text).unwrap(), dto);
+        assert!(serde_json::from_str::<BeginHand>(&text.replace(r#""stacks""#, r#""stacks_start""#)).is_err(), "unknown fields are rejected");
     }
 }
 ```
@@ -604,6 +650,19 @@ pub struct StreetRootSnapshot {
     pub history: Vec<(Seat, Action)>,
     pub bb_chips: u32,
 }
+
+/// Admission DTO of spec section 5 step 2: no `hand_id` (the engine assigns it),
+/// `stacks` in `dealt` order. `core_model::BeginHand` is the internal input that carries the id.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BeginHand {
+    pub button: Seat,
+    pub hero: Seat,
+    pub dealt: Vec<Seat>,
+    pub stacks: Vec<u32>,
+    #[serde(default)]
+    pub hero_cards: Option<[Card; 2]>,
+}
 ```
 
 Add to `lib.rs`: `pub mod game; pub mod hand; pub use game::*; pub use hand::*;`.
@@ -611,7 +670,7 @@ Add to `lib.rs`: `pub mod game; pub mod hand; pub use game::*; pub use hand::*;`
 - [ ] **Step 5: Run tests**
 
 Run: `cargo test -p proto`
-Expected: 5 tests pass.
+Expected: 6 tests pass.
 
 - [ ] **Step 6: Commit**
 
@@ -735,7 +794,7 @@ Add to `lib.rs`: `pub mod range; pub use range::*;`.
 - [ ] **Step 4: Run tests**
 
 Run: `cargo test -p proto`
-Expected: 6 tests pass.
+Expected: 7 tests pass.
 
 - [ ] **Step 5: Commit**
 
@@ -917,7 +976,7 @@ Add to `lib.rs`: `pub mod recommendation; pub use recommendation::*;`.
 - [ ] **Step 4: Run tests**
 
 Run: `cargo test -p proto`
-Expected: 7 tests pass.
+Expected: 8 tests pass.
 
 - [ ] **Step 5: Commit**
 
@@ -935,7 +994,9 @@ git commit -m "feat(proto): recommendation, coverage and event types" -m "Co-Aut
 
 **Interfaces:**
 - Consumes: `Action`, `Street` (Task 3).
-- Produces: `ChipPath = Vec<Action>`, `OrdinalPath = Vec<u8>`, `RaiseSize::{Mult(f32), AllInOnly}` (wire: number or `"a"`), `Menu { bet: Vec<f32>, raise: Vec<RaiseSize> }`, `PlayerMenus { oop: Menu, ip: Menu, donk: Option<Vec<f32>> }` (`donk` absent on the root street, `Some(vec![])` on later streets in phase 1; the worker of plan 2 enforces that), `MaterializedNode { path: OrdinalPath, street: Street, actor: String, actions: Vec<Action>, terminal_pots: Vec<Option<u32>> }`, `EffectiveTree` (spec fields verbatim, `inserted: Vec<(ChipPath, String, Action)>`), `RULES_VERSION: u16 = 3`, `resolve_chip_path(materialized: &[MaterializedNode], path: &[Action]) -> Option<OrdinalPath>` (spec §2: a chip path resolves only if every action exists in its node's menu in order, no step continues past a terminal child, and the final path names a materialized node).
+- Produces: `ChipPath = Vec<Action>`, `OrdinalPath = Vec<u8>`, `MenuSize::{Pot(f32), AllIn}` (untagged wire form: a positive number or the string `"a"`), `SideMenu { bet: Vec<MenuSize>, raise: Vec<MenuSize> }`, `PlayerMenus { oop: SideMenu, ip: SideMenu, donk: Option<Vec<MenuSize>> }` (`donk` absent on the root street, `Some(vec![])` on later streets in phase 1; the worker of plan 2 enforces that), `MaterializedNode { path: OrdinalPath, street: Street, actor: String, actions: Vec<Action>, terminal_pots: Vec<Option<u32>> }`, `EffectiveTree` (spec fields verbatim, `inserted: Vec<(ChipPath, String, Action)>`), `RULES_VERSION: u16 = 3`, `resolve_chip_path(materialized: &[MaterializedNode], path: &[Action]) -> Option<OrdinalPath>` (spec §2: a chip path resolves only if every action exists in its node's menu in order, no step continues past a terminal child, and the final path names a materialized node).
+
+  **One `MenuSize` type on both sides of the menu (cross-plan §1 M1).** Spec §10.1 gives `river_std_v1` the bet sizes "0.33, 0.75 + a", §4.6 says *"each bet size `r` gives `Bet(round(r * pot))`; an `a` entry gives `AllIn(max)`"*, and §13.1 T4 requires a test template with `a`-only bet menus. A `bet: Vec<f32>` cannot express any of that, so the bet list, the raise list and the donk list all carry `MenuSize`. The wire form is unchanged (`0.33` / `"a"`), so the §4.5 example `"bet":[1.0]` still round-trips byte for byte. Plans 2, 4 and 5 use these names verbatim (plan 5's ts-rs registry registers `crate::PlayerMenus`, `crate::SideMenu`, `crate::MenuSize` with `ts(type = r#"number | \"a\""#)`); `Menu` and `RaiseSize` do not exist.
 
 - [ ] **Step 1: Write the failing test** (bottom of `tree.rs`)
 
@@ -949,8 +1010,8 @@ mod tests {
     fn wire_tree_parses_and_paths_resolve() {
         let tree: EffectiveTree = serde_json::from_str(RIVER_ORACLE_TREE).unwrap();
         assert_eq!(tree.rules_version, RULES_VERSION);
-        assert_eq!(tree.menus[&Street::River].ip.bet, vec![1.0]);
-        assert_eq!(tree.menus[&Street::River].oop.donk, None);
+        assert_eq!(tree.menus[&Street::River].ip.bet, vec![MenuSize::Pot(1.0)]);
+        assert_eq!(tree.menus[&Street::River].donk, None, "donk is a field of PlayerMenus, not of SideMenu");
         let back: EffectiveTree = serde_json::from_str(&serde_json::to_string(&tree).unwrap()).unwrap();
         assert_eq!(back, tree);
         let m = &tree.materialized;
@@ -960,11 +1021,25 @@ mod tests {
         assert_eq!(resolve_chip_path(m, &[Action::Check, Action::AllIn { to: 100 }, Action::Call]), None, "terminal child is not a node");
         assert_eq!(resolve_chip_path(m, &[Action::Check, Action::Check]), None);
         assert_eq!(resolve_chip_path(m, &[Action::Bet { to: 50 }]), None);
-        let sizes: Vec<RaiseSize> = serde_json::from_str(r#"[2.5, "a"]"#).unwrap();
-        assert_eq!(sizes, vec![RaiseSize::Mult(2.5), RaiseSize::AllInOnly]);
+        let sizes: Vec<MenuSize> = serde_json::from_str(r#"[2.5, "a"]"#).unwrap();
+        assert_eq!(sizes, vec![MenuSize::Pot(2.5), MenuSize::AllIn]);
         assert_eq!(serde_json::to_string(&sizes).unwrap(), r#"[2.5,"a"]"#);
-        assert!(serde_json::from_str::<Vec<RaiseSize>>(r#"["b"]"#).is_err());
+        assert!(serde_json::from_str::<Vec<MenuSize>>(r#"["b"]"#).is_err());
         assert!(serde_json::from_str::<EffectiveTree>(&RIVER_ORACLE_TREE.replace(r#""wager_cap":1"#, r#""wager_cap":1,"extra":1"#)).is_err());
+    }
+
+    /// Spec 10.1 `river_std_v1` ("0.33, 0.75 + a") and the 13.1 T4 template with an `a`-only bet menu.
+    #[test]
+    fn bet_menus_carry_all_in_entries() {
+        let menus: PlayerMenus = serde_json::from_str(r#"{"oop":{"bet":[0.33,0.75,"a"],"raise":[2.5]},"ip":{"bet":[0.33,0.75,"a"],"raise":[2.5]},"donk":[]}"#).unwrap();
+        assert_eq!(menus.oop.bet, vec![MenuSize::Pot(0.33), MenuSize::Pot(0.75), MenuSize::AllIn]);
+        assert_eq!(menus.ip.raise, vec![MenuSize::Pot(2.5)]);
+        assert_eq!(menus.donk, Some(vec![]), "turn and river donk menus are the explicit empty list");
+        assert_eq!(serde_json::to_string(&menus).unwrap(), r#"{"oop":{"bet":[0.33,0.75,"a"],"raise":[2.5]},"ip":{"bet":[0.33,0.75,"a"],"raise":[2.5]},"donk":[]}"#);
+        let jam_only: PlayerMenus = serde_json::from_str(r#"{"oop":{"bet":["a"],"raise":["a"]},"ip":{"bet":["a"],"raise":["a"]}}"#).unwrap();
+        assert_eq!(jam_only.oop.bet, vec![MenuSize::AllIn]);
+        assert_eq!(jam_only.donk, None, "absent on the root street");
+        assert!(serde_json::from_str::<PlayerMenus>(r#"{"oop":{"bet":[0.0],"raise":[]},"ip":{"bet":[],"raise":[]}}"#).is_err(), "a pot fraction must be positive");
     }
 }
 ```
@@ -987,46 +1062,49 @@ pub type ChipPath = Vec<Action>;
 pub type OrdinalPath = Vec<u8>;
 pub const RULES_VERSION: u16 = 3;
 
-/// Raise size: a multiple of the facing wager, or "a" = all-in only (spec 10.1).
+/// One menu entry: a pot fraction (bets, donks) or a multiple of the facing wager (raises),
+/// or "a" = all-in only (spec 4.6, 10.1). The same type is used for bets, raises and donks so
+/// that a bet menu can carry `a` (`river_std_v1` is "0.33, 0.75 + a").
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RaiseSize { Mult(f32), AllInOnly }
+pub enum MenuSize { Pot(f32), AllIn }
 
-impl Serialize for RaiseSize {
+impl Serialize for MenuSize {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self { RaiseSize::Mult(x) => s.serialize_f32(*x), RaiseSize::AllInOnly => s.serialize_str("a") }
+        match self { MenuSize::Pot(x) => s.serialize_f32(*x), MenuSize::AllIn => s.serialize_str("a") }
     }
 }
 
-struct RaiseSizeVisitor;
+struct MenuSizeVisitor;
 
-impl<'de> Visitor<'de> for RaiseSizeVisitor {
-    type Value = RaiseSize;
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("a positive raise multiple or \"a\"") }
-    fn visit_f64<E: de::Error>(self, v: f64) -> Result<RaiseSize, E> {
-        if v.is_finite() && v > 0.0 { Ok(RaiseSize::Mult(v as f32)) } else { Err(E::custom("raise multiple must be positive and finite")) }
+impl<'de> Visitor<'de> for MenuSizeVisitor {
+    type Value = MenuSize;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("a positive menu size or \"a\"") }
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<MenuSize, E> {
+        if v.is_finite() && v > 0.0 { Ok(MenuSize::Pot(v as f32)) } else { Err(E::custom("a menu size must be positive and finite")) }
     }
-    fn visit_u64<E: de::Error>(self, v: u64) -> Result<RaiseSize, E> { self.visit_f64(v as f64) }
-    fn visit_i64<E: de::Error>(self, v: i64) -> Result<RaiseSize, E> { self.visit_f64(v as f64) }
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<RaiseSize, E> {
-        if v == "a" { Ok(RaiseSize::AllInOnly) } else { Err(E::custom(format!("unknown raise size {v:?}"))) }
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<MenuSize, E> { self.visit_f64(v as f64) }
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<MenuSize, E> { self.visit_f64(v as f64) }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<MenuSize, E> {
+        if v == "a" { Ok(MenuSize::AllIn) } else { Err(E::custom(format!("unknown menu size {v:?}"))) }
     }
 }
 
-impl<'de> Deserialize<'de> for RaiseSize {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<RaiseSize, D::Error> { d.deserialize_any(RaiseSizeVisitor) }
+impl<'de> Deserialize<'de> for MenuSize {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<MenuSize, D::Error> { d.deserialize_any(MenuSizeVisitor) }
 }
 
+/// One player's menu on one street.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct Menu { pub bet: Vec<f32>, pub raise: Vec<RaiseSize> }
+pub struct SideMenu { pub bet: Vec<MenuSize>, pub raise: Vec<MenuSize> }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlayerMenus {
-    pub oop: Menu,
-    pub ip: Menu,
+    pub oop: SideMenu,
+    pub ip: SideMenu,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub donk: Option<Vec<f32>>,
+    pub donk: Option<Vec<MenuSize>>,
 }
 
 /// One action node of the betting skeleton (spec section 2).
@@ -1085,7 +1163,7 @@ pub struct SolveInput { pub root: StreetRootSnapshot, pub ranges: [Range1326; 2]
 - [ ] **Step 4: Run tests**
 
 Run: `cargo test -p proto`
-Expected: 8 tests pass.
+Expected: 10 tests pass.
 
 - [ ] **Step 5: Commit**
 
@@ -1104,7 +1182,9 @@ git commit -m "feat(proto): effective tree, materialized nodes, chip path resolu
 
 **Interfaces:**
 - Consumes: `Card`, `Action`, `Range1326`, `EffectiveTree`, `MaterializedNode`, `OrdinalPath`, `resolve_chip_path`.
-- Produces: `REQUEST_LINE_MAX = 1 << 20`, `RESULT_LINE_MAX = 16 << 20`, `MAX_EXPORTED_NODES = 100_000`, `FAILURE_CODES`; `SolveRequest` (16 spec fields, `deny_unknown_fields`), `NodeLock { path: Vec<Action>, actor: String, probs: Vec<Vec<f32>> }`, `EngineMessage::{Solve(SolveRequest), Lock { id, spot, locks }, Cancel { id, target }, Shutdown { id }}`, `ReadyInfo`, `AckStatus::{Accepted, Staged, Rejected, AlreadyFinished, UnknownTarget}` (snake_case), `Stage::{Building, Solving, Extracting}`, `ResultStatus::{Ok, BestSoFar, Cancelled, Error}` (snake_case), `WorkerError { code, message, retryable, estimate_bytes: Option<u64> }`, `NodeStrategy`, `StreetSolution`, `WorkerMessage::{Ready(ReadyInfo), Ack { id, status, reason: Option<String>, replaced: Option<bool> }, Progress { id, stage, iterations, exploitability_chips: Option<f32>, elapsed_ms, memory_bytes }, Result { id, status, elapsed_ms, solution: Option<StreetSolution>, error: Option<WorkerError> }}`. All tagged `type`, lowercase, `deny_unknown_fields`; optional fields omitted when `None` except `exploitability_chips`, which is always present (`null` until measured).
+- Produces: `REQUEST_LINE_MAX = 1 << 20`, `RESULT_LINE_MAX = 16 << 20`, `MAX_EXPORTED_NODES = 100_000`, `FAILURE_CODES`; the three identity constants plans 2 and 4 import from `proto::worker`: `pub use crate::PROTO_VERSION;` (3), `pub const SOLVER_COMMIT: &str = "9d1509fe5077d019825f833eed04b16d342dfda1";` (spec §3.7 pins it) and `pub const ADAPTER_VERSION: u16 = 1;`; `SolveRequest` (17 spec fields, `deny_unknown_fields`), `NodeLock { path: Vec<Action>, actor: String, probs: Vec<Vec<f32>> }`, `EngineMessage::{Solve(SolveRequest), Lock { id, spot, locks }, Cancel { id, target }, Shutdown { id }}`, `Ready`, `AckStatus::{Accepted, Staged, Rejected, AlreadyFinished, UnknownTarget}` (snake_case), `Stage::{Building, Solving, Extracting}`, `ResultStatus::{Ok, BestSoFar, Cancelled, Error}` (snake_case), `WorkerError { code, message, retryable, estimate_bytes: Option<u64> }`, `NodeStrategy`, `StreetSolution`, `WorkerMessage::{Ready(Ready), Ack { id, status, reason: Option<String>, replaced: Option<bool> }, Progress { id, stage, iterations, exploitability_chips: Option<f32>, elapsed_ms, memory_bytes }, Result { id, status, elapsed_ms, solution: Option<StreetSolution>, error: Option<WorkerError> }}`. All tagged `type`, lowercase, `deny_unknown_fields`; optional fields omitted when `None` except `exploitability_chips`, which is always present (`null` until measured).
+
+  **Names plans 2-5 must use (cross-plan §1 M3-M5).** The `ready` payload struct is `Ready`, not `ReadyInfo` (plan 5's ts-rs registry registers `crate::Ready`). `Lock` stays a **struct variant** `EngineMessage::Lock { id, spot, locks }` — the wire form is identical under `#[serde(tag = "type")]`, so plan 2 matches `EngineMessage::Lock { id, spot, locks }` and deletes its `LockRequest` newtype rather than plan 1 adding one. `SOLVER_COMMIT` lives **here** and nowhere else: plan 2's `solver-worker` re-exports it and checks its `include_str!("PINNED_COMMIT")` against it instead of defining a second copy (`ProcessWorker` may not depend on `solver-worker`, §3.2).
 
 - [ ] **Step 1: Write the failing tests** (`crates/proto/tests/wire_examples.rs`)
 
@@ -1113,6 +1193,10 @@ use proto::worker::*;
 use proto::*;
 
 /// The two-combo river fixture of spec 4.5: OOP = the six AA combos at 1.0; IP = the three legal QQ combos on Qs Jd 7h 3c 2d at 1.0 and the twelve 54o combos at 0.25.
+///
+/// This function is the **definition** of that data (cross-plan §2 D7). Python cannot import it,
+/// so plan 2's `tools/gen_worker_fixtures.py` re-states it and plan 2 owes a cross-check test that
+/// `fixtures/worker/river_two_combo.jsonl` agrees with this function combo by combo.
 pub fn river_two_combo_ranges() -> (Range1326, Range1326) {
     let card = |s: &str| s.parse::<Card>().unwrap();
     let mut oop = Range1326::zero();
@@ -1129,6 +1213,16 @@ pub fn river_two_combo_ranges() -> (Range1326, Range1326) {
 }
 
 const READY: &str = r#"{"type":"ready","proto_version":3,"solver_commit":"9d1509fe5077d019825f833eed04b16d342dfda1","adapter_version":1,"threads":16,"build_features":["avx2"],"cpu_features":["avx2","fma"],"capabilities":["solve","lock","cancel","street_export","i16"]}"#;
+
+#[test]
+fn worker_identity_constants_match_the_ready_line() {
+    let m: WorkerMessage = serde_json::from_str(READY).unwrap();
+    let WorkerMessage::Ready(r) = m else { panic!("ready") };
+    assert_eq!(r.proto_version, PROTO_VERSION);
+    assert_eq!(r.solver_commit, SOLVER_COMMIT);
+    assert_eq!(r.adapter_version, ADAPTER_VERSION);
+    assert_eq!(SOLVER_COMMIT.len(), 40, "spec 3.7 pins a full sha1");
+}
 
 #[test]
 fn ready_ack_cancel_shutdown_roundtrip_exactly() {
@@ -1203,6 +1297,14 @@ pub const RESULT_LINE_MAX: usize = 16 << 20;
 pub const MAX_EXPORTED_NODES: usize = 100_000;
 pub const FAILURE_CODES: [&str; 7] = ["invalid_request", "tree_mismatch", "tree_too_large", "out_of_memory", "lock_mismatch", "no_iteration", "internal"];
 
+/// Wire protocol version, re-exported here so consumers import one `proto::worker::*` set.
+pub use crate::PROTO_VERSION;
+/// Pinned upstream solver commit (spec 3.7). The single definition in the workspace:
+/// `solver-worker` re-exports it and checks its vendored `PINNED_COMMIT` file against it.
+pub const SOLVER_COMMIT: &str = "9d1509fe5077d019825f833eed04b16d342dfda1";
+/// Version of the worker's library adapter (spec 4.5 `ready`, spec 10.4 cache key).
+pub const ADAPTER_VERSION: u16 = 1;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SolveRequest {
@@ -1225,9 +1327,10 @@ pub enum EngineMessage {
     Shutdown { id: String },
 }
 
+/// The `ready` payload (spec 4.5). Named `Ready` because plans 2 and 5 consume it under that name.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReadyInfo {
+pub struct Ready {
     pub proto_version: u16, pub solver_commit: String, pub adapter_version: u16, pub threads: u8,
     pub build_features: Vec<String>, pub cpu_features: Vec<String>, pub capabilities: Vec<String>,
 }
@@ -1269,7 +1372,7 @@ pub struct StreetSolution {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum WorkerMessage {
-    Ready(ReadyInfo),
+    Ready(Ready),
     Ack {
         id: String, status: AckStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")] reason: Option<String>,
@@ -1287,7 +1390,7 @@ pub enum WorkerMessage {
 - [ ] **Step 4: Run tests**
 
 Run: `cargo test -p proto`
-Expected: all pass (8 unit + 3 wire tests).
+Expected: all pass (10 unit + 4 wire tests).
 
 - [ ] **Step 5: Commit**
 
@@ -1601,12 +1704,14 @@ description = "Hand lifecycle, positions, legal actions, settlement and street r
 
 [dependencies]
 proto = { path = "../proto" }
-serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+serde = { workspace = true }
 serde_json = { workspace = true }
 ```
+
+(No type in `core-model` derives serde — every wire type lives in `proto` — so `serde` is a dev-dependency, needed only by the fixture-replay test of Task 18.)
 
 `crates/core-model/src/lib.rs`:
 ```rust
@@ -2020,20 +2125,404 @@ git commit -m "feat(core-model): betting round with cumulative reopening and leg
 ```
 
 ---
-### Task 11: `core-model` hand lifecycle, settlement and the public state API
+### Task 11: `core-model` settlement: refunds, side pots and the conservation invariant
 
 **Files:**
-- Create: `crates/core-model/src/settlement.rs`, `crates/core-model/src/lifecycle.rs`, `crates/core-model/src/state.rs`, `crates/core-model/tests/lifecycle.rs`
+- Create: `crates/core-model/src/settlement.rs`, `crates/core-model/tests/settlement.rs`
 - Modify: `crates/core-model/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `Round` (Task 10), positions and config helpers (Task 9), `proto::{HandState, HandPhase, CompleteReason, Derived, Pot, TakenAction, ...}`.
-- Produces: `settlement::{Settlement { pots: Vec<Pot>, returned: Vec<(Seat, u32)> }, refund_uncalled(committed: &mut [u32; 6], stacks: &mut [u32; 6]) -> Option<(Seat, u32)>, layer_pots(contributed: &[u32; 6], folded: &[bool; 6]) -> Vec<Pot>, check_conservation(stacks, live, pots, stacks_start_total) -> Result<(), RulesError>}`; `lifecycle::{Sim { round, phase, contributed, pots, returned, start_total }, simulate(&HandState) -> Result<Sim, RulesError>, Sim::derived(&self) -> Derived}`; `state::{BeginHand { hand_id, button, hero, dealt, stacks_start, hero_cards }, begin_hand(&HandConfig, BeginHand) -> Result<HandState, RulesError>, apply_action(&HandState, Action) -> Result<HandState, RulesError>, set_board(&HandState, &[Card]) -> Result<HandState, RulesError>, set_hero_cards(&HandState, [Card; 2]) -> Result<HandState, RulesError>, derive(&HandState) -> Derived, settle_pots(&HandState) -> Settlement, is_decision_point(&HandState) -> bool, abandon(&HandState) -> HandState}`. `HandState.stacks_start` is aligned with `HandState.dealt`; `Derived` vectors are indexed by `Seat.0`. `Derived.all_in[s] = !folded[s] && stacks_remaining[s] == 0`. In `Complete`, `Derived.street` is the last betting street; in `AwaitingBoard{s}` it is `s`.
+- Consumes: `proto::{Pot, Seat}`, `RulesError` (Task 9).
+- Produces: `settlement::{Settlement { pots: Vec<Pot>, returned: Vec<(Seat, u32)> }, refund_uncalled(committed: &mut [u32; 6], stacks: &mut [u32; 6]) -> Option<(Seat, u32)>, layer_pots(contributed: &[u32; 6], folded: &[bool; 6]) -> Vec<Pot>, check_conservation(stacks: &[u32; 6], live: &[u32; 6], pots: &[Pot], stacks_start_total: u64) -> Result<(), RulesError>}`. Per-seat arrays are indexed by `Seat.0`. **Layering rule (normative for this workspace):** contributions are split by level, and a layer is folded into the previous one when its eligible set equals the previous layer's **or** is empty (a folded seat's chips are dead money). Task 16's fixture generator normalizes PokerKit's raw decomposition to this rule, so `100 / 2 (folded) / 100` is one pot of 202 on both sides.
+
+- [ ] **Step 1: Write the failing tests** (`crates/core-model/tests/settlement.rs`)
+
+```rust
+use core_model::settlement::{check_conservation, layer_pots, refund_uncalled, Settlement};
+use core_model::RulesError;
+use proto::{Pot, Seat};
+
+fn seats(ids: &[u8]) -> Vec<Seat> { ids.iter().map(|i| Seat(*i)).collect() }
+fn pot(amount: u32, eligible: &[u8]) -> Pot { Pot { amount, eligible: seats(eligible) } }
+
+#[test]
+fn refund_returns_only_the_uncalled_top() {
+    // BTN(5) committed 200 against a next-highest 100: 100 goes back to the stack.
+    let mut committed = [50, 100, 0, 0, 0, 200];
+    let mut stacks = [0, 0, 0, 0, 0, 0];
+    assert_eq!(refund_uncalled(&mut committed, &mut stacks), Some((Seat(5), 100)));
+    assert_eq!(committed, [50, 100, 0, 0, 0, 100]);
+    assert_eq!(stacks[5], 100);
+    assert_eq!(stacks.iter().sum::<u32>() + committed.iter().sum::<u32>(), 350, "a refund moves chips, never creates them");
+    // an exactly matched top refunds nothing
+    let mut committed = [100, 100, 0, 0, 0, 0];
+    let mut stacks = [0; 6];
+    assert_eq!(refund_uncalled(&mut committed, &mut stacks), None);
+    // two equal tops: the tie must not produce a refund
+    let mut committed = [0, 0, 0, 0, 200, 200];
+    let mut stacks = [0; 6];
+    assert_eq!(refund_uncalled(&mut committed, &mut stacks), None);
+    assert_eq!(committed, [0, 0, 0, 0, 200, 200]);
+    // nothing committed at all
+    let mut committed = [0; 6];
+    let mut stacks = [7; 6];
+    assert_eq!(refund_uncalled(&mut committed, &mut stacks), None);
+    assert_eq!(stacks, [7; 6]);
+}
+
+#[test]
+fn layer_pots_splits_by_level_and_merges_equal_eligibility() {
+    // three all-ins 50 / 100 / 100 after the 200 was refunded down to 100
+    assert_eq!(layer_pots(&[50, 100, 0, 0, 0, 100], &[false, false, true, true, true, false]),
+               vec![pot(150, &[0, 1, 5]), pot(100, &[1, 5])]);
+    // four contributors, nothing uncalled: levels 50, 100, 200
+    assert_eq!(layer_pots(&[50, 100, 200, 0, 0, 200], &[false, false, false, true, true, false]),
+               vec![pot(200, &[0, 1, 2, 5]), pot(150, &[1, 2, 5]), pot(200, &[2, 5])]);
+    // a folded seat's chips are dead money: the level above absorbs them
+    assert_eq!(layer_pots(&[100, 2, 0, 0, 0, 100], &[false, true, true, true, true, false]),
+               vec![pot(202, &[0, 5])], "one pot of 202, not 6 + 196");
+    // adjacent layers with the same eligible set are one pot
+    assert_eq!(layer_pots(&[12, 2, 0, 0, 0, 12], &[false, true, true, true, true, false]),
+               vec![pot(26, &[0, 5])]);
+    // everyone folded to the straddle: blinds and straddle are one pot for the survivor
+    assert_eq!(layer_pots(&[1, 2, 4, 0, 0, 0], &[true, true, false, true, true, true]), vec![pot(7, &[2])]);
+    assert_eq!(layer_pots(&[0; 6], &[false; 6]), vec![]);
+}
+
+#[test]
+fn conservation_detects_a_missing_chip() {
+    let stacks = [100, 0, 0, 0, 0, 0];
+    let live = [0, 50, 0, 0, 0, 0];
+    let pots = vec![pot(200, &[0, 1])];
+    assert_eq!(check_conservation(&stacks, &live, &pots, 350), Ok(()));
+    assert_eq!(check_conservation(&stacks, &live, &pots, 351), Err(RulesError::Conservation { expected: 351, actual: 350 }));
+    assert_eq!(Settlement::default(), Settlement { pots: vec![], returned: vec![] });
+}
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p core-model --test settlement`
+Expected: compile error (`core_model::settlement` does not exist).
+
+- [ ] **Step 3: Implement `settlement.rs`**
+
+```rust
+use proto::{Pot, Seat};
+use crate::error::RulesError;
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Settlement { pub pots: Vec<Pot>, pub returned: Vec<(Seat, u32)> }
+
+/// Returns the uncalled portion of the highest street contribution to its owner (spec 4.3): a transfer from live commitment back to the stack.
+pub fn refund_uncalled(committed: &mut [u32; 6], stacks: &mut [u32; 6]) -> Option<(Seat, u32)> {
+    let top = (0..6).max_by_key(|i| committed[*i])?;
+    let top_amount = committed[top];
+    let second = (0..6).filter(|i| *i != top).map(|i| committed[i]).max().unwrap_or(0);
+    if top_amount > second {
+        let refund = top_amount - second;
+        committed[top] = second;
+        stacks[top] += refund;
+        Some((Seat(top as u8), refund))
+    } else {
+        None
+    }
+}
+
+/// Layers total contributions into main and side pots by contribution level; folded seats' chips are dead money.
+/// Adjacent layers with the same eligible set are merged.
+pub fn layer_pots(contributed: &[u32; 6], folded: &[bool; 6]) -> Vec<Pot> {
+    let mut levels: Vec<u32> = contributed.iter().copied().filter(|c| *c > 0).collect();
+    levels.sort_unstable();
+    levels.dedup();
+    let mut pots: Vec<Pot> = Vec::new();
+    let mut prev = 0u32;
+    for level in levels {
+        let amount: u32 = contributed.iter().map(|c| (*c).min(level) - (*c).min(prev)).sum();
+        let eligible: Vec<Seat> = (0..6).filter(|i| !folded[*i] && contributed[*i] >= level).map(|i| Seat(i as u8)).collect();
+        prev = level;
+        if amount == 0 { continue; }
+        match pots.last_mut() {
+            Some(last) if last.eligible == eligible || eligible.is_empty() => last.amount += amount,
+            _ => pots.push(Pot { amount, eligible }),
+        }
+    }
+    pots
+}
+
+/// Spec 4.3: `sum(stacks) + live commitments + unawarded pots + rake (0) == sum(stacks_start)`.
+pub fn check_conservation(stacks: &[u32; 6], live: &[u32; 6], pots: &[Pot], stacks_start_total: u64) -> Result<(), RulesError> {
+    let actual = stacks.iter().map(|s| *s as u64).sum::<u64>() + live.iter().map(|c| *c as u64).sum::<u64>() + pots.iter().map(|p| p.amount as u64).sum::<u64>();
+    if actual == stacks_start_total { Ok(()) } else { Err(RulesError::Conservation { expected: stacks_start_total, actual }) }
+}
+```
+
+
+Add to `lib.rs`: `pub mod settlement;` and `pub use settlement::Settlement;`.
+
+- [ ] **Step 4: Run tests**
+
+Run: `cargo test --workspace`
+Expected: all pass (3 new settlement tests).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/core-model
+git commit -m "feat(core-model): refunds, side-pot layering and the conservation invariant" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+### Task 12: `core-model::lifecycle::simulate` (hand replay through one betting round)
+
+**Files:**
+- Create: `crates/core-model/src/lifecycle.rs`, `crates/core-model/tests/lifecycle_sim.rs`
+- Modify: `crates/core-model/src/lib.rs`
+
+**Interfaces:**
+- Consumes: `Round` (Task 10), `settlement::{check_conservation, layer_pots, refund_uncalled}` (Task 11), positions and config helpers (Task 9), `proto::{CompleteReason, Derived, HandPhase, HandState, Pot, Seat, Street}`.
+- Produces: `lifecycle::{Sim { round, phase, contributed, pots, returned, start_total }, simulate(&HandState) -> Result<Sim, RulesError>, Sim::derived(&self) -> Derived}`. `simulate` replays `HandState.actions` and `HandState.board` from the forced posts through `Round`, closes each street (refund, layering, phase), and rebuilds `Derived`; it returns `Err` for any state whose recorded action, `paid` amount or street order does not replay, which is what makes it the safe entry point for an externally supplied `HandState`. `HandState.stacks_start` is aligned with `HandState.dealt`; `Derived` vectors are indexed by `Seat.0`; `Derived.all_in[s] = !folded[s] && stacks_remaining[s] == 0`. In `Complete`, `Derived.street` is the last betting street; in `AwaitingBoard{s}` it is `s`.
+
+- [ ] **Step 1: Write the failing tests** (`crates/core-model/tests/lifecycle_sim.rs`)
+
+```rust
+use core_model::lifecycle::simulate;
+use core_model::RulesError;
+use proto::*;
+
+fn cfg() -> HandConfig {
+    HandConfig { config_revision: 1, sb_chips: 1, bb_chips: 2, straddle: None, rake: Rake::TimeCharge, chip_label: "$1".into() }
+}
+fn cards(text: &str) -> Vec<Card> { text.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap().parse().unwrap()).collect() }
+fn took(seat: u8, street: Street, action: Action, paid: u32) -> TakenAction {
+    TakenAction { seat: Seat(seat), street, action, paid }
+}
+/// Button 5, dealt [BTN(5), SB(0), BB(1)], 200 chips each, blinds 1/2. `simulate` never reads
+/// `phase` or `derived`, so a literal state with the defaults is a legitimate input here.
+fn state(board: &str, actions: Vec<TakenAction>) -> HandState {
+    HandState {
+        hand_id: 1, hand_revision: 0, config: cfg(), phase: HandPhase::Betting { street: Street::Preflop },
+        button: Seat(5), hero: Seat(5), hero_cards: None,
+        dealt: vec![Seat(5), Seat(0), Seat(1)], stacks_start: vec![200, 200, 200],
+        board: cards(board), actions, derived: Derived::default(),
+    }
+}
+
+#[test]
+fn simulate_opens_the_preflop_round_from_the_posts() {
+    let sim = simulate(&state("", vec![])).unwrap();
+    let d = sim.derived();
+    assert_eq!(sim.phase, HandPhase::Betting { street: Street::Preflop });
+    assert_eq!(d.to_act, Some(Seat(5)), "BTN acts first three-handed");
+    assert_eq!(d.pot, 3);
+    assert_eq!(d.committed_this_street, vec![1, 2, 0, 0, 0, 0], "SB and BB posted; vectors are indexed by Seat.0");
+    assert_eq!(d.stacks_remaining, vec![199, 198, 0, 0, 0, 200]);
+    assert_eq!(d.folded, vec![false, false, true, true, true, false], "undealt seats are folded");
+    assert_eq!(d.all_in, vec![false; 6]);
+    assert_eq!(d.last_full_raise, 2);
+    assert_eq!(d.legal, vec![LegalAction::Fold, LegalAction::Call { cost: 2 }, LegalAction::Raise { min_to: 4, max_to: 200 }, LegalAction::AllIn { to: 200 }]);
+    assert_eq!(d.stacks_remaining.iter().sum::<u32>() + d.committed_this_street.iter().sum::<u32>(), 600, "conservation at the open");
+}
+
+#[test]
+fn simulate_closes_streets_settles_and_sets_the_phase() {
+    let actions = vec![
+        took(5, Street::Preflop, Action::Call, 2),
+        took(0, Street::Preflop, Action::Call, 1),
+        took(1, Street::Preflop, Action::Check, 0),
+        took(0, Street::Flop, Action::Bet { to: 10 }, 10),
+        took(1, Street::Flop, Action::Fold, 0),
+        took(5, Street::Flop, Action::Call, 10),
+    ];
+    let sim = simulate(&state("AsKd2c", actions)).unwrap();
+    let d = sim.derived();
+    assert_eq!(sim.phase, HandPhase::AwaitingBoard { street: Street::Turn });
+    assert_eq!(d.street, Street::Turn, "AwaitingBoard names the next street");
+    assert_eq!(d.to_act, None);
+    assert!(d.legal.is_empty());
+    assert_eq!(sim.contributed, [12, 2, 0, 0, 0, 12]);
+    assert_eq!(sim.returned, vec![], "both streets closed on a match");
+    assert_eq!(sim.pots, vec![Pot { amount: 26, eligible: vec![Seat(0), Seat(5)] }], "BB's dead 2 merges into the survivors' layer");
+    assert_eq!(d.stacks_remaining, vec![188, 198, 0, 0, 0, 188]);
+    assert_eq!(d.stacks_remaining.iter().sum::<u32>() + sim.pots.iter().map(|p| p.amount).sum::<u32>(), 600);
+}
+
+#[test]
+fn simulate_rejects_states_it_did_not_build() {
+    let wrong_paid = vec![took(5, Street::Preflop, Action::Call, 3)];
+    assert!(matches!(simulate(&state("", wrong_paid)), Err(RulesError::IllegalAction { .. })), "the recorded paid amount must replay");
+    let wrong_street = vec![took(5, Street::Flop, Action::Call, 2)];
+    assert!(matches!(simulate(&state("", wrong_street)), Err(RulesError::IllegalAction { .. })), "an action on a street the hand has not reached");
+    let out_of_turn = vec![took(0, Street::Preflop, Action::Call, 1)];
+    assert!(matches!(simulate(&state("", out_of_turn)), Err(RulesError::IllegalAction { .. })), "seat 5 is to act, not seat 0");
+    let no_board = vec![
+        took(5, Street::Preflop, Action::Call, 2),
+        took(0, Street::Preflop, Action::Call, 1),
+        took(1, Street::Preflop, Action::Check, 0),
+        took(0, Street::Flop, Action::Bet { to: 10 }, 10),
+    ];
+    assert!(matches!(simulate(&state("", no_board)), Err(RulesError::NotBetting)), "no flop on record: the flop action cannot replay");
+}
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p core-model --test lifecycle_sim`
+Expected: compile error (`core_model::lifecycle` does not exist).
+
+- [ ] **Step 3: Implement `lifecycle.rs`**
+
+```rust
+use proto::{CompleteReason, Derived, HandPhase, HandState, Pot, Seat, Street};
+use crate::betting::Round;
+use crate::config::{initial_full_raise, posts};
+use crate::error::RulesError;
+use crate::positions::{postflop_order, preflop_order, ring};
+use crate::settlement::{check_conservation, layer_pots, refund_uncalled};
+
+/// The replayed hand: the current (or last) betting round plus hand-level accounting.
+#[derive(Clone, Debug)]
+pub struct Sim {
+    pub round: Round,
+    pub phase: HandPhase,
+    pub contributed: [u32; 6],
+    pub pots: Vec<Pot>,
+    pub returned: Vec<(Seat, u32)>,
+    pub start_total: u64,
+}
+
+fn seat_array<T: Copy>(state: &HandState, default: T, mut f: impl FnMut(usize) -> T) -> [T; 6] {
+    let mut out = [default; 6];
+    for (k, seat) in state.dealt.iter().enumerate() { out[seat.0 as usize] = f(k); }
+    out
+}
+
+impl Sim {
+    fn open_preflop(state: &HandState) -> Sim {
+        let dealt = seat_array(state, false, |_| true);
+        let stacks = seat_array(state, 0u32, |k| state.stacks_start[k]);
+        let folded: [bool; 6] = std::array::from_fn(|i| !dealt[i]);
+        let order = preflop_order(state.button, &state.dealt, state.config.straddle.is_some());
+        let mut round = Round::open(Street::Preflop, order, stacks, folded, [false; 6], initial_full_raise(&state.config));
+        let r = ring(state.button, &state.dealt);
+        for (idx, chips) in posts(&state.config) { round.post(r[idx], chips); }
+        Sim { round, phase: HandPhase::Betting { street: Street::Preflop }, contributed: [0; 6], pots: vec![], returned: vec![], start_total: state.stacks_start.iter().map(|s| *s as u64).sum() }
+    }
+
+    fn check(&self) -> Result<(), RulesError> { check_conservation(&self.round.stacks, &self.round.committed, &self.pots, self.start_total) }
+
+    /// Street closure (spec 4.3): refund the uncalled portion, settle the pots, choose the next phase.
+    fn close(&mut self) -> Result<(), RulesError> {
+        if let Some(r) = refund_uncalled(&mut self.round.committed, &mut self.round.stacks) {
+            self.round.all_in[r.0 .0 as usize] = false;
+            self.returned.push(r);
+        }
+        self.check()?;
+        for i in 0..6 { self.contributed[i] += self.round.committed[i]; self.round.committed[i] = 0; }
+        self.pots = layer_pots(&self.contributed, &self.round.folded);
+        self.check()?;
+        let eligible = self.round.eligible_count();
+        let with_chips = (0..6).filter(|i| !self.round.folded[*i] && self.round.stacks[*i] > 0).count();
+        self.phase = if eligible == 1 { HandPhase::Complete { reason: CompleteReason::FoldedOut } }
+            else if with_chips < 2 { HandPhase::Complete { reason: CompleteReason::AllInRunout } }
+            else if let Some(next) = self.round.street.next() { HandPhase::AwaitingBoard { street: next } }
+            else { HandPhase::Complete { reason: CompleteReason::ShowdownReached } };
+        self.round.pending.clear();
+        Ok(())
+    }
+
+    fn open_street(&mut self, state: &HandState, street: Street) {
+        let order = postflop_order(state.button, &state.dealt);
+        self.round = Round::open(street, order, self.round.stacks, self.round.folded, self.round.all_in, state.config.bb_chips);
+        self.phase = HandPhase::Betting { street };
+    }
+
+    pub fn derived(&self) -> Derived {
+        let r = &self.round;
+        let betting = matches!(self.phase, HandPhase::Betting { .. });
+        let street = match self.phase { HandPhase::Betting { street } | HandPhase::AwaitingBoard { street } => street, _ => r.street };
+        Derived {
+            street,
+            to_act: if betting { r.to_act() } else { None },
+            pot: self.pots.iter().map(|p| p.amount).sum::<u32>() + r.committed.iter().sum::<u32>(),
+            committed_this_street: r.committed.to_vec(),
+            stacks_remaining: r.stacks.to_vec(),
+            folded: r.folded.to_vec(),
+            all_in: (0..6).map(|i| !r.folded[i] && r.stacks[i] == 0).collect(),
+            facing: r.facing,
+            last_full_raise: r.last_full_raise,
+            pots: self.pots.clone(),
+            legal: if betting { r.legal() } else { vec![] },
+        }
+    }
+}
+
+/// Replays `state.actions` and `state.board` from the forced posts. Fails only on a state that this crate did not build.
+pub fn simulate(state: &HandState) -> Result<Sim, RulesError> {
+    let mut sim = Sim::open_preflop(state);
+    sim.check()?;
+    let mut k = 0;
+    loop {
+        match sim.phase {
+            HandPhase::Betting { street } => {
+                if k >= state.actions.len() { break; }
+                let a = state.actions[k];
+                k += 1;
+                if a.street != street {
+                    return Err(RulesError::IllegalAction { reason: format!("action {k} is on {:?} but the hand is on {:?}", a.street, street) });
+                }
+                let (recorded, paid) = sim.round.apply(a.seat, a.action)?;
+                if recorded != a.action || paid != a.paid {
+                    return Err(RulesError::IllegalAction { reason: format!("action {k} recorded as {:?}/{} replays as {:?}/{}", a.action, a.paid, recorded, paid) });
+                }
+                sim.check()?;
+                if sim.round.eligible_count() == 1 || sim.round.closed() { sim.close()?; }
+            }
+            HandPhase::AwaitingBoard { street } => {
+                if state.board.len() >= street.board_len() { sim.open_street(state, street); } else { break; }
+            }
+            HandPhase::Complete { .. } | HandPhase::Abandoned => break,
+        }
+    }
+    if k < state.actions.len() { return Err(RulesError::NotBetting); }
+    if matches!(state.phase, HandPhase::Abandoned) { sim.phase = HandPhase::Abandoned; }
+    Ok(sim)
+}
+```
+
+
+Add to `lib.rs`: `pub mod lifecycle;`.
+
+- [ ] **Step 4: Run tests**
+
+Run: `cargo test --workspace`
+Expected: all pass (3 new `lifecycle_sim` tests).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/core-model
+git commit -m "feat(core-model): hand replay, street closure and the derived snapshot" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+### Task 13: `core-model` public state API
+
+**Files:**
+- Create: `crates/core-model/src/state.rs`, `crates/core-model/tests/lifecycle.rs`
+- Modify: `crates/core-model/src/lib.rs`
+
+**Interfaces:**
+- Consumes: `lifecycle::simulate` (Task 12), `settlement::Settlement` (Task 11), `validate_table` (Task 9), `proto::{Action, Card, CardParseError, Derived, HandConfig, HandPhase, HandState, Seat, Street, TakenAction}`.
+- Produces: `state::{BeginHand { hand_id, button, hero, dealt, stacks_start, hero_cards }, begin_hand(&HandConfig, BeginHand) -> Result<HandState, RulesError>, apply_action(&HandState, Action) -> Result<HandState, RulesError>, set_board(&HandState, &[Card]) -> Result<HandState, RulesError>, set_hero_cards(&HandState, [Card; 2]) -> Result<HandState, RulesError>, derive(&HandState) -> Derived, settle_pots(&HandState) -> Settlement, is_decision_point(&HandState) -> bool, abandon(&HandState) -> HandState}`, and the §13.1 tests `side_pot_three_allins`, `side_pot_two_contested`, `allin_runout_single_survivor`.
+- **Two `BeginHand` types, deliberately.** `core_model::BeginHand` is the **internal** input: it carries the engine-assigned `hand_id` and names the field `stacks_start` (aligned with `dealt`), exactly as spec §4.3 describes `HandState`. `proto::BeginHand` (Task 3) is the **id-free admission DTO** of spec §5 step 2 with the field `stacks`; plan 2's `Engine::begin_hand` takes the DTO, assigns `hand_id` from `IdentityState::begin_hand()` and converts. Because both crates export the name, any test or module that glob-imports `core_model::*` **and** `proto::*` must add an explicit `use core_model::state::BeginHand;` (an explicit import wins over glob imports); this plan's three affected test files do.
+- `derive` and `settle_pots` have no `Result` (spec §3.5) and panic on a state that does not replay. **They are only ever called on states this crate produced:** `begin_hand`, `apply_action`, `set_board` and `abandon` all refresh through `simulate` and return `Err` rather than store an inconsistent state. A `HandState` from outside the crate (deserialized, or built by a caller) must be validated with `lifecycle::simulate` (Task 12), which returns `Result`, before `derive` or `settle_pots` is called on it.
 
 - [ ] **Step 1: Write the failing tests** (`crates/core-model/tests/lifecycle.rs`)
 
 ```rust
 use core_model::settlement::{layer_pots, refund_uncalled};
+use core_model::state::BeginHand; // explicit: `proto::BeginHand` is the DTO of the same name
 use core_model::*;
 use proto::*;
 
@@ -2180,179 +2669,7 @@ fn lifecycle_streets_and_board() {
 Run: `cargo test -p core-model --test lifecycle`
 Expected: compile error.
 
-- [ ] **Step 3: Implement `settlement.rs`**
-
-```rust
-use proto::{Pot, Seat};
-use crate::error::RulesError;
-
-#[derive(Clone, Debug, PartialEq, Default)]
-pub struct Settlement { pub pots: Vec<Pot>, pub returned: Vec<(Seat, u32)> }
-
-/// Returns the uncalled portion of the highest street contribution to its owner (spec 4.3): a transfer from live commitment back to the stack.
-pub fn refund_uncalled(committed: &mut [u32; 6], stacks: &mut [u32; 6]) -> Option<(Seat, u32)> {
-    let top = (0..6).max_by_key(|i| committed[*i])?;
-    let top_amount = committed[top];
-    let second = (0..6).filter(|i| *i != top).map(|i| committed[i]).max().unwrap_or(0);
-    if top_amount > second {
-        let refund = top_amount - second;
-        committed[top] = second;
-        stacks[top] += refund;
-        Some((Seat(top as u8), refund))
-    } else {
-        None
-    }
-}
-
-/// Layers total contributions into main and side pots by contribution level; folded seats' chips are dead money.
-/// Adjacent layers with the same eligible set are merged.
-pub fn layer_pots(contributed: &[u32; 6], folded: &[bool; 6]) -> Vec<Pot> {
-    let mut levels: Vec<u32> = contributed.iter().copied().filter(|c| *c > 0).collect();
-    levels.sort_unstable();
-    levels.dedup();
-    let mut pots: Vec<Pot> = Vec::new();
-    let mut prev = 0u32;
-    for level in levels {
-        let amount: u32 = contributed.iter().map(|c| (*c).min(level) - (*c).min(prev)).sum();
-        let eligible: Vec<Seat> = (0..6).filter(|i| !folded[*i] && contributed[*i] >= level).map(|i| Seat(i as u8)).collect();
-        prev = level;
-        if amount == 0 { continue; }
-        match pots.last_mut() {
-            Some(last) if last.eligible == eligible || eligible.is_empty() => last.amount += amount,
-            _ => pots.push(Pot { amount, eligible }),
-        }
-    }
-    pots
-}
-
-/// Spec 4.3: `sum(stacks) + live commitments + unawarded pots + rake (0) == sum(stacks_start)`.
-pub fn check_conservation(stacks: &[u32; 6], live: &[u32; 6], pots: &[Pot], stacks_start_total: u64) -> Result<(), RulesError> {
-    let actual = stacks.iter().map(|s| *s as u64).sum::<u64>() + live.iter().map(|c| *c as u64).sum::<u64>() + pots.iter().map(|p| p.amount as u64).sum::<u64>();
-    if actual == stacks_start_total { Ok(()) } else { Err(RulesError::Conservation { expected: stacks_start_total, actual }) }
-}
-```
-
-- [ ] **Step 4: Implement `lifecycle.rs`**
-
-```rust
-use proto::{CompleteReason, Derived, HandPhase, HandState, Pot, Seat, Street};
-use crate::betting::Round;
-use crate::config::{initial_full_raise, posts};
-use crate::error::RulesError;
-use crate::positions::{postflop_order, preflop_order, ring};
-use crate::settlement::{check_conservation, layer_pots, refund_uncalled};
-
-/// The replayed hand: the current (or last) betting round plus hand-level accounting.
-#[derive(Clone, Debug)]
-pub struct Sim {
-    pub round: Round,
-    pub phase: HandPhase,
-    pub contributed: [u32; 6],
-    pub pots: Vec<Pot>,
-    pub returned: Vec<(Seat, u32)>,
-    pub start_total: u64,
-}
-
-fn seat_array<T: Copy>(state: &HandState, default: T, mut f: impl FnMut(usize) -> T) -> [T; 6] {
-    let mut out = [default; 6];
-    for (k, seat) in state.dealt.iter().enumerate() { out[seat.0 as usize] = f(k); }
-    out
-}
-
-impl Sim {
-    fn open_preflop(state: &HandState) -> Sim {
-        let dealt = seat_array(state, false, |_| true);
-        let stacks = seat_array(state, 0u32, |k| state.stacks_start[k]);
-        let folded: [bool; 6] = std::array::from_fn(|i| !dealt[i]);
-        let order = preflop_order(state.button, &state.dealt, state.config.straddle.is_some());
-        let mut round = Round::open(Street::Preflop, order, stacks, folded, [false; 6], initial_full_raise(&state.config));
-        let r = ring(state.button, &state.dealt);
-        for (idx, chips) in posts(&state.config) { round.post(r[idx], chips); }
-        Sim { round, phase: HandPhase::Betting { street: Street::Preflop }, contributed: [0; 6], pots: vec![], returned: vec![], start_total: state.stacks_start.iter().map(|s| *s as u64).sum() }
-    }
-
-    fn check(&self) -> Result<(), RulesError> { check_conservation(&self.round.stacks, &self.round.committed, &self.pots, self.start_total) }
-
-    /// Street closure (spec 4.3): refund the uncalled portion, settle the pots, choose the next phase.
-    fn close(&mut self) -> Result<(), RulesError> {
-        if let Some(r) = refund_uncalled(&mut self.round.committed, &mut self.round.stacks) {
-            self.round.all_in[r.0 .0 as usize] = false;
-            self.returned.push(r);
-        }
-        self.check()?;
-        for i in 0..6 { self.contributed[i] += self.round.committed[i]; self.round.committed[i] = 0; }
-        self.pots = layer_pots(&self.contributed, &self.round.folded);
-        self.check()?;
-        let eligible = self.round.eligible_count();
-        let with_chips = (0..6).filter(|i| !self.round.folded[*i] && self.round.stacks[*i] > 0).count();
-        self.phase = if eligible == 1 { HandPhase::Complete { reason: CompleteReason::FoldedOut } }
-            else if with_chips < 2 { HandPhase::Complete { reason: CompleteReason::AllInRunout } }
-            else if let Some(next) = self.round.street.next() { HandPhase::AwaitingBoard { street: next } }
-            else { HandPhase::Complete { reason: CompleteReason::ShowdownReached } };
-        self.round.pending.clear();
-        Ok(())
-    }
-
-    fn open_street(&mut self, state: &HandState, street: Street) {
-        let order = postflop_order(state.button, &state.dealt);
-        self.round = Round::open(street, order, self.round.stacks, self.round.folded, self.round.all_in, state.config.bb_chips);
-        self.phase = HandPhase::Betting { street };
-    }
-
-    pub fn derived(&self) -> Derived {
-        let r = &self.round;
-        let betting = matches!(self.phase, HandPhase::Betting { .. });
-        let street = match self.phase { HandPhase::Betting { street } | HandPhase::AwaitingBoard { street } => street, _ => r.street };
-        Derived {
-            street,
-            to_act: if betting { r.to_act() } else { None },
-            pot: self.pots.iter().map(|p| p.amount).sum::<u32>() + r.committed.iter().sum::<u32>(),
-            committed_this_street: r.committed.to_vec(),
-            stacks_remaining: r.stacks.to_vec(),
-            folded: r.folded.to_vec(),
-            all_in: (0..6).map(|i| !r.folded[i] && r.stacks[i] == 0).collect(),
-            facing: r.facing,
-            last_full_raise: r.last_full_raise,
-            pots: self.pots.clone(),
-            legal: if betting { r.legal() } else { vec![] },
-        }
-    }
-}
-
-/// Replays `state.actions` and `state.board` from the forced posts. Fails only on a state that this crate did not build.
-pub fn simulate(state: &HandState) -> Result<Sim, RulesError> {
-    let mut sim = Sim::open_preflop(state);
-    sim.check()?;
-    let mut k = 0;
-    loop {
-        match sim.phase {
-            HandPhase::Betting { street } => {
-                if k >= state.actions.len() { break; }
-                let a = state.actions[k];
-                k += 1;
-                if a.street != street {
-                    return Err(RulesError::IllegalAction { reason: format!("action {k} is on {:?} but the hand is on {:?}", a.street, street) });
-                }
-                let (recorded, paid) = sim.round.apply(a.seat, a.action)?;
-                if recorded != a.action || paid != a.paid {
-                    return Err(RulesError::IllegalAction { reason: format!("action {k} recorded as {:?}/{} replays as {:?}/{}", a.action, a.paid, recorded, paid) });
-                }
-                sim.check()?;
-                if sim.round.eligible_count() == 1 || sim.round.closed() { sim.close()?; }
-            }
-            HandPhase::AwaitingBoard { street } => {
-                if state.board.len() >= street.board_len() { sim.open_street(state, street); } else { break; }
-            }
-            HandPhase::Complete { .. } | HandPhase::Abandoned => break,
-        }
-    }
-    if k < state.actions.len() { return Err(RulesError::NotBetting); }
-    if matches!(state.phase, HandPhase::Abandoned) { sim.phase = HandPhase::Abandoned; }
-    Ok(sim)
-}
-```
-
-- [ ] **Step 5: Implement `state.rs`**
+- [ ] **Step 3: Implement `state.rs`**
 
 ```rust
 use proto::{Action, Card, CardParseError, Derived, HandConfig, HandPhase, HandState, Seat, Street, TakenAction};
@@ -2387,6 +2704,10 @@ pub fn begin_hand(cfg: &HandConfig, begin: BeginHand) -> Result<HandState, Rules
     Ok(state)
 }
 
+/// Spec 3.5 gives `derive` no `Result`, so it is only ever called on a state this crate built
+/// (`begin_hand`, `apply_action`, `set_board`, `abandon` all refresh through `simulate` and
+/// return `Err` instead of storing an inconsistent state). Validate any externally supplied
+/// `HandState` with `lifecycle::simulate` first.
 pub fn derive(state: &HandState) -> Derived {
     simulate(state).expect("a HandState built by core-model replays consistently").derived()
 }
@@ -2428,6 +2749,7 @@ pub fn set_hero_cards(state: &HandState, cards: [Card; 2]) -> Result<HandState, 
 }
 
 /// Settled pots and every refund made so far in the hand, in order.
+/// Same precondition as `derive`: only for states this crate built.
 pub fn settle_pots(state: &HandState) -> Settlement {
     let sim = simulate(state).expect("a HandState built by core-model replays consistently");
     Settlement { pots: sim.pots, returned: sim.returned }
@@ -2465,20 +2787,21 @@ pub use settlement::Settlement;
 pub use state::{abandon, apply_action, begin_hand, derive, is_decision_point, set_board, set_hero_cards, settle_pots, BeginHand};
 ```
 
-- [ ] **Step 6: Run tests**
+
+- [ ] **Step 4: Run tests**
 
 Run: `cargo test --workspace`
 Expected: all pass (4 new lifecycle tests). If `lifecycle_streets_and_board` fails on `parse_cards("AsAs2c").unwrap_or_default()`, keep the assertion: `unwrap_or_default()` yields an empty board and `set_board` must reject it with `BadBoard` (wrong length).
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add crates/core-model
-git commit -m "feat(core-model): hand lifecycle, settlement, conservation invariant and state API" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+git commit -m "feat(core-model): public state API, decision points and settlement view" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
-### Task 12: `core-model` street root, `replay_root` and the §10.2 projection rule
+### Task 14: `core-model` street root, `replay_root` and the §10.2 projection rule
 
 **Files:**
 - Create: `crates/core-model/src/street_root.rs`, `crates/core-model/tests/street_root.rs`
@@ -2491,6 +2814,7 @@ git commit -m "feat(core-model): hand lifecycle, settlement, conservation invari
 - [ ] **Step 1: Write the failing tests** (`crates/core-model/tests/street_root.rs`)
 
 ```rust
+use core_model::state::BeginHand; // explicit: `proto::BeginHand` is the DTO of the same name
 use core_model::*;
 use proto::*;
 
@@ -2769,34 +3093,48 @@ git commit -m "feat(core-model): street root snapshot, replay_root and the multi
 ```
 
 ---
-### Task 13: `tools/` Python project and `gen_fixtures.py` (200 PokerKit hands)
+### Task 15: `tools/` Python project with pinned oracle versions
 
 **Files:**
-- Create: `tools/pyproject.toml`, `tools/requirements.txt`, `tools/tests/conftest.py`, `tools/gen_fixtures.py`, `tools/tests/test_gen_fixtures.py`, `fixtures/hands/h0001.json` .. `fixtures/hands/h0200.json`
+- Create: `tools/pyproject.toml`, `tools/requirements.txt`, `tools/tests/conftest.py`, `tools/tests/test_environment.py`
 
 **Interfaces:**
-- Consumes: PokerKit 0.7.5 (`NoLimitTexasHoldem.create_state`, `deal_hole`, `deal_board`, `fold`, `check_or_call`, `complete_bet_or_raise_to`, `pots`, `bets`, `stacks`, `statuses`, `actor_index`, `can_*`, `min/max_completion_betting_or_raising_to_amount`, `checking_or_calling_amount`, `completion_betting_or_raising_amount`).
-- Produces: `generate(count, first_seed) -> (hands, dropped)` and one JSON file per hand with this schema (arrays "per dealt seat" are in `dealt` order = clockwise from the SB, button last, which is PokerKit's player order):
+- Consumes: nothing from the Rust workspace.
+- Produces: the `tools/` Python project every later Python task joins (`tools/.venv`, `pytest` rooted at `tools/tests`, `sys.path` pointing at `tools/`), with `pokerkit==0.7.5`, `phevaluator==0.6.0` and `pytest>=9.0` pinned. Dev only: nothing here is ever a runtime dependency of the app (§3.2).
 
-```
-{"id":"h0001","seed":1,
- "config":{"sb_chips":1,"bb_chips":2,"straddle_chips":4|null},
- "button":5,"hero":1,"dealt":[3,4,5,0,1,2],"stacks_start":[40,17,300,14,200,200],
- "hole_cards":["JhAc",...],                          per dealt seat
- "steps":[
-   {"kind":"action","seat":0,"street":"preflop","action":{"kind":"raise","to":8},"after":SNAP},
-   {"kind":"board","cards":["Ah","Kd","2c"],"after":SNAP}],
- "returned":[[seat,amount],...],                     every refund in hand order
- "stats":{"allins":n,"short_allins":n,"max_pots":n,"allin_players":n}}
-SNAP = {"phase":"betting"|"awaiting_board"|"complete","street":"preflop"|"flop"|"turn"|"river",
-        "to_act":seat|null,"pot_total":n,"committed":[per dealt seat],"stacks":[..],"folded":[..],"all_in":[..],
-        "pots":[{"amount":n,"eligible":[seats ascending]}],
-        "legal":{"fold":bool,"check_or_call":{"cost":n}|null,"raise":{"min_to":n,"max_to":n}|null}|null,
-        "final":"folded_out"|"all_in_runout"|"showdown_reached"   (complete only)}
-```
-`action.kind` is `fold|check|call|bet|raise|allin` with `to` = the actor's total street contribution (the same encoding as `proto::Action`). `phase`/`street` follow `core-model`: `awaiting_board` names the next street, `complete` keeps the closing street. At a fold-out the survivor's uncollected bet is normalized: the matched part joins the single pot and the rest is a refund (PokerKit leaves the whole bet in `bets`).
+- [ ] **Step 1: Write the failing test** (`tools/tests/test_environment.py`)
 
-- [ ] **Step 1: Create the Python project files**
+```python
+"""The oracles are pinned: a different version silently changes every generated fixture."""
+import sys
+from importlib import metadata
+
+
+def test_python_is_312_or_newer():
+    assert sys.version_info[:2] >= (3, 12), sys.version
+
+
+def test_oracle_versions_are_pinned():
+    assert metadata.version("pokerkit") == "0.7.5"
+    assert metadata.version("phevaluator") == "0.6.0"
+
+
+def test_oracles_import_and_expose_the_entry_points_the_generators_use():
+    from phevaluator import evaluate_cards
+    from pokerkit import Automation, Mode, NoLimitTexasHoldem
+
+    assert evaluate_cards("As", "Ks", "Qs", "Js", "Ts") == 1, "lower is stronger; 1 is the royal flush"
+    assert hasattr(NoLimitTexasHoldem, "create_state")
+    assert Mode.CASH_GAME is not None
+    assert Automation.BET_COLLECTION is not None
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `python -m pytest tools -q`
+Expected: collection error (`tools/.venv` does not exist yet, or `ModuleNotFoundError: No module named 'pokerkit'`).
+
+- [ ] **Step 3: Create the Python project files**
 
 `tools/pyproject.toml`:
 ```toml
@@ -2832,7 +3170,48 @@ python -m venv tools/.venv
 tools/.venv/Scripts/python -m pip install -r tools/requirements.txt
 ```
 
-- [ ] **Step 2: Write the failing tests** (`tools/tests/test_gen_fixtures.py`)
+
+- [ ] **Step 4: Run the tests**
+
+Run: `tools/.venv/Scripts/python -m pytest tools -q`
+Expected: 3 passed.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tools/pyproject.toml tools/requirements.txt tools/tests/conftest.py tools/tests/test_environment.py
+git commit -m "chore(tools): Python project with pinned PokerKit and phevaluator" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+### Task 16: `tools/gen_fixtures.py`, the PokerKit hand generator
+
+**Files:**
+- Create: `tools/gen_fixtures.py`, `tools/tests/test_gen_fixtures.py`
+
+**Interfaces:**
+- Consumes: the Python project of Task 15; PokerKit 0.7.5 (`NoLimitTexasHoldem.create_state`, `deal_hole`, `deal_board`, `fold`, `check_or_call`, `complete_bet_or_raise_to`, `pots`, `bets`, `stacks`, `statuses`, `actor_index`, `can_*`, `min/max_completion_betting_or_raising_to_amount`, `checking_or_calling_amount`, `completion_betting_or_raising_amount`).
+- Produces: `generate(count, first_seed) -> (hands, dropped)` and one JSON file per hand with this schema (arrays "per dealt seat" are in `dealt` order = clockwise from the SB, button last, which is PokerKit's player order):
+
+```
+{"id":"h0001","seed":1,
+ "config":{"sb_chips":1,"bb_chips":2,"straddle_chips":4|null},
+ "button":5,"hero":1,"dealt":[3,4,5,0,1,2],"stacks_start":[40,17,300,14,200,200],
+ "hole_cards":["JhAc",...],                          per dealt seat
+ "steps":[
+   {"kind":"action","seat":0,"street":"preflop","action":{"kind":"raise","to":8},"after":SNAP},
+   {"kind":"board","cards":["Ah","Kd","2c"],"after":SNAP}],
+ "returned":[[seat,amount],...],                     every refund in hand order
+ "stats":{"allins":n,"short_allins":n,"max_pots":n,"allin_players":n}}
+SNAP = {"phase":"betting"|"awaiting_board"|"complete","street":"preflop"|"flop"|"turn"|"river",
+        "to_act":seat|null,"pot_total":n,"committed":[per dealt seat],"stacks":[..],"folded":[..],"all_in":[..],
+        "pots":[{"amount":n,"eligible":[seats ascending]}],
+        "legal":{"fold":bool,"check_or_call":{"cost":n}|null,"raise":{"min_to":n,"max_to":n}|null}|null,
+        "final":"folded_out"|"all_in_runout"|"showdown_reached"   (complete only)}
+```
+`action.kind` is `fold|check|call|bet|raise|allin` with `to` = the actor's total street contribution (the same encoding as `proto::Action`). `phase`/`street` follow `core-model`: `awaiting_board` names the next street, `complete` keeps the closing street. At a fold-out the survivor's uncollected bet is normalized: the matched part joins the single pot and the rest is a refund (PokerKit leaves the whole bet in `bets`). The pot list is normalized the same way: a PokerKit layer whose eligible set equals the previous layer's, or is empty (dead money from a folded seat), is folded into the previous layer, so `100 / 2 (folded) / 100` is one pot of 202 in the fixture, exactly as `layer_pots` (Task 11) computes it. Pot **totals** are the oracle; the layering rule is `core-model`'s.
+
+- [ ] **Step 1: Write the failing tests** (`tools/tests/test_gen_fixtures.py`)
 
 ```python
 import collections
@@ -2862,7 +3241,10 @@ def test_generated_set_covers_spec_classes():
     assert sum(1 for h in hands if h["stats"]["allin_players"] >= 3) >= 15
     assert sum(1 for h in hands if h["stats"]["short_allins"] >= 1) >= 25
     assert sum(1 for h in hands if h["returned"]) >= 100
-    assert sum(1 for h in hands if h["stats"]["max_pots"] >= 2) >= 60
+    # `max_pots` counts pot layers after `normalize_pots`, so it counts *genuine* side pots
+    # (distinct eligible sets), not PokerKit's raw contribution levels. 20 is a floor, not the
+    # measured count: 65 hands have two or more all-in players and 25 have three or more.
+    assert sum(1 for h in hands if h["stats"]["max_pots"] >= 2) >= 20
     finals = collections.Counter(h["steps"][-1]["after"]["final"] for h in hands)
     assert finals["showdown_reached"] >= 15
     assert finals["folded_out"] >= 40
@@ -2909,21 +3291,38 @@ def test_fold_is_legal_only_when_facing_a_wager():
             assert a["legal"]["fold"] == (facing > a["committed"][idx])
             cc = a["legal"]["check_or_call"]
             assert cc is not None and cc["cost"] == min(facing - a["committed"][idx], a["stacks"][idx])
+
+
+def test_pot_layers_follow_core_model_merging():
+    """The fixture uses core-model's layering rule, not PokerKit's raw levels."""
+    hands, _ = generate(60, 1)
+    merged_cases = 0
+    for h in hands:
+        for step in h["steps"]:
+            pots = step["after"]["pots"]
+            assert all(p["eligible"] for p in pots), "an empty eligible set must be merged away"
+            for a, b in zip(pots, pots[1:]):
+                assert a["eligible"] != b["eligible"], f"adjacent equal eligibility must be merged: {pots}"
+            merged_cases += 1
+    assert merged_cases > 0
 ```
 
-- [ ] **Step 3: Run to verify failure**
+- [ ] **Step 2: Run to verify failure**
 
 Run: `tools/.venv/Scripts/python -m pytest tools -q`
 Expected: `ModuleNotFoundError: No module named 'gen_fixtures'`.
 
-- [ ] **Step 4: Write `tools/gen_fixtures.py`**
+- [ ] **Step 3: Write `tools/gen_fixtures.py`**
 
 ```python
 """Generate fixtures/hands/*.json: PokerKit hands for spec 13.1 `state_machine_pokerkit_fixtures`.
 
-PokerKit is the oracle for pots, stacks, refunds and legal actions. Two normalizations are applied
-(both verified on 2026-09-10): the minimum open over a straddle is 2S (PokerKit alone uses S + bb),
-and at a fold-out the survivor's uncollected bet is split into the matched part (pot) and the refund.
+PokerKit is the oracle for pot totals, stacks, refunds and legal actions. Three normalizations are
+applied (all verified on 2026-09-10) so the fixture states the same fact as core-model rather than a
+differently sliced one:
+  1. the minimum open over a straddle is 2S (PokerKit alone uses S + bb);
+  2. at a fold-out the survivor's uncollected bet is split into the matched part (pot) and the refund;
+  3. the pot list is folded into core-model's layering rule (`normalize_pots` below).
 Hands where PokerKit's reopening rule diverges from spec 4.3 (a full all-in raise followed by a short
 all-in raise) are dropped.
 """
@@ -3001,11 +3400,28 @@ def spec_may_aggress(state, reopen: SpecReopen, i: int) -> bool:
     return any(j != i and state.statuses[j] and state.stacks[j] + state.bets[j] > facing for j in range(len(state.stacks)))
 
 
+def normalize_pots(state, ring) -> list[dict]:
+    """PokerKit's raw pot decomposition, folded into core-model's layering rule (Task 11).
+
+    `core_model::settlement::layer_pots` merges a contribution layer into the previous one when the
+    eligible set is equal, or when it is empty (a folded seat's chips are dead money). PokerKit
+    reports the raw levels, so a fold-out like 100 / 2 (folded) / 100 is two PokerKit pots and one
+    core-model pot of 202. The totals are identical either way; this only aligns the slicing, so the
+    fixture asserts one layering rule instead of two.
+    """
+    out: list[dict] = []
+    for p in state.pots:
+        entry = {"amount": p.amount, "eligible": sorted(ring[j] for j in p.player_indices)}
+        if out and (not entry["eligible"] or out[-1]["eligible"] == entry["eligible"]):
+            out[-1]["amount"] += entry["amount"]
+        else:
+            out.append(entry)
+    return out
+
+
 def snapshot(state, ring, phase: str, street: str, pots_override=None, stacks_override=None) -> dict:
     n = len(ring)
-    pots = pots_override if pots_override is not None else [
-        {"amount": p.amount, "eligible": sorted(ring[j] for j in p.player_indices)} for p in state.pots
-    ]
+    pots = pots_override if pots_override is not None else normalize_pots(state, ring)
     stacks = stacks_override if stacks_override is not None else list(state.stacks)
     committed = [0] * n if pots_override is not None else list(state.bets)
     return {
@@ -3182,35 +3598,66 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 5: Run the tests and generate the fixtures**
+
+- [ ] **Step 4: Run the tests**
 
 Run: `tools/.venv/Scripts/python -m pytest tools -q`
-Expected: 4 passed (the run of 2026-09-10 with these constants gives 95 straddle hands, 65 with two all-in players, 25 with three, 36 short all-ins, 138 refunds, 86 side pots, 23 showdowns, 56 fold-outs, 121 runouts, 1 dropped seed).
+Expected: 8 passed (3 from Task 15 plus 5 here). The run of 2026-09-10 with these constants gives 95 straddle hands, 65 with two all-in players, 25 with three, 36 short all-ins, 138 refunds, 23 showdowns, 56 fold-outs, 121 runouts, 1 dropped seed. Those counts were measured on the raw PokerKit pot decomposition; the only figure `normalize_pots` changes is the side-pot count (86 raw layers), so record the normalized count from this run in the commit message rather than reusing 86 anywhere.
 
-Run: `tools/.venv/Scripts/python tools/gen_fixtures.py --out fixtures/hands`
-Expected: `wrote 200 hands to fixtures/hands (1 seeds dropped)`; 200 files, about 1.2 MB in total.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add tools fixtures/hands
-git commit -m "feat(tools): PokerKit hand fixture generator and 200 fixtures" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+git add tools/gen_fixtures.py tools/tests/test_gen_fixtures.py
+git commit -m "feat(tools): PokerKit hand fixture generator" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-### Task 14: `core-model` replays the PokerKit fixtures
+### Task 17: generate and commit the 200 hand fixtures
+
+**Files:**
+- Create: `fixtures/hands/h0001.json` .. `fixtures/hands/h0200.json`
+
+**Interfaces:**
+- Consumes: `tools/gen_fixtures.py` (Task 16).
+- Produces: `fixtures/hands/*.json` (§13.0), the committed input of Task 18's `state_machine_pokerkit_fixtures`. Regeneration is byte-deterministic for a fixed `--seed`, so a later change to the generator is verified by re-running this task and inspecting the diff.
+
+- [ ] **Step 1: Generate the fixtures**
+
+Run: `tools/.venv/Scripts/python tools/gen_fixtures.py --out fixtures/hands`
+Expected: `wrote 200 hands to fixtures/hands (1 seeds dropped)`; 200 files, about 1.2 MB in total.
+
+- [ ] **Step 2: Verify the inventory and that regeneration is byte-identical**
+
+Run:
+```
+tools/.venv/Scripts/python -c "import json,pathlib,collections; fs=sorted(pathlib.Path('fixtures/hands').glob('h*.json')); hs=[json.loads(p.read_text()) for p in fs]; print(len(fs)); print(collections.Counter(h['steps'][-1]['after']['final'] for h in hs)); print(sorted({len(h['dealt']) for h in hs})); print(sum(1 for h in hs if h['returned']))"
+tools/.venv/Scripts/python tools/gen_fixtures.py --out fixtures/hands
+git status --porcelain fixtures/hands
+```
+Expected: `200`; the counter shows `folded_out`, `all_in_runout` and `showdown_reached` all present (56 / 121 / 23 in the 2026-09-10 run); dealt-seat counts `[3, 4, 5, 6]`; 138 hands with a refund. The second generator run leaves `git status` empty: the bytes are reproducible.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add fixtures/hands
+git commit -m "test(fixtures): 200 PokerKit hand fixtures" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+### Task 18: `core-model` replays the PokerKit fixtures
 
 **Files:**
 - Create: `crates/core-model/tests/pokerkit_fixtures.rs`
 
 **Interfaces:**
-- Consumes: `fixtures/hands/*.json` (Task 13 schema), `begin_hand`, `apply_action`, `set_board`, `settle_pots`, `parse_hand`, `parse_cards`.
+- Consumes: `fixtures/hands/*.json` (Task 16 schema), `begin_hand`, `apply_action`, `set_board`, `settle_pots`, `parse_hand`, `parse_cards`.
 - Produces: the test `state_machine_pokerkit_fixtures` (§13.1, V14).
 
 - [ ] **Step 1: Write the test**
 
 ```rust
+use core_model::state::BeginHand; // explicit: `proto::BeginHand` is the DTO of the same name
 use core_model::*;
 use proto::*;
 use serde::Deserialize;
@@ -3280,7 +3727,7 @@ fn check_snapshot(id: &str, k: usize, state: &HandState, snap: &Snap) {
 #[test]
 fn state_machine_pokerkit_fixtures() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/hands");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir).expect("fixtures/hands exists (Task 13)").map(|e| e.unwrap().path()).filter(|p| p.extension().map_or(false, |e| e == "json")).collect();
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir).expect("fixtures/hands exists (Task 17)").map(|e| e.unwrap().path()).filter(|p| p.extension().map_or(false, |e| e == "json")).collect();
     files.sort();
     assert_eq!(files.len(), 200, "200 PokerKit hands");
     for file in files {
@@ -3315,7 +3762,15 @@ fn state_machine_pokerkit_fixtures() {
 - [ ] **Step 2: Run the test**
 
 Run: `cargo test -p core-model --test pokerkit_fixtures`
-Expected: PASS (200/200). A failure names the fixture id and step; the fixture is the oracle: fix `core-model`, never the fixture (the only intentional differences are the two documented normalizations of Task 13, both already expressed in the fixture data).
+Expected: PASS (200/200). A failure names the fixture id and step.
+
+**Fixture policy (read before changing anything on a failure).** The comparison covers only the quantities PokerKit and spec §4.3 define identically: the actor, the phase and street, the total pot, per-seat street contributions, remaining stacks, folded and all-in flags, the fold / check-or-call / raise triple of the legal set, the pot totals and the refunds in hand order. Three PokerKit behaviours are **normalized by the generator** (Task 16) and are therefore expected to differ from raw PokerKit output:
+
+1. the minimum open over a straddle is `2S`, not PokerKit's `S + bb`;
+2. at a fold-out the survivor's uncollected bet is split into the matched part (pot) and the refund, instead of being left whole in `bets`;
+3. the pot list is folded into `core-model`'s layering rule — adjacent layers with the same eligible set, and layers with an empty eligible set, are merged (`normalize_pots`, Task 16 = `layer_pots`, Task 11). Pot **totals** are the oracle; the layering is `core-model`'s.
+
+Seeds where PokerKit's reopening rule diverges from §4.3 are dropped by the generator, not compared. Given that, a mismatch is a `core-model` bug **unless** it is traced to the generator, in which case the fix goes into `tools/gen_fixtures.py` and Task 17 is re-run to regenerate and re-commit the fixtures. A fixture file is never hand-edited, and an assertion is never relaxed to make a hand pass.
 
 - [ ] **Step 3: Commit**
 
@@ -3325,7 +3780,7 @@ git commit -m "test(core-model): replay the 200 PokerKit fixtures" -m "Co-Author
 ```
 
 ---
-### Task 15: `core-ranges` Pio range strings and 169-class expansion
+### Task 19: `core-ranges` Pio range strings and 169-class expansion
 
 **Files:**
 - Create: `crates/core-ranges/Cargo.toml`, `crates/core-ranges/src/lib.rs`, `crates/core-ranges/src/parse.rs`, `crates/core-ranges/tests/ranges.rs`
@@ -3504,6 +3959,10 @@ fn classes_of(hi: u8, lo: u8, suits: Suits) -> Vec<u8> {
 }
 
 /// Expands one group body into combos.
+///
+/// Token precedence, in this order: `random`; an explicit four-character combo (`AsKh`, detected by
+/// suit characters at positions 2 and 4, which is why `AKs+` and `A9s-A6s` never reach that branch);
+/// a `+` suffix; a `-` range; a plain shape (`AA`, `AKs`, `AKo`, `AK`).
 fn expand_body(body: &str) -> Result<Vec<ComboIndex>, RangeError> {
     if body.eq_ignore_ascii_case("random") { return Ok((0..COMBOS as u16).collect()); }
     let chars: Vec<char> = body.chars().collect();
@@ -3598,7 +4057,7 @@ git commit -m "feat(core-ranges): Pio range parser, printer and 169-class expans
 
 ---
 
-### Task 16: `core-ranges` blocking, hero conditioning and `hash_scaled`
+### Task 20: `core-ranges` blocking, hero conditioning and `hash_scaled`
 
 **Files:**
 - Modify: `crates/core-ranges/src/lib.rs`, `crates/core-ranges/tests/ranges.rs`
@@ -3701,13 +4160,13 @@ git commit -m "feat(core-ranges): public blocking, hero-conditioned copies and h
 ```
 
 ---
-### Task 17: `core-iso` suit permutations and canonical boards
+### Task 21: `core-iso` suit permutations and canonical boards
 
 **Files:**
 - Create: `crates/core-iso/Cargo.toml`, `crates/core-iso/src/lib.rs`, `crates/core-iso/tests/iso.rs`
 
 **Interfaces:**
-- Consumes: `proto::{Card, Range1326, combo_cards, combo_index, COMBOS}`; `core_ranges::parse_range` (tests only).
+- Consumes: `proto::{Card, Range1326, combo_cards, combo_index, COMBOS}`; `core_ranges::parse_range`, called from `tests/iso.rs` (`core-ranges` is a declared dependency of `core-iso` per spec §3.2, and an integration test links the crate's own dependencies as well as its dev-dependencies).
 - Produces: `SuitPerm(pub [u8; 4])` (`perm.0[suit] = image suit`; `SuitPerm::IDENTITY`; derives `Ord`, serde), `ALL_PERMS: [[u8; 4]; 24]` in lexicographic order, `CanonicalBoard` (`cards(&self) -> &[Card]`, `flop(&self) -> &[Card]`; derives `Hash`, `Ord`, serde), `apply(&SuitPerm, Card) -> Card`, `inverse(&SuitPerm) -> SuitPerm`, `apply_range(&SuitPerm, &Range1326) -> Range1326`, `canonicalize(board: &[Card], ranges: &[&Range1326]) -> (CanonicalBoard, SuitPerm)` (§2: the flop as an unordered set, turn and river in dealt order, minimal card-id key over the 24 permutations; ties broken by the lexicographically minimal serialized ranges as `f32` bit patterns in combo order, then the lexicographically minimal permutation), `orbit_size(&CanonicalBoard) -> u8` and `orbit_size_of(&[Card]) -> u8` (`24 / |stabilizer|`).
 
 - [ ] **Step 1: Write the failing tests** (`crates/core-iso/tests/iso.rs`)
@@ -3778,12 +4237,22 @@ fn iso_stabilizer_tiebreak() {
     let (a, _) = canonicalize(&cards("AhKd2c7s7h"), &[]);
     let (b, _) = canonicalize(&cards("AhKd2c7h7s"), &[]);
     assert_ne!(a, b, "turn and river keep their dealt order");
+    // AhKd2c is rainbow: its stabilizer is trivial, so the two turns are genuinely different
+    // boards (verified keys [0,45,50,23] and [0,45,50,22]).
     let (a, _) = canonicalize(&cards("AhKd2c7s"), &[]);
     let (b, _) = canonicalize(&cards("AhKd2c7h"), &[]);
+    assert_ne!(a, b, "a rainbow flop fixes every suit, so the turn suit survives canonicalization");
+    // AsAh2c has the non-trivial stabilizer (s <-> h), so its two turns share one class
+    // (verified: both canonicalize to the key [0,49,50,21]).
+    let (a, _) = canonicalize(&cards("AsAh2c7s"), &[]);
+    let (b, _) = canonicalize(&cards("AsAh2c7h"), &[]);
     assert_eq!(a, b, "the turn is canonicalized within the flop's stabilizer");
+    // core-ranges is core-iso's declared dependency (spec 3.2): exercise it on a real Pio range.
+    let r3 = core_ranges::parse_range("AA,KK,AKs:0.5,54o").unwrap();
     for p in ALL_PERMS {
         let p = SuitPerm(p);
         assert_eq!(apply_range(&inverse(&p), &apply_range(&p, &r1)), r1);
+        assert_eq!(apply_range(&inverse(&p), &apply_range(&p, &r3)), r3);
         for c in Card::all() { assert_eq!(apply(&inverse(&p), apply(&p, c)), c); }
     }
     let (_, p) = canonicalize(&cards("AsKd2c"), &[]);
@@ -3928,7 +4397,7 @@ git commit -m "feat(core-iso): suit permutations, canonical boards and orbit siz
 ```
 
 ---
-### Task 18: `tools/gen_eval_oracle.py` and the phevaluator fixtures
+### Task 22: `tools/gen_eval_oracle.py` and the phevaluator fixtures
 
 **Files:**
 - Create: `tools/gen_eval_oracle.py`, `tools/tests/test_gen_eval_oracle.py`, `fixtures/eval/phevaluator_5card.bin`, `fixtures/eval/phevaluator_7card_200k.bin`
@@ -4072,13 +4541,13 @@ git commit -m "feat(tools): phevaluator oracle generator and eval fixtures" -m "
 
 ---
 
-### Task 19: `core-eval` evaluator trait, b-inary backend and oracle tests
+### Task 23: `core-eval` evaluator trait, b-inary backend and oracle tests
 
 **Files:**
 - Create: `crates/core-eval/Cargo.toml`, `crates/core-eval/src/lib.rs`, `crates/core-eval/src/evaluator.rs`, `crates/core-eval/tests/oracle.rs`
 
 **Interfaces:**
-- Consumes: `holdem_hand_evaluator::Hand`, `proto::Card`, `fixtures/eval/*.bin` (Task 18).
+- Consumes: `holdem_hand_evaluator::Hand`, `proto::Card`, `fixtures/eval/*.bin` (Task 22).
 - Produces: `trait Evaluator: Send + Sync { type Partial: Clone + Send + Sync; fn partial(&self, cards: &[Card]) -> Self::Partial; fn rank_with(&self, partial: &Self::Partial, extra: &[Card]) -> u16; fn rank(&self, cards: &[Card]) -> u16 }` (ranks are "higher is stronger"; 5 to 7 cards), `BinaryEvaluator` (the b-inary backend; `rs_poker` is the named contingency and is not implemented), `rank7(&[Card; 7]) -> u16`, `rank5(&[Card; 5]) -> u16`, `rank(&[Card]) -> u16`. Feature `exhaustive` gates the 10,000,000-sample test.
 
 - [ ] **Step 1: Write the failing tests** (`crates/core-eval/tests/oracle.rs`)
@@ -4087,14 +4556,21 @@ git commit -m "feat(tools): phevaluator oracle generator and eval fixtures" -m "
 use core_eval::*;
 use proto::Card;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/eval").join(name);
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e} (run tools/gen_eval_oracle.py)", path.display()))
 }
 
-/// phevaluator rank (1..7462) -> our rank, built from the full 5-card oracle; panics on any inconsistency.
-fn oracle_map() -> Vec<u16> {
+/// phevaluator rank (1..7462) -> our rank, built **once per test binary** from the full 5-card
+/// oracle; panics on any inconsistency. Without the cache every test rebuilds a 2,598,960-hand map.
+fn oracle_map() -> &'static [u16] {
+    static MAP: OnceLock<Vec<u16>> = OnceLock::new();
+    MAP.get_or_init(build_oracle_map)
+}
+
+fn build_oracle_map() -> Vec<u16> {
     let data = fixture("phevaluator_5card.bin");
     assert_eq!(data.len(), 2_598_960 * 2);
     let mut map: Vec<Option<u16>> = vec![None; 7463];
@@ -4217,7 +4693,7 @@ pub fn rank7(cards: &[Card; 7]) -> u16 { BinaryEvaluator.rank(cards) }
 - [ ] **Step 4: Run tests**
 
 Run: `cargo test --workspace`
-Expected: all pass (2 new; each builds the 2.6M-hand map, about a second with the evaluator at `opt-level = 3`).
+Expected: all pass (2 new; the 2,598,960-hand map is built once per test binary behind the `OnceLock`, a few seconds at `opt-level = 1` with the evaluator at `opt-level = 3`).
 
 Run: `cargo test -p core-eval --features exhaustive`
 Expected: the exhaustive test fails with the "run tools/gen_eval_oracle.py" message until the 10M file is generated; with the file present it passes (about 30 s).
@@ -4230,14 +4706,14 @@ git commit -m "feat(core-eval): evaluator trait with the b-inary backend and phe
 ```
 
 ---
-### Task 20: `core-eval` exact equity, per-combo equity and terminal payoffs
+### Task 24: `core-eval` exact equity, per-combo equity and terminal payoffs
 
 **Files:**
 - Create: `crates/core-eval/src/equity.rs`, `crates/core-eval/tests/equity.rs`
 - Modify: `crates/core-eval/src/lib.rs`
 
 **Interfaces:**
-- Consumes: `Evaluator`/`BinaryEvaluator` (Task 19), `proto::{Card, ComboIndex, EquityMethod, Rake, Range1326, Seat, combo_cards, COMBOS}`, `core_ranges::{parse_range, block_public}` (tests).
+- Consumes: `Evaluator`/`BinaryEvaluator` (Task 23), `proto::{Card, ComboIndex, EquityMethod, Rake, Range1326, Seat, combo_cards, COMBOS}`, `core_ranges::{parse_range, block_public}` (tests).
 - Produces: `PlayerRange { seat: Seat, range: Range1326 }` (a fixed hero combo is a range with one supported combo), `EquityMode::{Exact, MonteCarlo { seed: u64, max_samples: u32 }}`, `PotEligibility { pot_index: u8, eligible: Vec<Seat> }`, `EquityRequest { board: Vec<Card>, players: Vec<PlayerRange>, mode: EquityMode, pots: Vec<PotEligibility> }` (+ `EquityRequest::single_pot(board, players, mode)`; empty `pots` = one pot with every player eligible), `EquityStatus::{Ready, Cancelled, BudgetExceeded, InvalidRanges}`, `EquityShare { pot_index, seat, value: f32, std_err: f32 }`, `EquityResult { status, method: Option<EquityMethod>, shares: Vec<EquityShare>, samples: u64, elapsed: Duration }`, `equity(&EquityRequest, budget: Duration, cancel: &AtomicBool) -> EquityResult`, `exact_cost(&EquityRequest) -> u64` (product of support sizes × runouts; the engine applies the §7 rule `<= 2 * 10^7`), `per_combo_equity(hero: &Range1326, villain: &Range1326, board: &[Card]) -> [f32; 1326]` (exact, hero combo fixed against the villain's disjoint weighted combos, 0 for unsupported hero combos), `terminal_payoff(equity: f32, pot: u32, rake: &Rake) -> f32` = `equity * (pot - min(rate * pot, cap))`, 0 rake for `TimeCharge`. Joint weighting: every disjoint tuple of combos has weight = the product of its weights; runouts are uniform; a tie splits the pot equally among the tied eligible players. Cancel flag and clock are checked every 4096 evaluations.
 
 - [ ] **Step 1: Write the failing tests** (`crates/core-eval/tests/equity.rs`)
@@ -4539,16 +5015,19 @@ pub fn per_combo_equity(hero: &Range1326, villain: &Range1326, board: &[Card]) -
 }
 ```
 
-Add to `lib.rs`: `pub mod equity; pub mod mc; pub use equity::*;` and create a placeholder-free `mc.rs` for this task with only the function the dispatcher needs, replaced in Task 21:
+Add to `lib.rs`: `pub mod equity; pub mod mc; pub use equity::*;` and create a placeholder-free `mc.rs` for this task with only the function the dispatcher needs, replaced in Task 25:
 
 ```rust
-//! Monte Carlo equity (Task 21); this task ships exact enumeration only.
+//! Monte Carlo equity (Task 25); this task ships exact enumeration only.
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-use crate::equity::{result, EquityRequest, EquityResult, EquityStatus};
+use crate::equity::{EquityRequest, EquityResult};
 
+/// Complete, compiling dispatcher target for this task; Task 25 replaces the whole file.
+/// It panics rather than returning a plausible status so a mis-ordered execution fails loudly
+/// instead of silently reporting a budget overrun for every Monte Carlo request.
 pub fn monte_carlo(_req: &EquityRequest, _seed: u64, _max_samples: u32, _budget: Duration, _cancel: &AtomicBool) -> EquityResult {
-    result(EquityStatus::BudgetExceeded, None, vec![], 0, Duration::ZERO)
+    unreachable!("Monte Carlo lands in Task 25; no test of Task 24 requests EquityMode::MonteCarlo")
 }
 ```
 
@@ -4566,28 +5045,32 @@ git commit -m "feat(core-eval): exact joint-disjoint equity, per-combo equity an
 
 ---
 
-### Task 21: `core-eval` Monte Carlo with joint disjoint sampling
+### Task 25: `core-eval` Monte Carlo with joint disjoint sampling
 
 **Files:**
 - Modify: `crates/core-eval/src/mc.rs`, `crates/core-eval/tests/equity.rs`
 
 **Interfaces:**
-- Produces: `mc::Xoshiro256 { seed(u64), next_u64(), next_f64(), below(n) }` (deterministic, dependency-free), `sample_joint_holes(req: &EquityRequest, seed: u64, count: usize) -> Vec<Vec<[Card; 2]>>` (test support: `count` accepted joint draws), `mc::monte_carlo(req, seed, max_samples, budget, cancel) -> EquityResult`. Semantics: each player's combo is drawn proportionally to its weight from its support, the draw is rejected when any two combos overlap (so accepted tuples follow the product-weight law of Task 20), the runout is a uniform partial shuffle of the remaining deck; `std_err = sqrt(v * (1 - v) / samples)` per share; `method = MonteCarlo { samples, std_err: max over shares }`. Status: `Ready` when `max_samples` is reached or the budget stops the loop with at least one sample; `Cancelled` when the flag stops it (shares present when samples > 0); `BudgetExceeded` only when no sample completed; `InvalidRanges` when no disjoint assignment exists (bounded DFS over the supports, or 10,000,000 rejections without an accepted sample).
+- Produces: `mc::Xoshiro256 { seed(u64), next_u64(), next_f64(), below(n) }` (deterministic, dependency-free), `sample_joint_holes(req: &EquityRequest, seed: u64, count: usize) -> Vec<Vec<[Card; 2]>>` (test support: `count` accepted joint draws), `mc::monte_carlo(req, seed, max_samples, budget, cancel) -> EquityResult`. Semantics: each player's combo is drawn proportionally to its weight from its support, the draw is rejected when any two combos overlap (so accepted tuples follow the product-weight law of Task 24), the runout is a uniform partial shuffle of the remaining deck; `std_err = sqrt(v * (1 - v) / samples)` per share; `method = MonteCarlo { samples, std_err: max over shares }`. Status: `Ready` when `max_samples` is reached or the budget stops the loop with at least one sample; `Cancelled` when the flag stops it (shares present when samples > 0); `BudgetExceeded` only when no sample completed; `InvalidRanges` when no disjoint assignment exists (bounded DFS over the supports, or 10,000,000 rejections without an accepted sample).
 
 - [ ] **Step 1: Write the failing tests** (append to `crates/core-eval/tests/equity.rs`)
 
 ```rust
 #[test]
 fn equity_mc_within_standard_error() {
-    let heroes = ["AsKs", "7h7d", "QdJd", "9c8c", "AhQh"];
+    // Spec 13.1 requires 20 spots. The board changes every four spots while the hero cycles with
+    // period 5 and the villain with period 4, so the 20 (hero, board, villain) triples are distinct
+    // and no hero shares a card with its board (7h7s, not 7h7d, keeps Kd7d2c clean).
+    let heroes = ["AsKs", "7h7s", "QdJd", "9c8c", "AhQh"];
     let villains = ["QQ+,AKs", "22+,A2s+,KTs+", "JJ-77,AQo,KJs", "random"];
     let boards = ["Jh9h6c", "Kd7d2c", "8s8d3c", "AcQs5h", "Ts6s2d"];
     let mut checked = 0;
     for k in 0..20 {
-        let board = cards(boards[k % 5]);
+        let name = boards[(k / 4) % 5];
+        let board = cards(name);
         let hero = heroes[k % 5];
         let villain = villains[k % 4];
-        if board.iter().any(|c| cards(hero).contains(c)) { continue; }
+        assert!(!board.iter().any(|c| cards(hero).contains(c)), "spot {k}: {hero} must not share a card with {name}");
         let players = || vec![player(0, hero, &board), player(1, villain, &board)];
         let exact = equity(&EquityRequest::single_pot(board.clone(), players(), EquityMode::Exact), Duration::from_secs(30), &no_cancel());
         assert_eq!(exact.status, EquityStatus::Ready, "spot {k}");
@@ -4598,11 +5081,11 @@ fn equity_mc_within_standard_error() {
         let (e, m) = (share(&exact, 0), mc.shares.iter().find(|s| s.seat == Seat(0)).unwrap());
         let bound = ((m.value as f64) * (1.0 - m.value as f64) / 100_000.0).sqrt() as f32;
         assert!((m.std_err - bound).abs() < 1e-9, "spot {k}: reported std_err {} vs binomial bound {bound}", m.std_err);
-        assert!((m.value - e).abs() <= 4.0 * m.std_err, "spot {k} ({hero} vs {villain} on {}): mc {} exact {e} std_err {}", boards[k % 5], m.value, m.std_err);
+        assert!((m.value - e).abs() <= 4.0 * m.std_err, "spot {k} ({hero} vs {villain} on {name}): mc {} exact {e} std_err {}", m.value, m.std_err);
         match mc.method { Some(EquityMethod::MonteCarlo { samples: 100_000, std_err }) => assert!(std_err >= m.std_err), other => panic!("{other:?}") }
         checked += 1;
     }
-    assert!(checked >= 18);
+    assert_eq!(checked, 20, "spec 13.1 measures 20 spots");
 }
 
 #[test]
@@ -4733,14 +5216,23 @@ fn compatible(supports: &[Support], used: &mut [bool; 52], player: usize, steps:
     false
 }
 
-/// Test support: `count` accepted joint draws for the request's players.
+/// Test support: `count` accepted joint draws for the request's players. Bounded by the same
+/// 10,000,000-rejection cap as `monte_carlo`, so a request with no disjoint assignment returns the
+/// partial vector instead of spinning forever in the test binary.
 pub fn sample_joint_holes(req: &EquityRequest, seed: u64, count: usize) -> Vec<Vec<[Card; 2]>> {
     let sampler = Sampler::new(req.players.iter().map(|p| support(&p.range, &req.board)).collect());
     let mut rng = Xoshiro256::seed(seed);
     let board_used = req.board_used();
     let mut out = Vec::with_capacity(count);
+    let mut rejections = 0u64;
     while out.len() < count {
-        if let Some((holes, _)) = sampler.draw(&mut rng, &board_used) { out.push(holes); }
+        match sampler.draw(&mut rng, &board_used) {
+            Some((holes, _)) => out.push(holes),
+            None => {
+                rejections += 1;
+                if rejections > 10_000_000 { break; }
+            }
+        }
     }
     out
 }
@@ -4810,34 +5302,54 @@ git commit -m "feat(core-eval): Monte Carlo equity with joint disjoint sampling 
 ---
 ## Running everything
 
-- `cargo test --workspace` (green after every task; about 15 s in the `dev` profile once the fixtures exist).
-- `cargo test -p core-eval --features exhaustive` after `tools/.venv/Scripts/python tools/gen_eval_oracle.py --skip-5card --samples 10000000 --samples-name phevaluator_7card_10m.bin` (the file is gitignored; `bench oracle` of plan 2 wraps this).
-- `tools/.venv/Scripts/python -m pytest tools -q` (Python oracles and generators).
+- `cargo test --workspace` (green after every task). Budget **1-3 minutes** in the `dev` profile once the fixtures exist, not seconds: `core-eval`'s `oracle_map()` builds a 2,598,960-hand rank table (once per test binary, behind a `OnceLock`), `equity_mc_within_standard_error` performs roughly 2 x 10^7 evaluations, and `iso_class_count_1755` / `iso_orbit_sizes` each canonicalize 22,100 flops over 24 permutations.
+- `cargo test -p core-eval --features exhaustive` after `tools/.venv/Scripts/python tools/gen_eval_oracle.py --skip-5card --samples 10000000 --samples-name phevaluator_7card_10m.bin` (the file is gitignored; the `bench oracle` subcommand that wraps this belongs to **plan 4 Task 20**, cross-plan Or2 — plan 2's CLI is `run` / `gen-spots` / `materialize` only).
+- `tools/.venv/Scripts/python -m pytest tools -q` (Python oracles and generators: 3 tests after Task 15, 8 after Task 16, 11 after Task 22).
 - Regenerating fixtures is deterministic: `tools/.venv/Scripts/python tools/gen_fixtures.py --out fixtures/hands` and `tools/.venv/Scripts/python tools/gen_eval_oracle.py --out-dir fixtures/eval` reproduce the committed bytes.
+- `rustup show active-toolchain` must name `stable-x86_64-pc-windows-msvc` (repo-wide, §3.6). `scripts/build-worker-gnu.ps1` is the fallback for the `solver-worker` binary alone and is run only if plan 2's V1 check rejects MSVC for the vendored solver.
 
 ## Interfaces handed to plans 2-5
 
-| Item | Defined in | Signature |
+Every name below is frozen by this plan. Where the cross-plan review found a mismatch, the "Reconciliations" list after the table names the plan that changes.
+
+| Item | Defined in | Signature / contract |
 |---|---|---|
-| `proto::{Card, ComboIndex, combo_index, combo_cards, class_of, class_combos}` | Task 2 | `combo_index(a: Card, b: Card) -> ComboIndex`, `combo_cards(i) -> [Card; 2]` |
-| `proto::Range1326` | Task 4 | `zero() / uniform() / from_fn / get / set`; serde array of 1326 |
-| `proto::{GameConfig, HandConfig, Rake, SolverPrefs, SeatConfig, SeatTag, QuickFact}` | Task 3 | spec §4.2 |
-| `proto::{Seat, Position, Street, Action, TakenAction, HandPhase, CompleteReason, HandState, Derived, Pot, LegalAction, StreetRootSnapshot, SolveInput}` | Tasks 3, 6 | spec §4.3 (+ `StreetRootSnapshot.bb_chips`) |
+| `proto::{Card, ComboIndex, combo_index, combo_cards, class_of, class_combos, CardParseError}` | Task 2 | `Card::parse(&str) -> Result<Card, CardParseError>` (the inherent form; **there is no `ProtoError` in the workspace**), `FromStr`, `Display`, `combo_index(a: Card, b: Card) -> ComboIndex`, `combo_cards(i) -> [Card; 2]` |
+| `proto::Range1326` | Task 4 | `zero() / uniform() / from_fn / get / set`; serde array of exactly 1326 finite weights in `[0, 1]` |
+| `proto::{GameConfig, HandConfig, Rake, SolverPrefs, SeatConfig, SeatTag, QuickFact, UtgStraddle}` | Task 3 | spec §4.2; `SolverPrefs::default() = 16 / 50 / 10` |
+| `proto::{Seat, Position, Street, Action, TakenAction, HandPhase, CompleteReason, HandState, Derived, Pot, LegalAction, StreetRootSnapshot, BeginHand, SolveInput}` | Tasks 3, 6 | spec §4.3 rev 6. `StreetRootSnapshot` carries a **required** `bb_chips: u32` (the minimum bet `replay_root` needs); every struct literal must set it. `proto::BeginHand { button, hero, dealt, stacks, hero_cards }` is the id-free admission DTO of §5 step 2 — plan 5 must not define a second one |
 | `proto::{DecisionIdentity, Coverage, ApproxReason, UnsupportedReason, Unavailable, ActionAdvice, Availability, EquityMethod, EquityEstimate, EquitySummary, PotShares, Assumptions, ExperimentalHu, ExploitAdvice, Phase, Recommendation, RecommendationEvent}` | Task 5 | spec §4.4, §11 |
-| `proto::{EffectiveTree, PlayerMenus, Menu, RaiseSize, MaterializedNode, ChipPath, OrdinalPath, RULES_VERSION, resolve_chip_path}` | Task 6 | `resolve_chip_path(&[MaterializedNode], &[Action]) -> Option<OrdinalPath>` |
-| `proto::worker::{EngineMessage, WorkerMessage, SolveRequest, ReadyInfo, NodeLock, AckStatus, Stage, ResultStatus, WorkerError, StreetSolution, NodeStrategy, REQUEST_LINE_MAX, RESULT_LINE_MAX, MAX_EXPORTED_NODES, FAILURE_CODES}` | Task 7 | spec §4.5 |
+| `proto::{EffectiveTree, PlayerMenus, SideMenu, MenuSize, MaterializedNode, ChipPath, OrdinalPath, RULES_VERSION, resolve_chip_path}` | Task 6 | `SideMenu { bet: Vec<MenuSize>, raise: Vec<MenuSize> }`, `PlayerMenus { oop, ip, donk: Option<Vec<MenuSize>> }`, `MenuSize::{Pot(f32), AllIn}` (wire: a positive number or `"a"`). **`Menu` and `RaiseSize` do not exist.** `resolve_chip_path(&[MaterializedNode], &[Action]) -> Option<OrdinalPath>` is the single implementation of the §2 rule |
+| `proto::worker::{EngineMessage, WorkerMessage, SolveRequest, Ready, NodeLock, AckStatus, Stage, ResultStatus, WorkerError, StreetSolution, NodeStrategy}` | Task 7 | spec §4.5. The `ready` payload struct is `Ready` (not `ReadyInfo`); `EngineMessage::Lock { id, spot, locks }` is a **struct variant** (no `LockRequest`) |
+| `proto::worker::{REQUEST_LINE_MAX, RESULT_LINE_MAX, MAX_EXPORTED_NODES, FAILURE_CODES, PROTO_VERSION, SOLVER_COMMIT, ADAPTER_VERSION}` | Task 7 | `PROTO_VERSION: u16 = 3` (re-export of the crate root), `SOLVER_COMMIT: &str = "9d1509fe…dfda1"` (spec §3.7; the only definition in the workspace), `ADAPTER_VERSION: u16 = 1` |
 | `proto::worker::{validate_solution, validate_locks}` | Task 8 | `(&StreetSolution, &[MaterializedNode]) -> Result<Vec<OrdinalPath>, String>` |
 | `core_model::{RulesError, parse_card, parse_hand, parse_cards, cards_to_string}` | Task 9 | |
 | `core_model::{ring, validate_table, positions, position_of, preflop_order, postflop_order, straddle_posts, initial_full_raise, posts}` | Task 9 | `preflop_order(button: Seat, dealt: &[Seat], straddle: bool) -> Vec<Seat>` |
-| `core_model::betting::Round` | Task 10 | one betting street |
-| `core_model::{BeginHand, begin_hand, apply_action, set_board, set_hero_cards, derive, settle_pots, is_decision_point, abandon, Settlement}` | Task 11 | spec §3.5 |
-| `core_model::{RootError, street_root, replay_root}` | Task 12 | spec §3.5, §10.2 |
-| `core_ranges::{RangeError, parse_range, range_to_string, expand_169, class_name, class_index, block_public, hero_conditioned, mass, hash_scaled}` | Tasks 15-16 | spec §3.5 |
-| `core_iso::{SuitPerm, ALL_PERMS, CanonicalBoard, apply, inverse, apply_range, canonicalize, orbit_size, orbit_size_of}` | Task 17 | spec §3.5 |
-| `core_eval::{Evaluator, BinaryEvaluator, rank, rank5, rank7}` | Task 19 | |
-| `core_eval::{PlayerRange, EquityMode, PotEligibility, EquityRequest, EquityStatus, EquityShare, EquityResult, equity, exact_cost, per_combo_equity, terminal_payoff, sample_joint_holes, Xoshiro256}` | Tasks 20-21 | `equity(&EquityRequest, Duration, &AtomicBool) -> EquityResult` |
+| `core_model::betting::Round` | Task 10 | one betting street: `open, post, apply, legal, to_act, closed, live, eligible_count, all_in_to, min_raise_to, may_aggress` |
+| `core_model::settlement::{Settlement, refund_uncalled, layer_pots, check_conservation}` | Task 11 | `layer_pots` merges adjacent layers with an equal (or empty) eligible set — the normative layering rule |
+| `core_model::lifecycle::{Sim, simulate}` | Task 12 | `simulate(&HandState) -> Result<Sim, RulesError>`: the only **fallible** entry point, and therefore the one to use on any `HandState` this workspace did not just build |
+| `core_model::{BeginHand, begin_hand, apply_action, set_board, set_hero_cards, derive, settle_pots, is_decision_point, abandon}` | Task 13 | spec §3.5. `core_model::BeginHand { hand_id, button, hero, dealt, stacks_start, hero_cards }` is the **internal** input; convert from `proto::BeginHand` in the engine. A module that glob-imports both crates needs `use core_model::state::BeginHand;` |
+| `core_model::{RootError, street_root, replay_root}` | Task 14 | spec §3.5, §10.2. `RootError::{Multiway { pot_eligible: u8 }, ProjectionNotReproducing { step: u32 }, NoDecision, Preflop, Inconsistent { step: u32 }}` — five variants, `u32` steps, `Multiway` **has** a payload |
+| `core_ranges::{RangeError, parse_range, range_to_string, expand_169, class_name, class_index, block_public, hero_conditioned, mass, hash_scaled}` | Tasks 19-20 | spec §3.5; `hash_scaled(&Range1326) -> [u8; 32]` over `sha2 0.10.9` |
+| `core_iso::{SuitPerm, ALL_PERMS, CanonicalBoard, apply, inverse, apply_range, canonicalize, orbit_size, orbit_size_of}` | Task 21 | spec §3.5 |
+| `core_eval::{Evaluator, BinaryEvaluator, rank, rank5, rank7}` | Task 23 | ranks are "higher is stronger", 5 to 7 cards |
+| `core_eval::{PlayerRange, EquityMode, PotEligibility, EquityRequest, EquityStatus, EquityShare, EquityResult, equity, exact_cost, per_combo_equity, terminal_payoff, sample_joint_holes, Xoshiro256}` | Tasks 24-25 | `EquityRequest { board: Vec<Card>, players: Vec<PlayerRange>, mode: EquityMode, pots: Vec<PotEligibility> }`, `EquityResult { status, method: Option<EquityMethod>, shares: Vec<EquityShare>, samples: u64, elapsed: Duration }`, `EquityMode::{Exact, MonteCarlo { seed: u64, max_samples: u32 }}`, `equity(&EquityRequest, Duration, &AtomicBool) -> EquityResult` |
+| `scripts/build-worker-gnu.ps1` | Task 1 | the §3.6 `solver-worker`-only GNU fallback, activated only by plan 2's V1 check |
 
-The engine (plan 2) chooses `EquityMode::Exact` when `exact_cost(&req) <= 20_000_000` and Monte Carlo otherwise (spec §7), and converts `EquityResult` into `EquityEstimate`/`PotShares`.
+The engine (plan 2) chooses `EquityMode::Exact` when `core_eval::exact_cost(&req) <= 20_000_000` and Monte Carlo otherwise (spec §7), and converts `EquityResult` into `EquityEstimate` / `PotShares`. It never re-implements that rule locally.
+
+**Reconciliations the consuming plans own** (cross-plan review §1; plan 1 is frozen as above):
+
+- Plan 2 matches `EngineMessage::Lock { id, spot, locks }` and deletes its `LockRequest` newtype (M3).
+- Plan 2 uses the five-variant `RootError` with `step: u32` (not `usize`) and handles the two extra variants: `Preflop` -> `Classification::Preflop`, `Inconsistent { step }` -> `Unsupported{EngineError{retryable: false}}` per §10.2 (M7); plan 3's `RootError::Multiway` match arm takes the `pot_eligible` payload.
+- Plan 2 adds `bb_chips` to both `StreetRootSnapshot { .. }` literals (its own Task 4 Step 1 and Task 16 Step 1) (M9).
+- Plan 2 rewrites `crates/engine/src/equity.rs` and the `river_check_only_terminal_oracle` oracle against the `EquityRequest` / `EquityResult` shape above, reads `EquityResult.shares` / `.status`, and replaces its local `mode_for` with `core_eval::exact_cost` (M8).
+- Plans 2, 3 and 4 re-export `proto::resolve_chip_path` instead of defining `tree::resolve_chip_path` / `resolve_path` (M21, D2); plan 3's call site passes `&tree.materialized`.
+- Plans 2 and 4 take `serde`, `serde_json`, `thiserror` and `sha2` from `[workspace.dependencies]` with `.workspace = true`, and give `crates/engine` and `crates/cache` `version/edition/license.workspace = true` (M18, R6).
+- Plan 2 drops the "GNU toolchain for this plan" line from its Tech Stack; the repo-wide MSVC pin plus the V1 check above governs (M19, R1).
+- Plan 2 Task 1 adds only `"solver-worker"` to `members` and `exclude = ["third_party/postflop-solver"]`; `crates/*` already covers `engine` and `bench` (D9).
+- Plan 2's `tools/gen_worker_fixtures.py` owes a cross-check test that `fixtures/worker/river_two_combo.jsonl` agrees combo-by-combo with `river_two_combo_ranges()` in `crates/proto/tests/wire_examples.rs` (D7).
+- Plan 5 registers `crate::Ready`, `crate::PlayerMenus`, `crate::SideMenu` and `crate::MenuSize` (with `ts(type = r#"number | "a""#)`) in the ts-rs registry, and does **not** add a `proto::BeginHand` of its own (M1, M4, Or4).
 
 ## Self-review
 
@@ -4845,70 +5357,80 @@ The engine (plan 2) chooses `EquityMode::Exact` when `exact_cost(&req) <= 20_000
 
 | Spec section / requirement | Tasks |
 |---|---|
-| §2 decision point, NoDecision conditions | 11 (`is_decision_point`), 12 (`RootError::NoDecision`) |
-| §2 street root, pot-eligible counting, HU spot, OOP/IP | 12 |
+| §2 decision point, NoDecision conditions | 13 (`is_decision_point`), 14 (`RootError::NoDecision`) |
+| §2 street root, pot-eligible counting, HU spot, OOP/IP | 14 |
 | §2 positions, preflop/postflop order, UTG straddle order | 9 |
 | §2 money units (`u32` chips, `cap_mchips`), raise-to amounts | 3, 10 |
-| §2 EV convention at terminals (`equity * pot`, rake at terminals) | 20 (`terminal_payoff`) |
+| §2 EV convention at terminals (`equity * pot`, rake at terminals) | 24 (`terminal_payoff`) |
 | §2 coverage labels and reason names | 5 |
-| §2 public range vs hero-conditioned copies | 16 |
-| §2 canonical board with the stabilizer tie-break | 17 |
-| §2 range hash `hash_scaled` | 16 |
+| §2 public range vs hero-conditioned copies | 20 |
+| §2 canonical board with the stabilizer tie-break | 21 |
+| §2 range hash `hash_scaled` | 20 |
 | §2 materialized tree, ordinal and chip paths | 6 |
 | §2 decision identity | 5 |
-| §3.2 crate set, dependency direction, licenses | 1, 9, 15, 17, 19 |
-| §3.5 `core-model` interface (`parse_card`, `parse_hand`, `begin_hand`, `apply_action`, `set_board`, `derive`, `street_root`, `replay_root`, `settle_pots`) | 9, 11, 12 |
-| §3.5 `core-ranges` interface | 15, 16 |
-| §3.5 `core-iso` interface | 17 |
-| §3.5 `core-eval` interface (`rank7`, `equity` with budget and cancel) | 19, 20, 21 |
-| §3.6 toolchain pin (MSVC), §3.7 `+avx2` rustflags | 1 |
+| §3.2 crate set, dependency direction, licenses, single workspace dependency table | 1, 9, 19, 21, 23 |
+| §3.5 `core-model` interface (`parse_card`, `parse_hand`, `begin_hand`, `apply_action`, `set_board`, `derive`, `street_root`, `replay_root`, `settle_pots`) | 9, 11, 12, 13, 14 |
+| §3.5 `core-ranges` interface | 19, 20 |
+| §3.5 `core-iso` interface | 21 |
+| §3.5 `core-eval` interface (`rank7`, `equity` with budget and cancel, `exact_cost`) | 23, 24, 25 |
+| §3.6 toolchain pin (MSVC, repo-wide) + the V1 re-verification and GNU fallback, §3.7 `+avx2` rustflags | 1 |
+| §3.7 pinned `SOLVER_COMMIT` | 7 |
 | §4.1 cards, combo index, 169-class order | 2 |
 | §4.2 `GameConfig`, `HandConfig`, `SolverPrefs` defaults | 3 |
-| §4.3 types (`Action`, `TakenAction`, `HandPhase`, `HandState`, `Derived`, `StreetRootSnapshot`, `SolveInput`) | 3, 6 |
+| §4.3 types (`Action`, `TakenAction`, `HandPhase`, `HandState`, `Derived`, `StreetRootSnapshot`, `BeginHand` DTO, `SolveInput`) | 3, 6 |
 | §4.3 dealt-seat rules, two dealt seats `FormatUnsupported`, straddle requirements | 9 |
-| §4.3 lifecycle, street closure, `FoldedOut`/`AllInRunout`/`ShowdownReached`, `set_board` rules | 11 |
-| §4.3 settlement, uncalled returns, side pots, conservation invariant | 11 |
+| §4.3 settlement, uncalled returns, side pots, conservation invariant | 11, 12 |
+| §4.3 lifecycle, street closure, `FoldedOut`/`AllInRunout`/`ShowdownReached` | 12 |
+| §4.3 `set_board` rules, decision points, abandon | 13 |
 | §4.3 cumulative reopening | 10 |
 | §4.4 recommendation, events, headline data types | 5 |
-| §4.5 wire schema, tags, limits, examples, optional fields | 7 |
+| §4.5 wire schema, tags, limits, examples, optional fields, identity constants | 7 |
 | §4.5 matrix validation incl. `[0, 1]` bound, lock rows, chip-path resolution | 8 |
-| §4.6 `EffectiveTree`, `MaterializedNode`, donk menus as an explicit empty list | 6 |
-| §10.2 projection rule and its three worked cases | 12 |
-| §13.0 `fixtures/hands`, `fixtures/eval` | 13, 18 |
-| §13.1 `state_machine_pokerkit_fixtures` | 13, 14 |
+| §4.6 `EffectiveTree`, `MaterializedNode`, donk menus as an explicit empty list, `a` entries in bet menus (§10.1 `river_std_v1`, §13.1 T4) | 6 |
+| §10.2 projection rule and its three worked cases | 14 |
+| §13.0 `fixtures/hands`, `fixtures/eval` | 15, 16, 17, 22 |
+| §13.1 `state_machine_pokerkit_fixtures` | 16, 17, 18 |
 | §13.1 `straddle_action_order_utg`, `dealt_seats_3_to_6`, `card_parser_roundtrip` | 9 |
 | §13.1 `min_raise_and_short_allin_no_reopen`, `cumulative_short_allins_reopen` | 10 |
-| §13.1 `side_pot_three_allins`, `side_pot_two_contested`, `allin_runout_single_survivor` | 11 |
-| §13.1 `street_root_reconstruction`, `multiway_root_projection` | 12 |
-| §13.1 `range_roundtrip_pio_strings`, `class_expansion_multiplicity` | 15 |
-| §13.1 `public_blocking_board_only`, `hero_conditioned_copy`, `range_hash_scale_invariant` | 16 |
-| §13.1 `iso_class_count_1755`, `iso_orbit_sizes`, `iso_stabilizer_tiebreak` | 17 |
-| §13.1 `eval_vs_phevaluator_full_5card`, `eval_vs_phevaluator_random_7card` (+ exhaustive) | 18, 19 |
-| §13.1 `terminal_payoff_equity_times_pot`, `equity_budget_respected` | 20 |
-| §13.1 `equity_mc_within_standard_error`, `equity_joint_disjoint_sampling` | 21 |
+| §13.1 `side_pot_three_allins`, `side_pot_two_contested`, `allin_runout_single_survivor` | 11, 13 |
+| §13.1 `street_root_reconstruction`, `multiway_root_projection` | 14 |
+| §13.1 `range_roundtrip_pio_strings`, `class_expansion_multiplicity` | 19 |
+| §13.1 `public_blocking_board_only`, `hero_conditioned_copy`, `range_hash_scale_invariant` | 20 |
+| §13.1 `iso_class_count_1755`, `iso_orbit_sizes`, `iso_stabilizer_tiebreak` | 21 |
+| §13.1 `eval_vs_phevaluator_full_5card`, `eval_vs_phevaluator_random_7card` (+ exhaustive) | 22, 23 |
+| §13.1 `terminal_payoff_equity_times_pot`, `equity_budget_respected` | 24 |
+| §13.1 `equity_mc_within_standard_error` (20 spots), `equity_joint_disjoint_sampling` | 25 |
 | proto validator tests (negative entries, entries above 1, row sums, unavailable rows, `requested`, `covered_paths`, resolution) | 8 |
 
-Gaps and deliberate deviations (all small, all named so later plans can rely on them):
-1. `StreetRootSnapshot` carries an extra `bb_chips: u32` (the minimum bet that `replay_root` needs to reproduce the legal set of an unopened street). The worker ignores it.
-2. `RootError` has the spec's `Multiway` (with a `pot_eligible` payload), `ProjectionNotReproducing { step }` and `NoDecision`, plus `Preflop` (called on a preflop decision) and `Inconsistent { step }` (a genuine HU root that does not replay; the engine maps it to `EngineError`, spec §10.2).
-3. `EquityMode::MonteCarlo` carries `max_samples` next to `seed`; the §7 exact-versus-MC decision (`pairs * runouts <= 2 * 10^7`) is the engine's, using `exact_cost`.
-4. Weighted equity is implemented in-house on the evaluator trait instead of through `pokers` (its weights are `u8` percents and cannot represent `Range1326`); spec §3.2 names `pokers` as the mechanism, the interface of §3.5 is unchanged.
-5. `fixtures/worker/*.jsonl` and `tools/gen_worker_fixtures.py` belong to plan 2; the two-combo river ranges they use are defined by `river_two_combo_ranges()` in `crates/proto/tests/wire_examples.rs`.
-6. The 10,000,000-sample 7-card check runs only with `--features exhaustive` against a locally generated, gitignored file.
-7. The PokerKit generator drops hands where PokerKit's reopening rule diverges from spec §4.3 (verified: 1 seed in 201) and applies two documented normalizations (straddle minimum open, fold-out bet split).
-8. `ts-rs` bindings are plan 5's (per the series brief).
-9. `Derived` per-seat vectors are indexed by `Seat.0` with undealt seats marked folded; `HandState.stacks_start` is aligned with `HandState.dealt`.
+Deliberate deviations and cross-plan decisions (all named so later plans can rely on them):
+
+1. `StreetRootSnapshot.bb_chips` is **no longer a deviation**: spec §4.3 revision 6 carries it (amendment S1). It is a required field of every literal, which is a plan-2 edit (M9).
+2. `RootError` has all five variants including the `Multiway { pot_eligible }` payload; spec §3.5 revision 6 carries them (S2). Plans 2 and 3 match the payload and the two extra variants (M7).
+3. `EquityMode::MonteCarlo { seed, max_samples }` and `exact_cost(&EquityRequest) -> u64` with the engine applying `exact_cost <= 2 * 10^7`; spec §3.5 and §7 revision 6 carry them (S3).
+4. Weighted equity is implemented in-house over the `Evaluator` trait instead of through `pokers` (whose weights are `u8` percents and cannot represent `Range1326`); spec §3.2 revision 6 carries the replacement (S4). Plan 4's bench and gate text must not expect `pokers` in any `Cargo.toml`.
+5. `proto::Menu` / `proto::RaiseSize` are named `SideMenu` / `MenuSize { Pot(f32), AllIn }`, and `MenuSize` is used for the **bet** list as well as the raise and donk lists. Spec §10.1 `river_std_v1` ("0.33, 0.75 + a") and §13.1 T4 (`a`-only bet menus) cannot be expressed by `Vec<f32>`. The wire form is unchanged, so the §4.5 example round-trips byte for byte (cross-plan M1).
+6. `proto::BeginHand` (id-free admission DTO, spec §4.3 revision 6, S16) coexists with `core_model::BeginHand` (internal, carries `hand_id` and `stacks_start`). Plan 5 no longer adds a DTO; plan 2 converts (M6, Or4).
+7. `proto::worker` owns `PROTO_VERSION`, `SOLVER_COMMIT` and `ADAPTER_VERSION`; `solver-worker` re-exports rather than redefines `SOLVER_COMMIT` (M5, Or6).
+8. The repo-wide MSVC pin of §3.6 is kept because Tauri needs it and a hello-world with the git evaluator was verified to build and link under MSVC here. R8's solver numbers are GNU, so plan 2's V1 must re-verify the pinned solver under MSVC with `+avx2` before any timing comparison, with `scripts/build-worker-gnu.ps1` as the `solver-worker`-only fallback at a >25% regression (review M7, cross-plan M19/R1).
+9. `[workspace.dependencies]` pins `sha2 = "0.10.9"` and `thiserror = "2.0"` for the whole workspace so `hash_scaled` and plan 4's cache-key digest share one `Digest` trait (cross-plan M18, R6).
+10. `fixtures/worker/*.jsonl` and `tools/gen_worker_fixtures.py` belong to plan 2; `river_two_combo_ranges()` in `crates/proto/tests/wire_examples.rs` is the definition of that data, and plan 2 owes the combo-by-combo cross-check (D7).
+11. The 10,000,000-sample 7-card check runs only with `--features exhaustive` against a locally generated, gitignored file (spec §13.0 revision 6, S17); its runner is `bench oracle` in plan 4 Task 20 (Or2).
+12. The PokerKit generator applies **three** documented normalizations (straddle minimum open `2S`; fold-out survivor bet split; pot layers folded into `layer_pots`' rule) and drops seeds where PokerKit's reopening rule diverges from §4.3 (1 in 201). Spec §13.1 revision 6 records them (S5), and Task 18's fixture policy states which side a mismatch is fixed on.
+13. `Derived` per-seat vectors are indexed by `Seat.0` with undealt seats marked folded; `HandState.stacks_start` is aligned with `HandState.dealt` (spec §4.3 revision 6, S6).
+14. `ts-rs` bindings are plan 5's (per the series brief), gated behind `feature = "typescript"` so `cargo test --workspace` for plans 1-4 is unaffected.
 
 ### 2. Placeholder scan
 
-Searched the plan for `TBD`, `TODO`, `implement later`, `fill in`, `add validation`, `handle edge cases`, `similar to Task`, `write tests for`: none. Every code step contains the full code. The only transient artifact is the Task 20 `mc.rs` dispatcher (a complete, compiling function that Task 21 replaces; `cargo test --workspace` is green in between because no test of Task 20 exercises Monte Carlo).
+Searched the plan for `TBD`, `TODO`, `implement later`, `fill in`, `add validation`, `handle edge cases`, `similar to Task`, `write tests for`: none. Every code step contains the full code. The only transient artifact is the Task 24 `mc.rs` dispatcher: a complete, compiling function whose body is `unreachable!("Monte Carlo lands in Task 25")`, so a mis-ordered execution fails loudly instead of silently reporting a budget overrun. `cargo test --workspace` is green between Tasks 24 and 25 because no test of Task 24 requests `EquityMode::MonteCarlo`. `scripts/build-worker-gnu.ps1` (Task 1) is complete PowerShell that is deliberately not executed until plan 2's V1 check needs it.
 
 ### 3. Type consistency
 
-- `combo_index` / `combo_cards` / `class_combos` / `class_of` (Task 2) are used unchanged in Tasks 15, 16, 17, 20 and 21.
-- `Range1326::{zero, uniform, from_fn, get, set}` (Task 4) are the only accessors used by later tasks; `r.0[i]` direct indexing appears only inside `core-ranges` and `core-iso`.
-- `Round::{open, post, apply, legal, to_act, closed, live, eligible_count, all_in_to, min_raise_to, may_aggress}` (Task 10) are the calls made by `lifecycle.rs` (Task 11) and `street_root.rs` (Task 12); `Sim::{round, phase, pots, returned}` (Task 11) are read by Task 12.
-- `resolve_chip_path` (Task 6) is what `validate_solution`/`validate_locks` (Task 8) call; both validators return `Result<Vec<OrdinalPath>, String>`, the signature plan 4 assumes.
-- `support`, `Deadline`, `Tally`, `result`, `Support` are `pub(crate)` in `equity.rs` (Task 20) and imported by `mc.rs` (Task 21) under the same names; `BinaryEvaluator::{partial, rank_with}` (Task 19) are used by both.
-- `CanonicalBoard::cards()`, `orbit_size(&CanonicalBoard) -> u8`, `apply(&SuitPerm, Card)`, `apply_range(&SuitPerm, &Range1326)`, `inverse(&SuitPerm)` (Task 17), `parse_range(&str) -> Result<Range1326, RangeError>`, `block_public(&mut Range1326, &[Card])`, `hash_scaled(&Range1326) -> [u8; 32]` (Tasks 15-16) match the signatures plan 4 lists as assumptions.
-- Test helper names are local to each test file (`cfg`, `seats`, `begin`, `play`, `pot`, `cards`, `player`, `share`) and are redefined wherever used.
+- `combo_index` / `combo_cards` / `class_combos` / `class_of` / `Card::parse` (Task 2) are used unchanged in Tasks 19, 20, 21, 24 and 25 and by plans 2-5.
+- `Range1326::{zero, uniform, from_fn, get, set}` (Task 4) are the only accessors later tasks use; `r.0[i]` direct indexing appears only inside `core-ranges` and `core-iso`.
+- `SideMenu` / `MenuSize` / `PlayerMenus` (Task 6) are the names in Task 7's wire fixtures and in the interfaces table; `Menu` and `RaiseSize` appear nowhere.
+- `Round::{open, post, apply, legal, to_act, closed, live, eligible_count, all_in_to, min_raise_to, may_aggress}` (Task 10) are exactly the calls `lifecycle.rs` (Task 12) and `street_root.rs` (Task 14) make; `settlement::{refund_uncalled, layer_pots, check_conservation}` (Task 11) are the calls `lifecycle.rs` makes; `Sim::{round, phase, pots, returned}` (Task 12) are read by Tasks 13 and 14.
+- `core_model::BeginHand` (Task 13) and `proto::BeginHand` (Task 3) are distinct types with distinct field sets; the three core-model test files that glob-import both crates disambiguate with `use core_model::state::BeginHand;`.
+- `resolve_chip_path` (Task 6) is what `validate_solution` / `validate_locks` (Task 8) call; both validators return `Result<Vec<OrdinalPath>, String>`, the signature plans 2-4 assume.
+- `support`, `Deadline`, `Tally`, `result`, `Support` are `pub(crate)` in `equity.rs` (Task 24) and imported by `mc.rs` (Task 25) under the same names; `BinaryEvaluator::{partial, rank_with}` (Task 23) are used by both. `Hand: Copy` and `Hand::len()` are recorded in the verified-facts list because `rank_with` relies on them.
+- `CanonicalBoard::cards()`, `orbit_size(&CanonicalBoard) -> u8`, `apply(&SuitPerm, Card)`, `apply_range(&SuitPerm, &Range1326)`, `inverse(&SuitPerm)` (Task 21), `parse_range(&str) -> Result<Range1326, RangeError>`, `block_public(&mut Range1326, &[Card])`, `hash_scaled(&Range1326) -> [u8; 32]` (Tasks 19-20) match the signatures plan 4 lists as assumptions.
+- Test helper names are local to each test file (`cfg`, `seats`, `begin`, `play`, `pot`, `cards`, `took`, `state`, `player`, `share`) and are redefined wherever used.
