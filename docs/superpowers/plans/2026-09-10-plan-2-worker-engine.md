@@ -212,7 +212,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `proto::{DecisionIdentity, Street, PlayerMenus, SideMenu, MenuSize}`.
-- Produces: `clock::Clock { fn now_ms(&self) -> u64; fn wait_until(&self, t_ms: u64); }`, `clock::SystemClock`; `identity::IdentityState::{new(), set_config() -> u32, begin_hand() -> (u64, u32), mutate() -> u32, next_decision(&mut self) -> Option<DecisionIdentity>, is_active(&DecisionIdentity) -> bool, invalidate_hand(), cancel_active()}`; `tree::templates::{TemplateSpec, Templates::get(&str) -> Option<&'static TemplateSpec>, Templates::ids() -> Vec<&'static str>, Templates::min_variant(&str) -> Option<&'static str>, Templates::with_extra(&[TemplateSpec])}` (the last one behind `cfg(any(test, feature = "test-templates"))`); `EngineError`.
+- Produces: `clock::Clock { fn now_ms(&self) -> u64; fn wait_until(&self, t_ms: u64); }`, `clock::SystemClock`; `identity::IdentityState::{new(), set_config() -> u32, begin_hand() -> (u64, u32), mutate() -> u32, next_decision(&mut self) -> Option<DecisionIdentity>, is_active(&DecisionIdentity) -> bool, invalidate_hand(), cancel_active()}`; `tree::templates::{TemplateSpec, Templates::get(&str) -> Option<&'static TemplateSpec>, Templates::ids() -> Vec<&'static str>, Templates::base_ids() -> Vec<&'static str>, Templates::min_variant(&str) -> Option<&'static str>, Templates::with_extra(&[TemplateSpec])}` (the last one behind `cfg(any(test, feature = "test-templates"))`); `EngineError`.
 
 - [ ] **Step 1: Crate manifest and lib**
 
@@ -394,11 +394,12 @@ mod tests {
         assert_eq!(Templates::get("flop_fast_v1").unwrap().menus[&Street::Turn].donk, Some(vec![]));
         assert_eq!(Templates::min_variant("turn_std_v1"), Some("turn_min_v1"));
         assert_eq!(Templates::min_variant("river_min_v1"), None);
-        // the seven §10.1 ids are present by name, plus this plan's two §13.2 test templates
+        // the seven §10.1 ids are present by name, plus this plan's two §13.2 test templates.
+        // `base_ids()` is unaffected by `with_extra`, so this assertion cannot race the test below.
         for id in ["flop_fast_v1", "flop_full_v1", "flop_min_v1", "turn_std_v1", "turn_min_v1", "river_std_v1", "river_min_v1"] {
-            assert!(Templates::ids().contains(&id), "missing {id}");
+            assert!(Templates::base_ids().contains(&id), "missing {id}");
         }
-        assert_eq!(Templates::ids().len(), 9);
+        assert_eq!(Templates::base_ids().len(), 9);
     }
 
     #[test]
@@ -410,9 +411,10 @@ mod tests {
         Templates::with_extra(&extra);
         assert_eq!(Templates::get("check_only_test_v1").unwrap().wager_cap, 1);
         assert_eq!(Templates::get("river_std_v1").unwrap().wager_cap, 3);
-        assert!(Templates::ids().len() >= 10 && Templates::min_variant("check_only_test_v1").is_none());
-        Templates::with_extra(&[]);   // idempotent reset so test order never matters
-        assert_eq!(Templates::ids().len(), 9);
+        assert!(Templates::ids().contains(&"check_only_test_v1") && Templates::min_variant("check_only_test_v1").is_none());
+        assert_eq!(Templates::base_ids().len(), 9, "the production registry is never enlarged by with_extra");
+        Templates::with_extra(&[]);   // idempotent reset
+        assert!(Templates::get("check_only_test_v1").is_none());
     }
 }
 ```
@@ -501,8 +503,11 @@ impl Templates {
     pub fn get(id: &str) -> Option<&'static TemplateSpec> {
         Self::extra().into_iter().find(|t| t.id == id).or_else(|| Self::base().iter().find(|t| t.id == id))
     }
+    /// The 9 templates compiled into this crate: §10.1's seven plus `facing_test_v1` and `river_oracle_v1`.
+    /// Never affected by `with_extra`, so assertions on it cannot race a test harness.
+    pub fn base_ids() -> Vec<&'static str> { Self::base().iter().map(|t| t.id).collect() }
     pub fn ids() -> Vec<&'static str> {
-        let mut v: Vec<&'static str> = Self::base().iter().map(|t| t.id).collect();
+        let mut v = Self::base_ids();
         for t in Self::extra() { if !v.contains(&t.id) { v.push(t.id); } }
         v
     }
@@ -1636,7 +1641,7 @@ def materialization_cases(materializer):
     cases.append(("cap1_two_wagers", "flop_min_v1", 100, 500, [["oop", action("bet", 40)], ["ip", action("raise", 120)]]))
     cases.append(("cap3_three_wagers", "turn_std_v1", 100, 1000, [["oop", action("bet", 33)], ["ip", action("raise", 83)], ["oop", action("raise", 208)]]))
     cases.append(("insert_73", "flop_fast_v1", 100, 500, [["oop", action("bet", 73)]]))
-    cases.append(("basic_turn_std", "turn_std_v1", 200, 900, []))      # the pinned example spot of Task 12
+    cases.append(("basic_turn_std", "turn_std_v1", 200, 900, []))      # the pinned example spot of Task 15
     for case, t, pot, eff, prefix in cases:
         m = materializer(t, pot, eff, prefix)
         yield json.dumps({"case": case, "template_id": t, "pot": pot, "eff": eff, "prefix": prefix, "tree": m["tree"], "history": m["history"], "decision_path": m["decision_path"]}, separators=(",", ":"))
@@ -1964,7 +1969,7 @@ mod imp {
 pub use imp::set_priority_class;
 ```
 
-- [ ] **Step 4: `main.rs` (ready, EOF exit; the protocol loop arrives in Task 10)**
+- [ ] **Step 4: `main.rs` (ready, EOF exit; the protocol loop arrives in Task 12)**
 
 ```rust
 use std::io::{BufRead, Write};
@@ -1982,7 +1987,7 @@ fn main() {
     serde_json::to_writer(&mut out, &solver_worker::ready_message(threads)).expect("ready");
     out.write_all(b"\n").unwrap();
     out.flush().unwrap();
-    // Until Task 10 the control loop only drains stdin; EOF exits 0 (§4.5: EOF behaves like shutdown without the ack).
+    // Until Task 12 the control loop only drains stdin; EOF exits 0 (§4.5: EOF behaves like shutdown without the ack).
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         if line.is_err() { break; }
@@ -4521,7 +4526,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `crates/engine/src/deadline.rs`, `crates/engine/src/watchdog.rs`, `crates/engine/tests/watchdog.rs`
-- Modify: `crates/engine/src/lib.rs` (add `pub mod deadline; pub mod watchdog;` and the temporary `assumptions_stub()` helper of step 1)
+- Modify: `crates/engine/src/lib.rs` (add `pub mod deadline; pub mod watchdog;` and the `assumptions_stub()` helper of step 1)
 - Test: unit tests in `deadline.rs`; `crates/engine/tests/watchdog.rs::{watchdog_emits_final_at_delivery_minus_100ms, watchdog_disarm_retires_the_generation}`
 
 **Interfaces:**
@@ -5526,8 +5531,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Modify: `crates/engine/src/lib.rs` (`pub mod equity; pub mod allin;`)
 
 **Interfaces:**
-- Consumes: `core_eval::{equity, EquityRequest, EquityMode, EquityResult}` (only `equity.rs`), `core_ranges::hero_conditioned`, `proto::{ActionAdvice, Availability, EquityEstimate, EquityMethod, EquitySummary, Rake, Range1326, Card, Seat}`.
-- Produces: `equity::{hero_combo_equity(hero: [Card; 2], opp_public: &Range1326, board: &[Card], budget: Duration, cancel: &AtomicBool) -> Option<(f32, EquityMethod)>, range_vs_range(hero_public: &Range1326, opp_public: &Range1326, board, budget, cancel) -> Option<(f32, EquityMethod)>, pending_summary(opponents: &[Seat]) -> EquitySummary, equity_summary(hero: Option<[Card; 2]>, hero_public: &Range1326, opponents: &[(Seat, Range1326)], board: &[Card], budget: Duration, cancel: &AtomicBool) -> EquitySummary, EQUITY_BUDGET_MS}`; `allin::{AllInInput { hero: [Card; 2], board: Vec<Card>, opp_public: Range1326, call_cost: u32, pot: u32, facing: u32, rake: Rake, bb_chips: u32 }, AllInAnswer { equity: f32, method: EquityMethod, w: u32, r: f32, ev_call_chips: f32, actions: Vec<ActionAdvice> }, facing_allin(&AllInInput, budget, cancel) -> Result<AllInAnswer, UnsupportedReason>}`.
+- Consumes: `core_eval::{equity, exact_cost, EquityRequest, EquityMode, EquityResult, EquityStatus, PlayerRange}` (only `equity.rs`), `core_ranges::hero_conditioned`, `proto::{ActionAdvice, Availability, EquityEstimate, EquityMethod, EquitySummary, Rake, Range1326, Card, Seat}`.
+- **Resolved `core-eval` shape (cross-plan M8):** the request is `{ board, players: Vec<PlayerRange>, mode, pots }` and the result is `{ status, method, shares, samples, elapsed }`. The engine never writes its own exact/MC cost formula: it calls `exact_cost(&req)` and picks `Exact` iff the cost is `<= 20_000_000` (spec §7 / S3). `EquityMode::MonteCarlo` carries `{ seed, max_samples }`.
+- Produces: `equity::{hero_combo_equity(hero: [Card; 2], opp_public: &Range1326, board: &[Card], budget: Duration, cancel: &AtomicBool) -> Option<(f32, EquityMethod)>, range_vs_range(hero_public: &Range1326, opp_public: &Range1326, board, budget, cancel) -> Option<(f32, EquityMethod)>, pending_summary(opponents: &[Seat]) -> EquitySummary, equity_summary(hero: Option<[Card; 2]>, hero_public: &Range1326, opponents: &[(Seat, Range1326)], board: &[Card], budget: Duration, cancel: &AtomicBool) -> EquitySummary, EQUITY_BUDGET_MS}`; `allin::{AllInInput { hero: [Card; 2], board: Vec<Card>, opp_public: Range1326, hero_public: Option<Range1326>, call_cost: u32, pot: u32, facing: u32, rake: Rake, bb_chips: u32 }, AllInAnswer { equity: f32, method: EquityMethod, w: u32, r: f32, ev_call_chips: f32, actions: Vec<ActionAdvice> }, facing_allin(&AllInInput, budget, cancel) -> Result<AllInAnswer, UnsupportedReason>}`.
 
 - [ ] **Step 1: Failing test `crates/engine/tests/facing_allin.rs`**
 
@@ -5545,7 +5551,7 @@ fn qq_54o(w54: f32) -> Range1326 {
     range(&e)
 }
 fn input(opp: Range1326, rake: Rake) -> AllInInput {
-    AllInInput { hero: [c("Ah"), c("Ad")], board: "Qs Jd 7h 3c 2d".split(' ').map(c).collect(), opp_public: opp, call_cost: 73, pot: 173, facing: 73, rake, bb_chips: 5 }
+    AllInInput { hero: [c("Ah"), c("Ad")], board: "Qs Jd 7h 3c 2d".split(' ').map(c).collect(), opp_public: opp, hero_public: None, call_cost: 73, pot: 173, facing: 73, rake, bb_chips: 5 }
 }
 
 #[test]
@@ -5569,7 +5575,15 @@ fn facing_allin_golden() {
     assert!(d.actions.iter().find(|x| x.action == Action::Call).unwrap().headline);
     let e = facing_allin(&input(qq_54o(0.25), raked), Duration::from_secs(2), &cancel).unwrap();
     assert!((e.ev_call_chips - 47.5).abs() < 1e-3);
-    // hero's strategic range is irrelevant here: only hero's actual combo enters; an opponent range with no compatible combo is InvalidRanges
+    // §13.3 "hero's strategic range includes other hands and the headline uses AhAd": passing a non-trivial hero
+    // public range alongside changes nothing, because only hero's actual combo enters the analytic fallback.
+    let mut with_range = input(qq_54o(1.0 / 12.0), Rake::TimeCharge);
+    with_range.hero_public = Some(range(&[("Ah", "Ad", 1.0), ("Kh", "Kd", 1.0), ("7c", "7d", 1.0), ("As", "Ks", 1.0)]));
+    let g = facing_allin(&with_range, Duration::from_secs(2), &cancel).unwrap();
+    assert_eq!((g.w, g.equity == a.equity), (a.w, true));
+    assert!((g.ev_call_chips - a.ev_call_chips).abs() < 1e-6);
+    assert!(g.actions.iter().find(|x| x.action == Action::Fold).unwrap().headline, "the headline still comes from AhAd's EV");
+    // an opponent range with no compatible combo is InvalidRanges
     assert!(matches!(facing_allin(&input(range(&[("Ah", "Ad", 1.0)]), Rake::TimeCharge), Duration::from_secs(2), &cancel), Err(proto::UnsupportedReason::InvalidRanges)));
 }
 ```
@@ -5579,25 +5593,31 @@ fn facing_allin_golden() {
 `crates/engine/src/equity.rs`:
 
 ```rust
-//! The only file that touches `core-eval`'s request type (assumed shape in the plan header).
-use core_eval::{equity, EquityMode, EquityRequest};
+//! The only file that touches `core-eval`'s request type (resolved shape in the plan header, cross-plan M8).
+use core_eval::{equity, exact_cost, EquityMode, EquityRequest, EquityStatus, PlayerRange};
 use core_ranges::hero_conditioned;
 use proto::{combo_index, Availability, Card, EquityEstimate, EquityMethod, EquitySummary, Range1326, Seat};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 pub const EQUITY_BUDGET_MS: u64 = 500;
-const EXACT_LIMIT: u64 = 20_000_000;   // §7: exact when pairs * runouts <= 2e7
+/// §7 / spec S3: the engine chooses exact enumeration iff `exact_cost(&req) <= 2 * 10^7`.
+pub const EXACT_COST_LIMIT: u64 = 20_000_000;
+const MC_SEED: u64 = 7;
+const MC_MAX_SAMPLES: u32 = 200_000;
+/// Seat labels used only inside this module: hero is 0, the single opponent is 1.
+const HERO: Seat = Seat(0);
+const VILLAIN: Seat = Seat(1);
 
-fn choose(n: u64, k: u64) -> u64 { (0..k).fold(1u64, |acc, i| acc * (n - i) / (i + 1)) }
-fn mode_for(pairs: u64, board_len: usize) -> EquityMode {
-    let runouts = choose((52 - board_len - 4) as u64, (5 - board_len) as u64);
-    if pairs * runouts <= EXACT_LIMIT { EquityMode::Exact } else { EquityMode::MonteCarlo { seed: 7 } }
-}
+/// Builds the request twice: once to price exact enumeration, once with the mode that price selects.
 fn run(hero: Range1326, opp: Range1326, board: &[Card], budget: Duration, cancel: &AtomicBool) -> Option<(f32, EquityMethod)> {
-    let pairs = hero.0.iter().filter(|w| **w > 0.0).count() as u64 * opp.0.iter().filter(|w| **w > 0.0).count() as u64;
-    let res = equity(&EquityRequest { hero, opponents: vec![opp], board: board.to_vec(), mode: mode_for(pairs, board.len()) }, budget, cancel);
-    res.hero_equity.map(|e| (e, res.method))
+    let players = || vec![PlayerRange { seat: HERO, range: hero.clone() }, PlayerRange { seat: VILLAIN, range: opp.clone() }];
+    let probe = EquityRequest::single_pot(board.to_vec(), players(), EquityMode::Exact);
+    let mode = if exact_cost(&probe) <= EXACT_COST_LIMIT { EquityMode::Exact } else { EquityMode::MonteCarlo { seed: MC_SEED, max_samples: MC_MAX_SAMPLES } };
+    let res = equity(&EquityRequest::single_pot(board.to_vec(), players(), mode), budget, cancel);
+    if res.status != EquityStatus::Ready { return None; }   // Cancelled, BudgetExceeded or InvalidRanges: no value
+    let share = res.shares.iter().find(|s| s.pot_index == 0 && s.seat == HERO)?;
+    Some((share.value, res.method?))
 }
 
 pub fn hero_combo_equity(hero: [Card; 2], opp_public: &Range1326, board: &[Card], budget: Duration, cancel: &AtomicBool) -> Option<(f32, EquityMethod)> {
@@ -5632,11 +5652,18 @@ use proto::{Action, ActionAdvice, Card, EquityMethod, Rake, Range1326, Unsupport
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-pub struct AllInInput { pub hero: [Card; 2], pub board: Vec<Card>, pub opp_public: Range1326, pub call_cost: u32, pub pot: u32, pub facing: u32, pub rake: Rake, pub bb_chips: u32 }
+pub struct AllInInput {
+    pub hero: [Card; 2], pub board: Vec<Card>, pub opp_public: Range1326,
+    /// Hero's strategic range at the root. Accepted so callers can pass it, and deliberately unused: §6's
+    /// analytic fallback is conditioned on hero's ACTUAL combo only (pinned by `facing_allin_golden`).
+    pub hero_public: Option<Range1326>,
+    pub call_cost: u32, pub pot: u32, pub facing: u32, pub rake: Rake, pub bb_chips: u32,
+}
 #[derive(Debug, Clone)]
 pub struct AllInAnswer { pub equity: f32, pub method: EquityMethod, pub w: u32, pub r: f32, pub ev_call_chips: f32, pub actions: Vec<ActionAdvice> }
 
 pub fn facing_allin(inp: &AllInInput, budget: Duration, cancel: &AtomicBool) -> Result<AllInAnswer, UnsupportedReason> {
+    let _ = &inp.hero_public;   // §6: hero's strategic range never enters; only hero's actual combo does
     let (equity, method) = hero_combo_equity(inp.hero, &inp.opp_public, &inp.board, budget, cancel).ok_or(UnsupportedReason::InvalidRanges)?;
     let c = inp.call_cost;
     // W: final matched pot after returning the uncalled excess (facing - C) and adding C
@@ -5655,8 +5682,8 @@ pub fn facing_allin(inp: &AllInInput, budget: Duration, cancel: &AtomicBool) -> 
 
 - [ ] **Step 3: Run and commit**
 
-Run: `cargo test -p engine --features testing --test facing_allin`
-Expected: PASS (T1 numbers within 1e-3).
+Run: `cargo test -p engine --features testing --test facing_allin` then `cargo test --workspace --release`
+Expected: PASS (T1 numbers within 1e-3); the workspace stays green.
 
 ```bash
 git add crates/engine
@@ -5844,8 +5871,7 @@ pub fn map_to_legal(a: &Action, legal: &[LegalAction]) -> Option<Action> {
     }
 }
 pub fn empty_assumptions(template_id: &str) -> Assumptions {
-    Assumptions { ranges_used: vec![], tree_signature: String::new(), template_id: template_id.into(), source: "solver-worker".into(), source_accuracy: "unverified".into(), source_granularity: "1326 combos".into(),
-        target_bp: 50, reached_bp: None, elapsed_ms: 0, cache: "miss".into(), translations: vec![], mappings: vec![], notes: vec![] }
+    Assumptions { template_id: template_id.into(), source: "solver-worker".into(), ..crate::assumptions_stub() }
 }
 fn base(ctx: &AssemblyCtx, phase: Phase, coverage: Coverage, actions: Vec<ActionAdvice>, unresolved_mass: f32, range_mix: Option<Vec<(Action, f32)>>, assumptions: Assumptions) -> Recommendation {
     Recommendation { identity: ctx.identity.clone(), phase, coverage, legal: ctx.legal.clone(), actions, unresolved_mass, range_mix, equity: ctx.equity.clone(), assumptions, experimental: None, exploit: None }
@@ -5864,10 +5890,16 @@ pub fn final_from_solution(ctx: &AssemblyCtx, node: &NodeStrategy, reach: &[f32]
         return base(ctx, Phase::Final, Coverage::Unsupported { reason: UnsupportedReason::HeroComboOutOfSupport, partial }, actions, 0.0, mix, assumptions);
     }
     let c = ctx.hero_combo.unwrap() as usize;
+    let mut unmapped: Vec<String> = Vec::new();
     let mut actions: Vec<ActionAdvice> = node.actions.iter().enumerate().map(|(i, a)| match map_to_legal(a, &ctx.legal) {
         Some(mapped) => ActionAdvice { action: mapped, frequency: Some(node.probs[c][i]), ev_bb: Some(node.ev_chips[c][i] / ctx.bb_chips as f32), unavailable: None, headline: false },
-        None => ActionAdvice { action: a.clone(), frequency: Some(node.probs[c][i]), ev_bb: None, unavailable: Some(Unavailable::NotInMenu), headline: false },
+        // §4.4 reserves `NotInMenu` for "not in the SOURCE's menu". A tree action that falls outside `Derived.legal`
+        // is a different situation: §8.4 moves its probability to the nearest legal action and marks the destination
+        // `MovedProbability{from}`. That mapping is plan 4's bet translation, so until it lands the action is reported
+        // with its frequency, no EV, `NotEvaluated`, and an explicit note. It is never silently mislabelled.
+        None => { unmapped.push(format!("{a:?}")); ActionAdvice { action: a.clone(), frequency: Some(node.probs[c][i]), ev_bb: None, unavailable: Some(Unavailable::NotEvaluated), headline: false } }
     }).collect();
+    if !unmapped.is_empty() { assumptions.notes.push(format!("tree action(s) outside the legal intervals, not translated in this build (spec 8.4 MovedProbability arrives with the flop path): {}", unmapped.join(", "))); }
     if let Some(label) = headline(&mut actions, 0.0, HeadlineSource::Solved) { assumptions.notes.push(format!("headline: {label}")); }
     base(ctx, Phase::Final, coverage, actions, 0.0, mix, assumptions)
 }
@@ -5896,7 +5928,7 @@ pub fn merge_equity(rec: &mut Recommendation, eq: &EquitySummary) {
 
 - [ ] **Step 3: Run, hand-check the recorded golden, commit**
 
-Run: `cargo test -p engine --features testing --test assembly`
+Run: `cargo test -p engine --features testing --test assembly` then `cargo test --workspace --release`
 Expected: PASS; the recorded `recommendation_assembly_golden.json` must show `complete_ev` with `Raise{150}` as the only `headline: true`, `ev_bb` 0.0 / 1.25 / 3.0, and `out_of_support` with `coverage.reason == HeroComboOutOfSupport`, `range_mix[1] == [Call, 1.0]`.
 
 ```bash
@@ -5908,19 +5940,217 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Task 21: `Engine` API, request slot of depth 1, river/turn decision path, `identity_race_golden`, `final_delivery_independent_of_worker`
+## Task 27: Snapshot store and the root-range source
 
 **Files:**
-- Create: `crates/engine/src/snapshots.rs`, `crates/engine/src/ranges.rs`, `crates/engine/src/serve.rs`, `crates/engine/src/engine.rs`, `crates/engine/tests/identity_race.rs`, `crates/engine/tests/final_delivery.rs`
-- Modify: `crates/engine/src/lib.rs` (modules and `pub use engine::{Engine, Paths}`), `crates/engine/src/core.rs` (add `snapshots`, `config`, `range_source`)
+- Create: `crates/engine/src/snapshots.rs`, `crates/engine/src/ranges.rs`
+- Modify: `crates/engine/src/lib.rs` (`pub mod snapshots; pub mod ranges;`), `crates/engine/src/core.rs` (add `snapshots`, `config`, `range_source`)
+- Test: unit tests in `snapshots.rs` and `ranges.rs`
 
 **Interfaces:**
-- Consumes: every earlier engine task; `core_model::{begin_hand, apply_action, set_board, derive}`; `core_ranges::{block_public, hash_scaled, range_to_string, mass}`.
-- Produces: `snapshots::{SolvedStreet { identity_at_solve: DecisionIdentity, street: Street, board: Vec<Card>, tree: EffectiveTree, nodes: Vec<NodeStrategy>, ordinal_paths: Vec<OrdinalPath>, exploitability_chips: f32, reasons: Vec<ApproxReason>, solved_prefix: Vec<(Seat, Action)> }, SnapshotStore::{new(), register(&mut self, active: &DecisionIdentity, s: SolvedStreet) -> bool, invalidate_hand(&mut self, hand_id: u64), for_hand(&self, hand_id) -> Vec<&SolvedStreet>}}` (plan 3 wraps `SolvedStreet` into `StreetSnapshot` and adds `Engine::register_snapshot`); `ranges::{RootRanges { oop: Range1326, ip: Range1326, reasons: Vec<ApproxReason>, ranges_used: Vec<(Seat, String, f32)> }, RangeSource: Send { fn ranges_at_root(&self, state: &HandState, root: &StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason>; }, ExplicitRanges { oop: Option<Range1326>, ip: Option<Range1326> }}`; `serve::{LiveRequest { identity, state: HandState, t0_ms: u64, sink: SharedSink }, serve_request(&mut EngineCore, LiveRequest)}`; `engine::{Paths { log_dir: PathBuf, worker_exe: PathBuf }, Engine::new(GameConfig, Paths) -> Result<Engine, EngineError>, Engine::with_core(EngineCore) -> Engine, set_config(&mut self, GameConfig) -> u32, begin_hand(&mut self, BeginHand) -> Result<HandState, EngineError>, apply_action(&mut self, Action) -> Result<HandState, EngineError>, set_board(&mut self, &[Card]) -> Result<HandState, EngineError>, undo(&mut self) -> Result<HandState, EngineError>, set_explicit_ranges(&mut self, oop: Range1326, ip: Range1326), recommend(&mut self, sink: Box<dyn EventSink>) -> Result<DecisionIdentity, EngineError>, cancel(&mut self, decision_id: u64), finish_hand(&mut self), abandon_hand(&mut self), shutdown(self), state(&self) -> Option<HandState>}`.
+- Consumes: `identity::IdentityState`, `core_ranges::{block_public, mass, range_to_string}`; `proto::{Action, ApproxReason, Card, DecisionIdentity, EffectiveTree, GameConfig, HandState, OrdinalPath, Range1326, Rake, Seat, SolverPrefs, Street, StreetRootSnapshot, UnsupportedReason}`, `proto::worker::NodeStrategy`.
+- Produces: `snapshots::{SolvedStreet { identity_at_solve: DecisionIdentity, street: Street, board: Vec<Card>, tree: EffectiveTree, nodes: Vec<NodeStrategy>, ordinal_paths: Vec<OrdinalPath>, exploitability_chips: f32, reasons: Vec<ApproxReason>, solved_prefix: Vec<(Seat, Action)> }, SnapshotStore::{new(), register(&mut self, active: &DecisionIdentity, s: SolvedStreet) -> bool, invalidate_hand(&mut self, hand_id: u64), for_hand(&self, hand_id: u64) -> Vec<&SolvedStreet>}}`; `ranges::{RootRanges { oop: Range1326, ip: Range1326, reasons: Vec<ApproxReason>, ranges_used: Vec<(Seat, String, f32)> }, RangeSource: Send { fn ranges_at_root(&self, state: &HandState, root: &StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason>; }, ExplicitRanges { oop: Option<Range1326>, ip: Option<Range1326> }}`; `EngineCore` fields `snapshots: Arc<Mutex<SnapshotStore>>`, `config: Arc<Mutex<GameConfig>>`, `range_source: Arc<Mutex<Box<dyn RangeSource>>>` plus `EngineCore::{config(&self) -> GameConfig, set_config(&self, GameConfig)}`.
+
+**The two seams plans 3 and 4 attach to (cross-plan M15, M16, D1, D6; orchestrator interface request g):**
+1. `engine::snapshots::SnapshotStore` is the **single** registration path of spec §9.2 for this plan's river/turn results. Plan 3 Task 11 wraps `SolvedStreet` into `core_replay::StreetSnapshot` (spec §9.1 field name `covered_paths`, prefix-based invalidation) and re-exports through `engine::snapshots`, keeping `register(&DecisionIdentity, _) -> bool` with the identical identity rule. It replaces this store in one commit, never across several, so `identity_race_golden` (Task 28) is never red between tasks.
+2. `engine::ranges::RangeSource::ranges_at_root` is the **only** root-range provider. Plan 3 implements `RangeSource` for a `ReplayRanges` type and installs it into `EngineCore.range_source`; its `prepare_root` becomes that method's body. There is no second entry point and no `postflop.rs`. The matching hook on the serve path is `serve_request`'s `Classification::Preflop` arm (Task 28), which plan 3 replaces with the preflop store lookup.
 
 - [ ] **Step 1: Failing tests**
 
-`crates/engine/tests/identity_race.rs`:
+Bottom of `crates/engine/src/snapshots.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn id(hand: u64, rev: u32, dec: u64) -> DecisionIdentity { DecisionIdentity { hand_id: hand, hand_revision: rev, decision_id: dec, config_revision: 1, model_revision: 0 } }
+    fn solved(i: DecisionIdentity, street: Street) -> SolvedStreet {
+        SolvedStreet { identity_at_solve: i, street, board: vec![], tree: EffectiveTree { rules_version: 3, template_id: "t".into(), root_street: street, menus: Default::default(),
+            add_allin_threshold: 0.0, force_allin_threshold: 0.0, merging_threshold: 0.0, wager_cap: 1, inserted: vec![], materialized: vec![] },
+            nodes: vec![], ordinal_paths: vec![], exploitability_chips: 0.1, reasons: vec![], solved_prefix: vec![] }
+    }
+    #[test]
+    fn only_the_active_identity_registers_and_a_hand_can_be_invalidated() {
+        let mut s = SnapshotStore::new();
+        let a = id(1, 7, 10);
+        assert!(s.register(&a, solved(a.clone(), Street::River)));
+        assert_eq!(s.for_hand(1).len(), 1);
+        // a result whose identity is not the active one is refused outright (§4.4: stale results are never written)
+        let stale = id(1, 6, 9);
+        assert!(!s.register(&a, solved(stale, Street::River)));
+        assert_eq!(s.for_hand(1).len(), 1);
+        // a second decision of the same hand and street is kept alongside; re-registering the same decision replaces
+        let b = id(1, 7, 11);
+        assert!(s.register(&b, solved(b.clone(), Street::River)));
+        assert!(s.register(&b, solved(b.clone(), Street::River)));
+        assert_eq!(s.for_hand(1).len(), 2);
+        let other = id(2, 8, 12);
+        assert!(s.register(&other, solved(other, Street::Turn)));
+        s.invalidate_hand(1);
+        assert_eq!((s.for_hand(1).len(), s.for_hand(2).len()), (0, 1));
+    }
+}
+```
+
+Bottom of `crates/engine/src/ranges.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto::{Card, Street};
+    fn root() -> StreetRootSnapshot {
+        StreetRootSnapshot { street: Street::River, board: ["Kh", "7d", "2c", "4d", "9s"].iter().map(|s| Card::parse(s).unwrap()).collect(),
+            oop: Seat(2), ip: Seat(0), pot_root: 100, stack_oop_root: 500, stack_ip_root: 500, dead_this_street: 0, projected_from: 2, history: vec![], bb_chips: 2 }
+    }
+    fn state() -> HandState { crate::testing::hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), Seat(0), Seat(2), None) }
+    #[test]
+    fn explicit_ranges_block_the_board_and_reject_empty_support() {
+        let full = Range1326([1.0; 1326]);
+        let r = ExplicitRanges { oop: Some(full.clone()), ip: Some(full) }.ranges_at_root(&state(), &root()).unwrap();
+        // 5 board cards remove 5 * 51 - C(5,2) = 245 combos from each side
+        assert_eq!(r.oop.0.iter().filter(|w| **w > 0.0).count(), 1326 - 245);
+        assert_eq!(r.ranges_used.len(), 2);
+        assert!(r.reasons.is_empty());
+        assert!(matches!(ExplicitRanges { oop: None, ip: None }.ranges_at_root(&state(), &root()), Err(UnsupportedReason::InvalidRanges)));
+        // a range made entirely of board blockers has no support left
+        let mut only_board = Range1326([0.0; 1326]);
+        only_board.0[proto::combo_index(Card::parse("Kh").unwrap(), Card::parse("7d").unwrap()) as usize] = 1.0;
+        assert!(matches!(ExplicitRanges { oop: Some(only_board), ip: Some(Range1326([1.0; 1326])) }.ranges_at_root(&state(), &root()), Err(UnsupportedReason::InvalidRanges)));
+    }
+}
+```
+
+- [ ] **Step 2: Run to see them fail**
+
+Run: `cargo test -p engine --features testing snapshots ranges`
+Expected: FAIL to compile.
+
+- [ ] **Step 3: Implement `snapshots.rs` and `ranges.rs`**
+
+`crates/engine/src/snapshots.rs` (above the tests):
+
+```rust
+use proto::worker::NodeStrategy;
+use proto::{Action, ApproxReason, Card, DecisionIdentity, EffectiveTree, OrdinalPath, Seat, Street};
+
+#[derive(Debug, Clone)]
+pub struct SolvedStreet { pub identity_at_solve: DecisionIdentity, pub street: Street, pub board: Vec<Card>, pub tree: EffectiveTree, pub nodes: Vec<NodeStrategy>, pub ordinal_paths: Vec<OrdinalPath>, pub exploitability_chips: f32, pub reasons: Vec<ApproxReason>, pub solved_prefix: Vec<(Seat, Action)> }
+
+/// Validated solutions keyed by identity: the single registration path of §9.2 for live river/turn results.
+/// Plan 3 Task 11 replaces this with `core_replay::SnapshotStore`/`StreetSnapshot` in one commit and re-exports
+/// it from this module; the identity rule below is the contract that survives that swap.
+#[derive(Default)]
+pub struct SnapshotStore { items: Vec<SolvedStreet> }
+impl SnapshotStore {
+    pub fn new() -> Self { Self::default() }
+    /// Rejects anything whose identity is not the active one (§4.4: stale results are never written).
+    pub fn register(&mut self, active: &DecisionIdentity, s: SolvedStreet) -> bool {
+        if s.identity_at_solve != *active { return false; }
+        self.items.retain(|x| !(x.identity_at_solve.hand_id == s.identity_at_solve.hand_id && x.street == s.street && x.identity_at_solve.decision_id == s.identity_at_solve.decision_id));
+        self.items.push(s);
+        true
+    }
+    pub fn invalidate_hand(&mut self, hand_id: u64) { self.items.retain(|x| x.identity_at_solve.hand_id != hand_id); }
+    pub fn for_hand(&self, hand_id: u64) -> Vec<&SolvedStreet> { self.items.iter().filter(|x| x.identity_at_solve.hand_id == hand_id).collect() }
+}
+```
+
+`crates/engine/src/ranges.rs` (above the tests):
+
+```rust
+use core_ranges::{block_public, mass, range_to_string};
+use proto::{ApproxReason, HandState, Range1326, Seat, StreetRootSnapshot, UnsupportedReason};
+
+pub struct RootRanges { pub oop: Range1326, pub ip: Range1326, pub reasons: Vec<ApproxReason>, pub ranges_used: Vec<(Seat, String, f32)> }
+
+/// The only root-range provider (§9). Plan 3 implements it for a replay-backed type and installs that into
+/// `EngineCore.range_source`; this plan ships the explicit-ranges implementation used by the tests and by `bench`.
+pub trait RangeSource: Send {
+    fn ranges_at_root(&self, state: &HandState, root: &StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason>;
+}
+pub struct ExplicitRanges { pub oop: Option<Range1326>, pub ip: Option<Range1326> }
+impl RangeSource for ExplicitRanges {
+    fn ranges_at_root(&self, _state: &HandState, root: &StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason> {
+        let (Some(mut oop), Some(mut ip)) = (self.oop.clone(), self.ip.clone()) else { return Err(UnsupportedReason::InvalidRanges) };
+        block_public(&mut oop, &root.board);
+        block_public(&mut ip, &root.board);
+        if mass(&oop) <= 0.0 || mass(&ip) <= 0.0 { return Err(UnsupportedReason::InvalidRanges); }
+        let used = vec![(root.oop, range_to_string(&oop), mass(&oop)), (root.ip, range_to_string(&ip), mass(&ip))];
+        Ok(RootRanges { oop, ip, reasons: vec![], ranges_used: used })
+    }
+}
+```
+
+- [ ] **Step 4: Extend `EngineCore`**
+
+Add to `crates/engine/src/core.rs`:
+
+```rust
+use crate::ranges::{ExplicitRanges, RangeSource};
+use crate::snapshots::SnapshotStore;
+use proto::{GameConfig, Rake, SolverPrefs};
+```
+
+three fields on `EngineCore`. All three are behind an `Arc<Mutex<_>>` and shared with `Engine`, so a settings
+command or a hand mutation never has to wait for a running request to release the `EngineCore` lock (§3.4:
+commands never block).
+
+```rust
+    /// Shared with `Engine` so a mutation can invalidate snapshots without waiting for a running request.
+    pub snapshots: Arc<Mutex<SnapshotStore>>,
+    /// Read once, as a snapshot, at the start of each request.
+    pub config: Arc<Mutex<GameConfig>>,
+    pub range_source: Arc<Mutex<Box<dyn RangeSource>>>,
+```
+
+their initializers in `EngineCore::new`
+
+```rust
+            snapshots: Arc::new(Mutex::new(SnapshotStore::new())),
+            config: Arc::new(Mutex::new(GameConfig { config_revision: 0, chip_label: "$1".into(), sb_chips: 5, bb_chips: 10, straddle: None, rake: Rake::TimeCharge, seats: vec![], solver: SolverPrefs { threads: 16, target_bp: 50, flop_budget_s: 10 } })),
+            range_source: Arc::new(Mutex::new(Box::new(ExplicitRanges { oop: None, ip: None }))),
+```
+
+and the two accessors
+
+```rust
+    /// A snapshot of the session config; `serve_request` takes one per request so a mid-request change is ignored.
+    pub fn config(&self) -> GameConfig { self.config.lock().unwrap().clone() }
+    pub fn set_config(&self, cfg: GameConfig) { *self.config.lock().unwrap() = cfg; }
+```
+
+- [ ] **Step 5: Run and commit**
+
+Run: `cargo test -p engine --features testing` then `cargo test --workspace --release`
+Expected: `only_the_active_identity_registers_and_a_hand_can_be_invalidated` and `explicit_ranges_block_the_board_and_reject_empty_support` pass; the workspace stays green.
+
+```bash
+git add crates/engine
+git commit -m "feat(engine): identity-keyed snapshot store and the root-range source seam
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 28: `serve_request`: the river/turn decision path and `identity_race_golden`
+
+**Files:**
+- Create: `crates/engine/src/serve.rs`, `crates/engine/tests/identity_race.rs`
+- Modify: `crates/engine/src/lib.rs` (`pub mod serve;`)
+- Test: `identity_race.rs::identity_race_golden`
+
+**Interfaces:**
+- Consumes: every earlier engine task; `core_model::{derive, street_root}`; `core_ranges::{hash_scaled, parse_range}`.
+- Produces: `serve::{LiveRequest { identity: DecisionIdentity, state: HandState, t0_ms: u64, sink: SharedSink }, serve_request(&mut EngineCore, LiveRequest)}`.
+- **Plan-3 hook:** `serve_request`'s `Classification::Preflop` arm is the single place a preflop path attaches; `core.range_source` is the single place replay attaches (Task 27).
+
+**Two spec readings recorded here and in the self-review:**
+- `assumptions.source_accuracy` is formatted in **basis points**, not raw chips: §4.4's vocabulary is `"unverified" | "exploitability <= x"` and §7 compares in raw chips but displays in bp, so the string is `format!("exploitability <= {reached_bp} bp")` and the raw chips stay in the decision log and the snapshot. (Review m14.)
+- §13.3's `identity_race_golden` asks for "hand B with the same displayed revision" as hand A. That is unreachable by construction: §4.3's revision counter is monotonic and never reused, so hand B's revision is 9 where A's was 7. The test therefore pins the property the scenario is really about — an event carrying A's `(hand_id, hand_revision)` is refused while B's is accepted — and records that the "same displayed revision" clause is satisfied vacuously. (Review m10.)
+
+- [ ] **Step 1: Failing test `crates/engine/tests/identity_race.rs`**
 
 ```rust
 use engine::core::EngineCore;
@@ -5938,8 +6168,8 @@ fn river_state() -> proto::HandState {
     let aa = Some([Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()]);
     let s = hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), Seat(0), Seat(2), aa);
     let s = play(&s, &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold, Action::Call]);
-    let s = board(&play(&board(&play(&board(&s, "Kh 7d 2c"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d 9s");
-    s   // river, BB (hero) to act, pot 65, stacks 970
+    board(&play(&board(&play(&board(&s, "Kh 7d 2c"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d 9s")
+    // river, BB (hero) to act, pot 65, stacks 970
 }
 fn full(board: &[Card]) -> Range1326 { let mut r = Range1326([1.0; 1326]); for i in 0..1326 { let [a, b] = proto::combo_cards(i as u16); if board.contains(&a) || board.contains(&b) { r.0[i] = 0.0; } } r }
 fn ident(events: &[engine::testing::Recorded]) -> Vec<DecisionIdentity> {
@@ -5957,23 +6187,35 @@ fn identity_race_golden() {
     let identity = Arc::new(Mutex::new(IdentityState::new()));
     let state_a = river_state();
     let sol = solution_for(&state_a);
-    // hand A: the solve is live when the undo arrives (InvalidateIdentity); A's late ok result carries A's request id and is discarded
-    let script = vec![FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None }, FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 10, exploitability_chips: Some(0.5), elapsed_ms: 2 },
-        FakeReply::InvalidateIdentity, FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(sol.clone()), error: None, elapsed_ms: 3 }, FakeReply::Delay { ms: 1500 },   // no result{cancelled} within 1.5 s: kill
+    // Hand A: the solve is live when the undo arrives. `InvalidateIdentity` is followed by `Delay { ms: 1 }` so that
+    // `FakeWorker::recv` returns `Ok(None)` and the receive loop re-checks the identity BEFORE A's late `ok` result
+    // is offered; without the delay `recv` would hand back the result in the same call and no cancel would happen.
+    // A's late result then arrives during the 1.5 s cancel window, is not a `result{cancelled}`, and the worker is killed.
+    let script = vec![
+        FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None },
+        FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 10, exploitability_chips: Some(0.5), elapsed_ms: 2 },
+        FakeReply::InvalidateIdentity, FakeReply::Delay { ms: 1 },
+        FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(sol.clone()), error: None, elapsed_ms: 3 },
+        FakeReply::Delay { ms: 1500 },                       // no result{cancelled} within 1.5 s: kill and restart
         // hand B, request 2 (the re-request): request 1's stale result arrives first, then request 2's
-        FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None }, FakeReply::Result { id: IdRef::Fixed("B1".into()), status: ResultStatus::Ok, solution: Some(sol.clone()), error: None, elapsed_ms: 3 },
+        FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None },
+        FakeReply::Result { id: IdRef::Fixed("B1".into()), status: ResultStatus::Ok, solution: Some(sol.clone()), error: None, elapsed_ms: 3 },
         FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(sol.clone()), error: None, elapsed_ms: 4 }];
     let (worker, state) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
     let mut core = EngineCore::new(worker, clock.clone(), identity.clone(), DecisionLog::open(&std::env::temp_dir().join("pokerai_race_log")));
-    core.range_source = Box::new(ExplicitRanges { oop: Some(full(&state_a.board)), ip: Some(full(&state_a.board)) });
+    *core.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: Some(full(&state_a.board)), ip: Some(full(&state_a.board)) });
     let (sink, events) = RecordingSink::new(clock.clone(), Some(state.clone()));
     let sink: engine::watchdog::SharedSink = Arc::new(Mutex::new(Box::new(sink)));
     let id_a = { let mut s = identity.lock().unwrap(); s.set_config(); s.begin_hand(); for _ in 0..6 { s.mutate(); } s.next_decision().unwrap() };
     assert_eq!(id_a.hand_revision, 7);
     serve_request(&mut core, LiveRequest { identity: id_a.clone(), state: state_a.clone(), t0_ms: clock.now_ms(), sink: sink.clone() });
-    // undo to a non-decision, then hand B with the same displayed state; request B once, then re-request (new decision_id)
+    // undo to a non-decision, then hand B; request B once, then re-request (a new decision_id)
     let (id_b1, id_b2) = { let mut s = identity.lock().unwrap(); s.mutate(); s.begin_hand(); let b1 = s.next_decision().unwrap(); let b2 = s.next_decision().unwrap(); (b1, b2) };
+    // §4.3's counter is monotonic and never reused, so "hand B with the same displayed revision" is vacuous:
+    // B's revision is 9, not A's 7. What the scenario is about is that A's identity is refused and B's accepted.
+    assert_eq!((id_b1.hand_revision, id_b2.hand_revision), (9, 9));
     assert!(id_b1.hand_id != id_a.hand_id && id_b2.decision_id > id_b1.decision_id);
+    assert!(!identity.lock().unwrap().is_active(&id_a) && !identity.lock().unwrap().is_active(&id_b1));
     serve_request(&mut core, LiveRequest { identity: id_b2.clone(), state: state_a.clone(), t0_ms: clock.now_ms(), sink: sink.clone() });
     let ev = events.lock().unwrap();
     let ids = ident(&ev);
@@ -5982,124 +6224,28 @@ fn identity_race_golden() {
     assert!(!ev.iter().any(|r| matches!(&r.event, RecommendationEvent::Final(x) if x.identity == id_a)));
     assert_eq!(ev.iter().filter(|r| matches!(r.event, RecommendationEvent::Final(_))).count(), 1);
     assert!(ev.iter().any(|r| matches!(&r.event, RecommendationEvent::Final(x) if x.identity == id_b2 && matches!(x.coverage, proto::Coverage::Exact))));
-    // no stale snapshot: the store holds B2's solution only; A's request cancelled/killed the worker (ack never freed admission)
+    // no stale snapshot: the store holds B2's solution only; A's request cancelled and then killed the worker
     assert_eq!(core.snapshots.lock().unwrap().for_hand(id_b2.hand_id).len(), 1);
     assert_eq!(core.snapshots.lock().unwrap().for_hand(id_a.hand_id).len(), 0);
     let st = state.lock().unwrap();
-    assert!(st.cancels.len() == 1 && st.kills == 1);
+    assert_eq!((st.cancels.len(), st.kills), (1, 1));
+    // §4.4 accuracy vocabulary: basis points, not raw chips
+    let final_rec = ev.iter().find_map(|r| if let RecommendationEvent::Final(x) = &r.event { Some(x) } else { None }).unwrap();
+    assert_eq!(final_rec.assumptions.source_accuracy, "exploitability <= 31 bp");   // 0.2 chips of a 65-chip pot
     let _ = Street::River;
 }
 ```
 
-`crates/engine/tests/final_delivery.rs`:
+- [ ] **Step 2: Run to see it fail**
+
+Run: `cargo test -p engine --features testing --test identity_race`
+Expected: FAIL to compile (`serve_request` missing).
+
+- [ ] **Step 3: Implement `serve.rs`**
 
 ```rust
-use engine::core::EngineCore;
-use engine::identity::IdentityState;
-use engine::log::DecisionLog;
-use engine::ranges::ExplicitRanges;
-use engine::serve::{serve_request, LiveRequest};
-use engine::testing::{board, hand, play, FakeClock, FakeReply, FakeWorker, IdRef, RecordingSink};
-use proto::worker::{AckStatus, ResultStatus, Stage, WorkerError};
-use proto::{Action, Card, Coverage, Range1326, RecommendationEvent, Seat, UnsupportedReason};
-use std::sync::{Arc, Mutex};
-
-fn river_state() -> proto::HandState {
-    let aa = Some([Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()]);
-    let s = play(&hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), Seat(0), Seat(2), aa), &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold, Action::Call]);
-    board(&play(&board(&play(&board(&s, "Kh 7d 2c"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d 9s")
-}
-fn full(board: &[Card]) -> Range1326 { let mut r = Range1326([1.0; 1326]); for i in 0..1326 { let [a, b] = proto::combo_cards(i as u16); if board.contains(&a) || board.contains(&b) { r.0[i] = 0.0; } } r }
-fn ack() -> FakeReply { FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None } }
-
-fn run(script: Vec<FakeReply>, expected_stage: &str) {
-    let clock = FakeClock::new();
-    let identity = Arc::new(Mutex::new(IdentityState::new()));
-    let state = river_state();
-    let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
-    let mut core = EngineCore::new(worker, clock.clone(), identity.clone(), DecisionLog::open(&std::env::temp_dir().join("pokerai_delivery_log")));
-    core.range_source = Box::new(ExplicitRanges { oop: Some(full(&state.board)), ip: Some(full(&state.board)) });
-    let (sink, events) = RecordingSink::new(clock.clone(), Some(fake.clone()));
-    let id = { let mut s = identity.lock().unwrap(); s.set_config(); s.begin_hand(); s.next_decision().unwrap() };
-    serve_request(&mut core, LiveRequest { identity: id.clone(), state, t0_ms: 0, sink: Arc::new(Mutex::new(Box::new(sink))) });
-    let ev = events.lock().unwrap();
-    let finals: Vec<_> = ev.iter().filter(|r| matches!(r.event, RecommendationEvent::Final(_))).collect();
-    assert_eq!(finals.len(), 1, "exactly one Final");
-    let f = finals[0];
-    assert_eq!((f.at_ms, f.kills), (14_900, 0), "Final at t0 + 14.9 s before any kill or restart");
-    match &f.event { RecommendationEvent::Final(r) => match &r.coverage { Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage }, .. } => assert_eq!(stage, expected_stage), c => panic!("{c:?}") }, _ => unreachable!() }
-    assert!(fake.lock().unwrap().kills >= 1, "the kill/restart proceeds after delivery");
-}
-
-#[test]
-fn final_delivery_independent_of_worker() {
-    // (a) a worker that never replies
-    run(vec![FakeReply::Hang], "building");
-    // (b) no_iteration on the first attempt, then the retry hangs
-    run(vec![ack(), FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None, error: Some(WorkerError { code: "no_iteration".into(), message: "".into(), retryable: false, estimate_bytes: None }), elapsed_ms: 1 }, ack(), FakeReply::Hang], "building");
-    // (c) hangs in extraction
-    run(vec![ack(), FakeReply::Progress { id: IdRef::Last, stage: Stage::Extracting, iterations: 40, exploitability_chips: Some(0.3), elapsed_ms: 9 }, FakeReply::Hang], "extracting");
-}
-```
-
-- [ ] **Step 2: Implement `snapshots.rs`, `ranges.rs`, `serve.rs`, `engine.rs`**
-
-`crates/engine/src/snapshots.rs`:
-
-```rust
-use proto::worker::NodeStrategy;
-use proto::{Action, ApproxReason, Card, DecisionIdentity, EffectiveTree, OrdinalPath, Seat, Street};
-
-#[derive(Debug, Clone)]
-pub struct SolvedStreet { pub identity_at_solve: DecisionIdentity, pub street: Street, pub board: Vec<Card>, pub tree: EffectiveTree, pub nodes: Vec<NodeStrategy>, pub ordinal_paths: Vec<OrdinalPath>, pub exploitability_chips: f32, pub reasons: Vec<ApproxReason>, pub solved_prefix: Vec<(Seat, Action)> }
-
-/// Validated solutions keyed by identity (§9.2 single registration path; plan 3 wraps them into `StreetSnapshot`).
-#[derive(Default)]
-pub struct SnapshotStore { items: Vec<SolvedStreet> }
-impl SnapshotStore {
-    pub fn new() -> Self { Self::default() }
-    /// Rejects anything whose identity is not the active one (§4.4: stale results are never written).
-    pub fn register(&mut self, active: &DecisionIdentity, s: SolvedStreet) -> bool {
-        if s.identity_at_solve != *active { return false; }
-        self.items.retain(|x| !(x.identity_at_solve.hand_id == s.identity_at_solve.hand_id && x.street == s.street && x.identity_at_solve.decision_id == s.identity_at_solve.decision_id));
-        self.items.push(s);
-        true
-    }
-    pub fn invalidate_hand(&mut self, hand_id: u64) { self.items.retain(|x| x.identity_at_solve.hand_id != hand_id); }
-    pub fn for_hand(&self, hand_id: u64) -> Vec<&SolvedStreet> { self.items.iter().filter(|x| x.identity_at_solve.hand_id == hand_id).collect() }
-}
-```
-
-`crates/engine/src/ranges.rs`:
-
-```rust
-use core_ranges::{block_public, mass, range_to_string};
-use proto::{ApproxReason, HandState, Range1326, Seat, StreetRootSnapshot, UnsupportedReason};
-
-pub struct RootRanges { pub oop: Range1326, pub ip: Range1326, pub reasons: Vec<ApproxReason>, pub ranges_used: Vec<(Seat, String, f32)> }
-/// Public ranges at the street root. Plan 3 supplies the replay implementation; this plan's engine takes explicit ranges.
-pub trait RangeSource: Send {
-    fn ranges_at_root(&self, state: &HandState, root: &StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason>;
-}
-pub struct ExplicitRanges { pub oop: Option<Range1326>, pub ip: Option<Range1326> }
-impl RangeSource for ExplicitRanges {
-    fn ranges_at_root(&self, _state: &HandState, root: &StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason> {
-        let (Some(mut oop), Some(mut ip)) = (self.oop.clone(), self.ip.clone()) else { return Err(UnsupportedReason::InvalidRanges) };
-        block_public(&mut oop, &root.board);
-        block_public(&mut ip, &root.board);
-        if mass(&oop) <= 0.0 || mass(&ip) <= 0.0 { return Err(UnsupportedReason::InvalidRanges); }
-        let used = vec![(root.oop, range_to_string(&oop), mass(&oop)), (root.ip, range_to_string(&ip), mass(&ip))];
-        Ok(RootRanges { oop, ip, reasons: vec![], ranges_used: used })
-    }
-}
-```
-
-`crates/engine/src/core.rs` additions: fields `pub snapshots: Arc<Mutex<SnapshotStore>>` (shared with `Engine`, so a mutation never waits for a running request), `pub config: GameConfig`, `pub range_source: Box<dyn RangeSource>`; `new` initializes `snapshots: Arc::new(Mutex::new(SnapshotStore::new()))`, `config: GameConfig { config_revision: 0, chip_label: "$1".into(), sb_chips: 5, bb_chips: 10, straddle: None, rake: Rake::TimeCharge, seats: vec![], solver: SolverPrefs { threads: 16, target_bp: 50, flop_budget_s: 10 } }` and `range_source: Box::new(ExplicitRanges { oop: None, ip: None })`; add `pub fn set_config(&mut self, cfg: GameConfig) { self.config = cfg; }`.
-
-`crates/engine/src/serve.rs`:
-
-```rust
-//! §5 steps 4-10 for one request on `engine-main` (river and turn; preflop and flop paths arrive in plans 3 and 4).
+//! §5 steps 4-10 for one request on `engine-main` (river and turn; the preflop and flop paths attach at the
+//! `Classification::Preflop` arm and the flop guard below, in plans 3 and 4).
 use crate::allin::{facing_allin, AllInInput};
 use crate::assemble::{self, AssemblyCtx};
 use crate::coverage::{classify, Classification};
@@ -6131,29 +6277,34 @@ pub fn serve_request(core: &mut EngineCore, req: LiveRequest) {
     let class = classify(&req.state);
     let hero_combo = req.state.hero_cards.map(|h| combo_index(h[0], h[1]));
     let bb = req.state.config.bb_chips;
+    // One snapshot of the session config per request; a `set_config` that lands mid-request is ignored here
+    // and takes effect from the next hand (§4.2).
+    let config = core.config();
     let mut ctx = AssemblyCtx { identity: req.identity.clone(), legal: d.legal.clone(), hero_combo, bb_chips: bb, equity: pending_summary(&[]) };
     let mut assumptions = assemble::empty_assumptions("");
-    assumptions.target_bp = core.config.solver.target_bp;
-    let (root, inherited, facing_allin, opponent) = match class {
+    assumptions.target_bp = config.solver.target_bp;
+    let (root, inherited, facing_allin_flag, opponent) = match class {
         Classification::NoDecision { reason } => { emit(core, &req, None, RecommendationEvent::NoDecision { identity: req.identity.clone(), reason }); return; }
+        // PLAN 3 HOOK: the preflop store lookup replaces this arm.
         Classification::Preflop => { emit(core, &req, None, RecommendationEvent::Final(assemble::unsupported(&ctx, UnsupportedReason::EngineError { message: "no preflop path in this build (plan 3)".into(), retryable: false }, vec![], assumptions))); return; }
         Classification::Multiway { pot_eligible } => { emit(core, &req, None, RecommendationEvent::Final(assemble::unsupported(&ctx, UnsupportedReason::MultiwayEv { pot_eligible }, vec![], assumptions))); return; }
         Classification::Unsupported(reason) => { emit(core, &req, None, RecommendationEvent::Final(assemble::unsupported(&ctx, reason, vec![], assumptions))); return; }
         Classification::HuStreet { root, reasons, facing_allin, opponent } => (root, reasons, facing_allin, opponent),
     };
+    // PLAN 4 HOOK: the flop path (cache lookup, pre-solver templates, flop budget) replaces this guard.
     if root.street == Street::Flop { emit(core, &req, None, RecommendationEvent::Final(assemble::unsupported(&ctx, UnsupportedReason::EngineError { message: "no flop path in this build (plan 4)".into(), retryable: false }, inherited, assumptions))); return; }
     ctx.equity = pending_summary(&[opponent]);
     // deadlines and watchdog (§7)
-    let deadlines = Deadlines::for_request(req.t0_ms, root.street, core.config.solver.flop_budget_s);
+    let deadlines = Deadlines::for_request(req.t0_ms, root.street, config.solver.flop_budget_s);
     let delivered = Arc::new(AtomicBool::new(false));
     let terminal_seen = Arc::new(AtomicBool::new(false));
     let street_violation = Arc::new(AtomicBool::new(false));
     let retained = Arc::new(Mutex::new(None));
-    core.set_stage("fast");
+    core.reset_stage("fast");
     let fallback = assemble::unsupported(&ctx, UnsupportedReason::DeadlineExceeded { stage: String::new() }, inherited.clone(), assumptions.clone());
     core.watchdog.arm(Armed { identity: req.identity.clone(), street_deadline_ms: deadlines.street_deadline_ms, fire_ms: deadlines.watchdog_fire_ms(), retained: retained.clone(), fallback, stage: core.stage.clone(), sink: req.sink.clone(), delivered: delivered.clone(), terminal_seen: terminal_seen.clone(), street_violation: street_violation.clone() });
     // fast phase (§5 step 5): ranges, Fast event, equity
-    let ranges = match core.range_source.ranges_at_root(&req.state, &root) { Ok(r) => r, Err(reason) => { finish(core, &req, &deadlines, &delivered, RecommendationEvent::Final(assemble::unsupported(&ctx, reason, inherited, assumptions)), None, &root, false, false); return; } };
+    let ranges = match core.range_source.lock().unwrap().ranges_at_root(&req.state, &root) { Ok(r) => r, Err(reason) => { finish(core, &req, &deadlines, &delivered, RecommendationEvent::Final(assemble::unsupported(&ctx, reason, inherited, assumptions)), None, &root, false, false); return; } };
     let inherited: Vec<ApproxReason> = inherited.into_iter().chain(ranges.reasons.clone()).collect();
     let coverage_so_far = assemble::accumulate(Coverage::Exact, inherited.clone());
     assumptions.ranges_used = ranges.ranges_used.clone();
@@ -6168,13 +6319,14 @@ pub fn serve_request(core: &mut EngineCore, req: LiveRequest) {
         }).expect("fast-path thread");
     }
     let cancel = AtomicBool::new(false);
-    // tree and solve (§5 step 7): river and turn are rooted at the street root, never cached (river) / cache arrives in plan 4 (turn)
+    // tree and solve (§5 step 7): river and turn are rooted at the street root; the turn cache arrives in plan 4
     let template = if root.street == Street::River { "river_std_v1" } else { "turn_std_v1" };
     let build = match build_tree_full(&root, &TemplateSelection::from_history(template, &root.history)) { Ok(b) => b, Err(reason) => { finish(core, &req, &deadlines, &delivered, RecommendationEvent::Final(assemble::unsupported(&ctx, reason, inherited, assumptions)), None, &root, false, false); return; } };
     assumptions.template_id = template.into();
     assumptions.tree_signature = tree_signature(&build.tree, build.pot);
     let hero_actor = if root.oop == req.state.hero { "oop" } else { "ip" };
-    let input = SolveInput { root: root.clone(), ranges: [ranges.oop.clone(), ranges.ip.clone()], tree: build.tree.clone(), target_bp: core.config.solver.target_bp };
+    let input = SolveInput { root: root.clone(), ranges: [ranges.oop.clone(), ranges.ip.clone()], tree: build.tree.clone(), target_bp: config.solver.target_bp };
+    // `background: false` is this plan's value for a live decision; plan 4's pre-solver builds the same plan with `true`.
     let plan = SolvePlan { identity: req.identity.clone(), deadlines, template_id: template.into(), retry_template_id: Templates::min_variant(template).map(String::from), rake: req.state.config.rake.clone(), hero_actor: hero_actor.into(), background: false };
     let out = run_solve(core, &input, &plan, &req.sink);
     terminal_seen.store(true, Ordering::SeqCst);
@@ -6182,23 +6334,25 @@ pub fn serve_request(core: &mut EngineCore, req: LiveRequest) {
     assumptions.elapsed_ms = elapsed;
     assumptions.reached_bp = out.reached_bp;
     assumptions.source = format!("solver-worker@{}", proto::worker::SOLVER_COMMIT);
-    assumptions.source_accuracy = out.solution.as_ref().map(|s| format!("exploitability <= {:.3} chips", s.exploitability_chips)).unwrap_or_else(|| "n/a".into());
+    // §4.4 vocabulary: `"unverified" | "exploitability <= x"`, displayed in bp (§7 compares in raw chips).
+    assumptions.source_accuracy = out.reached_bp.map(|bp| format!("exploitability <= {bp} bp")).unwrap_or_else(|| "unverified".into());
     let event = match (&out.terminal, &out.solution) {
         (Terminal::Ok | Terminal::BestSoFar, Some(sol)) => {
-            let coverage = assemble::coverage_for_solve(sol.exploitability_chips, build.pot, core.config.solver.target_bp, out.terminal == Terminal::BestSoFar, inherited.clone());
+            let coverage = assemble::coverage_for_solve(sol.exploitability_chips, build.pot, config.solver.target_bp, out.terminal == Terminal::BestSoFar, inherited.clone());
             let requested = sol.requested as usize;
             let reach = assemble::hero_reach(&sol.nodes, &out.ordinal_paths, requested, hero_public, hero_actor);
             let rec = assemble::final_from_solution(&ctx, &sol.nodes[requested], &reach, coverage, assumptions.clone());
             let snap = SolvedStreet { identity_at_solve: req.identity.clone(), street: root.street, board: root.board.clone(), tree: out.tree.clone(), nodes: sol.nodes.clone(), ordinal_paths: out.ordinal_paths.clone(), exploitability_chips: sol.exploitability_chips, reasons: inherited.clone(), solved_prefix: root.history.clone() };
+            // the single registration path of §9.2; a stale identity is refused inside `register`
             let active = core.identity.lock().unwrap().active().cloned();
             if let Some(a) = active { core.snapshots.lock().unwrap().register(&a, snap); }
             RecommendationEvent::Final(rec)
         }
         (Terminal::Failed(reason), _) => {
-            let fallback_ok = facing_allin && matches!(reason, UnsupportedReason::EngineError { .. } | UnsupportedReason::DeadlineExceeded { .. });
+            let fallback_ok = facing_allin_flag && matches!(reason, UnsupportedReason::EngineError { .. } | UnsupportedReason::DeadlineExceeded { .. });
             let analytic = if fallback_ok && req.state.hero_cards.is_some() {
                 let call_cost = d.legal.iter().find_map(|l| if let LegalAction::Call { cost } = l { Some(*cost) } else { None }).unwrap_or(0);
-                facing_allin(&AllInInput { hero: req.state.hero_cards.unwrap(), board: req.state.board.clone(), opp_public: opp_public.clone(), call_cost, pot: d.pot, facing: d.facing, rake: req.state.config.rake.clone(), bb_chips: bb }, Duration::from_millis(EQUITY_BUDGET_MS), &cancel).ok()
+                facing_allin(&AllInInput { hero: req.state.hero_cards.unwrap(), board: req.state.board.clone(), opp_public: opp_public.clone(), hero_public: Some(hero_public.clone()), call_cost, pot: d.pot, facing: d.facing, rake: req.state.config.rake.clone(), bb_chips: bb }, Duration::from_millis(EQUITY_BUDGET_MS), &cancel).ok()
             } else { None };
             match analytic {
                 Some(a) => {
@@ -6235,7 +6389,235 @@ fn finish(core: &mut EngineCore, req: &LiveRequest, deadlines: &Deadlines, deliv
 }
 ```
 
-`crates/engine/src/engine.rs`:
+- [ ] **Step 4: Run and commit**
+
+Run: `cargo test -p engine --features testing --test identity_race` then `cargo test --workspace --release`
+Expected: PASS — A emits Fast, Equity and Progress only; B2 emits the single Final; exactly one cancel and one kill; the snapshot store holds B2's solution alone.
+
+```bash
+git add crates/engine
+git commit -m "feat(engine): serve_request river/turn decision path with the identity race golden
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 29: Public `Engine` API, startup report and `final_delivery_independent_of_worker`
+
+**Files:**
+- Create: `crates/engine/src/engine.rs`, `crates/engine/src/startup.rs`, `crates/engine/tests/final_delivery.rs`, `crates/engine/tests/engine_api.rs`
+- Modify: `crates/engine/src/lib.rs` (`pub mod engine; pub mod startup;` and `pub use engine::{Engine, Paths};`)
+- Test: `final_delivery.rs::final_delivery_independent_of_worker`; `engine_api.rs::{set_config_validates_and_queues, hero_cards_and_shutdown_are_idempotent}`
+
+**Interfaces:**
+- Consumes: every earlier engine task; `core_model::{begin_hand, apply_action, set_board, set_hero_cards, BeginHand as CoreBeginHand}`.
+- Produces (this is the surface plans 3, 4 and 5 consume; §3.5 as amended by spec S15/S16):
+
+```rust
+pub struct Paths { pub log_dir: PathBuf, pub worker_exe: PathBuf, pub preflop: PathBuf, pub cache: PathBuf }
+pub struct StartupReport { pub worker_ready: bool, pub worker_threads: u8, pub build_features: Vec<String>, pub cpu_features: Vec<String>,
+                           pub capabilities: Vec<String>, pub cpu_lacks_avx2: bool, pub quarantined_bundles: Vec<String>, pub cache_state: String, pub banners: Vec<String> }
+impl Engine {
+    pub fn new(cfg: GameConfig, paths: Paths) -> Result<Engine, EngineError>;
+    pub fn with_core(core: EngineCore) -> Engine;
+    pub fn startup_report(&self) -> StartupReport;
+    pub fn set_config(&mut self, cfg: GameConfig) -> Result<u32, EngineError>;
+    pub fn begin_hand(&mut self, req: proto::BeginHand) -> Result<HandState, EngineError>;
+    pub fn set_hero_cards(&mut self, cards: [Card; 2]) -> Result<HandState, EngineError>;
+    pub fn apply_action(&mut self, a: Action) -> Result<HandState, EngineError>;
+    pub fn set_board(&mut self, cards: &[Card]) -> Result<HandState, EngineError>;
+    pub fn undo(&mut self) -> Result<HandState, EngineError>;
+    pub fn set_explicit_ranges(&mut self, oop: Range1326, ip: Range1326);
+    pub fn recommend(&mut self, sink: Box<dyn EventSink>) -> Result<DecisionIdentity, EngineError>;
+    pub fn cancel(&mut self, decision_id: u64);
+    pub fn finish_hand(&mut self);
+    pub fn abandon_hand(&mut self);
+    pub fn shutdown(&mut self);
+    pub fn state(&self) -> Option<HandState>;
+}
+```
+
+**Five resolved interface requirements implemented here:**
+- `set_config` returns `Result<u32, EngineError>` and **rejects `flop_budget_s` outside `1..=30`** (§13.3 requires 31 to be rejected; cross-plan M10, spec S15). While a hand is active the new config is **queued for the next hand** and the active hand keeps its frozen `HandConfig` (§4.2); the revision is allocated and returned immediately so the caller can display it.
+- `set_hero_cards(&mut self, [Card; 2]) -> Result<HandState, EngineError>` exists (§3.5 lists it as a Tauri command; cross-plan M14/Or3). It is a mutation: fresh revision, in-flight work invalidated, snapshots for the hand dropped.
+- `shutdown(&mut self)` takes `&mut self` and is idempotent, because Tauri managed state cannot move out of the handle (cross-plan M11, spec S15).
+- `Paths` declares all four directories up front: `log_dir` and `worker_exe` are used here, `preflop` is populated by plan 3 Task 14 and `cache` read by plan 4's `Cache::open` (cross-plan M13/Or5).
+- `recommend` takes `Box<dyn EventSink>` (not `Box<dyn EventSink + Send>`); `EventSink: Send` already, and the two spellings are distinct types in Rust (cross-plan M12 — plan 5 follows this one).
+- `startup_report()` surfaces the §12 startup diagnostics plan 5 renders: worker features and capabilities, the "CPU lacks AVX2" banner of §3.7, bundle quarantine banners (filled by plan 3) and the cache state (filled by plan 4).
+
+- [ ] **Step 1: Failing tests**
+
+`crates/engine/tests/final_delivery.rs`:
+
+```rust
+use engine::core::EngineCore;
+use engine::identity::IdentityState;
+use engine::log::DecisionLog;
+use engine::ranges::ExplicitRanges;
+use engine::serve::{serve_request, LiveRequest};
+use engine::testing::{board, hand, play, FakeClock, FakeReply, FakeWorker, IdRef, RecordingSink};
+use proto::worker::{AckStatus, ResultStatus, Stage, WorkerError};
+use proto::{Action, Card, Coverage, Range1326, RecommendationEvent, Seat, UnsupportedReason};
+use std::sync::{Arc, Mutex};
+
+fn river_state() -> proto::HandState {
+    let aa = Some([Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()]);
+    let s = play(&hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), Seat(0), Seat(2), aa), &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold, Action::Call]);
+    board(&play(&board(&play(&board(&s, "Kh 7d 2c"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d 9s")
+}
+fn full(board: &[Card]) -> Range1326 { let mut r = Range1326([1.0; 1326]); for i in 0..1326 { let [a, b] = proto::combo_cards(i as u16); if board.contains(&a) || board.contains(&b) { r.0[i] = 0.0; } } r }
+fn ack() -> FakeReply { FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None } }
+
+fn run(script: Vec<FakeReply>, expected_stage: &str) {
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let state = river_state();
+    let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
+    let mut core = EngineCore::new(worker, clock.clone(), identity.clone(), DecisionLog::open(&std::env::temp_dir().join("pokerai_delivery_log")));
+    *core.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: Some(full(&state.board)), ip: Some(full(&state.board)) });
+    let (sink, events) = RecordingSink::new(clock.clone(), Some(fake.clone()));
+    let id = { let mut s = identity.lock().unwrap(); s.set_config(); s.begin_hand(); s.next_decision().unwrap() };
+    serve_request(&mut core, LiveRequest { identity: id.clone(), state, t0_ms: 0, sink: Arc::new(Mutex::new(Box::new(sink))) });
+    let ev = events.lock().unwrap();
+    let finals: Vec<_> = ev.iter().filter(|r| matches!(r.event, RecommendationEvent::Final(_))).collect();
+    assert_eq!(finals.len(), 1, "exactly one Final");
+    let f = finals[0];
+    assert_eq!((f.at_ms, f.kills), (14_900, 0), "Final at t0 + 14.9 s before any kill or restart");
+    match &f.event { RecommendationEvent::Final(r) => match &r.coverage { Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage }, .. } => assert_eq!(stage, expected_stage), c => panic!("{c:?}") }, _ => unreachable!() }
+    assert!(fake.lock().unwrap().kills >= 1, "the kill/restart proceeds after delivery");
+}
+
+#[test]
+fn final_delivery_independent_of_worker() {
+    // (a) a worker that never replies: both attempts hang, the stage never leaves Building
+    run(vec![FakeReply::Hang], "building");
+    // (b) no_iteration on the first attempt, then the retry hangs: still Building
+    run(vec![ack(), FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None, error: Some(WorkerError { code: "no_iteration".into(), message: "".into(), retryable: false, estimate_bytes: None }), elapsed_ms: 1 }, ack(), FakeReply::Hang], "building");
+    // (c) hangs in extraction: the reported stage is the FURTHEST reached, so the `_min` retry's Building does not
+    //     rewind it to "building" (`EngineCore::set_stage` only advances)
+    run(vec![ack(), FakeReply::Progress { id: IdRef::Last, stage: Stage::Extracting, iterations: 40, exploitability_chips: Some(0.3), elapsed_ms: 9 }, FakeReply::Hang], "extracting");
+}
+```
+
+`crates/engine/tests/engine_api.rs`:
+
+```rust
+use engine::core::EngineCore;
+use engine::identity::IdentityState;
+use engine::log::DecisionLog;
+use engine::testing::{cfg_1_2, FakeClock, FakeReply, FakeWorker};
+use engine::{Engine, EngineError};
+use proto::{Card, Seat, SolverPrefs};
+use std::sync::{Arc, Mutex};
+
+fn engine() -> Engine {
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let (worker, _state) = FakeWorker::scripted(clock.clone(), identity.clone(), vec![FakeReply::Hang]);
+    Engine::with_core(EngineCore::new(worker, clock, identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_engine_api_log"))))
+}
+fn begin() -> proto::BeginHand {
+    proto::BeginHand { button: Seat(0), hero: Seat(2), dealt: (0..6).map(Seat).collect(), stacks: vec![1000; 6], hero_cards: None }
+}
+
+#[test]
+fn set_config_validates_and_queues() {
+    let (mut cfg, _) = cfg_1_2();
+    let mut e = engine();
+    cfg.solver = SolverPrefs { threads: 16, target_bp: 50, flop_budget_s: 10 };
+    let rev1 = e.set_config(cfg.clone()).unwrap();
+    assert!(rev1 >= 1);
+    // §13.3: 31 is rejected by set_config; 0 too. The revision is not consumed by a rejected config.
+    cfg.solver.flop_budget_s = 31;
+    assert!(matches!(e.set_config(cfg.clone()), Err(EngineError::Message(ref m)) if m.contains("flop_budget_s")));
+    cfg.solver.flop_budget_s = 0;
+    assert!(e.set_config(cfg.clone()).is_err());
+    cfg.solver.flop_budget_s = 30;
+    let rev2 = e.set_config(cfg.clone()).unwrap();
+    assert!(rev2 > rev1);
+    // §4.2: a config set during a hand is queued for the NEXT hand; the active hand keeps its frozen HandConfig
+    let s = e.begin_hand(begin()).unwrap();
+    assert_eq!(s.config.config_revision, rev2);
+    cfg.solver.flop_budget_s = 12;
+    cfg.bb_chips = 20;
+    let rev3 = e.set_config(cfg.clone()).unwrap();
+    assert!(rev3 > rev2);
+    assert_eq!(e.state().unwrap().config.bb_chips, 10, "the active hand's config is frozen");
+    let next = e.begin_hand(begin()).unwrap();
+    assert_eq!((next.config.bb_chips, next.config.config_revision), (20, rev3));
+    e.shutdown();
+}
+
+#[test]
+fn hero_cards_and_shutdown_are_idempotent() {
+    let (cfg, _) = cfg_1_2();
+    let mut e = engine();
+    e.set_config(cfg).unwrap();
+    assert!(matches!(e.set_hero_cards([Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()]), Err(EngineError::Message(_))));   // no hand
+    let s = e.begin_hand(begin()).unwrap();
+    let rev = s.hand_revision;
+    let s = e.set_hero_cards([Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()]).unwrap();
+    assert_eq!(s.hero_cards, Some([Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()]));
+    assert!(s.hand_revision > rev, "set_hero_cards is a mutation: fresh revision, in-flight work invalidated");
+    // the startup report is available without a real worker and carries the fake's advertised features
+    let rep = e.startup_report();
+    assert!(rep.worker_ready && rep.build_features.iter().any(|f| f == "avx2") && !rep.cpu_lacks_avx2);
+    e.shutdown();
+    e.shutdown();   // once-only: the second call is a no-op, not a panic
+}
+```
+
+- [ ] **Step 2: Run to see them fail**
+
+Run: `cargo test -p engine --features testing --test final_delivery` and `cargo test -p engine --features testing --test engine_api`
+Expected: FAIL to compile (`Engine`, `Paths`, `StartupReport` missing).
+
+- [ ] **Step 3: Implement `startup.rs`**
+
+```rust
+//! §12 startup diagnostics, rendered by plan 5's settings panel. Plan 3 fills `quarantined_bundles`,
+//! plan 4 fills `cache_state`; both go through `Engine::startup_report`, never through a second channel.
+use crate::worker::ready::cpu_lacks_avx2;
+use proto::worker::Ready;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StartupReport {
+    pub worker_ready: bool,
+    pub worker_threads: u8,
+    pub build_features: Vec<String>,
+    pub cpu_features: Vec<String>,
+    pub capabilities: Vec<String>,
+    /// §3.7: the build requires AVX2; a CPU without it gets a startup banner rather than a refusal.
+    pub cpu_lacks_avx2: bool,
+    /// Preflop bundles that failed validation and were quarantined (§8.2); filled by plan 3.
+    pub quarantined_bundles: Vec<String>,
+    /// "absent" until plan 4 opens the cache, then its own summary.
+    pub cache_state: String,
+    /// Human-readable banners, in display order.
+    pub banners: Vec<String>,
+}
+
+impl StartupReport {
+    pub fn from_ready(ready: Option<&Ready>) -> Self {
+        let mut r = StartupReport { cache_state: "absent".into(), ..Default::default() };
+        if let Some(w) = ready {
+            r.worker_ready = true;
+            r.worker_threads = w.threads;
+            r.build_features = w.build_features.clone();
+            r.cpu_features = w.cpu_features.clone();
+            r.capabilities = w.capabilities.clone();
+            r.cpu_lacks_avx2 = cpu_lacks_avx2(w);
+            if r.cpu_lacks_avx2 { r.banners.push("this CPU does not report AVX2; solves will be much slower".into()); }
+        } else {
+            r.banners.push("the solver worker is not running".into());
+        }
+        r
+    }
+}
+```
+
+- [ ] **Step 4: Implement `engine.rs`**
 
 ```rust
 //! §3.5 public surface: commands never block; `engine-main` serves the request slot of depth 1 (newest wins).
@@ -6245,37 +6627,51 @@ use crate::identity::IdentityState;
 use crate::log::DecisionLog;
 use crate::ranges::ExplicitRanges;
 use crate::serve::{serve_request, LiveRequest};
+use crate::startup::StartupReport;
 use crate::worker::process::ProcessWorker;
 use crate::{EngineError, EventSink};
-use core_model::{apply_action, begin_hand, set_board, BeginHand};
+use core_model::{apply_action, begin_hand, set_board, set_hero_cards, BeginHand as CoreBeginHand};
 use proto::*;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
-pub struct Paths { pub log_dir: PathBuf, pub worker_exe: PathBuf }
+/// All four directories are declared here so downstream plans have nothing to add:
+/// `log_dir` and `worker_exe` are used by this plan, `preflop` by plan 3, `cache` by plan 4.
+pub struct Paths { pub log_dir: PathBuf, pub worker_exe: PathBuf, pub preflop: PathBuf, pub cache: PathBuf }
+
+/// §7 spec range for the per-session flop budget.
+pub const FLOP_BUDGET_RANGE: std::ops::RangeInclusive<u8> = 1..=30;
+
 struct Slot { pending: Option<LiveRequest>, stop: bool }
+/// Every field a command touches is either owned by `Engine` or shared through its own `Arc<Mutex<_>>`.
+/// Only `shutdown` locks the `EngineCore` itself, and it joins `engine-main` first, so no command can block
+/// behind a running solve (§3.4).
 pub struct Engine {
     identity: Arc<Mutex<IdentityState>>, clock: Arc<dyn crate::clock::Clock>, snapshots: Arc<Mutex<crate::snapshots::SnapshotStore>>,
+    shared_config: Arc<Mutex<GameConfig>>, range_source: Arc<Mutex<Box<dyn crate::ranges::RangeSource>>>, startup: StartupReport,
     core: Arc<Mutex<EngineCore>>, slot: Arc<(Mutex<Slot>, Condvar)>,
-    state: Option<HandState>, undo: Vec<HandState>, config: GameConfig, ranges: Option<(Range1326, Range1326)>,
-    main: Option<std::thread::JoinHandle<()>>,
+    state: Option<HandState>, undo: Vec<HandState>, config: GameConfig, queued_config: Option<GameConfig>,
+    main: Option<std::thread::JoinHandle<()>>, stopped: bool,
 }
 impl Engine {
     pub fn new(cfg: GameConfig, paths: Paths) -> Result<Engine, EngineError> {
         let worker = ProcessWorker::spawn(&paths.worker_exe, cfg.solver.threads).map_err(|e| EngineError::Message(e.to_string()))?;
         let identity = Arc::new(Mutex::new(IdentityState::new()));
         let clock: Arc<dyn crate::clock::Clock> = Arc::new(SystemClock::new());
-        let mut core = EngineCore::new(Box::new(worker), clock.clone(), identity.clone(), DecisionLog::open(&paths.log_dir));
-        core.set_config(cfg.clone());
+        let core = EngineCore::new(Box::new(worker), clock.clone(), identity.clone(), DecisionLog::open(&paths.log_dir));
         let mut e = Engine::with_core(core);
-        e.set_config(cfg);
+        e.set_config(cfg)?;
         Ok(e)
     }
     pub fn with_core(core: EngineCore) -> Engine {
         let identity = core.identity.clone();
         let clock = core.clock.clone();
         let snapshots = core.snapshots.clone();
-        let config = core.config.clone();
+        let shared_config = core.config.clone();
+        let range_source = core.range_source.clone();
+        let config = core.config();
+        // Captured once, before the core is handed to `engine-main`, so `startup_report` never takes that lock.
+        let startup = StartupReport::from_ready(core.worker.ready());
         let core = Arc::new(Mutex::new(core));
         let slot = Arc::new((Mutex::new(Slot { pending: None, stop: false }), Condvar::new()));
         let (c2, s2) = (core.clone(), slot.clone());
@@ -6283,31 +6679,56 @@ impl Engine {
             let req = { let (m, cv) = &*s2; let mut g = m.lock().unwrap(); while g.pending.is_none() && !g.stop { g = cv.wait(g).unwrap(); } if g.stop { return; } g.pending.take().unwrap() };
             serve_request(&mut c2.lock().unwrap(), req);
         }).expect("engine-main");
-        Engine { identity, clock, snapshots, core, slot, state: None, undo: vec![], config, ranges: None, main: Some(main) }
+        Engine { identity, clock, snapshots, shared_config, range_source, startup, core, slot, state: None, undo: vec![], config, queued_config: None, main: Some(main), stopped: false }
     }
-    pub fn set_config(&mut self, cfg: GameConfig) -> u32 {
+    /// §12 startup diagnostics for the UI; never blocks (the worker's `ready` is captured at construction,
+    /// and plans 3 and 4 fill `quarantined_bundles` / `cache_state` at the same point).
+    pub fn startup_report(&self) -> StartupReport { self.startup.clone() }
+    /// §4.2 / §13.3: validates the config, allocates a revision and applies it — immediately when no hand is in
+    /// progress, otherwise from the next `begin_hand` (the active hand keeps its frozen `HandConfig`).
+    pub fn set_config(&mut self, cfg: GameConfig) -> Result<u32, EngineError> {
+        if !FLOP_BUDGET_RANGE.contains(&cfg.solver.flop_budget_s) {
+            return Err(EngineError::Message(format!("flop_budget_s must be between 1 and 30 seconds, got {}", cfg.solver.flop_budget_s)));
+        }
+        if cfg.sb_chips == 0 || cfg.bb_chips < cfg.sb_chips { return Err(EngineError::Message("blinds must satisfy 0 < sb <= bb".into())); }
+        if cfg.solver.threads == 0 { return Err(EngineError::Message("threads must be at least 1".into())); }
         let rev = self.identity.lock().unwrap().set_config();
-        self.config = GameConfig { config_revision: rev, ..cfg };
-        self.core.lock().unwrap().set_config(self.config.clone());
-        rev
+        let stamped = GameConfig { config_revision: rev, ..cfg };
+        if self.state.is_some() { self.queued_config = Some(stamped); } else { self.apply_config(stamped); }
+        Ok(rev)
     }
+    fn apply_config(&mut self, cfg: GameConfig) { self.config = cfg.clone(); *self.shared_config.lock().unwrap() = cfg; }
     fn hand_config(&self) -> HandConfig { HandConfig { config_revision: self.config.config_revision, sb_chips: self.config.sb_chips, bb_chips: self.config.bb_chips, straddle: self.config.straddle.clone(), rake: self.config.rake.clone(), chip_label: self.config.chip_label.clone() } }
     fn stamp(&self, mut s: HandState, hand_id: u64, rev: u32) -> HandState { s.hand_id = hand_id; s.hand_revision = rev; s }
-    pub fn begin_hand(&mut self, req: BeginHand) -> Result<HandState, EngineError> {
-        let s = begin_hand(&self.hand_config(), req).map_err(|e| EngineError::Rules(e.to_string()))?;
+    /// Takes the ID-free admission DTO of §5 step 2; the engine allocates `hand_id` and converts to `core_model`'s input.
+    pub fn begin_hand(&mut self, req: proto::BeginHand) -> Result<HandState, EngineError> {
+        if let Some(c) = self.queued_config.take() { self.apply_config(c); }
         let (hand_id, rev) = self.identity.lock().unwrap().begin_hand();
+        let core_req = CoreBeginHand { hand_id, button: req.button, hero: req.hero, dealt: req.dealt, stacks_start: req.stacks, hero_cards: req.hero_cards };
+        let s = match begin_hand(&self.hand_config(), core_req) {
+            Ok(s) => s,
+            // A rejected admission must not leave the identity state pointing at a hand that does not exist,
+            // or `recommend` would hand out an identity for it. The hand id is simply burned (§4.4: never reused).
+            Err(e) => { self.identity.lock().unwrap().invalidate_hand(); self.state = None; self.undo.clear(); return Err(EngineError::Rules(e.to_string())); }
+        };
         self.undo.clear();
         self.state = Some(self.stamp(s, hand_id, rev));
         Ok(self.state.clone().unwrap())
     }
     fn mutate(&mut self, next: HandState) -> HandState {
         let rev = self.identity.lock().unwrap().mutate();
+        let hand_id = self.state.as_ref().map(|p| p.hand_id).unwrap_or(next.hand_id);
         if let Some(prev) = self.state.take() { self.undo.push(prev); }
-        let hand_id = self.undo.last().map(|p| p.hand_id).unwrap_or(next.hand_id);
         let s = self.stamp(next, hand_id, rev);
         self.snapshots.lock().unwrap().invalidate_hand(hand_id);
         self.state = Some(s.clone());
         s
+    }
+    /// §5 step 3: a mutation like any other (fresh revision, in-flight work invalidated).
+    pub fn set_hero_cards(&mut self, cards: [Card; 2]) -> Result<HandState, EngineError> {
+        let cur = self.state.as_ref().ok_or(EngineError::Message("no hand".into()))?;
+        let next = set_hero_cards(cur, cards).map_err(|e| EngineError::Rules(e.to_string()))?;
+        Ok(self.mutate(next))
     }
     pub fn apply_action(&mut self, a: Action) -> Result<HandState, EngineError> {
         let cur = self.state.as_ref().ok_or(EngineError::Message("no hand".into()))?;
@@ -6322,13 +6743,14 @@ impl Engine {
     pub fn undo(&mut self) -> Result<HandState, EngineError> {
         let prev = self.undo.pop().ok_or(EngineError::Message("nothing to undo".into()))?;
         let rev = self.identity.lock().unwrap().mutate();
-        let s = self.stamp(prev, self.state.as_ref().map(|s| s.hand_id).unwrap_or(0), rev);
-        self.snapshots.lock().unwrap().invalidate_hand(s.hand_id);
+        let hand_id = self.state.as_ref().map(|s| s.hand_id).unwrap_or(prev.hand_id);
+        let s = self.stamp(prev, hand_id, rev);
+        self.snapshots.lock().unwrap().invalidate_hand(hand_id);
         self.state = Some(s.clone());
         Ok(s)
     }
-    /// Plan 2 only: the public ranges at the street root (plan 3 replaces this with replay).
-    pub fn set_explicit_ranges(&mut self, oop: Range1326, ip: Range1326) { self.ranges = Some((oop.clone(), ip.clone())); self.core.lock().unwrap().range_source = Box::new(ExplicitRanges { oop: Some(oop), ip: Some(ip) }); }
+    /// Plan 2 only: the public ranges at the street root (plan 3 installs a replay-backed `RangeSource` instead).
+    pub fn set_explicit_ranges(&mut self, oop: Range1326, ip: Range1326) { *self.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: Some(oop), ip: Some(ip) }); }
     pub fn recommend(&mut self, sink: Box<dyn EventSink>) -> Result<DecisionIdentity, EngineError> {
         let state = self.state.clone().ok_or(EngineError::Message("no hand".into()))?;
         let identity = self.identity.lock().unwrap().next_decision().ok_or(EngineError::Message("no hand in progress".into()))?;
@@ -6341,9 +6763,19 @@ impl Engine {
     pub fn cancel(&mut self, decision_id: u64) { let mut i = self.identity.lock().unwrap(); if i.active().map(|a| a.decision_id) == Some(decision_id) { i.cancel_active(); } }
     pub fn finish_hand(&mut self) { self.end_hand(); }
     pub fn abandon_hand(&mut self) { self.end_hand(); }
-    fn end_hand(&mut self) { let hand_id = self.state.as_ref().map(|s| s.hand_id); self.identity.lock().unwrap().invalidate_hand(); if let Some(h) = hand_id { self.snapshots.lock().unwrap().invalidate_hand(h); } self.state = None; self.undo.clear(); }
+    fn end_hand(&mut self) {
+        let hand_id = self.state.as_ref().map(|s| s.hand_id);
+        self.identity.lock().unwrap().invalidate_hand();
+        if let Some(h) = hand_id { self.snapshots.lock().unwrap().invalidate_hand(h); }
+        self.state = None;
+        self.undo.clear();
+        if let Some(c) = self.queued_config.take() { self.apply_config(c); }
+    }
     pub fn state(&self) -> Option<HandState> { self.state.clone() }
-    pub fn shutdown(mut self) {
+    /// `&mut self` and idempotent: Tauri managed state cannot move out of the handle (spec §3.5).
+    pub fn shutdown(&mut self) {
+        if self.stopped { return; }
+        self.stopped = true;
         { let (m, cv) = &*self.slot; m.lock().unwrap().stop = true; cv.notify_all(); }
         if let Some(h) = self.main.take() { let _ = h.join(); }
         let mut core = self.core.lock().unwrap();
@@ -6352,18 +6784,19 @@ impl Engine {
         core.worker.kill();
     }
 }
+impl Drop for Engine { fn drop(&mut self) { self.shutdown(); } }
 ```
 
-`crates/engine/src/lib.rs` (final module list): `clock, identity, tree, worker, deadline, watchdog, core, solve, coverage, equity, allin, assemble, log, snapshots, ranges, serve, engine` plus `#[cfg(any(test, feature = "testing"))] pub mod testing;` and `pub use engine::{Engine, Paths};`.
+`crates/engine/src/lib.rs` (final module list): `clock, identity, tree, bench_support, worker, deadline, watchdog, log, core, solve, coverage, equity, allin, assemble, snapshots, ranges, serve, startup, engine` plus `#[cfg(any(test, feature = "testing"))] pub mod testing;`, `pub use engine::{Engine, Paths};` and `pub use startup::StartupReport;`.
 
-- [ ] **Step 3: Run and commit**
+- [ ] **Step 5: Run and commit**
 
-Run: `cargo test -p engine --features testing` then `cargo test --workspace`
-Expected: all green, including `identity_race_golden` (A: Fast, Equity, Progress only; B2: the single Final; one cancel, one kill) and `final_delivery_independent_of_worker` (Final at 14 900 ms with `kills == 0` at emission in all three scripts).
+Run: `cargo test -p engine --features testing` then `cargo test --workspace --release`
+Expected: all green, including `final_delivery_independent_of_worker` (Final at 14 900 ms with `kills == 0` at emission in all three scripts, stage `building`/`building`/`extracting`) and the two `engine_api` tests.
 
 ```bash
 git add crates/engine
-git commit -m "feat(engine): Engine API with the depth-1 request slot, river/turn decision path, snapshot store and identity goldens
+git commit -m "feat(engine): public Engine API with validated set_config, set_hero_cards, four-directory Paths, startup report and idempotent shutdown
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -6378,7 +6811,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Test: unit tests in `report.rs`; a smoke run in step 4
 
 **Interfaces:**
-- Consumes: `engine::worker::process::ProcessWorker`, `engine::worker::link::WorkerLink`, `engine::tree::{materialize_at, Templates, tree_signature}`, `engine::deadline::{street_budget_ms, extraction_margin_ms}`, `core_ranges::{parse_range, block_public}`, `suite::{Spot, Suite}`.
+- Consumes: `engine::worker::process::ProcessWorker`, `engine::worker::link::WorkerLink`, `engine::tree::{materialize_at, Templates}`, `engine::deadline::{street_budget_ms, extraction_margin_ms}`, `engine::bench_support::prepared_range`, `suite::{Spot, Suite}`. **`bench` never depends on `core-*`** (spec §3.2, cross-plan M17/R5): range parsing and board blocking go through `engine::bench_support` (Task 5).
 - Produces: `runner::{SpotResult { spot: String, rep: u32, cold: bool, wall_ms: u64, ack_ms: u64, status: String, reached_bp: Option<u16>, iterations: u32, memory_bytes: u64, peak_ws_bytes: u64, mode: String, street_violation: bool, final_violation: bool }, run_spot(worker: &mut dyn WorkerLink, spot: &Spot, rep: u32, cold: bool) -> SpotResult, cancel_latency(worker: &mut dyn WorkerLink, spot: &Spot) -> (u64, u64)}`; `report::{Report::new(suite: &str, threads: u8, reps: u32), push(&mut self, SpotResult), set_cancel_latency(ack_ms, result_ms), to_markdown(&self) -> String, append_to(&self, path: &Path)}`; CLI `bench run --suite river_std|river_min|turn_std|turn_min --threads N --reps R --out docs/bench/`.
 
 - [ ] **Step 1: Failing report test (bottom of `report.rs`)**
@@ -6397,7 +6830,15 @@ mod tests {
         assert!(md.contains("| river_std | 16 |") && md.contains("p50 30 ms") && md.contains("p95 2500 ms") && md.contains("max 2500 ms"));
         assert!(md.contains("Exact 80.0% / Approximate 20.0% / Unsupported 0.0%") && md.contains("street violations 1") && md.contains("final violations 0"));
         assert!(md.contains("cancel ack 4 ms, result 120 ms"));
-        assert_eq!(percentile(&[1, 2, 3, 4], 0.5), 3);
+        // nearest rank: idx = ceil(len * p).clamp(1, len) - 1, so p50 of [1,2,3,4] is index 1 -> 2
+        assert_eq!(percentile(&[1, 2, 3, 4], 0.5), 2);
+        assert_eq!(percentile(&[1, 2, 3, 4], 0.95), 4);
+        assert_eq!(percentile(&[10, 20, 30, 40, 2500], 0.5), 30);
+        assert_eq!(percentile(&[], 0.5), 0);
+        // a suite whose spots all finished before a cancel could be issued reports n/a, never a misleading 0
+        let mut none = Report::new("river_min", 16, 1);
+        none.push(r(4, "ok", 10));
+        assert!(none.to_markdown().contains("| n/a |"));
     }
 }
 ```
@@ -6411,14 +6852,14 @@ use crate::suite::Spot;
 use engine::deadline::{extraction_margin_ms, street_budget_ms};
 use engine::tree::{materialize_at, Templates};
 use engine::worker::link::WorkerLink;
-use proto::worker::{EngineMessage, ResultStatus, SolveRequest, WorkerMessage};
+use proto::worker::{EngineMessage, ResultStatus, SolveRequest, Stage, WorkerMessage};
 use proto::{Rake, Range1326};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SpotResult { pub spot: String, pub rep: u32, pub cold: bool, pub wall_ms: u64, pub ack_ms: u64, pub status: String, pub reached_bp: Option<u16>, pub iterations: u32, pub memory_bytes: u64, pub peak_ws_bytes: u64, pub mode: String, pub street_violation: bool, pub final_violation: bool }
 
-fn range(s: &str, board: &[proto::Card]) -> Range1326 { let mut r = core_ranges::parse_range(s).expect("range"); core_ranges::block_public(&mut r, board); r }
+fn range(s: &str, board: &[proto::Card]) -> Range1326 { engine::bench_support::prepared_range(s, board).expect("range") }
 static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub fn request(spot: &Spot, deadline_ms: u32) -> SolveRequest {
@@ -6454,12 +6895,24 @@ pub fn run_spot(worker: &mut dyn WorkerLink, spot: &Spot, rep: u32, cold: bool) 
         street_violation: wall_ms > budget, final_violation: wall_ms > 15_000 }
 }
 
-/// Sends a solve, cancels after 50 ms, measures the ack and the terminal latency (§13.5 "cancel latency").
-pub fn cancel_latency(worker: &mut dyn WorkerLink, spot: &Spot) -> (u64, u64) {
+/// §13.5 "cancel latency": send a solve with a long deadline, wait for the FIRST `progress{stage:"solving"}`
+/// (a fixed 50 ms sleep would let a 4 ms river spot finish first and record 0 / 0), then cancel and measure the
+/// ack and the terminal. `None` when the solve terminated before the cancel could be issued: the report then
+/// prints `n/a` rather than a misleading zero.
+pub fn cancel_latency(worker: &mut dyn WorkerLink, spot: &Spot) -> Option<(u64, u64)> {
     let req = request(spot, 30_000);
     let id = req.id.clone();
     worker.send(&EngineMessage::Solve(req)).expect("send");
-    std::thread::sleep(Duration::from_millis(50));
+    let mut finished = false;
+    loop {
+        match worker.recv(Duration::from_secs(30)).expect("worker alive") {
+            Some(WorkerMessage::Progress { id: i, stage: Stage::Solving, iterations, .. }) if i == id && iterations >= 1 => break,
+            Some(WorkerMessage::Result { id: i, .. }) if i == id => { finished = true; break; }
+            Some(_) => {}
+            None => { finished = true; break; }
+        }
+    }
+    if finished { return None; }
     let t = Instant::now();
     let cid = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst).to_string();
     worker.send(&EngineMessage::Cancel { id: cid.clone(), target: id.clone() }).expect("send");
@@ -6472,7 +6925,7 @@ pub fn cancel_latency(worker: &mut dyn WorkerLink, spot: &Spot) -> (u64, u64) {
             None => break,
         }
     }
-    (ack, result)
+    Some((ack, result))
 }
 ```
 
@@ -6482,6 +6935,8 @@ pub fn cancel_latency(worker: &mut dyn WorkerLink, spot: &Spot) -> (u64, u64) {
 use crate::runner::SpotResult;
 use std::path::Path;
 
+/// Nearest-rank percentile over an already sorted slice: `idx = ceil(len * p)` clamped to `1..=len`, minus one.
+/// `p50` of `[1,2,3,4]` is therefore `2` and `p50` of `[10,20,30,40,2500]` is `30`.
 pub fn percentile(sorted: &[u64], p: f64) -> u64 { if sorted.is_empty() { return 0; } let idx = ((sorted.len() as f64 * p).ceil() as usize).clamp(1, sorted.len()) - 1; sorted[idx] }
 
 pub struct Report { suite: String, threads: u8, reps: u32, rows: Vec<SpotResult>, cancel: Option<(u64, u64)> }
@@ -6514,7 +6969,7 @@ impl Report {
 }
 ```
 
-`crates/bench/src/main.rs` (add `mod runner; mod report;` and the `run` arm):
+Add `pub mod report; pub mod runner;` to `crates/bench/src/lib.rs`, then in `crates/bench/src/main.rs` extend the `use bench::{...}` line to `use bench::{gen_spots, materialize, report, runner, suite};` and add the `run` arm:
 
 ```rust
         Some("run") => {
@@ -6528,7 +6983,7 @@ impl Report {
             for spot in &suite.spots {
                 let mut worker = engine::worker::process::ProcessWorker::spawn(&exe, threads).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });   // cold = first run in a fresh process
                 for r in 1..=reps { let res = runner::run_spot(&mut worker, spot, r, r == 1); println!("{} rep {} {} {} ms", res.spot, r, res.status, res.wall_ms); rep.push(res); }
-                if spot.id == suite.spots[0].id { let (a, b) = runner::cancel_latency(&mut worker, spot); rep.set_cancel_latency(a, b); }
+                if spot.id == suite.spots[0].id { if let Some((a, b)) = runner::cancel_latency(&mut worker, spot) { rep.set_cancel_latency(a, b); } }
                 engine::worker::link::WorkerLink::kill(&mut worker);
             }
             let date = std::env::var("BENCH_DATE").unwrap_or_else(|_| "2026-09-10".into());
@@ -6538,13 +6993,21 @@ impl Report {
 
 - [ ] **Step 3: Run the unit tests**
 
-Run: `cargo test -p bench`
-Expected: 3 passed.
+Run: `cargo test -p bench` then `cargo test --workspace --release`
+Expected: 3 passed; the workspace stays green.
 
 - [ ] **Step 4: Smoke run and commit**
 
 Run: `cargo build --release -p solver-worker && cargo run --release -p bench -- run --suite river_std --threads 16 --reps 2 --out docs/bench/`
-Expected: `docs/bench/2026-09-10-i7-13700K.md` with a `river_std` section; every river spot `ok` at target within 2 s (measured 4 ms on the R8 analogue); `cancel ack` well under 50 ms. Repeat for `river_min`, `turn_std`, `turn_min` (turn spots at 200bb with two sizes: about 1 s each).
+Expected: `docs/bench/2026-09-10-i7-13700K.md` with a `river_std` section; every river spot `ok` at target within 2 s (measured 4 ms on the R8 analogue); `cancel ack` well under 50 ms (or `n/a` if the spot finished first). Repeat for `river_min`, `turn_std`, `turn_min` (turn spots at 200bb with two sizes: about 1 s each).
+
+Write this sentence at the top of the generated file, before the first suite section, and keep it until plan 4 Task 17 regenerates the suites:
+
+```markdown
+> **Pre-baseline reference run.** These suites use `--source r8` (uniform R8 addendum A.1 ranges), not the
+> chart-replay baseline set that spec section 13.5 defines. The V2/V22 gate is measured only after plan 4 Task 17
+> regenerates all six `bench/spots/*.json` from chart replay; nothing here satisfies that gate.
+```
 
 ```bash
 git add crates/bench docs/bench
@@ -6561,52 +7024,76 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 | Spec section | Requirement | Task(s) |
 |---|---|---|
-| §3.1, §3.2 | worker process, crate layout, dependency direction, `solver-worker` depends only on `proto` + vendored solver | 1, 2, 5, 7 |
+| §3.1, §3.2 | worker process, crate layout, dependency direction (`bench` -> `proto` + `engine` only, through `engine::bench_support`), `solver-worker` depends only on `proto` + the vendored solver and nothing depends on it | 1, 2, 5, 7, 30 |
 | §3.3 | AGPL boundary: `license = "AGPL-3.0"`, `LICENSE`/`PINNED_COMMIT`/`PATCHES.md` retained | 1, 7 |
-| §3.4 | worker threads `control`/`writer`/`executor`, rayon 16 by `--threads`, priority class by `background`; engine `engine-main`, `fast-path`, `watchdog`, `worker-stdout`/`worker-stderr` threads | 7, 10, 14, 16, 21 |
-| §3.5 | `Engine` API (river/turn), `build_effective_tree`, `bench run` CLI, worker exit codes | 4, 5, 7, 10, 21, 22 |
-| §3.7 | pinned commit, features, two patches, AVX2 build check, `ready` features, engine refusal without AVX2, library lifecycle constraints | 1, 7, 9, 14 |
-| §4.4 | identity tuple, headline rules, reason accumulation, `Unsupported.partial`, event merging (`Equity` never downgrades) | 2, 19, 21 |
-| §4.5 | wire schema, limits (1 MiB / 16 MiB / 100,000 nodes, truncated export), states, every ack/result rule, lock staging, progress cadence and `null` accuracy, `ready` validation, failure codes, matrix validation | 6, 7, 9, 10, 13, 14 |
-| §4.6 | pinned action construction (opening/donk/facing, clamp-force-dedupe, cross-street `matched`), exact insertion, wager cap, cross-check, `tree_signature`, `rules_version` 3 | 3, 4, 8 |
-| §5 steps 4-10 | admission, identity per request, fast phase, HU solve path, result validation, snapshot registration, decision log | 20, 21 |
-| §6 | classifier table and rules, facing-all-in analytic fallback with the T1 numbers | 17, 18, 21 |
-| §7 | budgets, `deadline_ms = remaining - 150`, extraction margins, worker stop rule, heartbeat 5 s, cancel 1.5 s kill, watchdog at final - 100 ms, retry admission | 9, 16, 21 |
-| §10.1 | seven templates, `_min` retry mapping | 2 |
-| §10.2 | root inputs from the snapshot, exact insertion alongside menus, projection labels | 4, 17 |
-| §10.3 | adapter mapping, memory admission, headroom, locks before the first iteration, extraction, index transposition, `normalize_ev` identity, rake mapping, job object 16 GiB | 8, 9, 11, 14 |
-| §10.6 | `best_so_far` labelled `DeadlineBestSoFar` with per-action EV | 16, 19, 21 |
-| §12 | typed handling of `tree_mismatch`, `no_iteration`, exit/heartbeat, `tree_too_large`, cancel-not-confirmed, stale identity | 16, 21 |
-| §13.0 | `fixtures/worker/*.jsonl`, `fixtures/solver/basic_0p3.json`, `bench/spots/*.json` | 5, 6, 12 |
-| §13.2 | every contract test (see the deviations below for three placements) | 7, 8, 10, 11, 12, 13, 14 |
-| §13.3 | `tree_builder_golden`, `coverage_classification_golden`, `facing_allin_golden`, `recommendation_assembly_golden`, `identity_race_golden`, `final_delivery_independent_of_worker` | 4, 17, 18, 19, 21 |
-| §13.5 | report columns, river/turn suites, cancel latency, violation counts | 22 |
+| §3.4 | worker threads `control`/`writer`/`executor`, rayon 16 by `--threads`, priority class by `background`; engine `engine-main`, `fast-path`, `watchdog`, `worker-stdout`/`worker-stderr` threads | 7, 11, 12, 18, 22, 28, 29 |
+| §3.5 | `Engine` API (river/turn) incl. `set_hero_cards`, validated `set_config`, four-field `Paths`, `startup_report`, `shutdown(&mut self)`; `build_effective_tree`; `bench run` CLI; worker exit codes | 4, 5, 7, 12, 29, 30 |
+| §3.6 | one toolchain: plan 1's `rust-toolchain.toml` (MSVC); this plan never overrides it and references plan 1's V1 MSVC/GNU check instead of duplicating it | Global Constraints, 1 |
+| §3.7 | pinned commit, features, two patches, AVX2 build check, `ready` features, engine refusal without AVX2, CPU-lacks-AVX2 banner, library lifecycle constraints | 1, 7, 11, 18, 29 |
+| §4.2 | `flop_budget_s` validated to `1..=30`; a config set during a hand applies from the next hand | 29 |
+| §4.4 | identity tuple, headline rules, reason accumulation, `Unsupported.partial`, event merging (`Equity` never downgrades), accuracy vocabulary in bp | 2, 26, 28 |
+| §4.5 | wire schema, limits imported from `proto::worker` (1 MiB / 16 MiB / 100,000 nodes, truncated export), states, every ack/result rule incl. duplicate-before-busy, lock staging, progress cadence and `null` accuracy, `ready` validation, failure codes, matrix validation | 6, 7, 10, 11, 12, 13, 14, 17, 18 |
+| §4.6 | pinned action construction (opening/donk/facing, clamp-force-dedupe, cross-street `matched`), exact insertion, duplicates merged, wager cap, cross-check, `tree_signature`, `rules_version` 3 | 3, 4, 8 |
+| §5 steps 4-10 | admission, identity per request, fast phase, HU solve path, result validation, snapshot registration, decision log | 21, 27, 28, 29 |
+| §6 | classifier table and rules, facing-all-in analytic fallback with the T1 numbers | 24, 25, 28 |
+| §7 | budgets, `deadline_ms = remaining - 150`, extraction margins, worker stop rule, heartbeat 5 s, cancel 1.5 s kill, watchdog at final - 100 ms, retry admission, street-violation definition | 9, 20, 22, 23, 28 |
+| §10.1 | seven templates plus the two §13.2 test templates, `_min` retry mapping, the `test-templates` extension point plan 4 uses | 2 |
+| §10.2 | root inputs from the snapshot, exact insertion alongside menus, projection labels, the five `RootError` variants | 4, 24 |
+| §10.3 | adapter mapping, memory admission, headroom, locks before the first iteration, extraction, index transposition, `normalize_ev` identity, rake mapping, job object 16 GiB | 8, 9, 10, 11, 15, 18 |
+| §10.5 | `background` is a request parameter, exercised as `false` here and as `true` by plan 4's pre-solver | 22, 28 |
+| §10.6 | `best_so_far` labelled `DeadlineBestSoFar` with per-action EV | 17, 23, 26, 28 |
+| §12 | typed handling of `tree_mismatch`, `no_iteration`, exit/heartbeat, `tree_too_large`, cancel-not-confirmed, stale identity; startup diagnostics | 23, 28, 29 |
+| §13.0 | `fixtures/worker/*.jsonl` (all five consumed), `fixtures/solver/basic_0p3.json`, `bench/spots/*.json` | 5, 6, 15, 17 |
+| §13.2 | every contract test (see the deviations below for the placements) | 7, 8, 12, 13, 14, 15, 16, 17, 18 |
+| §13.3 | `tree_builder_golden`, `coverage_classification_golden`, `facing_allin_golden`, `recommendation_assembly_golden`, `identity_race_golden`, `final_delivery_independent_of_worker` | 4, 24, 25, 26, 28, 29 |
+| §13.5 | report columns, river/turn suites, cancel latency, violation counts (on the labelled interim range set) | 30 |
 
 Gaps and deviations (all deliberate, each recorded in the task that carries it):
 
-1. `ev_convention_non_root_payoffs` (Task 11): the spec's OOP hand `AA` cannot have equity 1 on `Qs Jd 7h 3c 2d` (three queens beat aces); the stated `+200` / `-50` values are reproduced with OOP `QQ,66` through card removal. The spec text should be corrected to `QQ`.
-2. `river_check_only_terminal_oracle` runs in `crates/engine/tests/worker_link.rs` (Task 14) because its oracle is `core-eval`, which `solver-worker` may not depend on; it still spawns the real binary.
-3. `ev_conservation` (Task 11) checks the library's root EVs in-process through the adapter's mapping, because IP's root-range EV is not an actor-owned wire export.
-4. `tree_materialization_matches_library` equality over the 47 cases is checked in-process (Task 8, `every_materialization_case_matches_library`); the wire test of Task 12 covers the `tree_mismatch` cases.
-5. `register_snapshot(&DecisionIdentity, StreetSnapshot)` needs `core-replay`'s `StreetSnapshot` (plan 3); this plan provides `SnapshotStore::register(&DecisionIdentity, SolvedStreet)` with the same identity rule, and plan 3 wraps it.
-6. Preflop and flop decisions answer `Final` `Unsupported{EngineError{"no ... path in this build"}}` until plans 3 and 4; multiway answers `Unsupported{MultiwayEv}` without the `experimental` block. The §6 experimental surrogate (`experimental_surrogate_golden`) is in no plan of the series map; it belongs with the flop path (plan 4), reusing `run_solve` on a synthetic root.
-7. The engine always sends `background: false`; the worker's priority-class switch is exercised only by plan 4's pre-solver.
-8. `bench gen-spots --source r8` freezes uniform R8 ranges; the chart-replay baseline set (`--source file`) arrives with plan 3.
-9. `deadline_best_so_far_labelling` and `flop_budget_setting_golden` (§13.3) need the cache's `Provisional` and the flop budget and are plan 4's, as the brief assigns.
+1. `ev_convention_non_root_payoffs` (Task 15): the spec's OOP hand `AA` cannot have equity 1 on `Qs Jd 7h 3c 2d` (three queens beat aces); the stated `+200` / `-50` values are reproduced with OOP `QQ,66` through card removal. Spec revision 6 carries this correction (S7).
+2. `river_check_only_terminal_oracle` runs in `crates/engine/tests/worker_link.rs` (Task 18) because its oracle is `core-eval`, which `solver-worker` may not depend on; it still spawns the real binary (spec S8).
+3. `ev_conservation` (Task 15) checks the library's root EVs in-process through the adapter's mapping, because IP's root-range EV is not an actor-owned wire export (spec S9).
+4. `tree_materialization_matches_library` equality over the 43 cases is checked in-process (Task 8, `every_materialization_case_matches_library`); the wire test of Task 16 covers the `tree_mismatch` cases (spec S10).
+5. A **root-street** `donk` of `None` is legal and is never sent to the library (upstream ignores `turn_donk_sizes` at a turn root, where `prev_action` is `None`); only a later street's `None` is rejected. Recorded in Task 8.
+6. A later street's `None` donk is answered `ack{rejected}` rather than `result{error{tree_mismatch}}`: §13.2 lists the case under both `protocol_rejections` and `tree_materialization_matches_library`, and the cheap structural check in `precheck` costs no work. `tree_config` keeps the same check as defence in depth, where it surfaces as `tree_mismatch`. Recorded in Task 8.
+7. `identity_race_golden`'s "hand B with the same displayed revision" is unreachable: §4.3's revision counter is monotonic and never reused, so hand B's revision is 9 where A's was 7. The test pins the property the scenario is about (A's identity refused, B's accepted) and records the clause as vacuously satisfied. Task 28.
+8. A tree action outside `Derived.legal` is reported with its frequency, no EV, `Unavailable::NotEvaluated` and an explicit note, not `NotInMenu` (§4.4 reserves that for the source's menu) and not §8.4's `MovedProbability{from}` (that mapping is plan 4's bet translation). Task 26.
+9. `SnapshotStore::register(&DecisionIdentity, SolvedStreet)` carries §9.2's identity rule; plan 3 Task 11 replaces it with `core_replay::SnapshotStore`/`StreetSnapshot` (`covered_paths`, prefix-based invalidation) in a single commit and re-exports through `engine::snapshots`. `RangeSource::ranges_at_root` and `serve_request`'s `Classification::Preflop` arm are the two other plan-3 seams. Tasks 27 and 28.
+10. Preflop and flop decisions answer `Final` `Unsupported{EngineError{"no ... path in this build"}}` until plans 3 and 4; multiway answers `Unsupported{MultiwayEv}` without the `experimental` block. The §6 experimental surrogate and `experimental_surrogate_golden` are **plan 4 Task 10's to create** (cross-plan Or1/R4), not to extend: nothing exists here to extend.
+11. `bench gen-spots --source r8` freezes uniform R8 ranges and labels every spot `r8_uniform`; §13.5's baseline set is chart-replay, so any `docs/bench/*.md` section produced here is a pre-baseline reference run. `--source chart` arrives with plan 3's bundles and plan 4 Task 17 regenerates all six suites before the V2/V22 gate is claimed (cross-plan Or8/R3).
+12. R8 addendum A.1 publishes 646 / 804 combos for `BTN_OPEN` / `BB_DEFEND`, but those strings expand to **634 / 720** under the documented grammar (`CO_CALL_3BET` 194 and `BTN_3BET` 138 match A.1 exactly, so the parser is right). The strings, not A.1's two counts, are the definition, in both the Python generator and `crates/bench/src/gen_spots.rs`. Task 6.
+13. `deadline_best_so_far_labelling` and `flop_budget_setting_golden` (§13.3) need the cache's `Provisional` and the flop budget and are plan 4's, as the brief assigns. `bench oracle` (§13.1) is plan 4 Task 20's (cross-plan Or2).
+14. `flop_full_v1` is phase-2 only (§10.1), so it gets one materialization case at `(100, 100)` instead of the five-point sweep the six phase-1 templates get: 43 cases in total. Task 6.
 
 ### 2. Placeholder scan
 
-Searched the plan for `TBD`, `TODO`, `implement later`, `fill in`, `add validation`, `handle edge cases`, `similar to Task`: none. Every code step contains the code; every test step contains the test; the two golden files recorded on the first run (`tree_builder_golden.json`, `recommendation_assembly_golden.json`) have their hand-check values stated in the task, and `coverage_classification_golden.json` is written in full before the first run.
+Searched the plan for `TBD`, `TODO`, `implement later`, `fill in`, `add validation`, `handle edge cases`, `similar to Task`: none. Every code step contains the code; every test step contains the test; the two golden files recorded on the first run (`tree_builder_golden.json`, `recommendation_assembly_golden.json`) have their hand-check values stated in the task, and `coverage_classification_golden.json` is written in full before the first run. Two tasks reference a listing in a neighbouring task rather than repeating it, and both name the exact task, step and item list: Task 12 takes the `protocol.rs` scaffolding from Task 13 Step 3, and Task 14 replaces two named arms of that same listing with code written out in full.
 
 ### 3. Type consistency
 
-- `Templates::get(&str) -> Option<&'static TemplateSpec>` (Task 2) is used by Tasks 3, 4, 5, 12, 22 with that signature; `Templates::min_variant` by Tasks 16 and 21.
-- `materialize(&MaterializeInput) -> Result<Materialized, UnsupportedReason>` (Task 3) feeds `materialize_at` and `build_tree_full` (Task 4); `TreeBuild { tree, history, decision_path, pot, eff }` is consumed by `bench materialize` (Task 5), `run_solve` (Task 16) and `serve_request` (Task 21).
-- `WorkerLink { send, recv, restart, kill, ready, peak_working_set_bytes }` (Task 14) is implemented by `ProcessWorker` (14) and `FakeWorker` (15) and consumed by `run_solve` (16), `serve_request` (21) and `bench` (22).
-- `FakeReply::{Ack, Progress, Result, Delay, Eof, Malformed, Oversized, Hang, InvalidateIdentity}` and `IdRef::{Last, Fixed}` (Task 15) are the variants used in Tasks 16 and 21.
-- `EngineCore::new(worker, clock, identity)` (Task 16) gains the `log` argument in Task 20; Task 20 states that `solve_client.rs`'s rig is updated, and Task 21's tests use the four-argument form. `EngineCore.snapshots` is `Arc<Mutex<SnapshotStore>>` in Task 21 and every use locks it.
-- `SharedSink = Arc<Mutex<Box<dyn EventSink>>>` (Task 16) is the sink type of `run_solve`, `Armed`, `LiveRequest` and `Engine::recommend`.
-- `SolvePlan { identity, deadlines, template_id, retry_template_id, rake, hero_actor, background }` and `SolveOutcome { terminal, solution, ordinal_paths, decision_path, tree, elapsed_ms, template_used, street_violation, restarts, reached_bp }` (Task 16) are read field by field in Task 21.
-- `assemble::{final_from_solution, unsupported, fast, accumulate, coverage_for_solve, hero_reach, empty_assumptions, merge_equity}` (Task 19) are the names called in Task 21; `equity::{equity_summary, pending_summary, EQUITY_BUDGET_MS}` (Task 18) likewise.
-- Worker: `job::run(&SolveRequest, Option<&[NodeLock]>, &mut JobControl) -> JobResult` (Task 9) is what `executor_loop` (Task 10) calls; `locks::validate` is used by `handle_message`; `extract::MAX_NODES` by `precheck`; `tree_build::{build, enumerate, cross_check}` and `history::history_to_lib` by Tasks 9, 11, 12 and the example binary.
-- Fixture ids: `river_two_combo` (41/42/48), `flop_cancel` (43/44), `flop_best_so_far` (45), `lock_river` (47/51/52), `basic_turn_std_request` (`basic`) are the ids the tests of Tasks 10-13 look up.
+- `Templates::get(&str) -> Option<&'static TemplateSpec>` (Task 2) is used by Tasks 3, 4, 5, 16, 30 with that signature; `Templates::min_variant` by Tasks 23 and 28; `Templates::with_extra(&[TemplateSpec])` is plan 4's registration seam and is compiled out of release builds.
+- `materialize(&MaterializeInput) -> Result<Materialized, UnsupportedReason>` (Task 3) feeds `materialize_at` and `build_tree_full` (Task 4); `TreeBuild { tree, history, decision_path, pot, eff }` is consumed by `bench materialize` (Task 5), `run_solve` (Tasks 22-23) and `serve_request` (Task 28).
+- `proto::resolve_chip_path` is the one implementation of the §2 rule; `engine::tree` re-exports it and adds only `node_at`. `RULES_VERSION` is likewise re-exported from `proto`, and `MAX_EXPORTED_NODES` / `RESULT_LINE_MAX` / `REQUEST_LINE_MAX` from `proto::worker`.
+- `WorkerLink { send, recv, restart, kill, ready, peak_working_set_bytes }` (Task 18) is implemented by `ProcessWorker` (18) and `FakeWorker` (19) and consumed by `run_solve` (22, 23), `serve_request` (28) and `bench` (30).
+- `FakeReply::{Ack, Progress, Result, Delay, Eof, Malformed, Oversized, Hang, InvalidateIdentity}` and `IdRef::{Last, Fixed}` (Task 19) are the variants used in Tasks 22, 23, 28 and 29. `InvalidateIdentity` is documented as consumed within the same `recv` call, so scripts that need the client to observe it write `InvalidateIdentity, Delay { ms: 1 }`.
+- `EngineCore::new(worker, clock, identity, log)` is four-argument from Task 22 onward and never changes arity; Task 21 builds `DecisionLog` first precisely for that reason. `EngineCore.snapshots` is `Arc<Mutex<SnapshotStore>>` from Task 27 and every use locks it.
+- `SharedSink = Arc<Mutex<Box<dyn EventSink>>>` (Task 20) is the sink type of `run_solve`, `Armed`, `LiveRequest` and `Engine::recommend`; `Engine::recommend` takes `Box<dyn EventSink>`, which is what plan 5 must write (`dyn EventSink` and `dyn EventSink + Send` are distinct types even though `Send` is a supertrait).
+- `SolvePlan { identity, deadlines, template_id, retry_template_id, rake, hero_actor, background }` and `SolveOutcome { terminal, solution, ordinal_paths, decision_path, tree, elapsed_ms, template_used, street_violation, restarts, reached_bp }` (Task 22) are read field by field in Task 28.
+- `assemble::{final_from_solution, unsupported, fast, accumulate, coverage_for_solve, hero_reach, empty_assumptions, merge_equity}` (Task 26) are the names called in Task 28; `equity::{equity_summary, pending_summary, EQUITY_BUDGET_MS}` (Task 25) likewise. `assumptions_stub()` (Task 20) is the zero value `empty_assumptions` builds on.
+- Worker: `job::run(&SolveRequest, Option<&[NodeLock]>, &mut JobControl) -> JobResult` (Task 11) is what `executor_loop` (Task 12) calls; `locks::validate` is used by Task 14's `handle_message`; `extract::MAX_EXPORTED_NODES` by `precheck` and `job::run`; `tree_build::{build, enumerate, cross_check}` and `history::history_to_lib` by Tasks 11, 15, 16 and the fixture generator.
+- Fixture ids: `river_two_combo` (41/42/48), `flop_cancel` (43/44), `flop_best_so_far` (45), `lock_river` (47/51/52), `basic_turn_std_request` (`basic`) are the ids the tests of Tasks 13-17 look up. All five fixtures have a reader in this plan.
+- `proto::BeginHand` (admission DTO, no `hand_id`, field `stacks`) is what `Engine::begin_hand` takes; `core_model::BeginHand` (with `hand_id` and `stacks_start`) is what the engine passes down and what `testing::hand` builds. The two are never confused.
+
+### 4. Cross-plan surface this plan freezes
+
+Other plans consume exactly this and nothing else:
+
+- `engine::{Engine, Paths, StartupReport, EngineError, EventSink}` with the signatures listed in Task 29.
+- `engine::tree::{build_effective_tree, build_tree_full, materialize_at, node_at, resolve_chip_path, tree_signature, TemplateSelection, TemplateSpec, Templates, TreeBuild, RULES_VERSION}`; `Templates::with_extra` behind `cfg(any(test, feature = "test-templates"))`.
+- `engine::deadline::{Deadlines, street_budget_ms, final_delivery_ms, extraction_margin_ms, retry_admitted, DELIVERY_MARGIN_MS, PIPE_MARGIN_MS, WATCHDOG_LEAD_MS}` — plan 4 extends `Deadlines` for the flop budget rather than adding a parallel `flop_deadlines` (cross-plan D5).
+- `engine::worker::{WorkerLink, WorkerLinkError, ProcessWorker, ready::validate_ready}`; `engine::testing::{FakeClock, FakeWorker, FakeReply, IdRef, FakeState, RecordingSink, Recorded, uniform_solution, cfg_1_2, hand, play, board}` behind the `testing` feature.
+- `engine::snapshots::{SnapshotStore, SolvedStreet}` (replaced wholesale by plan 3 Task 11) and `engine::ranges::{RangeSource, RootRanges, ExplicitRanges}` (plan 3 installs its implementation).
+- `engine::assemble::{headline, accumulate, coverage_for_solve, final_from_solution, unsupported, fast, merge_equity, empty_assumptions, AssemblyCtx, HeadlineSource}` — plan 3 extends `headline`, it does not add a second entry point (cross-plan D8).
+- `engine::bench_support::{prepared_range, range_mass}` — the only path from `bench` to range handling.
+- `engine::solve::{run_solve, SolvePlan, SolveOutcome, Terminal, spot_hash}` and `engine::core::EngineCore`.
+- `bench::{suite, gen_spots, materialize, runner, report}` through `crates/bench/src/lib.rs`, so plan 4's integration tests link them; plan 4 *modifies* `report.rs`, `main.rs` and `gen_spots.rs` rather than creating them (cross-plan D4).
