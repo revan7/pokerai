@@ -4517,147 +4517,143 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Task 16: Absolute deadlines, watchdog, `EngineCore` and `run_solve` (admission, heartbeat, cancel/kill, `_min` retry)
+## Task 20: Absolute deadlines and the independent watchdog
 
 **Files:**
-- Create: `crates/engine/src/deadline.rs`, `crates/engine/src/watchdog.rs`, `crates/engine/src/core.rs`, `crates/engine/src/solve.rs`, `crates/engine/tests/solve_client.rs`
-- Modify: `crates/engine/src/lib.rs` (add `pub mod deadline; pub mod watchdog; pub mod core; pub mod solve;`)
-- Test: `solve_client.rs::{deadline_arithmetic_and_request_fields, superseded_request_cancels_then_kills_after_1_5s, heartbeat_failure_restarts_and_retries_min, error_codes_retry_policy, stale_ids_discarded}`
+- Create: `crates/engine/src/deadline.rs`, `crates/engine/src/watchdog.rs`, `crates/engine/tests/watchdog.rs`
+- Modify: `crates/engine/src/lib.rs` (add `pub mod deadline; pub mod watchdog;` and the temporary `assumptions_stub()` helper of step 1)
+- Test: unit tests in `deadline.rs`; `crates/engine/tests/watchdog.rs::{watchdog_emits_final_at_delivery_minus_100ms, watchdog_disarm_retires_the_generation}`
 
 **Interfaces:**
-- Consumes: Tasks 2, 4, 14, 15; `core_ranges::hash_scaled`; `proto::worker::validate_solution`.
-- Produces: `deadline::{Deadlines { t0_ms, street_deadline_ms, final_delivery_ms, extraction_margin_ms }, Deadlines::for_request(t0_ms: u64, street: Street, flop_budget_s: u8) -> Deadlines, Deadlines::worker_deadline_ms(&self, now_ms, until_ms) -> Option<u32>, Deadlines::watchdog_fire_ms(&self) -> u64, street_budget_ms(Street, u8) -> u64, final_delivery_ms(Street, u8) -> u64, extraction_margin_ms(Street) -> u32, retry_admitted(now_ms, final_delivery_ms, p95_ms, extraction_margin_ms) -> bool}`; `watchdog::{SharedSink = Arc<Mutex<Box<dyn EventSink>>>, Armed {..}, Watchdog::new(Arc<dyn Clock>), arm(&self, Armed), disarm(&self)}`; `core::EngineCore { worker, clock, identity: Arc<Mutex<IdentityState>>, watchdog, next_request_id, memory_limit_bytes, bench_p95_ms: HashMap<String, u64>, stage: Arc<Mutex<String>> }` with `new(worker, clock, identity) -> Self`, `next_id(&mut self) -> String`, `identity_active(&self, &DecisionIdentity) -> bool`; `solve::{SolvePlan { identity, deadlines, template_id, retry_template_id: Option<String>, rake: Rake, hero_actor: String, background: bool }, Terminal::{Ok, BestSoFar, Failed(UnsupportedReason)}, SolveOutcome { terminal, solution: Option<StreetSolution>, ordinal_paths, decision_path, tree: EffectiveTree, elapsed_ms: u32, template_used: String, street_violation: bool, restarts: u8, reached_bp: Option<u16> }, run_solve(&mut EngineCore, &SolveInput, &SolvePlan, &SharedSink) -> SolveOutcome, spot_hash(&EffectiveTree, pot: u32, board: &[Card], ranges: &[Range1326; 2]) -> String}`.
+- Consumes: `clock::Clock`, `EventSink` (Task 18), `testing::{FakeClock, RecordingSink}` (Task 19); `proto::{Coverage, DecisionIdentity, Phase, Recommendation, RecommendationEvent, Street, UnsupportedReason}`.
+- Produces: `deadline::{DELIVERY_MARGIN_MS, PIPE_MARGIN_MS, WATCHDOG_LEAD_MS, Deadlines { t0_ms, street_deadline_ms, final_delivery_ms, extraction_margin_ms }, Deadlines::for_request(t0_ms: u64, street: Street, flop_budget_s: u8) -> Deadlines, Deadlines::worker_deadline_ms(&self, now_ms: u64, until_ms: u64) -> Option<u32>, Deadlines::watchdog_fire_ms(&self) -> u64, street_budget_ms(Street, u8) -> u64, final_delivery_ms(Street, u8) -> u64, extraction_margin_ms(Street) -> u32, retry_admitted(now_ms, final_delivery_ms, p95_ms, extraction_margin_ms) -> bool}`; `watchdog::{SharedSink = Arc<Mutex<Box<dyn EventSink>>>, Armed { identity, street_deadline_ms, fire_ms, retained, fallback, stage, sink, delivered, terminal_seen, street_violation }, Watchdog::new(Arc<dyn Clock>) -> Watchdog, Watchdog::arm(&self, Armed), Watchdog::disarm(&self)}`; `crate::assumptions_stub() -> proto::Assumptions`.
 
-- [ ] **Step 1: Failing tests `crates/engine/tests/solve_client.rs`**
+- [ ] **Step 1: Failing tests**
+
+Bottom of `crates/engine/src/deadline.rs`:
 
 ```rust
-use engine::core::EngineCore;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn budgets_margins_and_retry_admission_of_section_7() {
+        let river = Deadlines::for_request(0, Street::River, 10);
+        assert_eq!((river.street_deadline_ms, river.final_delivery_ms, river.extraction_margin_ms), (2_000, 15_000, 200));
+        assert_eq!(river.watchdog_fire_ms(), 14_900);
+        let turn = Deadlines::for_request(1_000, Street::Turn, 10);
+        assert_eq!((turn.street_deadline_ms, turn.final_delivery_ms), (7_000, 16_000));
+        // the flop budget stretches both the first-attempt deadline and the final delivery, and only on the flop
+        let flop = Deadlines::for_request(0, Street::Flop, 30);
+        assert_eq!((flop.street_deadline_ms, flop.final_delivery_ms, flop.extraction_margin_ms), (30_000, 35_000, 600));
+        assert_eq!(Deadlines::for_request(0, Street::Flop, 10).final_delivery_ms, 15_000);
+        // deadline_ms = remaining - 100 - 50 at send time; None when not even the extraction margin fits
+        assert_eq!(river.worker_deadline_ms(500, 2_000), Some(1_350));
+        assert_eq!(river.worker_deadline_ms(0, 15_000), Some(14_850));
+        assert_eq!(river.worker_deadline_ms(1_800, 2_000), None);        // 50 <= 200
+        assert_eq!(river.worker_deadline_ms(3_000, 2_000), None);        // already past
+        // a retry is admitted only when the p95 of the retry template plus every margin still fits
+        assert!(retry_admitted(6_200, 15_000, 6_000, 200));               // 8_800 >= 6_350
+        assert!(!retry_admitted(9_000, 15_000, 6_000, 200));              // 6_000 <  6_350
+    }
+}
+```
+
+`crates/engine/tests/watchdog.rs`:
+
+```rust
 use engine::deadline::Deadlines;
-use engine::identity::IdentityState;
-use engine::solve::{run_solve, SolvePlan, Terminal};
-use engine::testing::{uniform_solution, FakeClock, FakeReply, FakeWorker, IdRef, RecordingSink};
-use engine::tree::{build_tree_full, TemplateSelection};
-use engine::watchdog::SharedSink;
-use proto::worker::{AckStatus, EngineMessage, ResultStatus, Stage, WorkerError};
-use proto::{Action, Card, Range1326, Rake, RecommendationEvent, Seat, SolveInput, Street, StreetRootSnapshot, UnsupportedReason};
+use engine::testing::{FakeClock, RecordingSink};
+use engine::watchdog::{Armed, SharedSink, Watchdog};
+use proto::{Coverage, DecisionIdentity, EquitySummary, Phase, Recommendation, RecommendationEvent, Street, UnsupportedReason};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-fn snap(street: Street) -> StreetRootSnapshot {
-    let board = match street { Street::River => "Qs Jd 7h 3c 2d", _ => "Qs Jd 7h 3c" };
-    StreetRootSnapshot { street, board: board.split(' ').map(|s| Card::parse(s).unwrap()).collect(), oop: Seat(2), ip: Seat(0), pot_root: 100, stack_oop_root: 100, stack_ip_root: 100, dead_this_street: 0, projected_from: 2, history: vec![] }
+fn identity() -> DecisionIdentity { DecisionIdentity { hand_id: 1, hand_revision: 1, decision_id: 1, config_revision: 1, model_revision: 0 } }
+fn fallback() -> Recommendation {
+    Recommendation { identity: identity(), phase: Phase::Fast,
+        coverage: Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage: String::new() }, partial: vec![] },
+        legal: vec![], actions: vec![], unresolved_mass: 0.0, range_mix: None,
+        equity: EquitySummary { hero_combo_vs_each: vec![], hero_range_vs_each: vec![], per_pot_shares: vec![] },
+        assumptions: engine::assumptions_stub(), experimental: None, exploit: None }
 }
-fn full_range(board: &[Card]) -> Range1326 { let mut r = Range1326([1.0; 1326]); for i in 0..1326 { let [a, b] = proto::combo_cards(i as u16); if board.contains(&a) || board.contains(&b) { r.0[i] = 0.0; } } r }
-struct Rig { core: EngineCore, input: SolveInput, plan: SolvePlan, sink: SharedSink, events: Arc<Mutex<Vec<engine::testing::Recorded>>>, state: Arc<Mutex<engine::testing::FakeState>>, clock: Arc<FakeClock> }
-fn rig(street: Street, script: Vec<FakeReply>) -> Rig {
+fn armed(sink: SharedSink, stage: &str) -> (Armed, Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
+    let d = Deadlines::for_request(0, Street::River, 10);
+    let (delivered, terminal_seen, violation) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let a = Armed { identity: identity(), street_deadline_ms: d.street_deadline_ms, fire_ms: d.watchdog_fire_ms(),
+        retained: Arc::new(Mutex::new(None)), fallback: fallback(), stage: Arc::new(Mutex::new(stage.to_string())),
+        sink, delivered: delivered.clone(), terminal_seen: terminal_seen.clone(), street_violation: violation.clone() };
+    (a, delivered, terminal_seen, violation)
+}
+/// Spins on the fake clock (the watchdog thread is woken by `FakeClock::set_ms`, not by wall time).
+fn wait_for(events: &Arc<Mutex<Vec<engine::testing::Recorded>>>, n: usize) -> Vec<engine::testing::Recorded> {
+    for _ in 0..100_000 {
+        let g = events.lock().unwrap();
+        if g.len() >= n { return g.clone(); }
+        drop(g);
+        std::thread::yield_now();
+    }
+    panic!("watchdog did not emit {n} event(s)");
+}
+
+#[test]
+fn watchdog_emits_final_at_delivery_minus_100ms() {
     let clock = FakeClock::new();
-    let identity = Arc::new(Mutex::new(IdentityState::new()));
-    let id = { let mut s = identity.lock().unwrap(); s.set_config(); s.begin_hand(); s.next_decision().unwrap() };
-    let (worker, state) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
-    let core = EngineCore::new(worker, clock.clone(), identity);
-    let root = snap(street);
-    let template = if street == Street::River { "river_std_v1" } else { "turn_std_v1" };
-    let tree = build_tree_full(&root, &TemplateSelection::from_history(template, &root.history)).unwrap().tree;
-    let input = SolveInput { root: root.clone(), ranges: [full_range(&root.board), full_range(&root.board)], tree, target_bp: 50 };
-    let plan = SolvePlan { identity: id, deadlines: Deadlines::for_request(0, street, 10), template_id: template.into(), retry_template_id: engine::tree::Templates::min_variant(template).map(String::from), rake: Rake::TimeCharge, hero_actor: "oop".into(), background: false };
-    let (sink, events) = RecordingSink::new(clock.clone(), Some(state.clone()));
-    Rig { core, input, plan, sink: Arc::new(Mutex::new(Box::new(sink))), events, state, clock }
-}
-fn ok_for(street: Street, template: &str, expl: f32) -> FakeReply {
-    let root = snap(street);
-    let tree = build_tree_full(&root, &TemplateSelection::from_history(template, &[])).unwrap().tree;
-    FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(uniform_solution(&tree, &[], expl)), error: None, elapsed_ms: 5 }
-}
-fn ack() -> FakeReply { FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None } }
-fn err(code: &str, retryable: bool, est: Option<u64>) -> FakeReply { FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None, error: Some(WorkerError { code: code.into(), message: code.into(), retryable, estimate_bytes: est }), elapsed_ms: 1 } }
-fn solves(state: &Arc<Mutex<engine::testing::FakeState>>) -> Vec<proto::worker::SolveRequest> { state.lock().unwrap().sent.iter().filter_map(|m| if let EngineMessage::Solve(r) = m { Some(r.clone()) } else { None }).collect() }
-
-#[test]
-fn deadline_arithmetic_and_request_fields() {
-    let mut r = rig(Street::River, vec![ack(), FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 10, exploitability_chips: Some(0.8), elapsed_ms: 3 }, ok_for(Street::River, "river_std_v1", 0.3)]);
-    r.clock.set_ms(500);
-    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
-    assert_eq!(out.terminal, Terminal::Ok);
-    let req = &solves(&r.state)[0];
-    assert_eq!((req.deadline_ms, req.extraction_margin_ms, req.memory_limit_bytes, req.background), (2000 - 500 - 150, 200, 10 << 30, false));
-    assert_eq!((req.pot, req.stack_oop, req.stack_ip, req.rake_rate, req.rake_cap_mchips), (100, 100, 100, 0.0, 0));
-    assert_eq!(req.spot.len(), 64);
-    assert_eq!((out.reached_bp, out.template_used.as_str(), out.street_violation, out.restarts), (Some(30), "river_std_v1", false, 0));
-    assert_eq!(out.ordinal_paths[out.solution.as_ref().unwrap().requested as usize], out.decision_path);
-    let ev = r.events.lock().unwrap();
-    assert!(matches!(&ev[0].event, RecommendationEvent::Progress { stage, iterations: 10, exploitability_pct: Some(p), .. } if stage == "solving" && (*p - 0.8).abs() < 1e-6));
-    // the watchdog fires at t0 + 14.9 s for a river decision
-    assert_eq!(r.plan.deadlines.watchdog_fire_ms(), 14_900);
-    assert_eq!(Deadlines::for_request(0, Street::Turn, 10).street_deadline_ms, 6_000);
+    let (sink, events) = RecordingSink::new(clock.clone(), None);
+    let sink: SharedSink = Arc::new(Mutex::new(Box::new(sink)));
+    let wd = Watchdog::new(clock.clone());
+    let (a, delivered, _terminal, violation) = armed(sink, "extracting");
+    wd.arm(a);
+    clock.set_ms(14_900);
+    let ev = wait_for(&events, 1);
+    assert_eq!(ev.len(), 1, "exactly one Final");
+    assert_eq!(ev[0].at_ms, 14_900);
+    match &ev[0].event {
+        RecommendationEvent::Final(r) => {
+            assert_eq!(r.phase, Phase::Final);
+            match &r.coverage { Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage }, .. } => assert_eq!(stage, "extracting"), c => panic!("{c:?}") }
+        }
+        e => panic!("{e:?}"),
+    }
+    assert!(delivered.load(Ordering::SeqCst));
+    assert!(violation.load(Ordering::SeqCst), "no terminal was seen by the street deadline");
 }
 
 #[test]
-fn superseded_request_cancels_then_kills_after_1_5s() {
-    let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: 100 }, FakeReply::InvalidateIdentity, FakeReply::Hang]);
-    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
-    assert!(matches!(out.terminal, Terminal::Failed(UnsupportedReason::EngineError { ref message, .. }) if message.contains("superseded")));
-    let s = r.state.lock().unwrap();
-    assert_eq!((s.cancels.len(), s.kills, s.restarts), (1, 1, 1));
-    assert!(r.clock.now_ms() >= 100 + 1500);
-    assert!(r.events.lock().unwrap().is_empty());   // nothing is emitted for a superseded identity
+fn watchdog_disarm_retires_the_generation() {
+    let clock = FakeClock::new();
+    let (sink, events) = RecordingSink::new(clock.clone(), None);
+    let sink: SharedSink = Arc::new(Mutex::new(Box::new(sink)));
+    let wd = Watchdog::new(clock.clone());
+    let (a, _delivered, terminal, violation) = armed(sink, "solving");
+    terminal.store(true, Ordering::SeqCst);
+    wd.arm(a);
+    wd.disarm();
+    clock.set_ms(20_000);
+    for _ in 0..100_000 { std::thread::yield_now(); }
+    assert!(events.lock().unwrap().is_empty(), "a retired generation emits nothing");
+    assert!(!violation.load(Ordering::SeqCst), "a terminal was seen before the street deadline");
 }
+```
 
-#[test]
-fn heartbeat_failure_restarts_and_retries_min() {
-    // no progress for 5 s during Solving: kill, respawn, retry once with turn_min_v1 under time admission
-    let mut r = rig(Street::Turn, vec![ack(), FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 1, exploitability_chips: None, elapsed_ms: 1 }, FakeReply::Delay { ms: 5100 }, FakeReply::Hang, ack(), ok_for(Street::Turn, "turn_min_v1", 0.4)]);
-    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
-    assert_eq!((out.terminal.clone(), out.template_used.as_str(), out.restarts), (Terminal::Ok, "turn_min_v1", 1));
-    let sent = solves(&r.state);
-    assert_eq!((sent.len(), sent[1].tree.template_id.as_str()), (2, "turn_min_v1"));
-    assert!(sent[1].deadline_ms as u64 <= 15_000 - r.clock.now_ms() + 15_000);   // the retry gets only the remaining time to final delivery
-    assert!(out.street_violation, "the first-attempt terminal never arrived before t0 + 6 s");
-}
+The test needs an `Assumptions` value and `assemble` does not exist yet (Task 26). Add this one helper to `crates/engine/src/lib.rs`; Task 26's `assemble::empty_assumptions` is built on top of it and this stays as the zero value.
 
-#[test]
-fn error_codes_retry_policy() {
-    // tree_too_large twice: TreeTooLarge with the retry's estimate
-    let mut r = rig(Street::Turn, vec![ack(), err("tree_too_large", false, Some(9_000_000_000)), ack(), err("tree_too_large", false, Some(3_000_000_000))]);
-    assert!(matches!(run_solve(&mut r.core, &r.input, &r.plan, &r.sink).terminal, Terminal::Failed(UnsupportedReason::TreeTooLarge { estimate_bytes: 3_000_000_000 })));
-    assert_eq!(solves(&r.state).len(), 2);
-    // no_iteration: not retried on the same template, the _min template is tried
-    let mut r = rig(Street::Turn, vec![ack(), err("no_iteration", false, None), ack(), ok_for(Street::Turn, "turn_min_v1", 0.4)]);
-    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
-    assert_eq!((out.terminal, out.template_used.as_str(), out.restarts), (Terminal::Ok, "turn_min_v1", 0));
-    // tree_mismatch: never retried, non-retryable EngineError, exactly one solve
-    let mut r = rig(Street::River, vec![ack(), err("tree_mismatch", false, None)]);
-    assert!(matches!(run_solve(&mut r.core, &r.input, &r.plan, &r.sink).terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: false, .. })));
-    assert_eq!(solves(&r.state).len(), 1);
-    // worker exit: restart and retry with _min; a second failure is a retryable EngineError
-    let mut r = rig(Street::River, vec![ack(), FakeReply::Eof, ack(), FakeReply::Eof]);
-    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
-    assert!(matches!(out.terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: true, .. })));
-    assert_eq!((out.restarts, r.state.lock().unwrap().restarts), (2, 2));
-    // a rejected ack (busy) frees nothing by itself: the outcome is a retryable EngineError and no result was accepted
-    let mut r = rig(Street::River, vec![FakeReply::Ack { id: IdRef::Last, status: AckStatus::Rejected, reason: Some("busy".into()) }]);
-    assert!(matches!(run_solve(&mut r.core, &r.input, &r.plan, &r.sink).terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: true, .. })));
-}
-
-#[test]
-fn stale_ids_discarded() {
-    let root = snap(Street::River);
-    let tree = build_tree_full(&root, &TemplateSelection::from_history("river_std_v1", &[])).unwrap().tree;
-    let stale = FakeReply::Result { id: IdRef::Fixed("old".into()), status: ResultStatus::Ok, solution: Some(uniform_solution(&tree, &[], 0.1)), error: None, elapsed_ms: 1 };
-    let mut r = rig(Street::River, vec![ack(), stale, FakeReply::Progress { id: IdRef::Fixed("old".into()), stage: Stage::Solving, iterations: 3, exploitability_chips: None, elapsed_ms: 1 }, ok_for(Street::River, "river_std_v1", 0.3)]);
-    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
-    assert_eq!((out.terminal, out.reached_bp), (Terminal::Ok, Some(30)));
-    assert!(r.events.lock().unwrap().is_empty(), "a stale progress is never forwarded");
-    let _ = Action::Check;
+```rust
+/// The zero `Assumptions` of §4.4: no ranges, no tree, nothing measured yet.
+pub fn assumptions_stub() -> proto::Assumptions {
+    proto::Assumptions { ranges_used: vec![], tree_signature: String::new(), template_id: String::new(), source: String::new(), source_accuracy: "unverified".into(),
+        source_granularity: "1326 combos".into(), target_bp: 50, reached_bp: None, elapsed_ms: 0, cache: "miss".into(), translations: vec![], mappings: vec![], notes: vec![] }
 }
 ```
 
 - [ ] **Step 2: Run to see them fail**
 
-Run: `cargo test -p engine --features testing --test solve_client`
+Run: `cargo test -p engine --features testing deadline` and `cargo test -p engine --features testing --test watchdog`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Implement `deadline.rs`, `watchdog.rs`, `core.rs`**
+- [ ] **Step 3: Implement `deadline.rs` and `watchdog.rs`**
 
-`crates/engine/src/deadline.rs`:
+`crates/engine/src/deadline.rs` (above the tests):
 
 ```rust
 use proto::Street;
@@ -4685,7 +4681,8 @@ impl Deadlines {
     }
     pub fn watchdog_fire_ms(&self) -> u64 { self.final_delivery_ms - WATCHDOG_LEAD_MS }
 }
-/// §7: a retry is admitted only if `remaining >= p95(_min template) + margins` (before a bench report exists, p95 = the street budget).
+/// §7: a retry is admitted only if `remaining >= p95(_min template) + margins`. Until a measured bench matrix
+/// exists (plan 4 Task 21) the caller passes the street budget as the p95 proxy.
 pub fn retry_admitted(now_ms: u64, final_delivery_ms: u64, p95_ms: u64, extraction_margin_ms: u32) -> bool {
     final_delivery_ms.saturating_sub(now_ms) >= p95_ms + DELIVERY_MARGIN_MS + PIPE_MARGIN_MS + extraction_margin_ms as u64
 }
@@ -4734,51 +4731,278 @@ impl Watchdog {
 }
 ```
 
-`crates/engine/src/core.rs`:
+- [ ] **Step 4: Run and commit**
+
+Run: `cargo test -p engine --features testing` then `cargo test --workspace --release`
+Expected: `budgets_margins_and_retry_admission_of_section_7`, `watchdog_emits_final_at_delivery_minus_100ms` and `watchdog_disarm_retires_the_generation` pass; the workspace stays green.
+
+```bash
+git add crates/engine
+git commit -m "feat(engine): section 7 absolute deadlines and the worker-independent watchdog
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 21: Decision log (§5 step 10)
+
+**Files:**
+- Create: `crates/engine/src/log.rs`
+- Modify: `crates/engine/src/lib.rs` (`pub mod log;`)
+
+**Interfaces:**
+- Consumes: `proto::{ApproxReason, Card, Coverage, DecisionIdentity, HandConfig, HandState, Rake, Seat, Street, TakenAction}`.
+- Produces: `log::{DecisionRecord { identity, street, coverage, reasons: Vec<ApproxReason>, elapsed_ms: u32, cache: String, presolver_scenario: Option<String>, tier: Option<u8>, reached_bp: Option<u16>, street_violation: bool, final_violation: bool, template_id: String, input: InputRecord }, InputRecord { version: u16 (1), config: HandConfig, button: Seat, hero: Seat, dealt: Vec<Seat>, stacks_start: Vec<u32>, hero_cards: Option<[Card; 2]>, actions: Vec<TakenAction>, board: Vec<Card>, range_hashes: Vec<String> }, InputRecord::from_state(&HandState, range_hashes: Vec<String>) -> InputRecord, DecisionLog::open(dir: &Path) -> DecisionLog, DecisionLog::with_limits(dir, rotate_bytes: u64, keep_files: usize) -> DecisionLog, DecisionLog::append(&mut self, &DecisionRecord), ROTATE_BYTES = 50 MiB, KEEP_FILES = 10}`.
+- **Why the log comes before `EngineCore`:** `EngineCore` owns a `DecisionLog`, so building the log first lets `EngineCore::new` take its four arguments from the first line it is written and never change arity afterwards (cross-plan section 4, green-workspace risk 1).
+
+- [ ] **Step 1: Failing unit test (bottom of `log.rs`)**
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn hand_config() -> proto::HandConfig {
+        proto::HandConfig { config_revision: 1, sb_chips: 5, bb_chips: 10, straddle: None,
+            rake: proto::Rake::PotRake { rate: 0.05, cap_mchips: 5000, no_flop_no_drop: false }, chip_label: "$1".into() }
+    }
+    fn rec(i: u64) -> DecisionRecord {
+        let hc = hand_config();
+        DecisionRecord { identity: proto::DecisionIdentity { hand_id: i, hand_revision: 1, decision_id: i, config_revision: 1, model_revision: 0 }, street: proto::Street::River, coverage: proto::Coverage::Exact, reasons: vec![], elapsed_ms: 12, cache: "miss".into(), presolver_scenario: None, tier: None, reached_bp: Some(30), street_violation: false, final_violation: false, template_id: "river_std_v1".into(),
+            input: InputRecord { version: 1, config: hc, button: proto::Seat(0), hero: proto::Seat(2), dealt: vec![], stacks_start: vec![], hero_cards: None, actions: vec![], board: vec![], range_hashes: vec!["x".repeat(64)] } }
+    }
+    #[test]
+    fn appends_jsonl_and_rotates() {
+        let dir = std::env::temp_dir().join(format!("pokerai_log_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut log = DecisionLog::with_limits(&dir, 2_000, 3);
+        for i in 0..40 { log.append(&rec(i)); }
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.contains(&"decisions.jsonl".to_string()) && names.contains(&"decisions.1.jsonl".to_string()));
+        assert!(names.len() <= 3, "{names:?}");
+        let first = std::fs::read_to_string(dir.join("decisions.jsonl")).unwrap();
+        let last: DecisionRecord = serde_json::from_str(first.lines().last().unwrap()).unwrap();
+        assert_eq!(last.identity.decision_id, 39);
+    }
+}
+```
+
+- [ ] **Step 2: Implement `log.rs`**
+
+```rust
+//! §5 step 10: `%LOCALAPPDATA%\PokerAI\decisions.jsonl`, rotated at 50 MiB, 10 files; a write failure is logged once per session.
+use proto::{ApproxReason, Card, Coverage, DecisionIdentity, HandConfig, HandState, Seat, Street, TakenAction};
+use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+pub const ROTATE_BYTES: u64 = 50 << 20;
+pub const KEEP_FILES: usize = 10;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputRecord { pub version: u16, pub config: HandConfig, pub button: Seat, pub hero: Seat, pub dealt: Vec<Seat>, pub stacks_start: Vec<u32>, pub hero_cards: Option<[Card; 2]>, pub actions: Vec<TakenAction>, pub board: Vec<Card>, pub range_hashes: Vec<String> }
+impl InputRecord {
+    pub fn from_state(s: &HandState, range_hashes: Vec<String>) -> Self {
+        Self { version: 1, config: s.config.clone(), button: s.button, hero: s.hero, dealt: s.dealt.clone(), stacks_start: s.stacks_start.clone(), hero_cards: s.hero_cards, actions: s.actions.clone(), board: s.board.clone(), range_hashes }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionRecord { pub identity: DecisionIdentity, pub street: Street, pub coverage: Coverage, pub reasons: Vec<ApproxReason>, pub elapsed_ms: u32, pub cache: String, pub presolver_scenario: Option<String>, pub tier: Option<u8>, pub reached_bp: Option<u16>, pub street_violation: bool, pub final_violation: bool, pub template_id: String, pub input: InputRecord }
+
+pub struct DecisionLog { dir: PathBuf, rotate_bytes: u64, keep: usize, failed_once: bool }
+impl DecisionLog {
+    pub fn open(dir: &Path) -> Self { Self::with_limits(dir, ROTATE_BYTES, KEEP_FILES) }
+    pub fn with_limits(dir: &Path, rotate_bytes: u64, keep: usize) -> Self { Self { dir: dir.to_path_buf(), rotate_bytes, keep, failed_once: false } }
+    fn path(&self, k: usize) -> PathBuf { if k == 0 { self.dir.join("decisions.jsonl") } else { self.dir.join(format!("decisions.{k}.jsonl")) } }
+    fn rotate(&self) -> std::io::Result<()> {
+        let _ = std::fs::remove_file(self.path(self.keep - 1));
+        for k in (1..self.keep).rev() { let from = self.path(k - 1); if from.exists() { std::fs::rename(&from, self.path(k))?; } }
+        Ok(())
+    }
+    pub fn append(&mut self, rec: &DecisionRecord) {
+        let result = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&self.dir)?;
+            let current = self.path(0);
+            if current.exists() && std::fs::metadata(&current)?.len() >= self.rotate_bytes { self.rotate()?; }
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&current)?;
+            f.write_all(serde_json::to_string(rec).map_err(std::io::Error::other)?.as_bytes())?;
+            f.write_all(b"\n")
+        })();
+        if let Err(e) = result { if !self.failed_once { eprintln!("decision log write failed (further failures not reported): {e}"); self.failed_once = true; } }
+    }
+}
+```
+
+- [ ] **Step 3: Run and commit**
+
+Run: `cargo test -p engine --features testing` then `cargo test --workspace --release`
+Expected: `appends_jsonl_and_rotates` passes; the workspace stays green. Nothing outside `log.rs` changes: `EngineCore` (Task 22) takes the `DecisionLog` as its fourth constructor argument from the start.
+
+```bash
+git add crates/engine
+git commit -m "feat(engine): rotating decisions.jsonl log with the versioned input record
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 22: `EngineCore` and the `run_solve` happy path
+
+**Files:**
+- Create: `crates/engine/src/core.rs`, `crates/engine/src/solve.rs`, `crates/engine/tests/solve_client.rs`
+- Modify: `crates/engine/src/lib.rs` (add `pub mod core; pub mod solve;`)
+- Test: `solve_client.rs::{deadline_arithmetic_and_request_fields, stale_ids_discarded}`
+
+**Interfaces:**
+- Consumes: Tasks 2, 4, 18, 19, 20, 21; `core_ranges::hash_scaled`; `proto::worker::validate_solution`.
+- Produces: `core::{DEFAULT_MEMORY_LIMIT_BYTES, EngineCore { worker: Box<dyn WorkerLink>, clock: Arc<dyn Clock>, identity: Arc<Mutex<IdentityState>>, watchdog: Watchdog, log: DecisionLog, next_request_id: u64, memory_limit_bytes: u64, stage: Arc<Mutex<String>> }, EngineCore::new(Box<dyn WorkerLink>, Arc<dyn Clock>, Arc<Mutex<IdentityState>>, DecisionLog) -> Self, next_id(&mut self) -> String, identity_active(&self, &DecisionIdentity) -> bool, set_stage(&self, &str), reset_stage(&self, &str), stage(&self) -> String}`; `solve::{HEARTBEAT_MS, CANCEL_KILL_MS, SolvePlan { identity, deadlines, template_id, retry_template_id: Option<String>, rake: Rake, hero_actor: String, background: bool }, Terminal::{Ok, BestSoFar, Failed(UnsupportedReason)}, SolveOutcome { terminal, solution: Option<StreetSolution>, ordinal_paths, decision_path, tree: EffectiveTree, elapsed_ms: u32, template_used: String, street_violation: bool, restarts: u8, reached_bp: Option<u16> }, run_solve(&mut EngineCore, &SolveInput, &SolvePlan, &SharedSink) -> SolveOutcome, spot_hash(&EffectiveTree, pot: u32, board: &[Card], ranges: &[Range1326; 2]) -> String}`.
+- **`EngineCore::new` takes four arguments from the start** (worker, clock, identity, log). The decision log is built in Task 21 precisely so this constructor never changes arity later (cross-plan section 4, green-workspace risk 1).
+- **`SolvePlan.background` is a parameter, not a constant** (cross-plan R2): this plan only ever passes `false`, plan 4's pre-solver passes `true` with `deadline_ms: 600000`. The test below pins that it reaches the wire.
+
+- [ ] **Step 1: Failing tests `crates/engine/tests/solve_client.rs`**
+
+```rust
+use engine::core::EngineCore;
+use engine::deadline::Deadlines;
+use engine::identity::IdentityState;
+use engine::log::DecisionLog;
+use engine::solve::{run_solve, SolvePlan, Terminal};
+use engine::testing::{uniform_solution, FakeClock, FakeReply, FakeWorker, IdRef, RecordingSink};
+use engine::tree::{build_tree_full, TemplateSelection};
+use engine::watchdog::SharedSink;
+use proto::worker::{AckStatus, EngineMessage, ResultStatus, Stage, WorkerError};
+use proto::{Action, Card, Range1326, Rake, RecommendationEvent, Seat, SolveInput, Street, StreetRootSnapshot, UnsupportedReason};
+use std::sync::{Arc, Mutex};
+
+fn snap(street: Street) -> StreetRootSnapshot {
+    let board = match street { Street::River => "Qs Jd 7h 3c 2d", _ => "Qs Jd 7h 3c" };
+    StreetRootSnapshot { street, board: board.split(' ').map(|s| Card::parse(s).unwrap()).collect(), oop: Seat(2), ip: Seat(0), pot_root: 100,
+        stack_oop_root: 100, stack_ip_root: 100, dead_this_street: 0, projected_from: 2, history: vec![], bb_chips: 2 }
+}
+fn full_range(board: &[Card]) -> Range1326 { let mut r = Range1326([1.0; 1326]); for i in 0..1326 { let [a, b] = proto::combo_cards(i as u16); if board.contains(&a) || board.contains(&b) { r.0[i] = 0.0; } } r }
+struct Rig { core: EngineCore, input: SolveInput, plan: SolvePlan, sink: SharedSink, events: Arc<Mutex<Vec<engine::testing::Recorded>>>, state: Arc<Mutex<engine::testing::FakeState>>, clock: Arc<FakeClock> }
+fn rig(street: Street, script: Vec<FakeReply>) -> Rig {
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let id = { let mut s = identity.lock().unwrap(); s.set_config(); s.begin_hand(); s.next_decision().unwrap() };
+    let (worker, state) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
+    let core = EngineCore::new(worker, clock.clone(), identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log")));
+    let root = snap(street);
+    let template = if street == Street::River { "river_std_v1" } else { "turn_std_v1" };
+    let tree = build_tree_full(&root, &TemplateSelection::from_history(template, &root.history)).unwrap().tree;
+    let input = SolveInput { root: root.clone(), ranges: [full_range(&root.board), full_range(&root.board)], tree, target_bp: 50 };
+    let plan = SolvePlan { identity: id, deadlines: Deadlines::for_request(0, street, 10), template_id: template.into(), retry_template_id: engine::tree::Templates::min_variant(template).map(String::from), rake: Rake::TimeCharge, hero_actor: "oop".into(), background: false };
+    let (sink, events) = RecordingSink::new(clock.clone(), Some(state.clone()));
+    Rig { core, input, plan, sink: Arc::new(Mutex::new(Box::new(sink))), events, state, clock }
+}
+fn ok_for(street: Street, template: &str, expl: f32) -> FakeReply {
+    let root = snap(street);
+    let tree = build_tree_full(&root, &TemplateSelection::from_history(template, &[])).unwrap().tree;
+    FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(uniform_solution(&tree, &[], expl)), error: None, elapsed_ms: 5 }
+}
+fn ack() -> FakeReply { FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None } }
+fn err(code: &str, retryable: bool, est: Option<u64>) -> FakeReply { FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None, error: Some(WorkerError { code: code.into(), message: code.into(), retryable, estimate_bytes: est }), elapsed_ms: 1 } }
+fn solves(state: &Arc<Mutex<engine::testing::FakeState>>) -> Vec<proto::worker::SolveRequest> { state.lock().unwrap().sent.iter().filter_map(|m| if let EngineMessage::Solve(r) = m { Some(r.clone()) } else { None }).collect() }
+
+#[test]
+fn deadline_arithmetic_and_request_fields() {
+    let mut r = rig(Street::River, vec![ack(), FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 10, exploitability_chips: Some(0.8), elapsed_ms: 3 }, ok_for(Street::River, "river_std_v1", 0.3)]);
+    r.clock.set_ms(500);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!(out.terminal, Terminal::Ok);
+    let req = &solves(&r.state)[0];
+    assert_eq!((req.deadline_ms, req.extraction_margin_ms, req.memory_limit_bytes, req.background), (2000 - 500 - 150, 200, 10 << 30, false));
+    assert_eq!((req.pot, req.stack_oop, req.stack_ip, req.rake_rate, req.rake_cap_mchips), (100, 100, 100, 0.0, 0));
+    assert_eq!(req.spot.len(), 64);
+    assert_eq!((out.reached_bp, out.template_used.as_str(), out.street_violation, out.restarts), (Some(30), "river_std_v1", false, 0));
+    assert_eq!(out.ordinal_paths[out.solution.as_ref().unwrap().requested as usize], out.decision_path);
+    let ev = r.events.lock().unwrap();
+    assert!(matches!(&ev[0].event, RecommendationEvent::Progress { stage, iterations: 10, exploitability_pct: Some(p), .. } if stage == "solving" && (*p - 0.8).abs() < 1e-6));
+    // the watchdog fires at t0 + 14.9 s for a river decision
+    assert_eq!(r.plan.deadlines.watchdog_fire_ms(), 14_900);
+    assert_eq!(Deadlines::for_request(0, Street::Turn, 10).street_deadline_ms, 6_000);
+    drop(ev);
+    // `background` is a request parameter, not an engine invariant: plan 4's pre-solver sends `true`
+    let mut bg = rig(Street::River, vec![ack(), ok_for(Street::River, "river_std_v1", 0.3)]);
+    bg.plan.background = true;
+    assert_eq!(run_solve(&mut bg.core, &bg.input, &bg.plan, &bg.sink).terminal, Terminal::Ok);
+    assert!(solves(&bg.state)[0].background);
+}
+
+#[test]
+fn stale_ids_discarded() {
+    let root = snap(Street::River);
+    let tree = build_tree_full(&root, &TemplateSelection::from_history("river_std_v1", &[])).unwrap().tree;
+    let stale = FakeReply::Result { id: IdRef::Fixed("old".into()), status: ResultStatus::Ok, solution: Some(uniform_solution(&tree, &[], 0.1)), error: None, elapsed_ms: 1 };
+    let mut r = rig(Street::River, vec![ack(), stale, FakeReply::Progress { id: IdRef::Fixed("old".into()), stage: Stage::Solving, iterations: 3, exploitability_chips: None, elapsed_ms: 1 }, ok_for(Street::River, "river_std_v1", 0.3)]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!((out.terminal, out.reached_bp), (Terminal::Ok, Some(30)));
+    assert!(r.events.lock().unwrap().is_empty(), "a stale progress is never forwarded");
+    let _ = (Action::Check, UnsupportedReason::InvalidRanges, err("x", false, None));
+}
+```
+
+- [ ] **Step 2: Run to see them fail**
+
+Run: `cargo test -p engine --features testing --test solve_client`
+Expected: FAIL to compile (`EngineCore`, `run_solve` missing).
+
+- [ ] **Step 3: Implement `core.rs`**
 
 ```rust
 use crate::clock::Clock;
 use crate::identity::IdentityState;
+use crate::log::DecisionLog;
 use crate::watchdog::Watchdog;
 use crate::worker::link::WorkerLink;
 use proto::DecisionIdentity;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 10 << 30;
 
-/// State owned by `engine-main` (§3.4). Tasks 20 and 21 add the decision log and the snapshot store.
+/// The watchdog reports the FURTHEST stage a request reached, so `set_stage` only ever moves forward:
+/// a `_min` retry that starts Building again must not rewind a stage the first attempt already reached (§7).
+fn stage_rank(s: &str) -> u8 { match s { "building" => 1, "solving" => 2, "extracting" => 3, _ => 0 } }
+
+/// State owned by `engine-main` (§3.4). Task 27 adds the snapshot store, the game config and the range source.
 pub struct EngineCore {
     pub worker: Box<dyn WorkerLink>,
     pub clock: Arc<dyn Clock>,
     pub identity: Arc<Mutex<IdentityState>>,
     pub watchdog: Watchdog,
+    pub log: DecisionLog,
     pub next_request_id: u64,
     pub memory_limit_bytes: u64,
-    pub bench_p95_ms: HashMap<String, u64>,
     pub stage: Arc<Mutex<String>>,
 }
 impl EngineCore {
-    pub fn new(worker: Box<dyn WorkerLink>, clock: Arc<dyn Clock>, identity: Arc<Mutex<IdentityState>>) -> Self {
-        Self { watchdog: Watchdog::new(clock.clone()), worker, clock, identity, next_request_id: 1, memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES, bench_p95_ms: HashMap::new(), stage: Arc::new(Mutex::new("fast".into())) }
+    pub fn new(worker: Box<dyn WorkerLink>, clock: Arc<dyn Clock>, identity: Arc<Mutex<IdentityState>>, log: DecisionLog) -> Self {
+        Self { watchdog: Watchdog::new(clock.clone()), worker, clock, identity, log, next_request_id: 1, memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES, stage: Arc::new(Mutex::new("fast".into())) }
     }
     pub fn next_id(&mut self) -> String { let id = self.next_request_id; self.next_request_id += 1; id.to_string() }
     pub fn identity_active(&self, id: &DecisionIdentity) -> bool { self.identity.lock().unwrap().is_active(id) }
-    pub fn set_stage(&self, s: &str) { *self.stage.lock().unwrap() = s.to_string(); }
+    /// Advances the reported stage; never rewinds it.
+    pub fn set_stage(&self, s: &str) { let mut g = self.stage.lock().unwrap(); if stage_rank(s) > stage_rank(&g) { *g = s.to_string(); } }
+    /// Starts a new request at `s`; only `serve_request` calls this, at admission.
+    pub fn reset_stage(&self, s: &str) { *self.stage.lock().unwrap() = s.to_string(); }
+    pub fn stage(&self) -> String { self.stage.lock().unwrap().clone() }
 }
 ```
 
-- [ ] **Step 4: Implement `solve.rs`**
+- [ ] **Step 4: Implement `solve.rs` (one attempt)**
+
+Task 23 adds the heartbeat, the cancel-then-kill and the retry loop; everything else is final here.
 
 ```rust
 use crate::core::EngineCore;
-use crate::deadline::{retry_admitted, street_budget_ms, Deadlines};
+use crate::deadline::Deadlines;
 use crate::tree::{build_tree_full, tree_signature, TemplateSelection, TreeBuild};
 use crate::watchdog::SharedSink;
 use crate::worker::link::WorkerLinkError;
 use core_ranges::hash_scaled;
 use proto::worker::{validate_solution, AckStatus, EngineMessage, ResultStatus, SolveRequest, Stage, StreetSolution, WorkerError, WorkerMessage};
-use proto::{Card, DecisionIdentity, EffectiveTree, OrdinalPath, Rake, Range1326, RecommendationEvent, SolveInput, Street, UnsupportedReason};
+use proto::{Card, DecisionIdentity, EffectiveTree, OrdinalPath, Rake, Range1326, RecommendationEvent, SolveInput, UnsupportedReason};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
@@ -4803,9 +5027,9 @@ pub fn spot_hash(tree: &EffectiveTree, pot: u32, board: &[Card], ranges: &[Range
 fn stage_name(s: Stage) -> &'static str { match s { Stage::Building => "building", Stage::Solving => "solving", Stage::Extracting => "extracting" } }
 fn engine_error(m: impl Into<String>, retryable: bool) -> UnsupportedReason { UnsupportedReason::EngineError { message: m.into(), retryable } }
 
-enum AttemptEnd { Result { status: ResultStatus, solution: Option<StreetSolution>, error: Option<WorkerError> }, Exit(i32), Protocol(String), Heartbeat, Hang, Rejected(String), Superseded, DeadlinePassed }
+pub(crate) enum AttemptEnd { Result { status: ResultStatus, solution: Option<StreetSolution>, error: Option<WorkerError> }, Exit(i32), Protocol(String), Heartbeat, Hang, Rejected(String), Superseded, DeadlinePassed }
 
-fn request(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, b: &TreeBuild, deadline_ms: u32) -> SolveRequest {
+pub(crate) fn request(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, b: &TreeBuild, deadline_ms: u32) -> SolveRequest {
     let (rake_rate, rake_cap_mchips) = match plan.rake { Rake::PotRake { rate, cap_mchips, .. } => (rate, cap_mchips), Rake::TimeCharge => (0.0, 0) };
     SolveRequest { id: core.next_id(), spot: spot_hash(&b.tree, b.pot, &input.root.board, &input.ranges), board: input.root.board.clone(),
         oop_range: input.ranges[0].clone(), ip_range: input.ranges[1].clone(), pot: b.pot, stack_oop: input.root.stack_oop_root, stack_ip: input.root.stack_ip_root,
@@ -4813,7 +5037,201 @@ fn request(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, b: &Tree
         extraction_margin_ms: plan.deadlines.extraction_margin_ms, memory_limit_bytes: core.memory_limit_bytes, background: plan.background }
 }
 
-fn cancel_or_kill(core: &mut EngineCore, target: &str) {
+/// One send/receive cycle. Task 23 adds the heartbeat branch and the cancel-then-kill of a superseded request.
+pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &SharedSink, req: &SolveRequest) -> AttemptEnd {
+    if let Err(e) = core.worker.send(&EngineMessage::Solve(req.clone())) { return match e { WorkerLinkError::Exit { code } => AttemptEnd::Exit(code), WorkerLinkError::Eof => AttemptEnd::Exit(-1), other => AttemptEnd::Protocol(other.to_string()) }; }
+    let sent = core.clock.now_ms();
+    let expected_by = sent + req.deadline_ms as u64 + 150 + RESULT_GRACE_MS;
+    loop {
+        if !core.identity_active(&plan.identity) { return AttemptEnd::Superseded; }
+        let now = core.clock.now_ms();
+        if now >= plan.deadlines.watchdog_fire_ms() { return AttemptEnd::DeadlinePassed; }
+        if now >= expected_by { return AttemptEnd::Hang; }
+        let wait = (expected_by - now).min(plan.deadlines.watchdog_fire_ms() - now);
+        match core.worker.recv(Duration::from_millis(wait.max(1))) {
+            Ok(Some(WorkerMessage::Ack { id, status, reason, .. })) if id == req.id => { if status == AckStatus::Rejected { return AttemptEnd::Rejected(reason.unwrap_or_default()); } }
+            Ok(Some(WorkerMessage::Progress { id, stage, iterations, exploitability_chips, .. })) if id == req.id => {
+                core.set_stage(stage_name(stage));
+                sink.lock().unwrap().emit(RecommendationEvent::Progress { identity: plan.identity.clone(), stage: stage_name(stage).into(), iterations,
+                    exploitability_pct: exploitability_chips.map(|c| 100.0 * c / req.pot as f32), elapsed_ms: (core.clock.now_ms() - plan.deadlines.t0_ms) as u32 });
+            }
+            Ok(Some(WorkerMessage::Result { id, status, solution, error, .. })) if id == req.id => {
+                // A result that races a mutation is discarded, not validated (§4.4).
+                if !core.identity_active(&plan.identity) { return AttemptEnd::Superseded; }
+                return AttemptEnd::Result { status, solution, error };
+            }
+            Ok(_) => {}   // stale ids (a superseded request's replies) and stray lines are discarded
+            Err(WorkerLinkError::Exit { code }) => return AttemptEnd::Exit(code),
+            Err(WorkerLinkError::Eof) => return AttemptEnd::Exit(-1),
+            Err(e) => return AttemptEnd::Protocol(e.to_string()),
+        }
+    }
+}
+
+pub(crate) fn validate(b: &TreeBuild, plan: &SolvePlan, sol: &StreetSolution) -> Result<Vec<OrdinalPath>, String> {
+    let paths = validate_solution(sol, &b.tree.materialized)?;
+    let r = sol.requested as usize;
+    if paths.get(r) != Some(&b.decision_path) { return Err("requested node is not the decision node".into()); }
+    if sol.nodes[r].actor != plan.hero_actor { return Err(format!("requested node actor {} is not hero's {}", sol.nodes[r].actor, plan.hero_actor)); }
+    Ok(paths)
+}
+
+pub(crate) fn succeeded(core: &EngineCore, t_start: u64, b: &TreeBuild, template: &str, sol: StreetSolution, paths: Vec<OrdinalPath>, target_bp: u16, street_violation: bool, restarts: u8) -> SolveOutcome {
+    let reached_bp = Some((10_000.0 * sol.exploitability_chips / b.pot as f32).round() as u16);
+    let terminal = if sol.exploitability_chips / b.pot as f32 <= target_bp as f32 / 10_000.0 { Terminal::Ok } else { Terminal::BestSoFar };
+    SolveOutcome { terminal, decision_path: b.decision_path.clone(), tree: b.tree.clone(), solution: Some(sol), ordinal_paths: paths,
+        elapsed_ms: (core.clock.now_ms() - t_start) as u32, template_used: template.to_string(), street_violation, restarts, reached_bp }
+}
+
+pub(crate) fn failed(core: &EngineCore, t_start: u64, reason: UnsupportedReason, input: &SolveInput, template: &str, restarts: u8, street_violation: bool) -> SolveOutcome {
+    SolveOutcome { terminal: Terminal::Failed(reason), solution: None, ordinal_paths: vec![], decision_path: vec![], tree: input.tree.clone(),
+        elapsed_ms: (core.clock.now_ms() - t_start) as u32, template_used: template.to_string(), street_violation, restarts, reached_bp: None }
+}
+
+/// Maps a non-success attempt end to its §12 reason, whether a retry is allowed and whether the worker must be restarted.
+pub(crate) fn classify(end: AttemptEnd) -> (UnsupportedReason, bool, bool) {
+    match end {
+        AttemptEnd::Result { status: ResultStatus::Cancelled, .. } => (engine_error("worker cancelled the job", true), true, false),
+        AttemptEnd::Result { error: Some(e), .. } => match e.code.as_str() {
+            "tree_mismatch" | "invalid_request" | "lock_mismatch" => (engine_error(format!("{}: {}", e.code, e.message), false), false, false),
+            "no_iteration" => (UnsupportedReason::DeadlineExceeded { stage: "solving".into() }, true, false),
+            "tree_too_large" | "out_of_memory" => (UnsupportedReason::TreeTooLarge { estimate_bytes: e.estimate_bytes.unwrap_or(0) }, true, false),
+            _ => (engine_error(format!("{}: {}", e.code, e.message), e.retryable), true, false),
+        },
+        AttemptEnd::Result { .. } => (engine_error("result without solution or error", false), false, false),
+        AttemptEnd::Exit(code) => (engine_error(format!("WorkerExit{{code: {code}}}"), true), true, true),
+        AttemptEnd::Protocol(m) => (engine_error(format!("protocol error: {m}"), true), true, true),
+        AttemptEnd::Heartbeat => (engine_error("no progress for 5 s during Solving", true), true, true),
+        AttemptEnd::Hang => (engine_error("no terminal result by the worker deadline", true), true, true),
+        AttemptEnd::Rejected(r) => (engine_error(format!("solve rejected: {r}"), true), false, false),
+        AttemptEnd::Superseded => (engine_error("superseded by a newer request", false), false, false),
+        AttemptEnd::DeadlinePassed => (UnsupportedReason::DeadlineExceeded { stage: "building".into() }, false, false),
+    }
+}
+
+/// §5 step 7 / §7: one live solve with an absolute deadline. Task 23 wraps this in the retry loop.
+pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, sink: &SharedSink) -> SolveOutcome {
+    let t_start = core.clock.now_ms();
+    let template = plan.template_id.clone();
+    let b = match build_tree_full(&input.root, &TemplateSelection::from_history(&template, &input.root.history)) { Ok(b) => b, Err(r) => return failed(core, t_start, r, input, &template, 0, false) };
+    let now = core.clock.now_ms();
+    let Some(deadline_ms) = plan.deadlines.worker_deadline_ms(now, plan.deadlines.street_deadline_ms) else { return failed(core, t_start, UnsupportedReason::DeadlineExceeded { stage: core.stage() }, input, &template, 0, false) };
+    core.set_stage("building");
+    let req = request(core, input, plan, &b, deadline_ms);
+    let end = run_attempt(core, plan, sink, &req);
+    if let AttemptEnd::Result { status: ResultStatus::Ok | ResultStatus::BestSoFar, solution: Some(sol), .. } = end {
+        return match validate(&b, plan, &sol) {
+            Ok(paths) => succeeded(core, t_start, &b, &template, sol, paths, input.target_bp, false, 0),
+            Err(e) => failed(core, t_start, engine_error(format!("invalid solution: {e}"), false), input, &template, 0, false),
+        };
+    }
+    let (reason, _retry, restart) = classify(end);
+    if restart { let _ = core.worker.restart(); }
+    failed(core, t_start, reason, input, &template, restart as u8, false)
+}
+```
+
+- [ ] **Step 5: Run and commit**
+
+Run: `cargo test -p engine --features testing --test solve_client` then `cargo test --workspace --release`
+Expected: 2 passed; the workspace stays green.
+
+```bash
+git add crates/engine
+git commit -m "feat(engine): EngineCore and the run_solve happy path with absolute deadlines and stale-id discard
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+## Task 23: `run_solve` resilience: heartbeat, cancel-then-kill, `_min` retry, error-code policy
+
+**Files:**
+- Modify: `crates/engine/src/solve.rs` (`run_attempt` gains the heartbeat branch and the superseded cancel; `run_solve` becomes the two-attempt loop), `crates/engine/tests/solve_client.rs`
+- Test: `solve_client.rs::{superseded_request_cancels_then_kills_after_1_5s, heartbeat_failure_restarts_and_retries_min, error_codes_retry_policy}`
+
+**Interfaces:**
+- Consumes: Task 22's `solve.rs`; `deadline::{retry_admitted, street_budget_ms}`.
+- Produces: `solve::cancel_or_kill(&mut EngineCore, target: &str)` and the final `run_solve` semantics. No new public types.
+
+**Three corrections applied here (reviews B1, M3, M5):**
+1. **Naming.** The loop variable is `attempt_no` and the function it calls is `run_attempt`. Binding a `u8` named `attempt` in the same scope as `fn attempt` shadows the function in the value namespace, so `attempt(...)` becomes "expected function, found u8" and the crate does not compile.
+2. **Stage on retry.** `core.set_stage` only advances (Task 22's `core.rs`), so a retry that restarts at Building never rewinds a stage an earlier attempt reached. Case (c) of `final_delivery_independent_of_worker` (Task 29) therefore reports `extracting`, while case (b), which never left Building, still reports `building`.
+3. **Street violation.** §7 defines it as "no first-attempt terminal arrived by `t0 + street budget`", not "the attempt ended after it". `run_solve` records `first_attempt_terminal` (set only when attempt 0 returned an `AttemptEnd::Result`) and evaluates `street_violation = !first_attempt_terminal && now >= street_deadline_ms` at the moment it returns.
+
+- [ ] **Step 1: Failing tests (append to `crates/engine/tests/solve_client.rs`)**
+
+```rust
+#[test]
+fn superseded_request_cancels_then_kills_after_1_5s() {
+    // the mutation lands 100 ms after the ack; the client cancels, waits 1.5 s for result{cancelled}, then kills
+    let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: 100 }, FakeReply::InvalidateIdentity, FakeReply::Hang]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert!(matches!(out.terminal, Terminal::Failed(UnsupportedReason::EngineError { ref message, .. }) if message.contains("superseded")));
+    let s = r.state.lock().unwrap();
+    assert_eq!((s.cancels.len(), s.kills, s.restarts), (1, 1, 1));
+    assert!(r.clock.now_ms() >= 100 + 1500);
+    assert!(r.events.lock().unwrap().is_empty());   // nothing is emitted for a superseded identity
+}
+
+#[test]
+fn heartbeat_failure_restarts_and_retries_min() {
+    // Progress at t = 1200 ms, then nothing for 5 s: at t = 6200 the heartbeat fires, the worker is killed and
+    // respawned, and one retry with turn_min_v1 is admitted. 6200 is past the 6 s turn budget and the first attempt
+    // never produced a terminal, so the street was violated even though the retry succeeds.
+    let mut r = rig(Street::Turn, vec![ack(), FakeReply::Delay { ms: 1200 },
+        FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 1, exploitability_chips: None, elapsed_ms: 1 },
+        FakeReply::Delay { ms: 5100 }, FakeReply::Hang, ack(), ok_for(Street::Turn, "turn_min_v1", 0.4)]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!((out.terminal.clone(), out.template_used.as_str(), out.restarts), (Terminal::Ok, "turn_min_v1", 1));
+    let sent = solves(&r.state);
+    assert_eq!((sent.len(), sent[1].tree.template_id.as_str()), (2, "turn_min_v1"));
+    assert_eq!(r.clock.now_ms(), 6_200);
+    // the retry gets only the time remaining to final delivery, minus the delivery and pipe margins
+    assert_eq!(sent[1].deadline_ms, 15_000 - 6_200 - 150);
+    assert!(out.street_violation, "no first-attempt terminal arrived before t0 + 6 s");
+}
+
+#[test]
+fn error_codes_retry_policy() {
+    // tree_too_large twice: TreeTooLarge with the retry's estimate
+    let mut r = rig(Street::Turn, vec![ack(), err("tree_too_large", false, Some(9_000_000_000)), ack(), err("tree_too_large", false, Some(3_000_000_000))]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert!(matches!(out.terminal, Terminal::Failed(UnsupportedReason::TreeTooLarge { estimate_bytes: 3_000_000_000 })));
+    assert_eq!(solves(&r.state).len(), 2);
+    assert!(!out.street_violation, "the first attempt produced a terminal well inside the 6 s budget");
+    // no_iteration: not retried on the same template, the _min template is tried
+    let mut r = rig(Street::Turn, vec![ack(), err("no_iteration", false, None), ack(), ok_for(Street::Turn, "turn_min_v1", 0.4)]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!((out.terminal, out.template_used.as_str(), out.restarts), (Terminal::Ok, "turn_min_v1", 0));
+    // tree_mismatch: never retried, non-retryable EngineError, exactly one solve
+    let mut r = rig(Street::River, vec![ack(), err("tree_mismatch", false, None)]);
+    assert!(matches!(run_solve(&mut r.core, &r.input, &r.plan, &r.sink).terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: false, .. })));
+    assert_eq!(solves(&r.state).len(), 1);
+    // worker exit: restart and retry with _min; a second failure is a retryable EngineError
+    let mut r = rig(Street::River, vec![ack(), FakeReply::Eof, ack(), FakeReply::Eof]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert!(matches!(out.terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: true, .. })));
+    assert_eq!((out.restarts, r.state.lock().unwrap().restarts), (2, 2));
+    // a rejected ack (busy) frees nothing by itself: the outcome is a retryable EngineError and no result was accepted
+    let mut r = rig(Street::River, vec![FakeReply::Ack { id: IdRef::Last, status: AckStatus::Rejected, reason: Some("busy".into()) }]);
+    assert!(matches!(run_solve(&mut r.core, &r.input, &r.plan, &r.sink).terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: true, .. })));
+}
+```
+
+- [ ] **Step 2: Run to see them fail**
+
+Run: `cargo test -p engine --features testing --test solve_client`
+Expected: FAIL (`run_solve` makes a single attempt and never cancels, restarts or retries).
+
+- [ ] **Step 3: Add the heartbeat and the cancel-then-kill to `solve.rs`**
+
+Add `use crate::deadline::{retry_admitted, street_budget_ms};` to the imports and replace `run_attempt`, adding `cancel_or_kill` above it:
+
+```rust
+/// Cancel-then-kill of §7/§12: send `cancel`, allow at most 1.5 s for `result{cancelled}`, then kill and restart.
+pub(crate) fn cancel_or_kill(core: &mut EngineCore, target: &str) {
     let id = core.next_id();
     if core.worker.send(&EngineMessage::Cancel { id, target: target.to_string() }).is_err() { let _ = core.worker.restart(); return; }
     let until = core.clock.now_ms() + CANCEL_KILL_MS;
@@ -4828,7 +5246,7 @@ fn cancel_or_kill(core: &mut EngineCore, target: &str) {
     }
 }
 
-fn attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &SharedSink, req: &SolveRequest) -> AttemptEnd {
+pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &SharedSink, req: &SolveRequest) -> AttemptEnd {
     if let Err(e) = core.worker.send(&EngineMessage::Solve(req.clone())) { return match e { WorkerLinkError::Exit { code } => AttemptEnd::Exit(code), WorkerLinkError::Eof => AttemptEnd::Exit(-1), other => AttemptEnd::Protocol(other.to_string()) }; }
     let sent = core.clock.now_ms();
     let expected_by = sent + req.deadline_ms as u64 + 150 + RESULT_GRACE_MS;
@@ -4848,104 +5266,88 @@ fn attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &SharedSink, req: &Sol
                 sink.lock().unwrap().emit(RecommendationEvent::Progress { identity: plan.identity.clone(), stage: stage_name(stage).into(), iterations,
                     exploitability_pct: exploitability_chips.map(|c| 100.0 * c / req.pot as f32), elapsed_ms: (last_progress - plan.deadlines.t0_ms) as u32 });
             }
-            Ok(Some(WorkerMessage::Result { id, status, solution, error, .. })) if id == req.id => return AttemptEnd::Result { status, solution, error },
-            Ok(_) => {}   // stale ids (a superseded request's replies) and stray lines are discarded
+            Ok(Some(WorkerMessage::Result { id, status, solution, error, .. })) if id == req.id => {
+                // A result that races a mutation is discarded, not validated (§4.4).
+                if !core.identity_active(&plan.identity) { cancel_or_kill(core, &req.id); return AttemptEnd::Superseded; }
+                return AttemptEnd::Result { status, solution, error };
+            }
+            Ok(_) => {}
             Err(WorkerLinkError::Exit { code }) => return AttemptEnd::Exit(code),
             Err(WorkerLinkError::Eof) => return AttemptEnd::Exit(-1),
             Err(e) => return AttemptEnd::Protocol(e.to_string()),
         }
     }
 }
+```
 
-fn validate(b: &TreeBuild, plan: &SolvePlan, sol: &StreetSolution) -> Result<Vec<OrdinalPath>, String> {
-    let paths = validate_solution(sol, &b.tree.materialized)?;
-    let r = sol.requested as usize;
-    if paths.get(r) != Some(&b.decision_path) { return Err("requested node is not the decision node".into()); }
-    if sol.nodes[r].actor != plan.hero_actor { return Err(format!("requested node actor {} is not hero's {}", sol.nodes[r].actor, plan.hero_actor)); }
-    Ok(paths)
-}
+- [ ] **Step 4: Replace `run_solve` with the two-attempt loop**
 
+```rust
 /// §5 step 7 / §7 / §12: one live solve, absolute deadlines, heartbeat, cancel-then-kill, one `_min` retry under admission.
 pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, sink: &SharedSink) -> SolveOutcome {
     let t_start = core.clock.now_ms();
     let mut restarts = 0u8;
-    let mut street_violation = false;
+    let mut first_attempt_terminal = false;
     let mut template = plan.template_id.clone();
-    let mut b = match build_tree_full(&input.root, &TemplateSelection::from_history(&template, &input.root.history)) { Ok(b) => b, Err(r) => return failed(core, t_start, r, input, &template, restarts, street_violation) };
-    for attempt in 0..2u8 {
-        let until = if attempt == 0 { plan.deadlines.street_deadline_ms } else { plan.deadlines.final_delivery_ms };
+    // §7: the violation is "no FIRST-ATTEMPT terminal by the street deadline", evaluated when the solve returns.
+    let violated = |core: &EngineCore, first: bool| !first && core.clock.now_ms() >= plan.deadlines.street_deadline_ms;
+    let mut b = match build_tree_full(&input.root, &TemplateSelection::from_history(&template, &input.root.history)) { Ok(b) => b, Err(r) => return failed(core, t_start, r, input, &template, restarts, violated(core, first_attempt_terminal)) };
+    for attempt_no in 0..2u8 {
+        let until = if attempt_no == 0 { plan.deadlines.street_deadline_ms } else { plan.deadlines.final_delivery_ms };
         let now = core.clock.now_ms();
-        let Some(deadline_ms) = plan.deadlines.worker_deadline_ms(now, until) else { return failed(core, t_start, UnsupportedReason::DeadlineExceeded { stage: core.stage.lock().unwrap().clone() }, input, &template, restarts, street_violation) };
-        core.set_stage("building");
+        let Some(deadline_ms) = plan.deadlines.worker_deadline_ms(now, until) else { return failed(core, t_start, UnsupportedReason::DeadlineExceeded { stage: core.stage() }, input, &template, restarts, violated(core, first_attempt_terminal)) };
+        core.set_stage("building");                       // advances only; a retry never rewinds the reported stage
         let req = request(core, input, plan, &b, deadline_ms);
-        let end = attempt(core, plan, sink, &req);
-        if attempt == 0 && core.clock.now_ms() > plan.deadlines.street_deadline_ms { street_violation = true; }
-        // classify: Ok(outcome) | Err((reason, retry allowed, restart needed, tree_too_large))
-        let failure: (UnsupportedReason, bool, bool) = match end {
-            AttemptEnd::Result { status: ResultStatus::Ok | ResultStatus::BestSoFar, solution: Some(sol), .. } => match validate(&b, plan, &sol) {
-                Ok(paths) => {
-                    let reached_bp = Some((10_000.0 * sol.exploitability_chips / b.pot as f32).round() as u16);
-                    let terminal = if sol.exploitability_chips / b.pot as f32 <= input.target_bp as f32 / 10_000.0 { Terminal::Ok } else { Terminal::BestSoFar };
-                    return SolveOutcome { terminal, decision_path: b.decision_path.clone(), tree: b.tree.clone(), solution: Some(sol), ordinal_paths: paths, elapsed_ms: (core.clock.now_ms() - t_start) as u32, template_used: template, street_violation, restarts, reached_bp };
-                }
-                Err(e) => (engine_error(format!("invalid solution: {e}"), false), false, false),
-            },
-            AttemptEnd::Result { status: ResultStatus::Cancelled, .. } => (engine_error("worker cancelled the job", true), true, false),
-            AttemptEnd::Result { error: Some(e), .. } => match e.code.as_str() {
-                "tree_mismatch" | "invalid_request" | "lock_mismatch" => (engine_error(format!("{}: {}", e.code, e.message), false), false, false),
-                "no_iteration" => (UnsupportedReason::DeadlineExceeded { stage: "solving".into() }, true, false),
-                "tree_too_large" | "out_of_memory" => (UnsupportedReason::TreeTooLarge { estimate_bytes: e.estimate_bytes.unwrap_or(0) }, true, false),
-                _ => (engine_error(format!("{}: {}", e.code, e.message), e.retryable), true, false),
-            },
-            AttemptEnd::Result { .. } => (engine_error("result without solution or error", false), false, false),
-            AttemptEnd::Exit(code) => (engine_error(format!("WorkerExit{{code: {code}}}"), true), true, true),
-            AttemptEnd::Protocol(m) => (engine_error(format!("protocol error: {m}"), true), true, true),
-            AttemptEnd::Heartbeat => (engine_error("no progress for 5 s during Solving", true), true, true),
-            AttemptEnd::Hang => (engine_error("no terminal result by the worker deadline", true), true, true),
-            AttemptEnd::Rejected(r) => (engine_error(format!("solve rejected: {r}"), true), false, false),
-            AttemptEnd::Superseded => return failed(core, t_start, engine_error("superseded by a newer request", false), input, &template, restarts, street_violation),
-            AttemptEnd::DeadlinePassed => return failed(core, t_start, UnsupportedReason::DeadlineExceeded { stage: core.stage.lock().unwrap().clone() }, input, &template, restarts, street_violation),
-        };
-        let (reason, retry_allowed, restart) = failure;
-        if restart { restarts += 1; if core.worker.restart().is_err() { return failed(core, t_start, engine_error("worker restart failed", false), input, &template, restarts, street_violation); } }
-        let Some(retry) = plan.retry_template_id.as_deref().filter(|_| attempt == 0 && retry_allowed) else { return failed(core, t_start, reason, input, &template, restarts, street_violation) };
+        let end = run_attempt(core, plan, sink, &req);
+        if attempt_no == 0 && matches!(end, AttemptEnd::Result { .. }) { first_attempt_terminal = true; }
+        if let AttemptEnd::Result { status: ResultStatus::Ok | ResultStatus::BestSoFar, solution: Some(sol), .. } = end {
+            let sv = violated(core, first_attempt_terminal);
+            return match validate(&b, plan, &sol) {
+                Ok(paths) => succeeded(core, t_start, &b, &template, sol, paths, input.target_bp, sv, restarts),
+                Err(e) => failed(core, t_start, engine_error(format!("invalid solution: {e}"), false), input, &template, restarts, sv),
+            };
+        }
+        let deadline_passed = matches!(end, AttemptEnd::DeadlinePassed);
+        let (reason, retry_allowed, restart) = classify(end);
+        let sv = violated(core, first_attempt_terminal);
+        if deadline_passed { return failed(core, t_start, UnsupportedReason::DeadlineExceeded { stage: core.stage() }, input, &template, restarts, sv); }
+        if !retry_allowed && matches!(reason, UnsupportedReason::EngineError { ref message, .. } if message.contains("superseded")) { return failed(core, t_start, reason, input, &template, restarts, sv); }
+        if restart { restarts += 1; if core.worker.restart().is_err() { return failed(core, t_start, engine_error("worker restart failed", false), input, &template, restarts, sv); } }
+        let Some(retry) = plan.retry_template_id.as_deref().filter(|_| attempt_no == 0 && retry_allowed) else { return failed(core, t_start, reason, input, &template, restarts, sv) };
         let now = core.clock.now_ms();
-        let p95 = core.bench_p95_ms.get(retry).copied().unwrap_or_else(|| street_budget_ms(input.root.street, 10));
-        if !retry_admitted(now, plan.deadlines.final_delivery_ms, p95, plan.deadlines.extraction_margin_ms) { return failed(core, t_start, reason, input, &template, restarts, street_violation); }
+        // §7 retry admission; the street budget stands in for the measured `_min` p95 until plan 4's matrix exists.
+        let p95 = street_budget_ms(input.root.street, 10);
+        if !retry_admitted(now, plan.deadlines.final_delivery_ms, p95, plan.deadlines.extraction_margin_ms) { return failed(core, t_start, reason, input, &template, restarts, sv); }
         template = retry.to_string();
-        b = match build_tree_full(&input.root, &TemplateSelection::from_history(&template, &input.root.history)) { Ok(b) => b, Err(r) => return failed(core, t_start, r, input, &template, restarts, street_violation) };
+        b = match build_tree_full(&input.root, &TemplateSelection::from_history(&template, &input.root.history)) { Ok(b) => b, Err(r) => return failed(core, t_start, r, input, &template, restarts, sv) };
     }
-    failed(core, t_start, engine_error("retry exhausted", true), input, &template, restarts, street_violation)
-}
-
-fn failed(core: &EngineCore, t_start: u64, reason: UnsupportedReason, input: &SolveInput, template: &str, restarts: u8, street_violation: bool) -> SolveOutcome {
-    let _ = Street::River;
-    SolveOutcome { terminal: Terminal::Failed(reason), solution: None, ordinal_paths: vec![], decision_path: vec![], tree: input.tree.clone(), elapsed_ms: (core.clock.now_ms() - t_start) as u32, template_used: template.to_string(), street_violation, restarts, reached_bp: None }
+    let sv = violated(core, first_attempt_terminal);
+    failed(core, t_start, engine_error("retry exhausted", true), input, &template, restarts, sv)
 }
 ```
 
 - [ ] **Step 5: Run and commit**
 
-Run: `cargo test -p engine --features testing --test solve_client`
-Expected: 5 passed. In `heartbeat_failure_restarts_and_retries_min` the fake clock reaches 5101 ms before the heartbeat fires, still inside the turn's 15 s final delivery, so the retry is admitted with `p95 = 6000` (no bench report): `15000 - 5101 >= 6000 + 350`.
+Run: `cargo test -p engine --features testing --test solve_client` then `cargo test --workspace --release`
+Expected: 5 passed. In `heartbeat_failure_restarts_and_retries_min` the fake clock reaches 6 200 ms when the heartbeat fires, still inside the turn's 15 s final delivery, so the retry is admitted with `p95 = 6000`: `15000 - 6200 = 8800 >= 6000 + 350`.
 
 ```bash
 git add crates/engine
-git commit -m "feat(engine): absolute deadlines, watchdog, EngineCore and run_solve with heartbeat, cancel-kill and _min retry
+git commit -m "feat(engine): run_solve heartbeat, cancel-then-kill, _min retry and the section 12 error-code policy
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
 
 ---
 
-## Task 17: Coverage classifier (§6) and `coverage_classification_golden`
+## Task 24: Coverage classifier (§6) and `coverage_classification_golden`
 
 **Files:**
 - Create: `crates/engine/src/coverage.rs`, `crates/engine/tests/coverage.rs`, `crates/engine/tests/golden/coverage_classification_golden.json`
 - Modify: `crates/engine/src/lib.rs` (`pub mod coverage;`), `crates/engine/src/testing.rs` (hand builders)
 
 **Interfaces:**
-- Consumes: `core_model::{begin_hand, apply_action, set_board, derive, street_root, RootError, BeginHand}`; `proto::{HandState, Derived, StreetRootSnapshot, ApproxReason, UnsupportedReason, Street, Seat}`.
+- Consumes: `core_model::{begin_hand, apply_action, set_board, derive, street_root, RootError, BeginHand}`; `proto::{HandState, Derived, StreetRootSnapshot, ApproxReason, UnsupportedReason, Street, Seat}`. `RootError` has the five resolved variants `{Multiway{pot_eligible: u8}, ProjectionNotReproducing{step: u32}, NoDecision, Preflop, Inconsistent{step: u32}}` (cross-plan M7 / spec S2) and `core_model::BeginHand` carries `hand_id` and `stacks_start` (cross-plan M6).
 - Produces: `coverage::{Classification::{NoDecision{reason: String}, Preflop, HuStreet{root: StreetRootSnapshot, reasons: Vec<ApproxReason>, facing_allin: bool, opponent: Seat}, Multiway{pot_eligible: u8}, Unsupported(UnsupportedReason)}, classify(&HandState) -> Classification, pot_eligible(&Derived) -> u8, decision_point(&HandState, &Derived) -> Result<(), String>, seat_index(&HandState, Seat) -> usize}`; `testing::{cfg_1_2() -> (GameConfig, HandConfig), hand(dealt_stacks: &[(Seat, u32)], button: Seat, hero: Seat, hero_cards: Option<[Card; 2]>) -> HandState, play(state, actions: &[Action]) -> HandState, board(state, &str) -> HandState}`.
 
 - [ ] **Step 1: Failing golden test `crates/engine/tests/coverage.rs`**
@@ -5092,8 +5494,11 @@ pub fn classify(state: &HandState) -> Classification {
             Classification::HuStreet { root, reasons, facing_allin, opponent }
         }
         Err(RootError::ProjectionNotReproducing { step }) => Classification::Unsupported(UnsupportedReason::UnsupportedHistory { reason: format!("multiway street root not reproducible at step {step}") }),
-        Err(RootError::Multiway) => Classification::Multiway { pot_eligible: n },
+        Err(RootError::Multiway { pot_eligible }) => Classification::Multiway { pot_eligible },
         Err(RootError::NoDecision) => Classification::NoDecision { reason: "no decision at the street root".into() },
+        Err(RootError::Preflop) => Classification::Preflop,
+        // §10.2: a genuine HU root that does not replay is an engine defect, not an unsupported history.
+        Err(RootError::Inconsistent { step }) => Classification::Unsupported(UnsupportedReason::EngineError { message: format!("street root does not replay at step {step}"), retryable: false }),
     }
 }
 ```
@@ -5112,7 +5517,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Task 18: Equity adapter and the facing-all-in analytic fallback (`facing_allin_golden`)
+## Task 25: Equity adapter and the facing-all-in analytic fallback (`facing_allin_golden`)
 
 **Files:**
 - Create: `crates/engine/src/equity.rs`, `crates/engine/src/allin.rs`, `crates/engine/tests/facing_allin.rs`
@@ -5260,7 +5665,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Task 19: Result assembly, headline rules, reason accumulation, equity merge (`recommendation_assembly_golden`)
+## Task 26: Result assembly, headline rules, reason accumulation, equity merge (`recommendation_assembly_golden`)
 
 **Files:**
 - Create: `crates/engine/src/assemble.rs`, `crates/engine/tests/assembly.rs`, `crates/engine/tests/golden/recommendation_assembly_golden.json` (recorded on the first green run)
@@ -5495,104 +5900,6 @@ Expected: PASS; the recorded `recommendation_assembly_golden.json` must show `co
 ```bash
 git add crates/engine
 git commit -m "feat(engine): recommendation assembly, headline rules, reason accumulation and equity merge
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
-```
-
----
-
-## Task 20: Decision log (§5 step 10)
-
-**Files:**
-- Create: `crates/engine/src/log.rs`
-- Modify: `crates/engine/src/lib.rs` (`pub mod log;`), `crates/engine/src/core.rs` (add `pub log: DecisionLog` and a `with_log` constructor argument)
-
-**Interfaces:**
-- Produces: `log::{DecisionRecord { identity, street, coverage, reasons: Vec<ApproxReason>, elapsed_ms: u32, cache: String, presolver_scenario: Option<String>, tier: Option<u8>, reached_bp: Option<u16>, street_violation: bool, final_violation: bool, template_id: String, input: InputRecord }, InputRecord { version: u16 (1), config: HandConfig, button: Seat, hero: Seat, dealt: Vec<Seat>, stacks_start: Vec<u32>, hero_cards: Option<[Card; 2]>, actions: Vec<TakenAction>, board: Vec<Card>, range_hashes: Vec<String> }, InputRecord::from_state(&HandState, range_hashes: Vec<String>) -> InputRecord, DecisionLog::open(dir: &Path) -> DecisionLog, DecisionLog::with_limits(dir, rotate_bytes: u64, keep_files: usize) -> DecisionLog, DecisionLog::append(&mut self, &DecisionRecord), ROTATE_BYTES = 50 MiB, KEEP_FILES = 10}`; `EngineCore::new(worker, clock, identity, log: DecisionLog)`.
-
-- [ ] **Step 1: Failing unit test (bottom of `log.rs`)**
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn rec(i: u64) -> DecisionRecord {
-        let (_, hc) = crate::testing::cfg_1_2();
-        DecisionRecord { identity: proto::DecisionIdentity { hand_id: i, hand_revision: 1, decision_id: i, config_revision: 1, model_revision: 0 }, street: proto::Street::River, coverage: proto::Coverage::Exact, reasons: vec![], elapsed_ms: 12, cache: "miss".into(), presolver_scenario: None, tier: None, reached_bp: Some(30), street_violation: false, final_violation: false, template_id: "river_std_v1".into(),
-            input: InputRecord { version: 1, config: hc, button: proto::Seat(0), hero: proto::Seat(2), dealt: vec![], stacks_start: vec![], hero_cards: None, actions: vec![], board: vec![], range_hashes: vec!["x".repeat(64)] } }
-    }
-    #[test]
-    fn appends_jsonl_and_rotates() {
-        let dir = std::env::temp_dir().join(format!("pokerai_log_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut log = DecisionLog::with_limits(&dir, 2_000, 3);
-        for i in 0..40 { log.append(&rec(i)); }
-        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-        assert!(names.contains(&"decisions.jsonl".to_string()) && names.contains(&"decisions.1.jsonl".to_string()));
-        assert!(names.len() <= 3, "{names:?}");
-        let first = std::fs::read_to_string(dir.join("decisions.jsonl")).unwrap();
-        let last: DecisionRecord = serde_json::from_str(first.lines().last().unwrap()).unwrap();
-        assert_eq!(last.identity.decision_id, 39);
-    }
-}
-```
-
-- [ ] **Step 2: Implement `log.rs`**
-
-```rust
-//! §5 step 10: `%LOCALAPPDATA%\PokerAI\decisions.jsonl`, rotated at 50 MiB, 10 files; a write failure is logged once per session.
-use proto::{ApproxReason, Card, Coverage, DecisionIdentity, HandConfig, HandState, Seat, Street, TakenAction};
-use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-
-pub const ROTATE_BYTES: u64 = 50 << 20;
-pub const KEEP_FILES: usize = 10;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InputRecord { pub version: u16, pub config: HandConfig, pub button: Seat, pub hero: Seat, pub dealt: Vec<Seat>, pub stacks_start: Vec<u32>, pub hero_cards: Option<[Card; 2]>, pub actions: Vec<TakenAction>, pub board: Vec<Card>, pub range_hashes: Vec<String> }
-impl InputRecord {
-    pub fn from_state(s: &HandState, range_hashes: Vec<String>) -> Self {
-        Self { version: 1, config: s.config.clone(), button: s.button, hero: s.hero, dealt: s.dealt.clone(), stacks_start: s.stacks_start.clone(), hero_cards: s.hero_cards, actions: s.actions.clone(), board: s.board.clone(), range_hashes }
-    }
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DecisionRecord { pub identity: DecisionIdentity, pub street: Street, pub coverage: Coverage, pub reasons: Vec<ApproxReason>, pub elapsed_ms: u32, pub cache: String, pub presolver_scenario: Option<String>, pub tier: Option<u8>, pub reached_bp: Option<u16>, pub street_violation: bool, pub final_violation: bool, pub template_id: String, pub input: InputRecord }
-
-pub struct DecisionLog { dir: PathBuf, rotate_bytes: u64, keep: usize, failed_once: bool }
-impl DecisionLog {
-    pub fn open(dir: &Path) -> Self { Self::with_limits(dir, ROTATE_BYTES, KEEP_FILES) }
-    pub fn with_limits(dir: &Path, rotate_bytes: u64, keep: usize) -> Self { Self { dir: dir.to_path_buf(), rotate_bytes, keep, failed_once: false } }
-    fn path(&self, k: usize) -> PathBuf { if k == 0 { self.dir.join("decisions.jsonl") } else { self.dir.join(format!("decisions.{k}.jsonl")) } }
-    fn rotate(&self) -> std::io::Result<()> {
-        let _ = std::fs::remove_file(self.path(self.keep - 1));
-        for k in (1..self.keep).rev() { let from = self.path(k - 1); if from.exists() { std::fs::rename(&from, self.path(k))?; } }
-        Ok(())
-    }
-    pub fn append(&mut self, rec: &DecisionRecord) {
-        let result = (|| -> std::io::Result<()> {
-            std::fs::create_dir_all(&self.dir)?;
-            let current = self.path(0);
-            if current.exists() && std::fs::metadata(&current)?.len() >= self.rotate_bytes { self.rotate()?; }
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&current)?;
-            f.write_all(serde_json::to_string(rec).map_err(std::io::Error::other)?.as_bytes())?;
-            f.write_all(b"\n")
-        })();
-        if let Err(e) = result { if !self.failed_once { eprintln!("decision log write failed (further failures not reported): {e}"); self.failed_once = true; } }
-    }
-}
-```
-
-In `core.rs` add `pub log: DecisionLog` to `EngineCore` and the parameter `log: DecisionLog` to `EngineCore::new` (the Task 16 test rigs pass `DecisionLog::open(&std::env::temp_dir().join("pokerai_test_log"))`).
-
-- [ ] **Step 3: Run and commit**
-
-Run: `cargo test -p engine --features testing`
-Expected: all green (update `solve_client.rs`'s `rig` for the new constructor argument).
-
-```bash
-git add crates/engine
-git commit -m "feat(engine): rotating decisions.jsonl log with the versioned input record
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
@@ -6061,7 +6368,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-## Task 22: `bench run` for the river and turn suites with the §13.5 report
+## Task 30: `bench run` for the river and turn suites with the §13.5 report
 
 **Files:**
 - Create: `crates/bench/src/runner.rs`, `crates/bench/src/report.rs`

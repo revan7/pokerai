@@ -1606,7 +1606,7 @@ git commit -m 'feat(engine): apply flop budgets and measured template policy' -m
 
 **Files:** Modify `crates/engine/src/{core,flop,cache_bridge,log,serve,solve}.rs`, `crates/engine/tests/{flop_path_golden,support/mod}.rs`; create `crates/engine/tests/golden/flop_path.json`.
 
-**Interfaces:** Consumes `Cache::lookup`, `Cache::store`, `cache_bridge::{key_and_source,make_cache_query}` (Task 7), Plan 2's `serve::serve_request`, `solve::{run_solve,SolvePlan,Terminal,SolveOutcome}`, `watchdog::Armed.retained`, `assemble::{accumulate,final_from_solution,hero_reach}`, `tree::{build_tree_full,tree_signature,TemplateSelection}`, `engine::snapshots::register_snapshot`, `SolveInput`. Produces `flop::{CacheRoute::{Final(CacheHit),Refine{retained:Option<CacheHit>}}, choose_cache_route(Vec<Lookup>)->CacheRoute, cacheable(Street,bool,u16,bool)->bool, is_street_violation(Street,bool,bool,bool)->bool}`; `serve::{CACHE_BUDGET_MS, Probe, probe_cache, cache_phase, cache_label_for}`; `cache_bridge::{entry_from_solution(input:&SolveInput,solution:&StreetSolution,reasons:&[ApproxReason],bb_chips:u32,rake:&Rake,signature:&str,perm:&SuitPerm,elapsed_ms:u32,target_bp:u16)->Result<CacheEntry,UnsupportedReason>, snapshot_from_hit(identity:&DecisionIdentity,input:&SolveInput,hit:&CacheHit,origin:&str)->StreetSnapshot}`; harness `support::run_flop_script(cache:Vec<Lookup>,raw:f32,status:&str)->Vec<RecommendationEvent>` uses the existing fake worker with a complete validated payload and does not mock the engine result.
+**Interfaces:** Consumes `Cache::lookup`, `Cache::store`, `cache_bridge::{key_and_source,make_cache_query}` (Task 7), Plan 2's `serve::serve_request`, `solve::{run_solve,SolvePlan,Terminal,SolveOutcome}`, `watchdog::Armed.retained`, `assemble::{accumulate,final_from_solution,hero_reach}`, `tree::{build_tree_full,tree_signature,TemplateSelection}`, Plan 3 Task 18's `Engine::register_snapshot` / `SnapshotStore::register`, `SolveInput`. Produces `flop::{CacheRoute::{Final(CacheHit),Refine{retained:Option<CacheHit>}}, choose_cache_route(Vec<Lookup>)->CacheRoute, cacheable(Street,bool,u16,bool)->bool, is_street_violation(Street,bool,bool,bool)->bool}`; `serve::{CACHE_BUDGET_MS, Probe, probe_cache, cache_phase, cache_label_for}`; `cache_bridge::{entry_from_solution(input:&SolveInput,solution:&StreetSolution,reasons:&[ApproxReason],bb_chips:u32,rake:&Rake,signature:&str,perm:&SuitPerm,elapsed_ms:u32,target_bp:u16)->Result<CacheEntry,UnsupportedReason>, snapshot_from_hit(identity:&DecisionIdentity,input:&SolveInput,hit:&CacheHit,origin:&str)->StreetSnapshot}`; and the `crates/engine/tests/support/mod.rs` harness `{run_flop_script(cache:Vec<Lookup>,raw:f32,status:&str)->Vec<RecommendationEvent>, final_count(&[RecommendationEvent])->usize, provisional_hit(raw_over_p:f64)->CacheHit, exact_hit()->Vec<Lookup>, approximate_hit()->Vec<Lookup>, provisional_route()->Vec<Lookup>, solve_input_for(&CacheQuery)->SolveInput}`. `run_flop_script` seeds the rig's cache directory so `Cache::lookup` really returns the scripted results, then drives Plan 2's existing fake worker with a complete validated payload; it never mocks the engine result.
 
 `cache::lookup::{Lookup, CacheHit}` gain `#[derive(Clone)]` in this task so a probe list can be inspected after routing.
 
@@ -1947,10 +1947,13 @@ if let (Terminal::Ok|Terminal::BestSoFar,Some(sol))=(&out.terminal,&out.solution
 - [ ] **Step 5 (5 min): Complete flop-path goldens.** Cases: exact synthetic hit (no reasons), chart hit (`ChartRounded`), SPR-only, menu-only, both, provisional->ok, provisional->no_iteration, cold SRP best_so_far, cold SRP raw-target ok, 3-bet fast, stale hit/result discarded, missed actor/path, disk blocked, turn store, river no store. Freeze canonical event projections (phase, identity, reasons, actions/EVs, mode, `assumptions.cache`, snapshot origin) in `flop_path.json`; exclude wall-clock nondeterminism. Assert exactly one Final at or before watchdog expiry even when the cache reader stays blocked.
 
 ```rust
-fn final_count(events:&[proto::RecommendationEvent])->usize {
+// crates/engine/tests/support/mod.rs
+pub fn final_count(events:&[proto::RecommendationEvent])->usize {
     events.iter().filter(|e|matches!(e,proto::RecommendationEvent::Final(_))).count()
 }
+```
 
+```rust
 #[test]
 fn cache_labels_are_recorded_for_every_route() {
     for (route,expected) in [
@@ -1963,7 +1966,7 @@ fn cache_labels_are_recorded_for_every_route() {
         let last=events.iter().rev().find_map(|e|match e {
             proto::RecommendationEvent::Final(r)=>Some(r),_=>None}).unwrap();
         assert_eq!(last.assumptions.cache,expected);
-        assert_eq!(final_count(&events),1);
+        assert_eq!(support::final_count(&events),1);
     }
 }
 ```
@@ -1982,7 +1985,7 @@ Cross-plan Or1/R4 and review m6: no earlier plan builds the `experimental` block
 
 **Files:** Create `crates/engine/src/experimental.rs`, `crates/engine/tests/experimental_surrogate.rs`, `crates/engine/tests/golden/experimental_surrogate.json`; modify `crates/engine/src/{lib,serve,equity}.rs`, `crates/engine/tests/support/mod.rs`.
 
-**Interfaces:** Consumes `proto::{ExperimentalHu, EXPERIMENTAL_NOTE, ActionAdvice, Derived, Seat, Range1326}`, `core_eval::{EquityRequest, PlayerRange, EquityMode, EquityStatus, equity, exact_cost}`, Plan 2's `deadline::Deadlines`, `solve::{run_solve, SolvePlan, Terminal}`, `tree::{materialize_at, Templates, TemplateSelection, build_tree_full}`, `assemble::advice_rows`. Produces `equity::range_vs_range(&Range1326,&Range1326,&[Card],Duration,&AtomicBool)->Option<f32>`; `experimental::{SurrogateInput{hero:Seat,opponent:Seat,pot:u32,stack:u32,hero_role:&'static str,template_id:String}, choose_opponent(hero:Seat,hero_public:&Range1326,others:&[(Seat,Range1326)],board:&[Card],budget:Duration,cancel:&AtomicBool)->Option<Seat>, surrogate_input(d:&Derived,state:&HandState,hero:Seat,opponent:Seat,street:Street,template_id:&str)->Option<SurrogateInput>, run_surrogate(core:&mut EngineCore,input:&SurrogateInput,ranges:[Range1326;2],board:&[Card],deadlines:&Deadlines,identity:&DecisionIdentity,sink:&SharedSink)->Option<ExperimentalHu>}`.
+**Interfaces:** Consumes `proto::{ExperimentalHu, EXPERIMENTAL_NOTE, ActionAdvice, Derived, Seat, Range1326}`, `core_eval::{EquityRequest, PlayerRange, EquityMode, EquityStatus, equity, exact_cost}`, Plan 2's `deadline::Deadlines`, `solve::{run_solve, SolvePlan, Terminal}`, `tree::{materialize_at, Templates, TemplateSelection, build_tree_full}`, `assemble::advice_rows`. Produces `equity::range_vs_range(&Range1326,&Range1326,&[Card],Duration,&AtomicBool)->Option<f32>`; `experimental::{SurrogateInput{hero:Seat,opponent:Seat,pot:u32,stack:u32,hero_role:&'static str,template_id:String}, choose_opponent(hero:Seat,hero_public:&Range1326,others:&[(Seat,Range1326)],board:&[Card],budget:Duration,cancel:&AtomicBool)->Option<Seat>, surrogate_input(d:&Derived,state:&HandState,hero:Seat,opponent:Seat,street:Street,template_id:&str)->Option<SurrogateInput>, run_surrogate(core:&mut EngineCore,input:&SurrogateInput,ranges:[Range1326;2],board:&[Card],deadlines:&Deadlines,identity:&DecisionIdentity,sink:&SharedSink)->Option<ExperimentalHu>}`; and the `crates/engine/tests/support/mod.rs` helpers `{three_way_flop()->HandState, three_way_turn()->HandState, three_way_river()->HandState, three_way_flop_with_all_in_opponent()->HandState, street_root_public_ranges(&HandState)->RootRanges2{hero:Range1326,others:Vec<(Seat,Range1326)>}, run_three_way_flop_script(&HandState)->Vec<RecommendationEvent>, snapshot_count(&HandState)->usize, cache_entry_count()->usize}`, all built on Plan 2's `FakeWorker`/`FakeClock` and the rig's temporary cache directory.
 
 - [ ] **Step 1 (4 min): Write `experimental_surrogate_golden` with the spec's three-way flop.**
 
@@ -2568,8 +2571,8 @@ impl Queue {
             item.status=TaskStatus::Failed{n};
             item.last_error=Some(error);
             item.retry_after_unix_ms=match retry_delay(n) {
-                Some(d)=>now_ms.saturating_add(d.as_millis() as u64),u64::MAX=>u64::MAX,
-                None=>u64::MAX,
+                Some(d)=>now_ms.saturating_add(d.as_millis() as u64),
+                None=>u64::MAX,          // the fourth failure is terminal
             };
         }
     }
@@ -2603,7 +2606,7 @@ impl Queue {
 }
 ```
 
-The `u64::MAX=>u64::MAX` arm above is written as a single `None => u64::MAX` arm in the implementation; `retry_delay` returns `None` exactly once the fourth attempt has failed. `queue.json` is written through Task 6's `write_atomic`. A successful worker terminal is not sufficient for `Done`: validate the solution, await the writer receipt, then read and validate the exact normalized scenario identity at raw `<= 0.005` before calling `record_done`. A read-only cache or full disk leaves the item Pending or Failed; corrupt, evicted or stale-range entries move Done back to Pending on startup and on periodic reconciliation.
+`retry_delay` returns `None` exactly once the fourth attempt has failed, which is why that arm parks the item at `u64::MAX`. `queue.json` is written through Task 6's `write_atomic`. A successful worker terminal is not sufficient for `Done`: validate the solution, await the writer receipt, then read and validate the exact normalized scenario identity at raw `<= 0.005` before calling `record_done`. A read-only cache or full disk leaves the item Pending or Failed; corrupt, evicted or stale-range entries move Done back to Pending on startup and on periodic reconciliation.
 
 - [ ] **Step 5 (4 min): Test persistence roundtrip.** Save the cursor after tier 1 board 0 scenario 2, reopen, verify the next job is scenario 2 and that completed earlier entries are not repeated. Delete its cache cell then reconcile: Pending. Replace the source bundle hash: a new identity, and old entries stay isolated. Simulate a crash before and after the entry rename and before the queue save: neither falsely marks Done. Failed attempts 1/2/3 retry at 30 s; failure 4 does not. Cancellation and restart do not burn retries.
 
@@ -3574,7 +3577,7 @@ git commit -m 'feat(bench): regenerate all six replay suites and add V3 measurem
 
 **Files:** Create `crates/bench/src/e2e.rs`, `crates/bench/tests/e2e.rs`; modify `crates/bench/src/{lib,main,report}.rs`, `crates/engine/src/bench_support.rs`.
 
-**Interfaces:** Consumes Task 19's `RecordedHand`/`load_records` and the existing `Engine` commands and `WorkerLink`. Produces CLI `bench e2e [--reps N] [--cache cold|presolved]` and the alias `bench run --suite e2e`; engine facade `run_record(record:&RecordedHand,options:&RunOptions)->Result<DecisionRun,EngineError>`. `RunOptions{cache_dir:PathBuf,worker_factory:Box<dyn Fn()->Box<dyn WorkerLink>>,clock:Arc<dyn Clock>,cold_cache:bool}` injects the transport without depending on the future fault module (cross-plan M2: these three types are defined here, in `bench_support.rs`, not only described). `DecisionRun{events:Vec<RecommendationEvent>,timestamps:Vec<u64>,record:DecisionRecord,peak_rss_bytes:u64,raw_exploitability:Option<f64>,snapshots:usize}`. Inputs use public `Engine` commands; timing starts immediately before `recommend` admission and excludes human-entry playback.
+**Interfaces:** Consumes Task 19's `RecordedHand`/`load_records` and the existing `Engine` commands and `WorkerLink`. Produces CLI `bench e2e [--reps N] [--cache cold|presolved]` and the alias `bench run --suite e2e`; engine facade `run_record(record:&RecordedHand,options:&RunOptions)->Result<DecisionRun,EngineError>`. `RunOptions{cache_dir:PathBuf,worker_factory:Box<dyn Fn()->Box<dyn WorkerLink>>,clock:Arc<dyn Clock>,cold_cache:bool}` injects the transport without depending on the future fault module (cross-plan M2: these three types are defined here, in `bench_support.rs`, not only described). `DecisionRun{events:Vec<RecommendationEvent>,timestamps:Vec<u64>,record:DecisionRecord,peak_rss_bytes:u64,raw_exploitability:Option<f64>,snapshots:usize}`; `bench::e2e::{default_options()->RunOptions, run_suite(reps:u32,presolved:bool,out:&Path)->E2eReport}` (`default_options` builds a per-run temporary cache directory, the real `ProcessWorker` factory and the system clock). Inputs use public `Engine` commands; timing starts immediately before `recommend` admission and excludes human-entry playback.
 
 **Fault fixtures (review m11):** records 037–050 declare a `fault` and are **skipped by this task** — `run_record` returns `Err(EngineError::Message("fault fixtures require the fault runner"))` for any record whose `fault` is `Some`, and `crates/bench/tests/e2e.rs` asserts exactly 36 runnable records. Task 22 supplies `FaultyWorker`, sets `RunOptions.worker_factory` accordingly and enables all 14.
 
@@ -3643,7 +3646,7 @@ git commit -m 'feat(bench): replay thirty-six frozen hands through engine admiss
 
 **Files:** Create `crates/bench/src/{fault,faulty_worker}.rs`, `crates/bench/tests/fault.rs`; modify `crates/bench/Cargo.toml`, `crates/bench/src/{lib,main,e2e}.rs`, `crates/engine/src/{bench_support,testing}.rs`, `crates/engine/tests/flop_path_golden.rs`.
 
-**Interfaces:** Consumes Plan 2's `engine::worker::WorkerLink`, `engine::testing::{FakeClock,FakeWorker,FakeReply}`, the existing raw-line parser and `WorkerLinkError`, and the cache I/O test seam. Produces `Fault`, `FaultyWorker` implementing that existing trait by delegation to `FakeWorker`, `run_fault(fault:Fault,street:Street,budget:u8,retained:bool)->FaultRun`, `fault_worker_factory(Fault)->Box<dyn Fn()->Box<dyn WorkerLink>>`; CLI `bench fault` and `bench run --suite fault`. Enables the engine feature `testing` in the bench dependency. Uses the actual trait signatures from Plan 2; no alternate worker transport contract. This task also **enables records 037–050** in Task 21's runner by supplying `RunOptions.worker_factory` from `fault_worker_factory`, and removes `run_record`'s temporary rejection of `fault.is_some()`.
+**Interfaces:** Consumes Plan 2's `engine::worker::WorkerLink`, `engine::testing::{FakeClock,FakeWorker,FakeReply}`, the existing raw-line parser and `WorkerLinkError`, and the cache I/O test seam. Produces `Fault`, `FaultyWorker` implementing that existing trait by delegation to `FakeWorker`, `run_fault(fault:Fault,street:Street,budget:u8,retained:bool)->FaultRun`, `fault_worker_factory(Fault)->Box<dyn Fn()->Box<dyn WorkerLink>>`, `options_for(record:&RecordedHand)->RunOptions` (Task 21's `default_options` with the record's declared fault bound into `worker_factory`); CLI `bench fault` and `bench run --suite fault`. Enables the engine feature `testing` in the bench dependency. Uses the actual trait signatures from Plan 2; no alternate worker transport contract. This task also **enables records 037–050** in Task 21's runner by supplying `RunOptions.worker_factory` from `fault_worker_factory`, and removes `run_record`'s temporary rejection of `fault.is_some()`.
 
 - [ ] **Step 1 (4 min): Define the exhaustive injections and the red suite assertion.**
 
