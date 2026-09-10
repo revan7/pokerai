@@ -5407,7 +5407,7 @@ fn coverage_classification_golden() {
     cases.push(("hero_cards_unknown", label(&classify(&board(&play(&fold3(hand(&six([1000; 6]), B, BB, None)), &[r(30), Action::Fold, Action::Call]), "Kh 7d 2c")))));
     // two dealt seats: FormatUnsupported at begin_hand
     let (_, hc) = engine::testing::cfg_1_2();
-    let two = core_model::begin_hand(&hc, core_model::BeginHand { button: B, hero: SB, hero_cards: aa, dealt: vec![B, SB], stacks: vec![1000, 1000] });
+    let two = core_model::begin_hand(&hc, core_model::BeginHand { hand_id: 1, button: B, hero: SB, hero_cards: aa, dealt: vec![B, SB], stacks_start: vec![1000, 1000] });
     cases.push(("two_dealt_seats", match two { Err(e) => format!("format_unsupported:{}", e.to_string().contains("two dealt seats")), Ok(_) => "accepted".into() }));
     let _ = (UTG, HJ, CO);
     let expected: Vec<(String, String)> = serde_json::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/coverage_classification_golden.json")).unwrap()).unwrap();
@@ -5441,9 +5441,11 @@ pub fn cfg_1_2() -> (GameConfig, HandConfig) {
     let hc = HandConfig { config_revision: 1, sb_chips: 5, bb_chips: 10, straddle: None, rake: rake.clone(), chip_label: "$1".into() };
     (GameConfig { config_revision: 1, chip_label: "$1".into(), sb_chips: 5, bb_chips: 10, straddle: None, rake, seats: vec![], solver: SolverPrefs { threads: 16, target_bp: 50, flop_budget_s: 10 } }, hc)
 }
+/// `core_model::BeginHand` carries the engine-assigned `hand_id` and the field name `stacks_start` (cross-plan M6);
+/// the ID-free `proto::BeginHand` is the admission DTO the public `Engine` takes (Task 29).
 pub fn hand(dealt_stacks: &[(Seat, u32)], button: Seat, hero: Seat, hero_cards: Option<[Card; 2]>) -> HandState {
     let (_, hc) = cfg_1_2();
-    begin_hand(&hc, BeginHand { button, hero, hero_cards, dealt: dealt_stacks.iter().map(|d| d.0).collect(), stacks: dealt_stacks.iter().map(|d| d.1).collect() }).expect("begin_hand")
+    begin_hand(&hc, BeginHand { hand_id: 1, button, hero, hero_cards, dealt: dealt_stacks.iter().map(|d| d.0).collect(), stacks_start: dealt_stacks.iter().map(|d| d.1).collect() }).expect("begin_hand")
 }
 /// Applies actions for whoever is to act, in order.
 pub fn play(state: &HandState, actions: &[Action]) -> HandState { let mut s = state.clone(); for a in actions { s = apply_action(&s, a.clone()).unwrap_or_else(|e| panic!("{a:?}: {e}")); } s }
@@ -5505,8 +5507,8 @@ pub fn classify(state: &HandState) -> Classification {
 
 - [ ] **Step 4: Run and commit**
 
-Run: `cargo test -p engine --features testing --test coverage`
-Expected: PASS (if `core-model`'s error text for two dealt seats differs from "two dealt seats", match on `RulesError::FormatUnsupported { .. }` instead; the spec fixes the detail string).
+Run: `cargo test -p engine --features testing --test coverage` then `cargo test --workspace --release`
+Expected: PASS (plan 1 fixes the detail string to exactly `"two dealt seats"`; if it differs, match on `RulesError::FormatUnsupported { .. }` instead).
 
 ```bash
 git add crates/engine
