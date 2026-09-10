@@ -1444,7 +1444,7 @@ let expected:serde_json::Value=serde_json::from_slice(&std::fs::read("tests/gold
 assert_eq!(frozen,expected);
 ```
 
-Run once with `POKERAI_RECORD_GOLDENS=1`, review, unset it, then normal green tests. No automatic golden acceptance in CI. Cache corruption mutations from Task5 now run with these real fixtures, completing `cache_payload_validated`.
+Run once with `POKERAI_RECORD_GOLDENS=1`, review, unset it, then normal green tests. No automatic golden acceptance in CI. The cache-corruption mutations of Task 5 now run with these real fixtures, completing `cache_payload_validated`.
 
 - [ ] **Step 6 (3 min): Run green:** `cargo test -p engine --test cache_key_structural_identity`; `cargo test --workspace`.
 - [ ] **Step 7 (2 min): Commit.**
@@ -2178,7 +2178,7 @@ git commit -m 'feat(engine): add the section 6 experimental synthetic-root surro
 
 **Files:** Modify `crates/engine/src/{cache_bridge,snapshots}.rs`, `crates/engine/tests/support/mod.rs`; create `crates/engine/tests/cache_snapshot_replay.rs`, `crates/engine/tests/golden/cache_snapshot_replay.json`.
 
-**Interfaces:** Consumes `core_replay::{SnapshotKey, SnapshotProvenance, StreetSnapshot, ReplayInput, replay}` (Plan 3 Tasks 10/11), `cache_bridge::snapshot_from_hit` (Task 10), `engine::snapshots::register_snapshot`. Produces the cached prior-street translation goldens and `snapshots::register_snapshot(core:&mut EngineCore,active:&DecisionIdentity,snapshot:StreetSnapshot)->bool` as the single registration path shared by cache and live results. Root hashes are the query public range hashes at that root; snapshot tree/nodes are query-sized, original-suit values.
+**Interfaces:** Consumes `core_replay::{SnapshotKey, SnapshotProvenance, StreetSnapshot, SnapshotStore, ReplayInput, replay}` (Plan 3 Tasks 11/14), `cache_bridge::snapshot_from_hit` (Task 10), Plan 3 Task 18's `Engine::register_snapshot(&mut self, active:&DecisionIdentity, snapshot:StreetSnapshot)->bool` and `SnapshotStore::register`. Produces the cached prior-street translation goldens and `snapshots::CACHE_ORIGINS: [&str; 3]`. This plan adds **no** second registration path (cross-plan M15/D1): the cache route calls the same `EngineCore.snapshots` store that live results use. Root hashes are the query public range hashes at that root; snapshot tree/nodes are query-sized, original-suit values.
 
 - [ ] **Step 1 (5 min): Write cache-hit replay integration assertions.** Cache-hit Final at the flop root, append Bet50/Call and turn 4d: the root and the IP call likelihoods each condition once, the returned turn input uses replayed marginals, and no turn strategy is requested from the flop entry. Equivalent 100/500 and 200/1000 paths must produce equal normalized turn ranges. Then solve at prefix Check, append villain Bet73/Call against snapshot menus 50/100: expect a prior-street `BetTranslation`, and the turn solves from the turn root.
 
@@ -2213,21 +2213,31 @@ fn cache_hit_snapshot_keeps_query_identity_and_paths() {
 `StreetRootSnapshot` carries `bb_chips` (Plan 1 dev 1, spec S1, cross-plan M9); every literal in this plan sets it.
 
 - [ ] **Step 2 (2 min): Run red:** `cargo test -p engine --features testing --test cache_snapshot_replay`; cache origin/prefix/range assertions fail until registration is wired.
-- [ ] **Step 3 (5 min): Route every registration through one function.**
+- [ ] **Step 3 (5 min): Prove the cache route uses the existing registration path.** Plan 3 Task 14 already made `crates/engine/src/snapshots.rs` a re-export of `core_replay::{SnapshotStore, StreetSnapshot, SnapshotKey, SnapshotProvenance}` and Plan 3 Task 18 added `Engine::register_snapshot`. This plan adds only the origin constant and the test that pins the shared behaviour.
 
 ```rust
-// crates/engine/src/snapshots.rs — Plan 3 Task 11 has already replaced Plan 2's
-// SolvedStreetStore with core_replay::SnapshotStore; this plan adds the shared entry point.
-pub use core_replay::{SnapshotKey, SnapshotProvenance, SnapshotStore, StreetSnapshot};
+// crates/engine/src/snapshots.rs — one added constant beside Plan 3's re-exports
+/// §9.1 provenance origins written by the cache route; live solves keep `"live"`.
+pub const CACHE_ORIGINS:[&str;3]=["cache_exact","cache_approximate","cache_provisional"];
+```
 
-/// §9.2 single registration path. Rejects anything whose identity is not the active one and
-/// anything whose solved prefix no longer matches the live history; a same-decision Final
-/// replaces its Provisional inside `SnapshotStore::register`.
-pub fn register_snapshot(core:&mut crate::core::EngineCore,active:&proto::DecisionIdentity,
-    snapshot:StreetSnapshot)->bool {
-    if snapshot.provenance.identity_at_solve!=*active {return false;}
-    if !core.identity_active(active) {return false;}
-    core.snapshots.lock().unwrap().register(active,snapshot)
+```rust
+#[test]
+fn cache_and_live_registrations_share_one_store_and_one_rule() {
+    let rig=CacheRig::new("flop_fast_v1",100,500,5000);
+    let mut store=core_replay::SnapshotStore::new();
+    let active=proto::DecisionIdentity{hand_id:1,hand_revision:7,decision_id:9,
+        config_revision:1,model_revision:0};
+    let stale=proto::DecisionIdentity{decision_id:8,..active.clone()};
+    let query=rig.query(100,500,5000,&[],"oop");let hit=rig.hit(&query);
+    let input=support::solve_input_for(&query);
+    for origin in engine::snapshots::CACHE_ORIGINS {
+        let fresh=engine::cache_bridge::snapshot_from_hit(&active,&input,&hit,origin);
+        assert!(store.register(&active,fresh));
+        let old=engine::cache_bridge::snapshot_from_hit(&stale,&input,&hit,origin);
+        assert!(!store.register(&active,old),"a stale identity never registers");
+    }
+    assert_eq!(store.for_identity(&active).len(),1,"a later origin replaces the earlier one");
 }
 ```
 
@@ -2911,7 +2921,8 @@ Use checked multiplication and model legality for the source sizes, and freeze t
 // crates/engine/src/presolve.rs
 pub const BACKGROUND_DEADLINE_MS:u32=600_000;
 pub const BACKGROUND_TARGET_BP:u16=50;
-pub const BACKGROUND_TEMPLATE:&str="flop_fast_v1";
+/// One definition, shared with the flop lookup order of Task 10.
+pub use crate::flop::PRESOLVER_TEMPLATE as BACKGROUND_TEMPLATE;
 
 impl cache::presolver::scheduler::PresolveExecutor for EngineExecutor {
     fn store_and_verify(&mut self,item:&cache::presolver::queue::QueueItem,
@@ -2980,7 +2991,9 @@ Cross-plan §5 splits the original 236-line fixture task into three review-gated
 
 **Files:** Create `tools/chart_sources.py`, `tools/tests/test_chart_sources.py`, `bench/spots/sources.json`; modify `tools/gen_fixtures.py` (a `sources` subcommand), `crates/engine/src/bench_support.rs` (created by Plan 2 Task 22, cross-plan M17).
 
-**Interfaces:** Consumes Plan 3's inspected chart bundles `fixtures/charts/<name>.json` and `<name>.manifest.json`. Produces `chart_sources.freeze_sources(repo:Path)->dict`, `chart_sources.write_sources(repo:Path)->None`, CLI `python tools/gen_fixtures.py sources [--check]`; `engine::bench_support::{SourceLock, load_source_lock(&Path)->Result<SourceLock,String>, verify_source_lock(&SourceLock,&core_preflop::PreflopStore)->Result<(),String>}`.
+**Interfaces:** Consumes Plan 3's inspected chart bundles `fixtures/charts/<name>.json` and `<name>.manifest.json`, and Plan 3 Task 4's acquisition record `fixtures/charts/sources.manifest.json`, whose per-depth rows are `available` or `unsupported`. Produces `chart_sources.{available_depths(repo:Path)->dict, freeze_sources(repo:Path)->dict, write_sources(repo:Path)->None}`, CLI `python tools/gen_fixtures.py sources [--check]`; `engine::bench_support::{SourceLock, load_source_lock(&Path)->Result<SourceLock,String>, verify_source_lock(&SourceLock,&Path)->Result<(),String>}`.
+
+**Conditional depth 200.** Plan 3 marks the RangeConverter 200bb bundle `unsupported` when its publisher download could not be resolved. `freeze_sources` therefore reads `sources.manifest.json` first and emits a bundle row only for a depth whose status is `available`; an `unsupported` depth is recorded in `lock['unavailable']` with the manifest's stated reason. Task 20 then generates the 100bb halves of the six suites and marks each 200bb line `not generated: depth 200 unsupported by the acquired sources`, and Task 23's gate reports `required_matrix_complete = false` for those cells rather than passing them. Nothing substitutes another publisher, another depth or a screenshot.
 
 - [ ] **Step 1 (4 min): Write the provenance test before generating the lock.**
 
@@ -2994,9 +3007,13 @@ REPO = Path(__file__).resolve().parents[2]
 def test_sources_cover_every_required_node():
     lock = freeze_sources(REPO)
     names = [b['name'] for b in lock['bundles']]
-    assert names == ['pokercoaching_100', 'rangeconverter_200']
+    # depth 200 is present only when Plan 3's acquisition record marks it `available`
+    assert names[0] == 'pokercoaching_100'
+    assert set(names) | {b['name'] for b in lock['unavailable']} == {
+        'pokercoaching_100', 'rangeconverter_200'}
     assert lock['version'] == 1 and lock['snapshot_date'] == '2026-09-10'
     assert all(len(b['sha256']) == 64 for b in lock['bundles'])
+    assert all(b['reason'] for b in lock['unavailable'])
     required = {'', 'F', 'FF', 'FFF', 'FFFF', 'FFFFF'}          # unopened folds to each opener
     for bundle in lock['bundles']:
         histories = {n for n in bundle['nodes']}
@@ -3024,9 +3041,20 @@ SOURCES = {
 }
 MISSING = ['UTG-limp', 'CO-limp', 'BB-cold-call-vs-3bet']
 
+def available_depths(repo: Path) -> dict:
+    """Plan 3 Task 4's acquisition record: {'pokercoaching_100': ('available', ''), ...}."""
+    record = json.loads((repo / 'fixtures/charts/sources.manifest.json').read_text())
+    return {row['name']: (row['status'], row.get('reason', '')) for row in record['depths']}
+
 def freeze_sources(repo: Path) -> dict:
-    result = {'version': 1, 'snapshot_date': SNAPSHOT_DATE, 'missing': list(MISSING), 'bundles': []}
+    statuses = available_depths(repo)
+    result = {'version': 1, 'snapshot_date': SNAPSHOT_DATE, 'missing': list(MISSING),
+              'bundles': [], 'unavailable': []}
     for name, meta in SOURCES.items():
+        status, reason = statuses.get(name, ('unsupported', 'absent from sources.manifest.json'))
+        if status != 'available':
+            result['unavailable'].append({'name': name, 'reason': reason or status})
+            continue
         raw = (repo / 'fixtures/charts' / f'{name}.json').read_bytes()
         manifest = json.loads((repo / 'fixtures/charts' / f'{name}.manifest.json').read_text())
         result['bundles'].append({'name': name, 'sha256': hashlib.sha256(raw).hexdigest(),
@@ -3049,8 +3077,10 @@ Freeze the covered nodes needed for all six benchmark lines and the 24 pre-solve
 pub struct SourceBundle {pub name:String,pub sha256:String,pub bytes:u64,
     pub nodes:Vec<String>}
 #[derive(serde::Deserialize)]
+pub struct UnavailableBundle {pub name:String,pub reason:String}
+#[derive(serde::Deserialize)]
 pub struct SourceLock {pub version:u16,pub snapshot_date:String,pub missing:Vec<String>,
-    pub bundles:Vec<SourceBundle>}
+    pub bundles:Vec<SourceBundle>,pub unavailable:Vec<UnavailableBundle>}
 
 pub fn load_source_lock(path:&std::path::Path)->Result<SourceLock,String> {
     let bytes=std::fs::read(path).map_err(|e|format!("sources.json: {e}"))?;
@@ -3465,10 +3495,17 @@ fn flop_matrix_has_six_lines_on_three_boards() {
 
 #[test]
 fn all_six_suites_use_chart_replay_ranges() {
+    let lock=engine::bench_support::load_source_lock(
+        std::path::Path::new("../../bench/spots/sources.json")).unwrap();
+    let depth_200_available=lock.bundles.iter().any(|b|b.name=="rangeconverter_200");
     for suite in ["river_std","river_min","turn_std","turn_min","flop_fast","flop_min"] {
         let s=bench::suite::Suite::load(std::path::Path::new(&format!("../../bench/spots/{suite}.json"))).unwrap();
         assert_eq!(s.spots.len(),6,"{suite}");
-        assert!(s.spots.iter().all(|spot|spot.range_source.starts_with("chart_replay:")),"{suite}");
+        // Uniform `r8` ranges from Plan 2 Task 5 must be gone from every suite (Or8).
+        assert!(s.spots.iter().all(|spot|spot.range_source.starts_with("chart_replay:")
+            ||spot.range_source.starts_with("unavailable:")),"{suite}");
+        let unavailable=s.spots.iter().filter(|spot|spot.range_source.starts_with("unavailable:")).count();
+        assert_eq!(unavailable,if depth_200_available {0} else {3},"{suite}");
     }
 }
 ```
@@ -3494,7 +3531,7 @@ pub fn flop_matrix()->Vec<RunConfig> {
 }
 ```
 
-`crates/bench/src/lib.rs` (declared by Plan 2 Task 5, cross-plan D4) gains `pub mod flop;` beside the existing `suite`, `gen_spots`, `runner` and `report` modules; `main.rs` imports the library modules. The e2e, fault, gate and oracle exports are added by the tasks that create those files, never declared ahead of them, so each task's workspace build stays green.
+`crates/bench/src/lib.rs` (declared by Plan 2 Task 5, cross-plan D4) gains `pub mod flop;` beside the existing `suite`, `gen_spots`, `runner` and `report` modules; `main.rs` imports the library modules. The e2e, fault, gate and oracle exports are added by the tasks that create those files, never declared ahead of them, so each task's workspace build stays green. When Task 17's lock marks depth 200 `unsupported`, `gen-spots` still writes six entries per suite and gives each 200bb spot `range_source = "unavailable: depth 200 unsupported by the acquired sources"` with no ranges; the runner skips those spots and the gate reports `required_matrix_complete = false` rather than treating them as passes.
 
 - [ ] **Step 4 (5 min): Add diagnostic mode forcing without changing the production protocol.** Production memory selection remains §10.3. The `bench-mode` feature (default off) permits the launch flag `--bench-storage-mode f32|i16`; it is never accepted as a solve JSON field. The default worker rejects the flag. Build the diagnostic binary into `target/bench-mode`, not the normal packaged path; `ready` adds the capability `bench_storage_override`, which the normal Engine rejects unless the bench facade explicitly opts in. A forced mode still checks memory headroom and the 16 GiB job-object limit. Bench records both estimates and refusals; a failed allocation is data, never a silent mode switch.
 
