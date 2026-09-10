@@ -142,3 +142,82 @@ Also available: `remove_lines()` (delete lines after tree build, e.g. per-runout
 * Flop, two sizes + one raise per street: **~42 s to 0.5 % at 3.8 GB** (2.0 GB in 16-bit mode, +5 % time); AVX2 does not help there; one cold run took 110 s.
 * Build needs a fork (pin `bincode`/`bincode_derive` to `=2.0.0-rc.3` and a 3-line lint fix); upstream is unmaintained and AGPL-3.0.
 * API has everything on the list except async cancellation inside an iteration and continuing a solve after `finalize()`; a caller-side `solve_step` loop gives deadline/progress control at 0.1-0.3 s granularity.
+
+## Addendum: realistic-range flop benchmarks (2026-09-10)
+
+Same build as section 3.3 (commit `9d1509fe` + the two patches, `RUSTFLAGS="-C target-cpu=native"` = AVX2, `--release`, rayon 24 threads), same timing method (wall clock around the `solve_step` loop, exploitability checked every 10 iterations, one process per run, "cold" = first process launch of that spot/board, "warm" = the immediately following identical runs). Raw lines: scratchpad `spike-solver/results-v2.txt` (60 runs); bench source `spike-solver/bench/src/main.rs` (v2). Chip unit is 0.1 bb (pot 55 = 5.5 bb) so that 2.5x raises round sensibly. Background load ~7-22 % CPU from other software during the session.
+
+### A.1 Ranges and trees
+
+Uniform-weight Pio-style strings (dash ranges high-to-low):
+
+| Range | Share | Combos | String |
+| --- | --- | --- | --- |
+| BTN open (IP in SRP) | 48.7 % | 646 | `22+,A2s+,K2s+,Q2s+,J3s+,T6s+,96s+,86s+,75s+,65s,54s,43s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o` |
+| BB defend / call (OOP in SRP; QQ+, AK, AQs assumed 3-bet) | 60.6 % | 804 | `JJ-22,AJs-A2s,K2s+,Q2s+,J2s+,T2s+,92s+,84s+,74s+,63s+,53s+,43s,32s,AJo-A2o,K5o+,Q7o+,J8o+,T8o+,98o,97o,87o,76o` |
+| CO open-then-call vs 3-bet (OOP in 3BP) | 14.6 % | 194 | `QQ-22,AKs-ATs,A5s-A4s,KQs-KTs,QJs-QTs,JTs,J9s,T9s,T8s,98s,87s,76s,65s,54s,AQo-AJo,KQo,KJo` |
+| BTN 3-bet vs CO (IP in 3BP) | 10.4 % | 138 | `TT+,AJs+,A5s-A2s,KJs+,QJs,JTs,T9s,76s,65s,54s,AQo+,KQo,KJo` |
+
+Spots: **(a)** SRP BTN vs BB 100 bb, pot 5.5 / stack 97.5; **(b)** 3-bet pot CO vs BTN, pot 19 / stack 91; **(c)** SRP 200 bb, pot 5.5 / stack 197.5; **turn** = (a) ranges at 200 bb after a 3 bb flop c-bet is called (Kh7d2c 4d, pot 11.5 / stack 194.5). Boards: `Kh7d2c` (dry rainbow), `Jh9h6c` (wet two-tone), `8s8d3c` (paired). After board removal the SRP spots have 629-647 x 559-572 hands, the 3-bet pot 170-180 x 121-137.
+
+Trees: **FAST** = one bet 55 % pot + one raise 2.5x on every street, `add_allin_threshold 1.0`, `force_allin 0.15`, `merging 0.1`, **no donk bets**; **TWO** = 33 % / 75 % + raise 2.5x on every street, `add_allin 1.5`, otherwise identical. Note on donk bets: `turn_donk_sizes: None` (used in section 3) means "use the default bet sizes", i.e. OOP may lead after calling the previous street; disabling donks needs `Some(DonkSizeOptions { donk: vec![] })`. That alone shrinks spot (a) on K72r from 6.8 GB to 5.3 GB.
+
+### A.2 FAST tree, f32, 24 threads, AVX2 (5 runs per cell; cold = run 1, p50/p95 over runs 2-5)
+
+| Spot | Board | Hands OOP x IP | Cold: 0.5 % / 0.3 % | Warm 0.5 %: p50 (p95) | Warm 0.3 %: p50 (p95) | Iters 0.5 / 0.3 | `memory_usage()` f32 / i16 | Peak WS |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| (a) SRP 100 bb | Kh7d2c | 642 x 572 | **35.1 s / 42.0 s** | 34.7 s (35.0) | 41.6 s (41.8) | 100 / 120 | 5279 / 2680 MB | 5299 MB |
+| (a) | Jh9h6c | 629 x 559 | 19.3 s / 25.5 s | 19.4 s (19.5) | 25.8 s (26.0) | 90 / 120 | 3148 / 1600 MB | 3167 MB |
+| (a) | 8s8d3c | 637 x 566 | 26.6 s / 35.2 s | 26.5 s (26.5) | 35.2 s (35.3) | 120 / 160 | 3291 / 1673 MB | 3309 MB |
+| (b) 3BP | Kh7d2c | 176 x 121 | **6.6 s / 7.9 s** | 6.7 s (6.7) | 8.0 s (8.0) | 100 / 120 | 889 / 471 MB | 900 MB |
+| (b) | Jh9h6c | 170 x 125 | 4.3 s / 5.1 s | 4.2 s (4.2) | 5.0 s (5.1) | 100 / 120 | 539 / 286 MB | 550 MB |
+| (b) | 8s8d3c | 180 x 137 | 5.0 s / 9.5 s | 5.0 s (5.0) | 9.6 s (16.3 *) | 110 / 210 | 596 / 315 MB | 608 MB |
+| (c) SRP 200 bb | Kh7d2c | 642 x 572 | 125.2 s / 149.9 s * | **63.7 s (82.0 *)** | 81.0 s (99.1 *) | 110 / 140 | 8780 / 4454 MB | 8803 MB |
+| (c) | Jh9h6c | 629 x 559 | 38.5 s / 48.9 s | 39.2 s (39.3) | 49.6 s (49.6) | 110 / 140 | 5231 / 2656 MB | 5254 MB |
+| (c) | 8s8d3c | 637 x 566 | 47.3 s / 61.6 s | 47.5 s (47.6) | 62.0 s (62.2) | 130 / 170 | 5470 / 2777 MB | 5493 MB |
+
+\* Outliers (background load / sustained-load throttling, see A.6): (c) K72r runs 1-2 took 125 s and 86 s, runs 3-6 63.4-64.3 s; (b) 883r run 5 reached 0.3 % at 17.5 s (its 0.5 % time was a normal 5.0 s). Excluding these, run-to-run spread is < 2 %.
+
+Cold vs warm: no meaningful difference. The only cold cost is the first iteration (demand-zero page faulting): 1.12 s cold vs 0.66 s warm on the 5.3 GB tree, 1.70 vs 1.17 s on 8.8 GB, unchanged on < 1 GB trees. There is no file I/O, so OS caching plays no role. Peak working set tracks `memory_usage()` within 0.5 % on every run.
+
+Scaling: per-iteration cost is ~0.066-0.078 s per GB of f32 tree on this box (0.35 s/it at 5.3 GB, 0.58 s/it at 8.8 GB, 0.066 s/it at 0.9 GB), and 90-130 iterations are needed for 0.5 % - i.e. **time to 0.5 % ~ 6.5-8 s per GB of tree**. The dry rainbow board is the worst case on every spot because it has the least suit isomorphism (more distinct turn/river runouts), not because of the ranges. Compared with section 3.1 (179 x 264 hands, 0.96 GB, 6.2 s): the 3.4x larger hand count gives 3.3-5.5x the memory and 3-10x the time.
+
+### A.3 Two-size tree (33 % / 75 % + 2.5x, all-in 150 %), target 0.5 %, 5-minute cap, board Jh9h6c
+
+| Spot | Mode | `memory_usage()` | Peak WS | Result |
+| --- | --- | --- | --- | --- |
+| (b) 3BP | f32 | 1864 MB | 1875 MB | **18.3 s cold / 18.2 s warm** (130 it), final 0.452 % |
+| (a) SRP 100 bb | f32 | 22285 MB | 22306 MB | **not converged at 300 s**: 0.504 % after 195 it (1.0 % at 217.6 s / 140 it); 1.55 s/it, would have crossed 0.5 % at ~310 s |
+| (a) SRP 100 bb | i16 | 11301 MB | 11324 MB | **229.6 s** (180 it), 1.27 s/it, flat per-iteration time throughout |
+| (c) SRP 200 bb | i16 (f32 would be 34.8 GB, more than the 41 GB free) | 17648 MB | 17671 MB | **not converged at 300 s**: 0.736 % after 156 it (1.0 % at 251 s / 130 it); 1.93 s/it steady, ~350-390 s projected |
+
+The Jh9h6c board is the *smallest* of the three for these spots; the dry K72r two-size trees are 37.4 GB f32 / 19.0 GB i16 for (a) and 58.5 GB / 29.6 GB for (c) and were not run (only ~41 GB of the 64 GB was free). Two-size flop trees at realistic SRP ranges are therefore a 4-7 minute, 11-37 GB job on this machine - offline only.
+
+### A.4 Turn solve, (a) ranges at 200 bb, two-size tree (Kh7d2c 4d, pot 11.5 bb, stack 194.5 bb)
+
+626 x 560 hands, `memory_usage()` 130 MB (66 MB i16), peak WS 148 MB. Three runs: **0.96-0.98 s to 0.5 %** (100 it), 1.23-1.24 s to 0.3 % (130 it). The FAST turn tree is 33 MB. Turn-start solves remain effectively free even at 200 bb with two sizes.
+
+### A.5 16-bit compression (`allocate_memory(true)`) on FAST trees
+
+| Spot / board | f32: 0.5 % / 0.3 %, peak WS | i16: 0.5 % / 0.3 %, peak WS | Delta |
+| --- | --- | --- | --- |
+| (a) Kh7d2c | 34.7 s / 41.6 s, 5299 MB | 27.0-27.9 s / 36.1-37.0 s, 2699 MB (2 runs) | **-20 % time, -49 % memory** |
+| (a) Jh9h6c | 19.4 s / 25.8 s, 3167 MB | 17.1 s / 22.9 s, 1618 MB (1 run) | -12 % time, -49 % memory |
+| (c) Kh7d2c | 63.4-64.3 s / 80.3-81.5 s, 8803 MB | 51.8 s / 65.8 s, 4475 MB (1 clean run; a first attempt launched right after a 5-minute full-load run took 174.7 s and is discarded as throttled) | -18 % time, -49 % memory |
+| (a) two-size Jh9h6c | 1.55 s/it, 22.3 GB | 1.27 s/it, 11.3 GB | -18 % per iteration |
+
+This reverses the section 3.2 finding (i16 was +25-30 % slower on the 0.96 GB tree): at 3-22 GB the solver is memory-bandwidth bound, so halving the bytes wins despite the encode/decode work. Iteration counts are the same or slightly lower in i16 (quantisation changes the path: 90 vs 100 iterations on (a) K72r); final exploitability differs in the third digit. **Use i16 for any flop tree above ~2 GB.**
+
+### A.6 Variance notes
+
+Within a spot/board, warm runs repeat to < 2 % (p95 == p50 to one decimal) except the flagged outliers. Two slow runs (174.7 s vs 51.8 s; 84 iterations vs 156 in 300 s) happened immediately after a 5-minute all-core AVX2 run, and (c) K72r's first two runs were 2x / 1.35x slow while a WMI process scan ran; a run with `--verbose` per-10-iteration timing showed no drift *within* a 4-5 minute run, so the effect is between processes (clock/thermal state or background load), not the solver. Plan with the p50 and keep a deadline in the `solve_step` loop.
+
+### A.7 Verdict on the 10 s budget
+
+**No.** With realistic preflop ranges the reduced (FAST) flop tree does not meet 10 s on this CPU for single-raised pots, cold or warm:
+
+* (a) SRP 100 bb: **35 s** on the worst board (K72r), 19-27 s on the others, at 3.2-5.3 GB; 27 s / 17 s in i16. Even 1.0 % exploitability takes 28 s on K72r.
+* (c) SRP 200 bb: **64 s** worst board (52 s i16), 39-48 s others, 5.2-8.8 GB.
+* (b) 3-bet pot (170-180 x 121-137 hands): **4.1-6.7 s to 0.5 %** (p95 6.7 s), 5-8 s to 0.3 % (9.6 s p50 on the paired board), 0.55-0.9 GB - this is the only flop spot that fits, and it fits on all three boards.
+
+Rule of thumb from A.2: a FAST f32 tree must be <= ~1.3-1.5 GB (i16: <= ~2 GB) to finish 0.5 % inside 10 s here, i.e. roughly <= 250 x 250 hands, or the SRP ranges cut to about a third of their combos. Practical options for SRP flops: solve them offline and load (`save_data_to_file`, optionally `set_target_storage_mode(BoardState::Turn)` to keep only flop+turn data), start live solves from the turn (~1 s at 200 bb with two sizes, section A.4), or accept a 20-35 s flop solve with a progress indicator. The two-size flop tree is offline-only at these ranges (4-7 min, 11-37 GB).
