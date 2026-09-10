@@ -8,6 +8,12 @@ Source of truth for the spec writer. Facts come from docs/research/SYNTHESIS.md,
 - Game config is a per-session setting (blinds, straddle, rake or time charge, stacks). Week-1 validation targets 100bb and 200bb, 5% pot rake with cap, UTG straddle supported.
 - Budget: strong baseline in 1-2 weeks, then iterate.
 
+## 0b. Approval decisions (2026-09-10, after spec revision 5)
+- Spec revision 5 approved by the user; implementation planning starts.
+- Flop budget: `flop_budget_s` default 10 (final delivery 15 s) confirmed as the phase-1 setting.
+- MSVC: the user authorized installing the Visual Studio 2022 "Desktop development with C++" workload now; Tauri remains the shell.
+- Preflop data: phase 1 ships on transcribed free charts (labelled ChartRounded, no EV). The PokerData purchase is deferred by the user; V9 stays a conditional gate and nothing in the baseline depends on it. The exploit slice and preflop EV wait for that purchase.
+
 ## 1. Goals and non-goals
 Goals: for each hero decision point, return legal actions with frequency + incremental EV (bb, fold = 0) + a coverage label (exact / approximate / unsupported) + assumptions, within a 15 s hard deadline (excluding human entry), with progressive display (fast equity estimate first, solver result when ready). GTO baseline first; exploit slice only after the baseline is validated.
 
