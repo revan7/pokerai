@@ -1,0 +1,28 @@
+{
+  "synthetic": true,
+  "game": "nl",
+  "version": 2,
+  "stack": 100,
+  "actor": "HJ",
+  "history": "UTG_60%",
+  "actions": [
+    {
+      "step": "fold"
+    },
+    {
+      "step": "call",
+      "weights": {
+        "AKs": 0.35,
+        "KK": 0.0
+      },
+      "evs": {
+        "AKs": 1.84,
+        "KK": 2.31
+      }
+    },
+    {
+      "step": "raise",
+      "to_bb_x1000": 8750
+    }
+  ]
+}

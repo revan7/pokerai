@@ -1,0 +1,26 @@
+{
+  "bundle_id": "synthetic_v2_100bb",
+  "source": "PokerDataJson",
+  "game": "nl",
+  "version": 2,
+  "depth_bb": 100,
+  "depths": [
+    100
+  ],
+  "source_blinds": [
+    0.5,
+    1.0
+  ],
+  "rake_profile": "5% cap 0.5bb",
+  "rake": {
+    "rate": 0.05,
+    "cap_bb": 0.5,
+    "no_flop_no_drop": true
+  },
+  "straddle": false,
+  "ev_unit": "source_sb",
+  "ev_reference": "decision_incremental_verified",
+  "accuracy": "unverified",
+  "license_note": "Synthetic test data; not vendor data; no V9 claim",
+  "sha256": "d623e106ed4864c045a1c795966ca592b70f31d3eb714b5ca6701b3abe209c40"
+}

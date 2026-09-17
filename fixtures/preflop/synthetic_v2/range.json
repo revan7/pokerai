@@ -1,0 +1,18 @@
+{
+  "synthetic": true,
+  "spot": "UTG_60%_HJ_Call",
+  "actor": "HJ",
+  "hand": "AKs",
+  "freq": 0.35,
+  "ev": 1.84,
+  "combos": 61.9,
+  "weights": {
+    "AKs": 0.35,
+    "KK": 0,
+    "JJ": 1
+  },
+  "evs": {
+    "AKs": 1.84,
+    "KK": 2.31
+  }
+}
