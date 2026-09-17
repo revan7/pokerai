@@ -27,3 +27,6 @@ docs/bench/*.tmp
 
 # Large fixture binary fetched separately, not committed (plan 1 task 1 brief)
 fixtures/eval/phevaluator_7card_10m.bin
+
+# Python editable-install metadata
+tools/*.egg-info/
