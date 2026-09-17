@@ -3,6 +3,7 @@
 
 # Rust build artifacts
 target/
+**/*.rs.bk
 
 # Node.js dependencies
 node_modules/
@@ -23,3 +24,6 @@ docs/bench/*.tmp
 
 # SDD scratch workspace (ledger, briefs, reports, review packages)
 .superpowers/
+
+# Large fixture binary fetched separately, not committed (plan 1 task 1 brief)
+fixtures/eval/phevaluator_7card_10m.bin

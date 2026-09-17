@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+sha2 = "0.10.9"
+holdem-hand-evaluator = { git = "https://github.com/b-inary/holdem-hand-evaluator", rev = "d7b2a5bba4015f96855d5cd66d21f781d3cbcf9b" }
+hex = "0.4"
+ts-rs = "=12.0.1"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.holdem-hand-evaluator]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
