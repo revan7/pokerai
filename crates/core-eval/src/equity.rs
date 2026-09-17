@@ -164,17 +164,39 @@ pub fn terminal_payoff(equity: f32, pot: u32, rake: &Rake) -> f32 {
     equity * (pot - r)
 }
 
-pub(crate) struct Deadline<'a> { start: Instant, budget: Duration, cancel: &'a AtomicBool, pub evals: u64 }
+/// Budget and cancellation clock.
+///
+/// Two counters, polled on the same 4096 cadence but kept apart on purpose:
+/// `evals` counts rank evaluations and is what `EquityResult::samples` reports, while `work`
+/// counts units of search that produce no evaluation at all. A search whose deeper players always
+/// collide finishes no runout, so it would never reach an evaluation-only poll and could run for
+/// an unbounded time past its budget (spec section 7, and the 50 ms overrun limit of section 13.1).
+pub(crate) struct Deadline<'a> { start: Instant, budget: Duration, cancel: &'a AtomicBool, pub evals: u64, work: u64 }
 
 impl<'a> Deadline<'a> {
-    pub fn new(budget: Duration, cancel: &'a AtomicBool) -> Self { Deadline { start: Instant::now(), budget, cancel, evals: 0 } }
+    pub fn new(budget: Duration, cancel: &'a AtomicBool) -> Self { Deadline { start: Instant::now(), budget, cancel, evals: 0, work: 0 } }
+    /// Unconditional poll: the cancel flag first, then the clock.
+    ///
+    /// The clock comparison is `>=`, not `>`, so a zero budget is exhausted whatever the timer's
+    /// resolution reports on the first call. Used on entry to a run and again before any run
+    /// reports a terminal status, so a cancelled or out-of-budget request never returns an answer
+    /// the caller has already stopped waiting for.
+    pub fn check(&self) -> Option<EquityStatus> {
+        if self.cancel.load(Ordering::Relaxed) { return Some(EquityStatus::Cancelled); }
+        if self.start.elapsed() >= self.budget { return Some(EquityStatus::BudgetExceeded); }
+        None
+    }
     /// Counts one evaluation; every 4096 evaluations checks the cancel flag and the clock.
     pub fn tick(&mut self) -> Option<EquityStatus> {
         self.evals += 1;
-        if self.evals % 4096 == 0 {
-            if self.cancel.load(Ordering::Relaxed) { return Some(EquityStatus::Cancelled); }
-            if self.start.elapsed() > self.budget { return Some(EquityStatus::BudgetExceeded); }
-        }
+        if self.evals % 4096 == 0 { return self.check(); }
+        None
+    }
+    /// Counts one unit of search work — one candidate combo visited, accepted or rejected — on the
+    /// same cadence. Never touches `evals`, so `samples` stays a pure rank-evaluation count.
+    pub fn tick_work(&mut self) -> Option<EquityStatus> {
+        self.work += 1;
+        if self.work % 4096 == 0 { return self.check(); }
         None
     }
     pub fn elapsed(&self) -> Duration { self.start.elapsed() }
@@ -190,12 +212,17 @@ impl Tally {
         Tally { acc: vec![vec![0.0; n]; pots.len()], total: vec![0.0; pots.len()], eligible_idx }
     }
     /// Awards one showdown of weight `w`: per pot the best eligible rank wins; ties split equally.
+    ///
+    /// Three allocation-free passes over the pot's eligible indices (best rank, count of holders,
+    /// credit) rather than collecting the winners. This is the innermost statement of the whole
+    /// enumeration and spec section 7 admits requests of up to `2 * 10^7` evaluations inside a
+    /// 0.5 s budget, so one heap allocation per pot per showdown is not affordable here.
     pub fn award(&mut self, ranks: &[u16], w: f64) {
         for (k, idx) in self.eligible_idx.iter().enumerate() {
             let best = idx.iter().map(|i| ranks[*i]).max().expect("a pot has an eligible player");
-            let winners: Vec<usize> = idx.iter().copied().filter(|i| ranks[*i] == best).collect();
-            let each = w / winners.len() as f64;
-            for i in winners { self.acc[k][i] += each; }
+            let winners = idx.iter().filter(|i| ranks[**i] == best).count();
+            let each = w / winners as f64;
+            for i in idx.iter().filter(|i| ranks[**i] == best) { self.acc[k][*i] += each; }
             self.total[k] += w;
         }
     }
@@ -235,6 +262,10 @@ impl ExactRun<'_> {
     fn assign(&mut self, player: usize, weight: f64) -> Option<EquityStatus> {
         if player == self.req.players.len() { return self.runouts(weight); }
         for idx in 0..self.supports[player].len() {
+            // Every candidate counts, accepted or rejected. A search whose later seats always
+            // collide completes no runout and evaluates no hand, so this is the only poll that
+            // can observe the budget or the cancel flag on that path.
+            if let Some(s) = self.deadline.tick_work() { return Some(s); }
             let (_, cards, w) = self.supports[player][idx];
             let (a, b) = (cards[0].0 as usize, cards[1].0 as usize);
             if self.used[a] || self.used[b] { continue; }
@@ -282,17 +313,25 @@ pub(crate) fn exact(req: &EquityRequest, budget: Duration, cancel: &AtomicBool) 
     check_request(req);
     let pots = req.pot_list();
     let deadline = Deadline::new(budget, cancel);
+    // Entry poll, before any work: an already-cancelled or zero-budget request must never report
+    // a result, and must never report `Ready`.
+    if let Some(status) = deadline.check() { return result(status, None, vec![], 0, deadline.elapsed()); }
     let supports: Vec<Support> = req.players.iter().map(|p| support(&p.range, &req.board)).collect();
-    if supports.iter().any(|s| s.is_empty()) { return result(EquityStatus::InvalidRanges, None, vec![], 0, deadline.elapsed()); }
+    if supports.iter().any(|s| s.is_empty()) {
+        let status = deadline.check().unwrap_or(EquityStatus::InvalidRanges);
+        return result(status, None, vec![], 0, deadline.elapsed());
+    }
     let n = req.players.len();
     let mut run = ExactRun { req, supports, used: req.board_used(), chosen: Vec::with_capacity(n), ranks: vec![0; n], tally: Tally::new(req, &pots), deadline };
     let stop = run.assign(0, 1.0);
     let elapsed = run.deadline.elapsed();
-    match stop {
-        Some(status) => result(status, None, vec![], run.deadline.evals, elapsed),
-        None if run.tally.empty() => result(EquityStatus::InvalidRanges, None, vec![], run.deadline.evals, elapsed),
-        None => result(EquityStatus::Ready, Some(EquityMethod::Exact), run.tally.shares(req, &pots, None), run.deadline.evals, elapsed),
-    }
+    if let Some(status) = stop { return result(status, None, vec![], run.deadline.evals, elapsed); }
+    // Final poll before reporting a terminal status. Without it a run that finished between two
+    // polls could report `Ready` after cancellation, or `InvalidRanges` for a search that simply
+    // ran out of budget before completing a single tuple.
+    if let Some(status) = run.deadline.check() { return result(status, None, vec![], run.deadline.evals, elapsed); }
+    if run.tally.empty() { return result(EquityStatus::InvalidRanges, None, vec![], run.deadline.evals, elapsed); }
+    result(EquityStatus::Ready, Some(EquityMethod::Exact), run.tally.shares(req, &pots, None), run.deadline.evals, elapsed)
 }
 
 /// Spec 3.5 entry point: exact enumeration or time-bounded Monte Carlo per `req.mode`.
