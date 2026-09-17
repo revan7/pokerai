@@ -56,7 +56,12 @@ pub enum EvReference {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RakeProfile {
+    /// Domain `[0, 1)` (a fraction, never a full rake), wide-checked before narrowing.
+    #[serde(deserialize_with = "crate::numeric::deserialize_rake_rate", serialize_with = "crate::numeric::serialize_rake_rate")]
     pub rate: f32,
+    /// Domain `>= 0`, wide-checked before narrowing (rejects e.g. an `f64` cap that
+    /// overflows `f32` on narrowing).
+    #[serde(deserialize_with = "crate::numeric::deserialize_cap_bb", serialize_with = "crate::numeric::serialize_cap_bb")]
     pub cap_bb: f32,
     pub no_flop_no_drop: bool,
 }
@@ -70,6 +75,9 @@ pub struct BundleInfo {
     pub source: SourceKind,
     pub depth_bb: u16,
     pub depths: Vec<u16>,
+    /// `[sb, bb]`: both finite and strictly positive, `bb >= sb`, wide-checked before
+    /// narrowing (`crate::numeric`).
+    #[serde(deserialize_with = "crate::numeric::deserialize_source_blinds", serialize_with = "crate::numeric::serialize_source_blinds")]
     pub source_blinds: [f32; 2],
     pub rake_profile: String,
     pub rake: Option<RakeProfile>,

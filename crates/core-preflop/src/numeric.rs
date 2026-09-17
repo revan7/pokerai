@@ -18,12 +18,19 @@
 
 use serde::de::Error as DeError;
 use serde::ser::{Error as SerError, SerializeSeq};
-use serde::{Deserialize, Deserializer, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Probabilities (`weights`): closed unit interval.
 fn domain_unit_interval(x: f64) -> bool { (0.0..=1.0).contains(&x) }
 /// EV chips in source small-blind units (`evs`): no bound beyond finiteness.
 fn domain_finite(_: f64) -> bool { true }
+/// `RakeProfile::rate` (spec 2): a fraction, never a full rake (half-open at 1), mirroring
+/// `proto::worker`'s identical `domain_rake_rate`.
+fn domain_rake_rate(x: f64) -> bool { (0.0..1.0).contains(&x) }
+/// `RakeProfile::cap_bb`: a chip cap, never negative.
+fn domain_nonneg(x: f64) -> bool { x >= 0.0 }
+/// `BundleInfo::source_blinds` entries: a blind size, always strictly positive.
+fn domain_positive(x: f64) -> bool { x > 0.0 }
 
 /// Reads a wire number as `f64`, checks it is finite and inside `domain`, and only then
 /// narrows to `f32`, re-checking the narrowed value against the same domain. This ordering is
@@ -51,6 +58,21 @@ fn widen_checked(v: f32, domain: fn(f64) -> bool, what: &str) -> Result<f32, Str
         return Err(format!("{what} {v} is outside its valid domain"));
     }
     Ok(v)
+}
+
+/// Narrows one already wide-domain-checked weight (`[0, 1]`, which can never overflow `f32`).
+/// Used by `decode`'s wide-then-narrow restructuring (R1): the aggregate node/class checks
+/// in `validate.rs` run on raw `f64` first, and only after they pass does `decode` call this
+/// to produce the `f32` value it stores -- the same `narrow_checked`/`domain_unit_interval`
+/// used by `deserialize_weights` below, not a second copy of the domain rule.
+pub(crate) fn narrow_weight(raw: f64) -> Result<f32, String> {
+    narrow_checked(raw, domain_unit_interval, "weight")
+}
+/// Narrows one already wide-finite-checked EV cell; unlike a weight, a finite `f64` (e.g.
+/// `1e39`) can still overflow `f32` on narrowing, so this can legitimately fail even after
+/// the wide check passed.
+pub(crate) fn narrow_ev(raw: f64) -> Result<f32, String> {
+    narrow_checked(raw, domain_finite, "ev_source_sb")
 }
 
 pub(crate) fn deserialize_weights<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<f32>>, D::Error> {
@@ -111,4 +133,45 @@ pub(crate) fn serialize_evs<S: Serializer>(v: &Option<Vec<Vec<Option<f32>>>>, s:
             outer.end()
         }
     }
+}
+
+// --- R2: BundleInfo/RakeProfile metadata codecs (same wide-then-narrow pattern) ---
+
+pub(crate) fn deserialize_rake_rate<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    let raw = f64::deserialize(d)?;
+    narrow_checked(raw, domain_rake_rate, "rate").map_err(DeError::custom)
+}
+pub(crate) fn serialize_rake_rate<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    let checked = widen_checked(*v, domain_rake_rate, "rate").map_err(SerError::custom)?;
+    s.serialize_f32(checked)
+}
+
+pub(crate) fn deserialize_cap_bb<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    let raw = f64::deserialize(d)?;
+    narrow_checked(raw, domain_nonneg, "cap_bb").map_err(DeError::custom)
+}
+pub(crate) fn serialize_cap_bb<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    let checked = widen_checked(*v, domain_nonneg, "cap_bb").map_err(SerError::custom)?;
+    s.serialize_f32(checked)
+}
+
+/// `[source_blind_sb, source_blind_bb]`: both strictly positive and finite, and the second
+/// at least the first -- checked wide (`f64`) before narrowing, and re-checked (including
+/// the ordering) on serialize, matching every other codec in this module.
+pub(crate) fn deserialize_source_blinds<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; 2], D::Error> {
+    let raw: [f64; 2] = Deserialize::deserialize(d)?;
+    let sb = narrow_checked(raw[0], domain_positive, "source_blinds[0]").map_err(DeError::custom)?;
+    let bb = narrow_checked(raw[1], domain_positive, "source_blinds[1]").map_err(DeError::custom)?;
+    if bb < sb {
+        return Err(DeError::custom(format!("source_blinds[1] {bb} must be >= source_blinds[0] {sb}")));
+    }
+    Ok([sb, bb])
+}
+pub(crate) fn serialize_source_blinds<S: Serializer>(v: &[f32; 2], s: S) -> Result<S::Ok, S::Error> {
+    let sb = widen_checked(v[0], domain_positive, "source_blinds[0]").map_err(SerError::custom)?;
+    let bb = widen_checked(v[1], domain_positive, "source_blinds[1]").map_err(SerError::custom)?;
+    if bb < sb {
+        return Err(SerError::custom(format!("source_blinds[1] {bb} must be >= source_blinds[0] {sb}")));
+    }
+    Serialize::serialize(&[sb, bb], s)
 }
