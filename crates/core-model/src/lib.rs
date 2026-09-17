@@ -2,6 +2,7 @@ pub mod betting;
 pub mod cards;
 pub mod config;
 pub mod error;
+pub mod lifecycle;
 pub mod positions;
 pub mod settlement;
 
