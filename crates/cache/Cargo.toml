@@ -9,6 +9,8 @@ description = "Canonical cache keys, on-disk street-solution store and backgroun
 [features]
 # Plan 5 enables this to generate the `PresolverStatus` TypeScript binding (cross-plan Or7).
 typescript = ["dep:ts-rs"]
+# Exhaustive suites (spec section 5 / CLAUDE.md section 5): not part of the default gate.
+exhaustive = []
 
 [dependencies]
 proto = { path = "../proto" }
