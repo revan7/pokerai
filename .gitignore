@@ -1,0 +1,22 @@
+# Obsidian workspace state
+.obsidian/
+
+# Rust build artifacts
+target/
+
+# Node.js dependencies
+node_modules/
+
+# Vite build output
+apps/pokerai-ui/dist/
+
+# Python virtual environment
+tools/.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Benchmark temporary files
+docs/bench/*.tmp
