@@ -1,0 +1,25 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Coverage classifier, tree builder, worker client and result assembly (spec sections 4.4, 5, 10.1)"
+
+[dependencies]
+proto = { path = "../proto" }
+core-model = { path = "../core-model" }
+core-ranges = { path = "../core-ranges" }
+core-iso = { path = "../core-iso" }
+core-eval = { path = "../core-eval" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[features]
+# Fake clock, fake worker and recording sink (Task 19). Never enabled by a release consumer.
+testing = []
+# Extra tree templates registered by a downstream test harness (plan 4 Task 8).
+test-templates = []
