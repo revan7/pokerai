@@ -13,4 +13,5 @@ pub enum CacheError {
     Codec(#[from] bincode::Error),
 }
 
+pub mod entry;
 pub mod key;
