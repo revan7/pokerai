@@ -1,5 +1,8 @@
+pub mod equity;
 pub mod evaluator;
+pub mod mc;
 
+pub use equity::*;
 pub use evaluator::{BinaryEvaluator, Evaluator, PartialHand};
 use proto::Card;
 
