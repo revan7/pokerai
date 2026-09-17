@@ -27,6 +27,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-iso"
+version = "0.1.0"
+dependencies = [
+ "core-ranges",
+ "proto",
+ "serde",
+]
+
+[[package]]
 name = "core-model"
 version = "0.1.0"
 dependencies = [
