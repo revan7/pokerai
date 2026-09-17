@@ -439,3 +439,205 @@ fn rank_is_equal_for_identical_comparisons() {
     let a = Comparison { delta: 0.1, max_dev: 0.02, delta_num: 1, delta_den: 10, menu_num: 1, menu_den: 50 };
     assert_eq!(a.rank(&a), std::cmp::Ordering::Equal);
 }
+
+// --- task 4: inherited reasons and raw-accuracy filtering (spec 10.4/13.1) -----------------------
+//
+// `zero_comparison`/`comparison_with_max_dev` build a `Comparison` for `label` tests: `label`
+// only ever reads `c.max_dev`, never `c.delta`/`_num`/`_den` (the query's own exact `spr` is
+// compared against `e.source.spr` directly instead), so the other fields are harmless
+// placeholders here.
+fn zero_comparison() -> Comparison {
+    Comparison { delta: 0.0, max_dev: 0.0, delta_num: 0, delta_den: 1, menu_num: 0, menu_den: 1 }
+}
+
+fn comparison_with_max_dev(max_dev: f64) -> Comparison {
+    Comparison { delta: 0.0, max_dev, delta_num: 0, delta_den: 1, menu_num: 0, menu_den: 1 }
+}
+
+#[test]
+fn cache_inherited_reasons_survive() {
+    use cache::label::{accuracy_ok, merge_reasons};
+    use proto::ApproxReason;
+    assert!(!accuracy_ok(0.005049, 50));
+    assert!(accuracy_ok(0.005049, 51));
+    assert!(accuracy_ok(0.005, 50));
+    assert!(!accuracy_ok(f64::NAN, 50));
+    let reasons = vec![
+        ApproxReason::ChartRounded,
+        ApproxReason::DeadlineBestSoFar { reached_bp: 190, target_bp: 50 },
+        ApproxReason::UnconditionedPriorStreet { street: proto::Street::Flop, seat: proto::Seat(2), cause: "uncovered path []".into() },
+    ];
+    assert_eq!(merge_reasons(&reasons, &[ApproxReason::ChartRounded]).len(), 3);
+}
+
+/// Isolates the nonnegativity guard from the finiteness guard: `-0.001` is finite (passes
+/// `is_finite()`) but negative, so only the explicit `raw >= 0.0` check can reject it.
+#[test]
+fn accuracy_ok_rejects_finite_negative_raw() {
+    use cache::label::accuracy_ok;
+    assert!(!accuracy_ok(-0.001, 50));
+}
+
+/// Isolates the finiteness guard from a narrower "NaN-only" check: `+inf` is not NaN, so an
+/// implementation that only tested `raw.is_nan()` (rather than `!raw.is_finite()`) would wrongly
+/// accept it here.
+#[test]
+fn accuracy_ok_rejects_positive_infinity() {
+    use cache::label::accuracy_ok;
+    assert!(!accuracy_ok(f64::INFINITY, 50));
+}
+
+/// Isolates ordering and true (not just count-based) dedup: two of `b`'s three reasons duplicate
+/// `a`'s entries and must be dropped, the third (unique) reason from `b` must survive, and every
+/// surviving reason must keep the position of its *first* occurrence.
+#[test]
+fn merge_reasons_preserves_first_occurrence_order_and_drops_only_the_duplicate_from_b() {
+    use cache::label::merge_reasons;
+    let a = vec![proto::ApproxReason::ChartRounded, proto::ApproxReason::EvReferenceUnverified];
+    let b = vec![
+        proto::ApproxReason::EvReferenceUnverified, // duplicate of a[1]
+        proto::ApproxReason::ChartRounded,          // duplicate of a[0]
+        proto::ApproxReason::DeadlineBestSoFar { reached_bp: 190, target_bp: 50 },
+    ];
+    let merged = merge_reasons(&a, &b);
+    assert_eq!(
+        merged,
+        vec![
+            proto::ApproxReason::ChartRounded,
+            proto::ApproxReason::EvReferenceUnverified,
+            proto::ApproxReason::DeadlineBestSoFar { reached_bp: 190, target_bp: 50 },
+        ]
+    );
+}
+
+/// The brief's boundary case: `support::entry()` has `exploitability_over_P = 0.004` (40bp) and
+/// no reasons. A 30bp target misses (`provisional`), but a raw-accuracy miss alone must never
+/// synthesize an `Approximate{reasons: []}` -- it stays `Coverage::Exact`, disclosed solely by
+/// the `Provisional` phase plus the raw reached exploitability.
+#[test]
+fn provisional_without_reasons_is_never_an_empty_approximate() {
+    let entry = support::entry();
+    let comparison = zero_comparison();
+    let (coverage, provisional) = cache::label::label(&entry, entry.source.spr, &comparison, 30, &[]);
+    assert!(provisional, "0.004 > 30 bp");
+    assert!(matches!(coverage, proto::Coverage::Exact));
+}
+
+/// Isolates the "inherited reasons survive" guard: query spr equals the entry's own stored spr
+/// (no `SprBucketed`), `max_dev` is zero (no `MenuRounded`), and the target is loose enough that
+/// `0.004` passes (`provisional` false, so no accuracy-driven disclosure either). Only
+/// `e.reasons` can produce the result.
+#[test]
+fn label_preserves_entrys_own_inherited_reasons_when_no_other_guard_fires() {
+    let mut entry = support::entry();
+    entry.reasons = vec![proto::ApproxReason::ChartRounded];
+    let (coverage, provisional) = cache::label::label(&entry, entry.source.spr, &zero_comparison(), 50, &[]);
+    assert_eq!(coverage, proto::Coverage::Approximate { reasons: vec![proto::ApproxReason::ChartRounded] });
+    assert!(!provisional, "0.004 <= 50bp target");
+}
+
+/// Isolates dedup-on-merge inside `label` itself (not just the standalone `merge_reasons` unit
+/// test above): the same reason is both inherited (`e.reasons`) and incurred by the query
+/// (`query_reasons`), and must appear exactly once in the disclosed coverage, alongside the
+/// entry's other, non-duplicated inherited reason.
+#[test]
+fn label_merges_query_reasons_with_inherited_reasons_and_dedups() {
+    let mut entry = support::entry();
+    entry.reasons = vec![proto::ApproxReason::ChartRounded, proto::ApproxReason::EvReferenceUnverified];
+    let (coverage, provisional) =
+        cache::label::label(&entry, entry.source.spr, &zero_comparison(), 50, &[proto::ApproxReason::ChartRounded]);
+    assert_eq!(
+        coverage,
+        proto::Coverage::Approximate { reasons: vec![proto::ApproxReason::ChartRounded, proto::ApproxReason::EvReferenceUnverified] }
+    );
+    assert!(!provisional);
+}
+
+/// Isolates the `SprBucketed` guard: no inherited/query reasons, `max_dev` is zero (no
+/// `MenuRounded`), accuracy passes (no provisional) -- the sole possible addition is
+/// `SprBucketed`, triggered only because the query's exact spr differs from the entry's stored
+/// spr (`support::entry()`'s `source.spr` is `5/1`).
+#[test]
+fn label_adds_spr_bucketed_reason_only_when_query_spr_differs_from_entry_spr() {
+    let entry = support::entry();
+    let query_spr = Rational::new(6, 1).unwrap();
+    let (coverage, provisional) = cache::label::label(&entry, query_spr, &zero_comparison(), 50, &[]);
+    assert_eq!(coverage, proto::Coverage::Approximate { reasons: vec![proto::ApproxReason::SprBucketed { actual: 6.0, used: 5.0 }] });
+    assert!(!provisional);
+}
+
+/// The control case for the guard above: when the query's spr equals the entry's own, no
+/// `SprBucketed` (or any other) reason fires and coverage is plain `Exact` -- proving the guard
+/// above is conditioned on the spr difference, not unconditional.
+#[test]
+fn label_omits_spr_bucketed_reason_when_query_spr_equals_entry_spr() {
+    let entry = support::entry();
+    let (coverage, provisional) = cache::label::label(&entry, entry.source.spr, &zero_comparison(), 50, &[]);
+    assert_eq!(coverage, proto::Coverage::Exact);
+    assert!(!provisional);
+}
+
+/// Isolates the `MenuRounded` guard: query spr equals the entry's own (no `SprBucketed`), no
+/// inherited/query reasons, accuracy passes (no provisional) -- the sole possible addition is
+/// `MenuRounded`, triggered solely by a positive `c.max_dev` (spec 13.1's own worked example:
+/// `100/500` vs `20/100` -> `MenuRounded{2.0}`).
+#[test]
+fn label_adds_menu_rounded_reason_only_when_max_dev_is_positive() {
+    let entry = support::entry();
+    let (coverage, provisional) = cache::label::label(&entry, entry.source.spr, &comparison_with_max_dev(0.02), 50, &[]);
+    assert_eq!(coverage, proto::Coverage::Approximate { reasons: vec![proto::ApproxReason::MenuRounded { max_delta_pct: 2.0 }] });
+    assert!(!provisional);
+}
+
+/// Standing rule (task brief): reaching a looser target on this query never strips a reason the
+/// entry's own solve already incurred. `support::entry()`'s `exploitability_over_P` (0.004, 40bp)
+/// fails a 30bp target but passes a looser 100bp one; the stored `DeadlineBestSoFar` from the
+/// entry's own (tighter) original solve must still be disclosed even though *this* query's own
+/// target now passes -- coverage never upgrades back toward `Exact` on a looser query.
+#[test]
+fn label_never_removes_a_stored_deadline_reason_when_a_looser_query_target_now_passes() {
+    let mut entry = support::entry();
+    entry.reasons = vec![proto::ApproxReason::DeadlineBestSoFar { reached_bp: 60, target_bp: 50 }];
+    let (coverage, provisional) = cache::label::label(&entry, entry.source.spr, &zero_comparison(), 100, &[]);
+    assert_eq!(
+        coverage,
+        proto::Coverage::Approximate { reasons: vec![proto::ApproxReason::DeadlineBestSoFar { reached_bp: 60, target_bp: 50 }] }
+    );
+    assert!(!provisional, "0.004 <= 100bp target, so this query itself is not provisional");
+}
+
+/// Accuracy miss (`provisional`) fires even while `SprBucketed`, `MenuRounded` and an inherited
+/// reason are all simultaneously present -- the two disclosures (the `Coverage` reason list and
+/// the `Provisional` phase) are independent axes; neither masks the other.
+#[test]
+fn label_provisional_flag_is_independent_of_reasons_present() {
+    let mut entry = support::entry(); // exploitability_over_P = 0.004 = 40bp
+    entry.reasons = vec![proto::ApproxReason::ChartRounded];
+    let query_spr = Rational::new(6, 1).unwrap();
+    let (coverage, provisional) = cache::label::label(&entry, query_spr, &comparison_with_max_dev(0.02), 30, &[]);
+    assert!(provisional, "40bp > 30bp target");
+    match coverage {
+        proto::Coverage::Approximate { reasons } => {
+            assert_eq!(reasons.len(), 3, "expected inherited + SprBucketed + MenuRounded, got {reasons:?}");
+            assert!(reasons.contains(&proto::ApproxReason::ChartRounded));
+            assert!(reasons.contains(&proto::ApproxReason::SprBucketed { actual: 6.0, used: 5.0 }));
+            assert!(reasons.contains(&proto::ApproxReason::MenuRounded { max_delta_pct: 2.0 }));
+        }
+        other => panic!("expected Approximate with 3 reasons, got {other:?}"),
+    }
+}
+
+/// "mode is disclosed and does not change raw accuracy or labels" (task brief): two entries
+/// identical except `mode` ("f32" vs "i16") must label identically under the same query.
+#[test]
+fn label_output_is_unaffected_by_entry_mode_f32_or_i16() {
+    let mut f32_entry = support::entry();
+    f32_entry.mode = "f32".into();
+    let mut i16_entry = f32_entry.clone();
+    i16_entry.mode = "i16".into();
+    let query_spr = Rational::new(6, 1).unwrap();
+    let c = comparison_with_max_dev(0.02);
+    let f32_result = cache::label::label(&f32_entry, query_spr, &c, 30, &[]);
+    let i16_result = cache::label::label(&i16_entry, query_spr, &c, 30, &[]);
+    assert_eq!(f32_result, i16_result);
+}

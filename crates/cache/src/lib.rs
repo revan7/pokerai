@@ -15,4 +15,5 @@ pub enum CacheError {
 
 pub mod entry;
 pub mod key;
+pub mod label;
 pub mod lookup;
