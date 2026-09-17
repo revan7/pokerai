@@ -139,7 +139,14 @@ fn rejects_duplicate_action_kind_and_amount() {
 
 #[test]
 fn rejects_duplicate_unreachable_class() {
+    // R3: zero class 5's only action weight first, so `[5]` alone is a valid unreachable
+    // declaration (exact-zero rule satisfied) -- otherwise `[5, 5]` would be rejected by the
+    // exact-zero rule regardless of the duplicate-index guard, and this test would not
+    // actually exercise that guard.
     let mut e = base_envelope();
+    e.nodes[0].weights[0][5] = 0.0;
+    e.nodes[0].unreachable_classes = vec![5];
+    assert!(validate(&e).is_ok());
     e.nodes[0].unreachable_classes = vec![5, 5];
     assert!(validate(&e).is_err());
 }
@@ -177,8 +184,15 @@ fn probability_bound_boundaries() {
     e.nodes[0].weights = vec![vec![1.0; 169], vec![0.0; 169]];
     assert!(validate(&e).is_ok());
 
+    // R3: a compensating in-domain sibling (1.0) keeps the sum within the 1e-3 tolerance
+    // despite the negative value, isolating the per-element domain-bound rule from the
+    // sibling-sum rule -- with the original sibling 0.0, sum -0.0001 independently violates
+    // the sum tolerance too, so that assertion could not tell which rule actually fired.
+    e.nodes[0].weights[1][0] = 1.0;
     e.nodes[0].weights[0][0] = -0.0001;
     assert!(validate(&e).is_err());
+    e.nodes[0].weights[1][0] = 0.0; // restore for the remaining sub-cases below
+
     e.nodes[0].weights[0][0] = 1.0001;
     assert!(validate(&e).is_err());
     e.nodes[0].weights[0][0] = f32::NAN;
@@ -285,4 +299,50 @@ fn decode_round_trips_a_valid_bundle() {
     let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.bundle_id, e.bundle_id);
     assert_eq!(decoded.nodes.len(), e.nodes.len());
+}
+
+// --- R1 (fix round 1): decode rejects wide-form violations that per-element narrowing
+// would otherwise hide, with no clamping or renormalization -- both are the review's exact
+// probe inputs, each paired with a nearby valid control. ---
+
+/// A two-action ("fold", "call") envelope, 169-wide, valid at every class except `idx`,
+/// where the two given tokens are substituted (`row0[idx] = tok0`, `row1[idx] = tok1`).
+/// `unreachable` optionally declares `idx` unreachable.
+fn decode_two_action_envelope(idx: usize, tok0: &str, tok1: &str, unreachable: bool) -> Result<Envelope, BundleError> {
+    let mut row0 = vec!["1".to_string(); 169];
+    let mut row1 = vec!["0".to_string(); 169];
+    row0[idx] = tok0.to_string();
+    row1[idx] = tok1.to_string();
+    let unreachable_classes = if unreachable { format!("[{idx}]") } else { "[]".to_string() };
+    let json = format!(
+        r#"{{"bundle_id":"s","depth_bb":100,"rake_profile":"r","straddle":false,"class_order":"A-2 row-major, section 4.1","nodes":[{{"history":[],"actor":"UTG","actions":[{{"step":"fold"}},{{"step":"call"}}],"weights":[[{}],[{}]],"unreachable_classes":{unreachable_classes}}}]}}"#,
+        row0.join(","),
+        row1.join(",")
+    );
+    decode(json.as_bytes())
+}
+
+#[test]
+fn decode_rejects_sibling_sum_that_narrowing_would_have_hidden() {
+    // The review's exact probe: raw sum 1.00100000001 (outside the 1e-3 tolerance), but the
+    // narrowed-f32-then-summed value 1.000999987125 was inside it under the pre-fix code.
+    assert!(decode_two_action_envelope(0, "0.5", "0.50100000001", false).is_err());
+}
+
+#[test]
+fn decode_accepts_nearby_valid_sibling_sum_control() {
+    assert!(decode_two_action_envelope(0, "0.5", "0.5", false).is_ok());
+}
+
+#[test]
+fn decode_rejects_unreachable_class_with_tiny_nonzero_weight_that_narrowing_would_have_hidden() {
+    // The review's exact probe: a declared-unreachable class holding 1e-50, which narrows to
+    // exactly 0.0 (satisfying the exact-zero rule) under the pre-fix code, hiding the
+    // nonzero wire content.
+    assert!(decode_two_action_envelope(0, "1e-50", "0", true).is_err());
+}
+
+#[test]
+fn decode_accepts_unreachable_class_with_exact_zero_control() {
+    assert!(decode_two_action_envelope(0, "0", "0", true).is_ok());
 }
