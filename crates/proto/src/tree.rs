@@ -15,12 +15,33 @@ pub const RULES_VERSION: u16 = 3;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MenuSize { Pot(f32), AllIn }
 
+/// Bincode-only mirror of `MenuSize` (spec 10.4's pinned cache storage format is not
+/// self-describing). The JSON wire form below is a hand-duck-typed union (a bare number or the
+/// literal `"a"`), decoded via `Deserializer::deserialize_any` -- which every human-readable
+/// format supports but bincode's `Deserializer` categorically refuses
+/// (`ErrorKind::DeserializeAnyNotSupported`, unconditionally, regardless of the visitor). This
+/// ordinary two-variant enum, plainly derived with no `#[serde(...)]` attribute, gets bincode's
+/// normal variant-index-plus-fields encoding instead, which needs no self-description.
+#[derive(Serialize, Deserialize)]
+enum MenuSizeWire {
+    Pot(f32),
+    AllIn,
+}
+
 impl Serialize for MenuSize {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // A constructed `Pot` can be built outside `Deserialize` (the type is public), so the
+        // same positive-finite domain is re-checked here on every format: emitting an invalid
+        // value as JSON `null` (serde's behavior for a non-finite f32) would silently corrupt the
+        // wire form, and bincode has no `null` to fall back to at all.
+        if !s.is_human_readable() {
+            return match self {
+                MenuSize::Pot(x) if x.is_finite() && *x > 0.0 => MenuSizeWire::Pot(*x).serialize(s),
+                MenuSize::Pot(x) => Err(S::Error::custom(format!("a menu size must be positive and finite, got {x:e}"))),
+                MenuSize::AllIn => MenuSizeWire::AllIn.serialize(s),
+            };
+        }
         match self {
-            // A constructed `Pot` can be built outside `Deserialize` (the type is public), so the
-            // same positive-finite domain is re-checked here: emitting an invalid value as JSON
-            // `null` (serde's behavior for a non-finite f32) would silently corrupt the wire form.
             MenuSize::Pot(x) if x.is_finite() && *x > 0.0 => s.serialize_f32(*x),
             MenuSize::Pot(x) => Err(S::Error::custom(format!("a menu size must be positive and finite, got {x:e}"))),
             MenuSize::AllIn => s.serialize_str("a"),
@@ -55,7 +76,16 @@ impl<'de> Visitor<'de> for MenuSizeVisitor {
 }
 
 impl<'de> Deserialize<'de> for MenuSize {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<MenuSize, D::Error> { d.deserialize_any(MenuSizeVisitor) }
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<MenuSize, D::Error> {
+        if !d.is_human_readable() {
+            return match MenuSizeWire::deserialize(d)? {
+                MenuSizeWire::Pot(x) if x.is_finite() && x > 0.0 => Ok(MenuSize::Pot(x)),
+                MenuSizeWire::Pot(x) => Err(de::Error::custom(format!("a menu size must be positive and finite, got {x:e}"))),
+                MenuSizeWire::AllIn => Ok(MenuSize::AllIn),
+            };
+        }
+        d.deserialize_any(MenuSizeVisitor)
+    }
 }
 
 /// `MenuSize`'s untagged mixed-payload wire form (`0.33` / `"a"`) cannot be derived by ts-rs;
@@ -80,14 +110,66 @@ impl ts_rs::TS for MenuSize {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SideMenu { pub bet: Vec<MenuSize>, pub raise: Vec<MenuSize> }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// `Serialize`/`Deserialize` are hand-written (Task: P4.T2-followup), reachable from
+/// `CacheEntry` via `EffectiveTree.menus`. The derive's `#[serde(default,
+/// skip_serializing_if = "Option::is_none")]` on `donk` is itself a *second*,
+/// independent bincode incompatibility beyond internally-tagged enums: it makes the derived
+/// `Serialize` omit the `donk` field from the wire entirely whenever it is `None` -- on every
+/// format, not only human-readable ones -- but bincode's struct encoding is purely positional
+/// (no field names on the wire), so a reader expecting three fields silently desyncs onto the
+/// next struct's bytes when only two were written, corrupting everything that follows (observed
+/// directly: a `bincode::deserialize::<CacheEntry>` of the plan-4 `support::entry()` fixture,
+/// whose flop `PlayerMenus.donk` is `None`, later fails with `InvalidTagEncoding(2)` deep inside
+/// an unrelated `Option` read). `PlayerMenusJson` keeps the identical derive (including
+/// `skip_serializing_if`) for the human-readable path; `PlayerMenusBincode` always encodes all
+/// three fields, keeping bincode's field count symmetric between write and read.
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct PlayerMenus {
     pub oop: SideMenu,
     pub ip: SideMenu,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional = nullable))]
     pub donk: Option<Vec<MenuSize>>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlayerMenusJson {
+    oop: SideMenu,
+    ip: SideMenu,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    donk: Option<Vec<MenuSize>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PlayerMenusBincode {
+    oop: SideMenu,
+    ip: SideMenu,
+    donk: Option<Vec<MenuSize>>,
+}
+
+impl From<PlayerMenus> for PlayerMenusJson {
+    fn from(p: PlayerMenus) -> Self { PlayerMenusJson { oop: p.oop, ip: p.ip, donk: p.donk } }
+}
+impl From<PlayerMenusJson> for PlayerMenus {
+    fn from(p: PlayerMenusJson) -> Self { PlayerMenus { oop: p.oop, ip: p.ip, donk: p.donk } }
+}
+impl From<PlayerMenus> for PlayerMenusBincode {
+    fn from(p: PlayerMenus) -> Self { PlayerMenusBincode { oop: p.oop, ip: p.ip, donk: p.donk } }
+}
+impl From<PlayerMenusBincode> for PlayerMenus {
+    fn from(p: PlayerMenusBincode) -> Self { PlayerMenus { oop: p.oop, ip: p.ip, donk: p.donk } }
+}
+
+impl Serialize for PlayerMenus {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() { PlayerMenusJson::from(self.clone()).serialize(s) } else { PlayerMenusBincode::from(self.clone()).serialize(s) }
+    }
+}
+impl<'de> Deserialize<'de> for PlayerMenus {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<PlayerMenus, D::Error> {
+        if d.is_human_readable() { PlayerMenusJson::deserialize(d).map(PlayerMenus::from) } else { PlayerMenusBincode::deserialize(d).map(PlayerMenus::from) }
+    }
 }
 
 /// One action node of the betting skeleton (spec section 2).

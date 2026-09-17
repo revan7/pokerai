@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::cards::Card;
 use crate::game::HandConfig;
 use crate::range::Range1326;
@@ -30,10 +30,90 @@ impl Street {
 }
 
 /// `to` = the actor's total contribution on this street.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+///
+/// `Serialize`/`Deserialize` are hand-written (Task: P4.T2-followup) rather than derived with
+/// `#[serde(tag = "kind", rename_all = "lowercase")]` directly: serde's internally-tagged enum
+/// representation deserializes by buffering the object's content via `Deserializer::deserialize_any`
+/// (to find the tag before knowing which variant to decode), and bincode 1.3.3 -- the pinned cache
+/// storage format, spec 10.4 -- unconditionally refuses `deserialize_any`
+/// (`ErrorKind::DeserializeAnyNotSupported`, regardless of the visitor). Any `CacheEntry`
+/// containing an `Action` (every `MaterializedNode.actions` does) therefore could never round-trip
+/// through the cache. The fix keeps the exact tagged-map JSON form via a private `ActionJson`
+/// mirror that still carries the removed `#[serde(...)]` attributes (so human-readable output is
+/// byte-for-byte unchanged, including error behavior), and uses a second private `ActionBincode`
+/// mirror -- an ordinary, attribute-free derive -- for every non-human-readable format, which
+/// bincode encodes as a plain variant index plus fields, needing no self-description at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(tag = "kind", rename_all = "lowercase"))]
 pub enum Action { Fold, Check, Call, Bet { to: u32 }, Raise { to: u32 }, AllIn { to: u32 } }
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum ActionJson { Fold, Check, Call, Bet { to: u32 }, Raise { to: u32 }, AllIn { to: u32 } }
+
+#[derive(Serialize, Deserialize)]
+enum ActionBincode { Fold, Check, Call, Bet { to: u32 }, Raise { to: u32 }, AllIn { to: u32 } }
+
+impl From<Action> for ActionJson {
+    fn from(a: Action) -> Self {
+        match a {
+            Action::Fold => ActionJson::Fold,
+            Action::Check => ActionJson::Check,
+            Action::Call => ActionJson::Call,
+            Action::Bet { to } => ActionJson::Bet { to },
+            Action::Raise { to } => ActionJson::Raise { to },
+            Action::AllIn { to } => ActionJson::AllIn { to },
+        }
+    }
+}
+impl From<ActionJson> for Action {
+    fn from(a: ActionJson) -> Self {
+        match a {
+            ActionJson::Fold => Action::Fold,
+            ActionJson::Check => Action::Check,
+            ActionJson::Call => Action::Call,
+            ActionJson::Bet { to } => Action::Bet { to },
+            ActionJson::Raise { to } => Action::Raise { to },
+            ActionJson::AllIn { to } => Action::AllIn { to },
+        }
+    }
+}
+impl From<Action> for ActionBincode {
+    fn from(a: Action) -> Self {
+        match a {
+            Action::Fold => ActionBincode::Fold,
+            Action::Check => ActionBincode::Check,
+            Action::Call => ActionBincode::Call,
+            Action::Bet { to } => ActionBincode::Bet { to },
+            Action::Raise { to } => ActionBincode::Raise { to },
+            Action::AllIn { to } => ActionBincode::AllIn { to },
+        }
+    }
+}
+impl From<ActionBincode> for Action {
+    fn from(a: ActionBincode) -> Self {
+        match a {
+            ActionBincode::Fold => Action::Fold,
+            ActionBincode::Check => Action::Check,
+            ActionBincode::Call => Action::Call,
+            ActionBincode::Bet { to } => Action::Bet { to },
+            ActionBincode::Raise { to } => Action::Raise { to },
+            ActionBincode::AllIn { to } => Action::AllIn { to },
+        }
+    }
+}
+
+impl Serialize for Action {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() { ActionJson::from(*self).serialize(s) } else { ActionBincode::from(*self).serialize(s) }
+    }
+}
+impl<'de> Deserialize<'de> for Action {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Action, D::Error> {
+        if d.is_human_readable() { ActionJson::deserialize(d).map(Action::from) } else { ActionBincode::deserialize(d).map(Action::from) }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
