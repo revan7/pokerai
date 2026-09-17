@@ -147,6 +147,19 @@ mod tests {
         assert!(!text.contains("hand_id"), "the engine assigns hand_id (spec 4.3): {text}");
         assert!(text.contains(r#""stacks":[200,100,150]"#), "{text}");
         assert_eq!(serde_json::from_str::<BeginHand>(&text).unwrap(), dto);
-        assert!(serde_json::from_str::<BeginHand>(&text.replace(r#""stacks""#, r#""stacks_start""#)).is_err(), "unknown fields are rejected");
+
+        // Control: the unmodified, fully valid payload deserializes successfully.
+        let mut value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(serde_json::from_value::<BeginHand>(value.clone()).unwrap(), dto);
+
+        // Unknown-field guard: injecting an extra field into an otherwise-valid
+        // payload must be rejected, and the error must name the unknown field.
+        // (A renamed-required-field case would fail deserialization even without
+        // the guard, so it cannot prove the guard is load-bearing; see review R1.)
+        value["hand_id"] = serde_json::json!(42);
+        let err = serde_json::from_value::<BeginHand>(value)
+            .expect_err("BeginHand must reject an unknown `hand_id` field")
+            .to_string();
+        assert!(err.contains("hand_id"), "error should mention the unknown field `hand_id`: {err}");
     }
 }
