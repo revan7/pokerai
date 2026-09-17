@@ -5,9 +5,11 @@ use crate::error::RulesError;
 /// One betting street (spec 4.3). Per-seat arrays are indexed by `Seat.0`; undealt seats are marked folded.
 ///
 /// Invariants established by [`Round::open`] and preserved by every method:
-/// `facing` is the largest street commitment (so `committed[i] <= facing` for every seat) and never
-/// decreases; `committed[i] + stacks[i]` is the seat's starting stack and never changes, which is this
-/// street's share of the conservation invariant; `pending` holds live seats only, in action order.
+/// `facing` is the largest wager faced this street — the largest of the nominal posts and the accepted
+/// wagers — and never decreases; a short post leaves its poster's commitment below it, but
+/// `committed[i] <= facing` still holds for every seat; `committed[i] + stacks[i]` is the seat's starting
+/// stack and never changes, which is this street's share of the conservation invariant; `pending` holds
+/// live seats only, in action order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Round {
     pub street: Street,
@@ -26,11 +28,14 @@ pub struct Round {
 fn illegal(reason: impl Into<String>) -> RulesError { RulesError::IllegalAction { reason: reason.into() } }
 
 impl Round {
-    /// Opens a street; `order` is the action order among the seats present at the street start.
+    /// Opens a street; `order` is the action order of the seats at the street start. Folded and all-in
+    /// seats may appear in it — the lifecycle caller passes the whole dealt-seat order for the street
+    /// along with the current flags — and are filtered out of `pending` here, so they are never given a
+    /// turn (review R1).
     ///
     /// Infallible, so the caller's contract is enforced with always-on assertions: `order` lists every
-    /// unfolded seat that still has chips, exactly once, with no folded seat; a seat with no chips left
-    /// is all-in; and the minimum bet is at least one chip.
+    /// unfolded seat that still has chips, each seat at most once; a seat with no chips left is all-in;
+    /// and the minimum bet is at least one chip.
     pub fn open(street: Street, order: Vec<Seat>, stacks: [u32; 6], folded: [bool; 6], all_in: [bool; 6], min_bet: u32) -> Round {
         assert!(min_bet > 0, "the minimum bet is at least one chip");
         assert!(!order.is_empty(), "a street needs at least one seat in the action order");
@@ -39,7 +44,6 @@ impl Round {
             let i = usize::from(seat.0);
             assert!(i < 6, "seat {i} is out of range 0..6");
             assert!(!listed[i], "seat {i} appears twice in the action order");
-            assert!(!folded[i], "folded seat {i} cannot be in the action order");
             listed[i] = true;
         }
         for (i, listed) in listed.iter().enumerate() {
@@ -51,13 +55,17 @@ impl Round {
         Round { street, order, committed: [0; 6], stacks, folded, all_in, facing: 0, last_full_raise: min_bet, facing_at_last: [None; 6], pending }
     }
 
-    /// Posts a blind or straddle without consuming the seat's turn; a post above the stack is all-in for the stack.
+    /// Posts a blind or straddle without consuming the seat's turn. A post above the stack is all-in for
+    /// the stack, but the *nominal* amount is still the wager everyone else faces: a short blind does not
+    /// lower the bring-in, so the others enter for the full blind and a raise is measured from it
+    /// (review R2). No chips are manufactured — the poster's commitment stays capped at its stack and the
+    /// uncalled remainder is returned at settlement.
     pub fn post(&mut self, seat: Seat, amount: u32) {
         let i = usize::from(seat.0);
         let paid = amount.min(self.stacks[i]);
         self.stacks[i] -= paid;
         self.committed[i] += paid;
-        self.facing = self.facing.max(self.committed[i]);
+        self.facing = self.facing.max(amount).max(self.committed[i]);
         if self.stacks[i] == 0 { self.all_in[i] = true; self.pending.retain(|s| *s != seat); }
     }
 
@@ -81,9 +89,9 @@ impl Round {
     /// unreachable, and [`Round::legal`] and [`Round::apply`] compare the exact `u64` value.
     pub fn min_raise_to(&self) -> u32 { u32::try_from(self.min_raise_to_wide()).unwrap_or(u32::MAX) }
 
-    /// What the seat still owes to match the highest wager.
+    /// What the seat still owes to match the highest wager (capped at its stack by the caller).
     fn owed(&self, i: usize) -> u32 {
-        assert!(self.facing >= self.committed[i], "facing is the largest street commitment");
+        assert!(self.facing >= self.committed[i], "facing is the largest wager faced this street");
         self.facing - self.committed[i]
     }
 
