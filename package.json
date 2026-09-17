@@ -1,0 +1,1 @@
+{"name":"pokerai","private":true,"workspaces":["apps/pokerai-ui"],"scripts":{"test":"npm test --workspace pokerai-ui","check":"npm run check --workspace pokerai-ui","build":"npm run build --workspace pokerai-ui"}}

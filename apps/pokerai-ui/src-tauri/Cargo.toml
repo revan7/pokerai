@@ -1,0 +1,23 @@
+[package]
+name = "pokerai-app"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+[lib]
+name = "pokerai_app"
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+[dependencies]
+proto = { path = "../../../crates/proto" }
+engine = { path = "../../../crates/engine" }
+tauri = { version = "=2.11.5", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+futures-channel = "0.3.31"
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+proto = { path = "../../../crates/proto", features = ["typescript"] }
+[dev-dependencies]
+tauri = { version = "=2.11.5", features = ["test"] }
+tempfile = "3"

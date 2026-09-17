@@ -6,14 +6,17 @@ use crate::tree::EffectiveTree;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct Seat(pub u8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum Position { Btn, Sb, Bb, Utg, Hj, Co }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum Street { Preflop, Flop, Turn, River }
 
 impl Street {
@@ -29,17 +32,21 @@ impl Street {
 /// `to` = the actor's total contribution on this street.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum Action { Fold, Check, Call, Bet { to: u32 }, Raise { to: u32 }, AllIn { to: u32 } }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct TakenAction { pub seat: Seat, pub street: Street, pub action: Action, pub paid: u32 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum CompleteReason { FoldedOut, AllInRunout, ShowdownReached }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum HandPhase {
     Betting { street: Street },
     AwaitingBoard { street: Street },
@@ -48,14 +55,17 @@ pub enum HandPhase {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct Pot { pub amount: u32, pub eligible: Vec<Seat> }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum LegalAction { Fold, Check, Call { cost: u32 }, Bet { min_to: u32, max_to: u32 }, Raise { min_to: u32, max_to: u32 }, AllIn { to: u32 } }
 
 /// Per-seat vectors are indexed by `Seat.0` (length 6); an undealt seat is `folded = true`, `all_in = false`, zeros elsewhere.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct Derived {
     pub street: Street,
     pub to_act: Option<Seat>,
@@ -77,6 +87,7 @@ impl Default for Derived {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct HandState {
     pub hand_id: u64,
     pub hand_revision: u32,
@@ -94,6 +105,7 @@ pub struct HandState {
 
 /// Financial snapshot only (spec section 2); no ranges. `bb_chips` is carried so that `replay_root` knows the minimum bet.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct StreetRootSnapshot {
     pub street: Street,
     pub board: Vec<Card>,
@@ -111,6 +123,7 @@ pub struct StreetRootSnapshot {
 /// Solve request sent to the engine/worker: financial root, both players' public ranges
 /// and the effective tree to solve against (spec section 2). Hero's cards never appear here.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SolveInput {
     pub root: StreetRootSnapshot,
     pub ranges: [Range1326; 2],
@@ -122,6 +135,7 @@ pub struct SolveInput {
 /// `stacks` in `dealt` order. `core_model::BeginHand` is the internal input that carries the id.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct BeginHand {
     pub button: Seat,
     pub hero: Seat,

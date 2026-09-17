@@ -11,6 +11,9 @@ node_modules/
 # Vite build output
 apps/pokerai-ui/dist/
 
+# Tauri generated bundle output
+apps/pokerai-ui/src-tauri/gen/
+
 # Python virtual environment
 tools/.venv/
 
