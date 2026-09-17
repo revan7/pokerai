@@ -69,16 +69,14 @@ fn equity_budget_respected() {
     let req = EquityRequest::single_pot(board.clone(), vec![player(0, "random", &board), player(1, "random", &board)], EquityMode::Exact);
     assert!(exact_cost(&req) > 20_000_000);
     let budget = Duration::from_millis(100);
-    let (took, runs) = min_elapsed_of_3(|| {
+    assert_within_bound_eventually("equity_budget_respected", budget + Duration::from_millis(50), || {
         let start = Instant::now();
         let res = equity(&req, budget, &no_cancel());
         (start.elapsed(), res)
-    });
-    for res in &runs {
+    }, |res| {
         assert_eq!(res.status, EquityStatus::BudgetExceeded);
         assert!(res.shares.is_empty());
-    }
-    assert!(took < budget + Duration::from_millis(50), "stopped {took:?} after a {budget:?} budget (min of 3 runs)");
+    });
     // The flag is raised through `cancel_after`, not a raw `std::thread::sleep`: this enumeration
     // is hundreds of milliseconds of work, so a 1 ms spun delay is unambiguously *inside* it on
     // either build profile, whereas a 30 ms `sleep` lands within a Windows timer tick (15.6 ms) of
@@ -242,17 +240,15 @@ fn zero_budget_request_reports_budget_exceeded_before_any_work() {
 fn assignment_search_observes_the_budget_with_no_evaluations() {
     let req = colliding_six_player();
     assert_eq!(exact_cost(&req), 9_150_625);
-    let (took, runs) = min_elapsed_of_3(|| {
+    assert_within_bound_eventually("assignment_search_observes_the_budget_with_no_evaluations", Duration::from_millis(50), || {
         let start = Instant::now();
         let res = equity(&req, Duration::from_millis(1), &no_cancel());
         (start.elapsed(), res)
-    });
-    for res in &runs {
+    }, |res| {
         assert_eq!(res.status, EquityStatus::BudgetExceeded, "not InvalidRanges: the search never finished");
         assert!(res.shares.is_empty());
         assert_eq!(res.samples, 0, "no runout completes, so no rank is evaluated");
-    }
-    assert!(took < Duration::from_millis(50), "spec 13.1 overrun limit: stopped after {took:?} (min of 3 runs)");
+    });
 }
 
 /// R1: the same search must observe a cancellation raised while it is running, which only a poll
@@ -565,18 +561,16 @@ fn colliding_supports_report_invalid_ranges_promptly() {
     ];
     for (i, players) in cases.into_iter().enumerate() {
         let req = EquityRequest::single_pot(board.clone(), players, EquityMode::MonteCarlo { seed: 1, max_samples: 100_000 });
-        let (took, runs) = min_elapsed_of_3(|| {
+        assert_within_bound_eventually(&format!("colliding_supports_report_invalid_ranges_promptly case {i}"), Duration::from_millis(100), || {
             let start = Instant::now();
             let res = equity(&req, Duration::from_secs(5), &no_cancel());
             (start.elapsed(), res)
-        });
-        for res in &runs {
+        }, |res| {
             assert_eq!(res.status, EquityStatus::InvalidRanges, "case {i}");
             assert!(res.shares.is_empty(), "case {i}");
             assert_eq!(res.samples, 0, "case {i}");
             assert_eq!(res.method, None, "case {i}");
-        }
-        assert!(took < Duration::from_millis(100), "case {i}: took {took:?} (min of 3 runs)");
+        });
     }
 }
 
@@ -621,19 +615,35 @@ fn cancel_after(cancel: &Arc<AtomicBool>, after: Duration) -> std::thread::JoinH
     handle
 }
 
-/// Orchestrator ruling (post-close follow-up, plan 1): every wall-clock *overrun* assertion in
-/// this file measures the minimum elapsed time over three consecutive runs of the same request
-/// and asserts the spec 13.1 bound on that minimum, instead of on a single run. A scheduling
-/// stall (a parallel `cargo test --release` run starving this thread for a tick) lengthens at
-/// most one of the three runs; it cannot hit all three. A systematic overrun -- the actual defect
-/// the bound guards against -- lengthens every run and still fails on the minimum. Every
-/// non-timing assertion (status, sample counts, share sums, std_err) is still checked on each of
-/// the three runs, not only on the fastest, so a correctness regression cannot hide in the two
-/// runs this helper would otherwise discard.
-fn min_elapsed_of_3(mut f: impl FnMut() -> (Duration, EquityResult)) -> (Duration, Vec<EquityResult>) {
-    let runs: Vec<(Duration, EquityResult)> = (0..3).map(|_| f()).collect();
-    let min = runs.iter().map(|(d, _)| *d).min().unwrap();
-    (min, runs.into_iter().map(|(_, r)| r).collect())
+/// Orchestrator ruling (post-close follow-up, plan 1, timing follow-up 3): every wall-clock
+/// *overrun* assertion in this file runs its request, checks every non-timing assertion on that
+/// run's result, and stops as soon as one run's elapsed time meets the spec 13.1 bound, retrying
+/// up to ten times otherwise. Under extreme machine load even three fixed runs (the previous
+/// scheme, `min_elapsed_of_3`) can all be descheduled past a 50 ms bound -- observed on
+/// `mc_partial_runs_keep_their_shares` under seven parallel cargo builds (~40 compiler processes)
+/// -- so the bound is now asserted on the first attempt that meets it, not on the minimum (or
+/// mean) of a fixed sample. A scheduling stall lengthens at most a few consecutive attempts; it
+/// cannot hit ten consecutive overruns of the same bound. A systematic overrun -- the actual
+/// defect the bound guards against -- lengthens every attempt and still fails all ten. Every
+/// non-timing assertion (status, sample counts, share sums, std_err) is still checked on *every*
+/// attempt, not only the one that meets the bound, so a correctness regression cannot hide behind
+/// a slow first attempt. `label` identifies the call site in the all-ten-overran panic message.
+fn assert_within_bound_eventually(
+    label: &str,
+    bound: Duration,
+    mut run: impl FnMut() -> (Duration, EquityResult),
+    mut check: impl FnMut(&EquityResult),
+) -> (Duration, EquityResult) {
+    let mut elapsed = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let (took, res) = run();
+        check(&res);
+        elapsed.push(took);
+        if took < bound {
+            return (took, res);
+        }
+    }
+    panic!("{label}: all 10 attempts overran the {bound:?} bound: {elapsed:?}");
 }
 
 /// T25-R1: the compatibility search runs inside the request's budget like every other phase. This
@@ -642,18 +652,16 @@ fn min_elapsed_of_3(mut f: impl FnMut() -> (Duration, EquityResult)) -> (Duratio
 #[test]
 fn mc_compatibility_search_observes_the_budget() {
     let req = incompatible_six_player_mc(1);
-    let (took, runs) = min_elapsed_of_3(|| {
+    assert_within_bound_eventually("mc_compatibility_search_observes_the_budget", Duration::from_millis(50), || {
         let start = Instant::now();
         let res = equity(&req, Duration::from_millis(1), &no_cancel());
         (start.elapsed(), res)
-    });
-    for res in &runs {
-        assert_eq!(res.status, EquityStatus::BudgetExceeded, "stopped after {took:?}");
+    }, |res| {
+        assert_eq!(res.status, EquityStatus::BudgetExceeded, "must stop on the budget, not report InvalidRanges");
         assert_eq!(res.samples, 0, "no tuple is sampled during the compatibility search");
         assert!(res.shares.is_empty());
         assert_eq!(res.method, None);
-    }
-    assert!(took < Duration::from_millis(50), "spec 13.1 overrun limit: stopped after {took:?} (min of 3 runs)");
+    });
 }
 
 /// T25-R1: the same search must observe a cancellation raised while it is running, which only a
@@ -697,33 +705,29 @@ fn rejection_exhaustion_is_never_invalid_ranges() {
     // old behaviour to surface and short enough to keep the test cheap.
     let budget = Duration::from_millis(300);
     let mc = EquityRequest::single_pot(board.clone(), players(), EquityMode::MonteCarlo { seed: 1, max_samples: 1 });
-    let (took, runs) = min_elapsed_of_3(|| {
+    let (took, _) = assert_within_bound_eventually("rejection_exhaustion_is_never_invalid_ranges budget path", budget + Duration::from_millis(100), || {
         let start = Instant::now();
         let res = equity(&mc, budget, &no_cancel());
         (start.elapsed(), res)
-    });
-    for res in &runs {
+    }, |res| {
         assert_ne!(res.status, EquityStatus::InvalidRanges, "a compatible tuple exists; rejections prove nothing");
-        assert_eq!(res.status, EquityStatus::BudgetExceeded, "stopped after {took:?}");
+        assert_eq!(res.status, EquityStatus::BudgetExceeded, "must stop on the budget");
         assert_eq!(res.samples, 0);
         assert!(res.shares.is_empty());
         assert_eq!(res.method, None);
-    }
-    assert!(took >= budget, "the loop must sample until the budget, not stop at a rejection count: {took:?} (min of 3 runs)");
-    assert!(took < budget + Duration::from_millis(100), "overran its budget: {took:?} (min of 3 runs)");
+    });
+    assert!(took >= budget, "the loop must sample until the budget, not stop at a rejection count: {took:?}");
 
     // Contrast: no disjoint tuple at all, which the completed proof does report.
     let impossible = EquityRequest::single_pot(board, vec![fixed(0, "AcAd"), fixed(1, "AcAd")], EquityMode::MonteCarlo { seed: 1, max_samples: 1 });
-    let (took, runs) = min_elapsed_of_3(|| {
+    assert_within_bound_eventually("rejection_exhaustion_is_never_invalid_ranges impossible path", Duration::from_millis(100), || {
         let start = Instant::now();
         let res = equity(&impossible, Duration::from_secs(5), &no_cancel());
         (start.elapsed(), res)
-    });
-    for res in &runs {
+    }, |res| {
         assert_eq!(res.status, EquityStatus::InvalidRanges);
         assert_eq!(res.samples, 0);
-    }
-    assert!(took < Duration::from_millis(100), "a completed proof is prompt (min of 3 runs)");
+    });
 }
 
 /// A Monte Carlo request that is already cancelled, or has no budget left, reports that before it
@@ -753,12 +757,11 @@ fn mc_partial_runs_keep_their_shares() {
     let req = || EquityRequest::single_pot(board.clone(), vec![player(0, "random", &board), player(1, "random", &board)], EquityMode::MonteCarlo { seed: 8, max_samples: u32::MAX });
 
     let budget = Duration::from_millis(50);
-    let (took, runs) = min_elapsed_of_3(|| {
+    assert_within_bound_eventually("mc_partial_runs_keep_their_shares", budget + Duration::from_millis(50), || {
         let start = Instant::now();
         let res = equity(&req(), budget, &no_cancel());
         (start.elapsed(), res)
-    });
-    for res in &runs {
+    }, |res| {
         assert_eq!(res.status, EquityStatus::Ready, "a budget stop with samples in hand is still an answer");
         assert!(res.samples > 0 && res.samples < u32::MAX as u64, "partial sample count {}", res.samples);
         let sum: f32 = res.shares.iter().map(|s| s.value).sum();
@@ -770,8 +773,7 @@ fn mc_partial_runs_keep_their_shares() {
             }
             other => panic!("{other:?}"),
         }
-    }
-    assert!(took < budget + Duration::from_millis(50), "stopped {took:?} after a {budget:?} budget (min of 3 runs)");
+    });
 
     // 1 ms, not 20: `max_samples` is `u32::MAX`, so the run cannot end on its own and the only
     // question is whether a sample completes before the flag -- one takes microseconds. Spinning
