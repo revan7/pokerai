@@ -111,6 +111,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-preflop"
+version = "0.1.0"
+dependencies = [
+ "core-model",
+ "core-ranges",
+ "proto",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "core-ranges"
 version = "0.1.0"
 dependencies = [
