@@ -115,3 +115,43 @@ fn expand_169_rejects_weight_above_one() {
     classes[5] = 1.5;
     expand_169(&classes);
 }
+
+fn cards(text: &str) -> Vec<Card> { text.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap().parse().unwrap()).collect() }
+
+#[test]
+fn public_blocking_board_only() {
+    let mut r = Range1326::uniform();
+    block_public(&mut r, &cards("AsKd2c"));
+    assert_eq!(mass(&r), 1326.0 - 3.0 * 51.0 + 3.0, "combos containing a board card are zero; the three board pairs were counted twice");
+    assert_eq!(weight_of(&r, "AsQh"), 0.0);
+    assert_eq!(weight_of(&r, "QhQd"), 1.0, "hero's own cards keep their weight in a public range");
+    assert_eq!(weight_of(&r, "KdKc"), 0.0);
+}
+
+#[test]
+fn hero_conditioned_copy() {
+    let mut public = Range1326::uniform();
+    block_public(&mut public, &cards("AsKd2c"));
+    let hero = hero_conditioned(&public, ["Qh".parse().unwrap(), "Qd".parse().unwrap()]);
+    assert_eq!(weight_of(&hero, "QhJh"), 0.0);
+    assert_eq!(weight_of(&hero, "QdQc"), 0.0);
+    assert_eq!(weight_of(&hero, "JhJd"), 1.0);
+    assert_eq!(weight_of(&public, "QhJh"), 1.0, "the public range is untouched");
+    assert!(mass(&hero) < mass(&public));
+}
+
+#[test]
+fn range_hash_scale_invariant() {
+    let r = Range1326::from_fn(|i| ((i % 17) as f32 + 1.0) / 100.0); // max 0.17 <= 0.25, min 0.01 >= 2^-100
+    let scaled = |k: f32| Range1326::from_fn(|i| r.get(i) * k);
+    assert_eq!(hash_scaled(&r), hash_scaled(&scaled(0.5)));
+    assert_eq!(hash_scaled(&r), hash_scaled(&scaled(4.0)));
+    let _maybe_different = hash_scaled(&scaled(0.37)); // not asserted either way: an unequal hash is simply a miss
+    let mut changed = r.clone();
+    changed.set(5, changed.get(5) + 0.01);
+    assert_ne!(hash_scaled(&changed), hash_scaled(&r), "a changed normalized bit pattern alters the hash");
+    let one = |w: f32| Range1326::from_fn(|i| if i == 100 { w } else { 0.0 });
+    assert_eq!(hash_scaled(&one(0.2)), hash_scaled(&one(0.9)), "a single supported combo normalizes to 1.0");
+    assert_ne!(hash_scaled(&one(0.2)), hash_scaled(&Range1326::zero()));
+    assert_eq!(hash_scaled(&Range1326::zero()), hash_scaled(&Range1326::zero()));
+}
