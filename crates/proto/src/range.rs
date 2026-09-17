@@ -60,7 +60,15 @@ impl<'de> Visitor<'de> for RangeVisitor {
             if !raw.is_finite() || !(0.0..=1.0).contains(&raw) {
                 return Err(de::Error::custom(format!("weight {raw} at combo {i} is outside [0, 1]")));
             }
-            let w = raw as f32;
+            // `+ 0.0` maps `-0.0` to `+0.0` and is the identity on every other in-domain value.
+            // `-0.0` passes the `[0, 1]` domain check above (`-0.0 == 0.0`) and would otherwise
+            // survive into the bit-exact layers, where `hash_scaled` hashes `0x80000000`
+            // differently from `0x00000000`: a range and its own `range_to_string` round trip are
+            // numerically identical yet produce different cache keys (review S5). Normalizing here,
+            // at the one ingestion boundary, leaves `hash_scaled`, `apply_range` and `canonicalize`
+            // bit-exact as ruled by T20/T21 -- including `iso_tiebreak_negative_zero_regression`,
+            // which builds its `-0.0` in memory and never crosses this boundary.
+            let w = (raw as f32) + 0.0;
             if !w.is_finite() || !(0.0..=1.0).contains(&w) {
                 return Err(de::Error::custom(format!("weight {w} at combo {i} is outside [0, 1]")));
             }
@@ -152,6 +160,21 @@ mod tests {
         // the original f64 tokens are outside [0, 1].
         assert!(serde_json::from_str::<Range1326>(&array_json_with_first_token("1.00000001")).is_err());
         assert!(serde_json::from_str::<Range1326>(&array_json_with_first_token("-1e-50")).is_err());
+    }
+
+    /// S5: `-0.0` is in `[0, 1]` and so is admitted, but it must be *stored* as `+0.0`, because
+    /// everything downstream of this boundary is bit-exact by design. Only the wire boundary
+    /// normalizes: an in-memory `-0.0` is preserved, which is what T21's isomorphism tie-break
+    /// regression depends on.
+    #[test]
+    fn range_deserialize_normalizes_negative_zero_to_positive_zero() {
+        let r: Range1326 = serde_json::from_str(&array_json_with_first_token("-0.0")).unwrap();
+        assert_eq!(r.get(0).to_bits(), 0.0f32.to_bits(), "-0.0 must be ingested as +0.0, not 0x80000000");
+        let ordinary: Range1326 = serde_json::from_str(&array_json_with_first_token("0.5")).unwrap();
+        assert_eq!(ordinary.get(0).to_bits(), 0.5f32.to_bits(), "every other weight is unchanged, bit for bit");
+        let mut in_memory = Range1326::zero();
+        in_memory.set(19, -0.0);
+        assert_eq!(in_memory.get(19).to_bits(), (-0.0f32).to_bits(), "`set` is not an ingestion boundary and must not normalize");
     }
 
     #[test]

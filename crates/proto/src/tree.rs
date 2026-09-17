@@ -90,22 +90,41 @@ pub struct EffectiveTree {
     pub template_id: String,
     pub root_street: Street,
     pub menus: BTreeMap<Street, PlayerMenus>,
+    // Spec 4.6: the tree materializer reads these at every opening/facing boundary. Each is a
+    // non-negative finite magnitude, validated wide before narrowing and again on serialize
+    // (review S1), so a `null` or an `inf` can never reach the materializer.
+    #[serde(with = "crate::numeric::non_negative")]
     pub add_allin_threshold: f32,
+    #[serde(with = "crate::numeric::non_negative")]
     pub force_allin_threshold: f32,
+    #[serde(with = "crate::numeric::non_negative")]
     pub merging_threshold: f32,
     pub wager_cap: u8,
     pub inserted: Vec<(ChipPath, String, Action)>,
     pub materialized: Vec<MaterializedNode>,
 }
 
-/// Resolves a wire chip path into the ordinal path of a materialized decision node (spec section 2).
+/// Ordinal path -> materialized node, for repeated path resolution against one tree.
+pub type MaterializedIndex<'a> = HashMap<&'a [u8], &'a MaterializedNode>;
+
+/// Builds the ordinal-path index of a materialized tree **once**, for a caller that is about to
+/// resolve many paths against it (review S2).
+///
+/// `resolve_chip_path` builds this itself on every call, which is Theta(materialized) per path; a
+/// validator that resolves one path per exported node (up to `worker::MAX_EXPORTED_NODES` of them)
+/// must hoist it instead, or the whole validation is quadratic in the tree.
+pub fn index_materialized(materialized: &[MaterializedNode]) -> MaterializedIndex<'_> {
+    materialized.iter().map(|n| (n.path.as_slice(), n)).collect()
+}
+
+/// Resolves a wire chip path into the ordinal path of a materialized decision node (spec section 2),
+/// against an index built once by [`index_materialized`].
 ///
 /// A path resolves only if, for every edge including the last: the action exists in the current
 /// node's menu, the action's index is a representable ordinal (`u8`), its `terminal_pots` marker
 /// exists and is `None` (a continuation, never a terminal child), and a materialized node exists
 /// at the resulting ordinal path.
-pub fn resolve_chip_path(materialized: &[MaterializedNode], path: &[Action]) -> Option<OrdinalPath> {
-    let index: HashMap<&[u8], &MaterializedNode> = materialized.iter().map(|n| (n.path.as_slice(), n)).collect();
+pub fn resolve_chip_path_indexed(index: &MaterializedIndex<'_>, path: &[Action]) -> Option<OrdinalPath> {
     let mut node = *index.get(&[][..])?;
     let mut ordinal: OrdinalPath = Vec::with_capacity(path.len());
     for action in path {
@@ -120,6 +139,13 @@ pub fn resolve_chip_path(materialized: &[MaterializedNode], path: &[Action]) -> 
         node = *index.get(ordinal.as_slice())?;
     }
     Some(ordinal)
+}
+
+/// [`resolve_chip_path_indexed`] for a caller resolving a single path: builds the index, resolves,
+/// throws it away. Unchanged in signature and in answers; a caller resolving many paths against the
+/// same tree wants [`index_materialized`] instead.
+pub fn resolve_chip_path(materialized: &[MaterializedNode], path: &[Action]) -> Option<OrdinalPath> {
+    resolve_chip_path_indexed(&index_materialized(materialized), path)
 }
 
 #[cfg(test)]
