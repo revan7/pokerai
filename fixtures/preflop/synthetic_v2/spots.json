@@ -1,0 +1,226 @@
+{
+  "synthetic": true,
+  "spots": [
+    {
+      "path": "UTG_RFI",
+      "actor": "UTG",
+      "history": [],
+      "resolved_sizes_bb": {
+        "raise": 2.5
+      },
+      "node": true
+    },
+    {
+      "path": "HJ_vs_UTG_RFI",
+      "actor": "HJ",
+      "history": [
+        [
+          "UTG",
+          "raise",
+          2500
+        ]
+      ],
+      "resolved_sizes_bb": {
+        "raise": 8.75
+      },
+      "node": true
+    },
+    {
+      "path": "UTG_vs_HJ_3bet",
+      "actor": "UTG",
+      "history": [
+        [
+          "UTG",
+          "raise",
+          2500
+        ],
+        [
+          "HJ",
+          "raise",
+          8750
+        ],
+        [
+          "CO",
+          "fold",
+          0
+        ],
+        [
+          "BTN",
+          "fold",
+          0
+        ],
+        [
+          "SB",
+          "fold",
+          0
+        ],
+        [
+          "BB",
+          "fold",
+          0
+        ]
+      ],
+      "resolved_sizes_bb": {
+        "raise": 22.0
+      },
+      "node": true
+    },
+    {
+      "path": "HJ_vs_UTG_4bet",
+      "actor": "HJ",
+      "history": [
+        [
+          "UTG",
+          "raise",
+          2500
+        ],
+        [
+          "HJ",
+          "raise",
+          8750
+        ],
+        [
+          "CO",
+          "fold",
+          0
+        ],
+        [
+          "BTN",
+          "fold",
+          0
+        ],
+        [
+          "SB",
+          "fold",
+          0
+        ],
+        [
+          "BB",
+          "fold",
+          0
+        ],
+        [
+          "UTG",
+          "raise",
+          22000
+        ]
+      ],
+      "resolved_sizes_bb": {},
+      "node": true
+    },
+    {
+      "path": "BB_squeeze",
+      "actor": "BB",
+      "history": [
+        [
+          "UTG",
+          "raise",
+          2500
+        ],
+        [
+          "HJ",
+          "call",
+          0
+        ],
+        [
+          "CO",
+          "fold",
+          0
+        ],
+        [
+          "BTN",
+          "fold",
+          0
+        ],
+        [
+          "SB",
+          "fold",
+          0
+        ]
+      ],
+      "resolved_sizes_bb": {
+        "raise": 12.0
+      },
+      "node": true
+    },
+    {
+      "path": "SB_limp",
+      "actor": "SB",
+      "history": [
+        [
+          "UTG",
+          "fold",
+          0
+        ],
+        [
+          "HJ",
+          "fold",
+          0
+        ],
+        [
+          "CO",
+          "fold",
+          0
+        ],
+        [
+          "BTN",
+          "fold",
+          0
+        ]
+      ],
+      "resolved_sizes_bb": {
+        "raise": 3.0
+      },
+      "node": true
+    },
+    {
+      "path": "BB_vs_SB_limp",
+      "actor": "BB",
+      "history": [
+        [
+          "UTG",
+          "fold",
+          0
+        ],
+        [
+          "HJ",
+          "fold",
+          0
+        ],
+        [
+          "CO",
+          "fold",
+          0
+        ],
+        [
+          "BTN",
+          "fold",
+          0
+        ],
+        [
+          "SB",
+          "call",
+          0
+        ]
+      ],
+      "resolved_sizes_bb": {
+        "raise": 3.5
+      },
+      "node": true
+    },
+    {
+      "path": "explicit_absences",
+      "actor": null,
+      "history": [
+        "CO_cold_call_vs_3bet",
+        "SB_cold_call_vs_3bet",
+        "UTG_open_limp",
+        "HJ_open_limp",
+        "CO_open_limp",
+        "BTN_open_limp"
+      ],
+      "resolved_sizes_bb": {},
+      "node": false
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "synthetic": true,
+  "ev_reference_variants": [
+    "decision_incremental_verified",
+    "net_hand_start_verified",
+    "absolute_stack_verified",
+    "unverified"
+  ],
+  "sb_committed_sb": 1,
+  "bb_committed_sb": 2,
+  "source_stack_sb": 200,
+  "absences": [
+    {
+      "path": "CO_cold_call_vs_3bet",
+      "note": "CO cold-call vs 3bet: no node recorded"
+    },
+    {
+      "path": "SB_cold_call_vs_3bet",
+      "note": "SB cold-call vs 3bet: no node recorded"
+    },
+    {
+      "path": "UTG_open_limp",
+      "note": "UTG open-limp: no node recorded"
+    },
+    {
+      "path": "HJ_open_limp",
+      "note": "HJ open-limp: no node recorded"
+    },
+    {
+      "path": "CO_open_limp",
+      "note": "CO open-limp: no node recorded"
+    },
+    {
+      "path": "BTN_open_limp",
+      "note": "BTN open-limp: no node recorded"
+    }
+  ]
+}

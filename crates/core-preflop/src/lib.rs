@@ -4,7 +4,9 @@
 
 pub mod envelope;
 mod numeric;
+pub mod store;
 pub mod validate;
 
 pub use envelope::*;
+pub use store::*;
 pub use validate::*;
