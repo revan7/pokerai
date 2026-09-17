@@ -1,0 +1,15 @@
+[package]
+name = "core-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "7-card evaluator and weighted range-vs-range equity (exact and Monte Carlo)"
+
+[features]
+exhaustive = []
+
+[dependencies]
+proto = { path = "../proto" }
+core-ranges = { path = "../core-ranges" }
+holdem-hand-evaluator = { workspace = true }
