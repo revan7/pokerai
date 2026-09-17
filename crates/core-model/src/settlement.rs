@@ -1,3 +1,14 @@
+//! Street settlement (spec 4.3): uncalled-bet refunds, side-pot layering and the conservation invariant.
+//!
+//! **Aggregate precondition (enforced by hand admission, spec 4.3): the six starting stacks sum to at
+//! most `u32::MAX`; therefore every pot fits in `u32`. Violations are caught by always-on assertions.**
+//! Individually valid `u32` stacks do not by themselves bound their total, so the bound is a named
+//! admission-time invariant rather than a property of the types. The admission contract is that
+//! `begin_hand` rejects a table whose starting stacks sum above `u32::MAX` with a typed
+//! [`RulesError`]; settlement does not re-check it, which is why the functions here are infallible.
+//! Chips only move between stacks, live commitments and pots, so the total never grows after
+//! admission and every layer and merged pot stays a share of that `u32` total.
+
 use proto::{Pot, Seat};
 use crate::error::RulesError;
 
@@ -9,8 +20,10 @@ pub struct Settlement { pub pots: Vec<Pot>, pub returned: Vec<(Seat, u32)> }
 /// Returns the uncalled portion of the highest street contribution to its owner (spec 4.3): a transfer
 /// from live commitment back to the stack.
 ///
-/// Infallible, so the caller's contract is enforced with an always-on check: the refund is chips the
-/// seat already owned, so returning them cannot overflow its stack.
+/// Precondition (enforced by hand admission, spec 4.3): the six starting stacks sum to at most
+/// `u32::MAX`; therefore a seat's commitment plus its remaining stack fits in `u32` and the refund,
+/// which only moves chips the seat already committed back to it, cannot overflow. Violations are
+/// caught by always-on assertions.
 pub fn refund_uncalled(committed: &mut [u32; 6], stacks: &mut [u32; 6]) -> Option<(Seat, u32)> {
     let top = (0..6).max_by_key(|i| committed[*i])?;
     let top_amount = committed[top];
@@ -20,7 +33,7 @@ pub fn refund_uncalled(committed: &mut [u32; 6], stacks: &mut [u32; 6]) -> Optio
         committed[top] = second;
         stacks[top] = stacks[top]
             .checked_add(refund)
-            .expect("a refund returns chips the seat already committed, so its stack cannot overflow");
+            .expect("refunded stack exceeds u32: starting stacks must sum to at most u32::MAX (hand admission invariant)");
         Some((Seat(top as u8), refund))
     } else {
         None
@@ -30,9 +43,13 @@ pub fn refund_uncalled(committed: &mut [u32; 6], stacks: &mut [u32; 6]) -> Optio
 /// Layers total contributions into main and side pots by contribution level; folded seats' chips are dead money.
 /// Adjacent layers with the same eligible set are merged.
 ///
-/// Infallible, so the caller's contract is enforced with always-on checks: contributions are shares of the
-/// starting stacks, so every layer total fits in `u32`. Layer totals are accumulated in `u64` first and
-/// narrowed only after that check, never by wraparound.
+/// Precondition (enforced by hand admission, spec 4.3): the six starting stacks sum to at most
+/// `u32::MAX`; therefore every pot fits in `u32`. Violations are caught by always-on assertions.
+///
+/// Six individually valid `u32` contributions can sum past `u32` (three matched 1,500,000,000 stacks
+/// suffice), and two layers that each fit can merge into one that does not, so neither narrowing is
+/// safe on the types alone — both are guarded here. Layer totals are accumulated in `u64` and
+/// narrowed only after the check, never by wraparound.
 pub fn layer_pots(contributed: &[u32; 6], folded: &[bool; 6]) -> Vec<Pot> {
     let mut levels: Vec<u32> = contributed.iter().copied().filter(|c| *c > 0).collect();
     levels.sort_unstable();
@@ -41,13 +58,13 @@ pub fn layer_pots(contributed: &[u32; 6], folded: &[bool; 6]) -> Vec<Pot> {
     let mut prev = 0u32;
     for level in levels {
         let wide: u64 = contributed.iter().map(|c| u64::from((*c).min(level) - (*c).min(prev))).sum();
-        let amount = u32::try_from(wide).expect("a pot is a share of the starting stacks and fits in u32");
+        let amount = u32::try_from(wide).expect("layer total exceeds u32: starting stacks must sum to at most u32::MAX (hand admission invariant)");
         let eligible: Vec<Seat> = (0..6).filter(|i| !folded[*i] && contributed[*i] >= level).map(|i| Seat(i as u8)).collect();
         prev = level;
         if amount == 0 { continue; }
         match pots.last_mut() {
             Some(last) if last.eligible == eligible || eligible.is_empty() => {
-                last.amount = last.amount.checked_add(amount).expect("a pot is a share of the starting stacks and fits in u32");
+                last.amount = last.amount.checked_add(amount).expect("merged pot exceeds u32: starting stacks must sum to at most u32::MAX (hand admission invariant)");
             }
             _ => pots.push(Pot { amount, eligible }),
         }
