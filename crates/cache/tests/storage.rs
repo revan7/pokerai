@@ -421,36 +421,13 @@ fn read_cell_reads_back_a_validly_written_cell_and_leaves_it_in_place() {
 }
 
 // --- review R3: deletion race --------------------------------------------------------------------
-
-/// The controlled-interleaving regression review R3 asked for: a valid replacement is published
-/// at `path` in the exact window between `read_cell`'s read (of the original corrupt bytes) and
-/// its cleanup decision, using the test-only `read_cell_with_hook` seam (`storage.rs`'s module
-/// doc explains why a real thread race would be nondeterministic here). The replacement must
-/// survive -- not be deleted -- because its `(len, last_write_time)` no longer agrees with what
-/// was captured from the *original* file's opened handle.
-#[test]
-fn read_cell_does_not_delete_a_replacement_published_between_read_and_cleanup() {
-    let dir = TempDir::new("race");
-    let path = dir.path().join("cell.bin");
-    std::fs::write(&path, b"not a cache header").unwrap();
-
-    let e = support::entry();
-    let replacement = storage::encode(&Cell { entries: vec![e.clone()] }).unwrap();
-
-    let got = storage::read_cell_with_hook(&path, || {
-        // Simulates a cache-writer's atomic publish landing in the window between this read's
-        // decode failure and its cleanup step (review R3). A real writer would use a
-        // temp-file-plus-rename publish (Task 6's job); an in-place overwrite is enough here to
-        // change this path's (len, last_write_time) identity, which is all the guard checks.
-        std::fs::write(&path, &replacement).unwrap();
-    });
-    assert!(got.is_none(), "the original corrupt bytes must still be reported as a miss");
-    assert!(path.exists(), "the concurrently published replacement must survive cleanup");
-    assert_eq!(std::fs::read(&path).unwrap(), replacement, "cleanup must not have touched the replacement's bytes");
-
-    let reread = storage::read_cell(&path).expect("the surviving replacement must still be a hit");
-    assert_eq!(reread.entries[0].key, e.key);
-}
+//
+// Fix round 2 (review N1): the controlled-interleaving regression that needs the hook
+// (`read_cell_does_not_delete_a_replacement_published_between_read_and_cleanup`) moved into
+// `crates/cache/src/storage.rs`'s own `#[cfg(test)] mod tests`, with every assertion unchanged --
+// the hook it depends on is now `#[cfg(test)]` and non-public, so it is only reachable from that
+// crate-internal unit test, never from this integration-test crate. The ordinary (non-racing)
+// case below needs no hook at all, so it stays here using only `read_cell`.
 
 /// The ordinary (non-racing) case: when nothing else touches the path, the identity check
 /// agrees and a genuinely corrupt file is still deleted exactly as before.
@@ -459,7 +436,7 @@ fn read_cell_still_deletes_an_undisturbed_corrupt_file() {
     let dir = TempDir::new("no-race");
     let path = dir.path().join("cell.bin");
     std::fs::write(&path, b"not a cache header").unwrap();
-    assert!(storage::read_cell_with_hook(&path, || {}).is_none());
+    assert!(storage::read_cell(&path).is_none());
     assert!(!path.exists());
 }
 
