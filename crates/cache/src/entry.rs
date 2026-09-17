@@ -12,6 +12,89 @@
 
 use crate::CacheError;
 
+// --- Numeric wire validation for cached matrices (standing ruling (a): validate wide, never
+// clamp; fix round 1 R1) ---
+//
+// `CachedNode::probs`/`ev_over_P` are `Vec<Vec<f32>>` in memory (spec: EV is signed finite f32
+// chips), matching `proto::worker::NodeStrategy`. Deriving plain `Deserialize` for those fields
+// (as the brief's literal code did) admits any f32 the *narrow* decode happens to produce --
+// e.g. a persisted probability row `[1.00000001, -1e-50]` narrows silently to `[1.0, -0.0]`,
+// which is in-domain and passes `validate_entry` even though the wide value never was.
+//
+// `proto::worker` already solves this for the worker wire (spec 4.5) with private
+// `narrow_checked`/`widen_checked`/`deserialize_matrix` helpers; they are not exported, so
+// (per this fix's instruction) equivalent private helpers are defined here rather than
+// weakening proto's visibility. Unlike proto::worker's codec, which only ever serializes to
+// JSON-lines and can safely write narrow `f32` while reading wide `f64` (JSON is
+// self-describing), `CachedNode` is also the type a bincode-encoded on-disk cache entry
+// carries (spec 10.4). Bincode is *not* self-describing -- the deserializer reads exactly as
+// many bytes as the field type it is asked for -- so if this codec wrote narrow `f32` (4
+// bytes) but read wide `f64` (8 bytes), a bincode round trip of the very data this codec
+// wrote would desync and fail to decode. Reading and writing `f64` on *both* sides keeps
+// bincode's width symmetric while still performing the wide-before-narrow admission check
+// against a value that may have arrived with more precision than f32 (the demonstrated JSON
+// attack); the field type itself stays `Vec<Vec<f32>>`, so nothing about the in-memory or
+// spec-mandated representation changes, and the wire cost is the same 8 bytes/value bincode
+// would already spend on a raw `f64` field.
+
+fn narrow_checked(raw: f64, domain: fn(f64) -> bool, what: &str) -> Result<f32, String> {
+    if !raw.is_finite() || !domain(raw) {
+        return Err(format!("{what} {raw} is outside its valid domain"));
+    }
+    let narrowed = raw as f32;
+    if !narrowed.is_finite() || !domain(narrowed as f64) {
+        return Err(format!("{what} {raw} narrows to {narrowed:e}, outside its valid domain"));
+    }
+    Ok(narrowed)
+}
+
+fn widen_checked(v: f32, domain: fn(f64) -> bool, what: &str) -> Result<f64, String> {
+    if !v.is_finite() || !domain(v as f64) {
+        return Err(format!("{what} {v} is outside its valid domain"));
+    }
+    Ok(v as f64)
+}
+
+fn domain_unit_interval(x: f64) -> bool {
+    (0.0..=1.0).contains(&x)
+}
+fn domain_finite(_: f64) -> bool {
+    true
+}
+
+fn deserialize_matrix<'de, D: serde::Deserializer<'de>>(d: D, domain: fn(f64) -> bool, what: &str) -> Result<Vec<Vec<f32>>, D::Error> {
+    let raw: Vec<Vec<f64>> = serde::Deserialize::deserialize(d)?;
+    raw.into_iter()
+        .map(|row| row.into_iter().map(|x| narrow_checked(x, domain, what).map_err(serde::de::Error::custom)).collect())
+        .collect()
+}
+
+fn serialize_matrix<S: serde::Serializer>(v: &[Vec<f32>], s: S, domain: fn(f64) -> bool, what: &str) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut outer = s.serialize_seq(Some(v.len()))?;
+    for row in v {
+        let mut checked_row = Vec::with_capacity(row.len());
+        for x in row {
+            checked_row.push(widen_checked(*x, domain, what).map_err(serde::ser::Error::custom)?);
+        }
+        outer.serialize_element(&checked_row)?;
+    }
+    outer.end()
+}
+
+fn deserialize_prob_matrix<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<f32>>, D::Error> {
+    deserialize_matrix(d, domain_unit_interval, "probability")
+}
+fn serialize_prob_matrix<S: serde::Serializer>(v: &Vec<Vec<f32>>, s: S) -> Result<S::Ok, S::Error> {
+    serialize_matrix(v, s, domain_unit_interval, "probability")
+}
+fn deserialize_ev_matrix<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<f32>>, D::Error> {
+    deserialize_matrix(d, domain_finite, "ev_over_P")
+}
+fn serialize_ev_matrix<S: serde::Serializer>(v: &Vec<Vec<f32>>, s: S) -> Result<S::Ok, S::Error> {
+    serialize_matrix(v, s, domain_finite, "ev_over_P")
+}
+
 /// The financial and range inputs a `CacheEntry` was solved from. Kept separately from
 /// `KeyFields` because these are the raw, chip-scale values the key's normalized fields (SPR
 /// rational, rake-over-pot fraction, range hashes) were derived from -- a reader needs them to
@@ -37,7 +120,9 @@ pub struct SourceInputs {
 pub struct CachedNode {
     pub path: proto::OrdinalPath,
     pub actor: String,
+    #[serde(deserialize_with = "deserialize_prob_matrix", serialize_with = "serialize_prob_matrix")]
     pub probs: Vec<Vec<f32>>,
+    #[serde(deserialize_with = "deserialize_ev_matrix", serialize_with = "serialize_ev_matrix")]
     pub ev_over_P: Vec<Vec<f32>>,
     pub available: Vec<bool>,
 }
@@ -88,6 +173,14 @@ pub use proto::resolve_chip_path as resolve_path;
 /// them in ordinal-path order with no duplicates (review m2).
 pub fn sorted_by_path(t: &[proto::MaterializedNode]) -> bool {
     t.windows(2).all(|w| w[0].path < w[1].path)
+}
+
+/// Bit-exact range comparison (fix round 1 R2): unlike `Range1326`'s derived `PartialEq`
+/// (ordinary float equality, which treats `+0.0 == -0.0`), this compares every weight's
+/// `to_bits()` pattern -- matching the bit-exactness `core_iso::canonicalize`'s tie-break and
+/// `core_ranges::hash_scaled` both already require (spec section 2).
+fn ranges_bit_equal(a: &proto::Range1326, b: &proto::Range1326) -> bool {
+    a.0.iter().zip(b.0.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 /// Normalizes a worker `StreetSolution` against the `EffectiveTree` it was solved on into the
@@ -219,10 +312,12 @@ pub fn validate_entry(e: &CacheEntry) -> Result<(), CacheError> {
     let (_, perm) = core_iso::canonicalize(board, &[&s.ranges[0], &s.ranges[1]]);
     let mut canonical = board.iter().map(|c| core_iso::apply(&perm, *c)).collect::<Vec<_>>();
     canonical[..3].sort_by_key(|c| c.0);
-    if canonical != *board
-        || core_iso::apply_range(&perm, &s.ranges[0]) != s.ranges[0]
-        || core_iso::apply_range(&perm, &s.ranges[1]) != s.ranges[1]
-    {
+    // Fix round 1 R2: `Range1326` derives ordinary float `PartialEq`, which treats `+0.0` and
+    // `-0.0` as equal, while `canonicalize`'s own tie-break and `hash_scaled` both distinguish
+    // the bit patterns (spec section 2: "every weight is divided ... and the resulting f32 bit
+    // patterns are hashed"). A range that is numerically but not bit-exactly fixed under the
+    // recomputed permutation must still be rejected, so compare `to_bits()` weight-by-weight.
+    if canonical != *board || !ranges_bit_equal(&core_iso::apply_range(&perm, &s.ranges[0]), &s.ranges[0]) || !ranges_bit_equal(&core_iso::apply_range(&perm, &s.ranges[1]), &s.ranges[1]) {
         return Err(bad());
     }
     if e.covered_paths != e.nodes.iter().map(|n| n.path.clone()).collect::<Vec<_>>()
