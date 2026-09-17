@@ -29,8 +29,10 @@ fn terminal_payoff_equity_times_pot() {
     let board = cards("QsJd7h3c2d");
     let oop = player(0, "AA,KK,QQ,JJ,TT,AKs,AQs,54s", &board).range;
     let ip = player(1, "QQ,JJ,77,AKo,54o,T9s", &board).range;
-    let eq_oop = per_combo_equity(&oop, &ip, &board);
-    let eq_ip = per_combo_equity(&ip, &oop, &board);
+    let (st_oop, eq_oop) = per_combo_equity(&oop, &ip, &board, Duration::from_secs(10), &no_cancel());
+    assert_eq!(st_oop, EquityStatus::Ready);
+    let (st_ip, eq_ip) = per_combo_equity(&ip, &oop, &board, Duration::from_secs(10), &no_cancel());
+    assert_eq!(st_ip, EquityStatus::Ready);
     let unraked = Rake::TimeCharge;
     let raked = Rake::PotRake { rate: 0.05, cap_mchips: 5000, no_flop_no_drop: false };
     for (range, eq) in [(&oop, &eq_oop), (&ip, &eq_ip)] {
@@ -44,9 +46,11 @@ fn terminal_payoff_equity_times_pot() {
     }
     let aces = eq_oop[combo("AcAd") as usize];
     assert!(aces > 0.0 && aces < 1.0, "AcAd loses to the sets and beats the rest: {aces}");
-    let aa = per_combo_equity(&parse_range("AA").unwrap(), &parse_range("54o").unwrap(), &board);
+    let (st, aa) = per_combo_equity(&parse_range("AA").unwrap(), &parse_range("54o").unwrap(), &board, Duration::from_secs(10), &no_cancel());
+    assert_eq!(st, EquityStatus::Ready);
     assert_eq!(aa[combo("AcAd") as usize], 1.0, "aces beat 54o on Q J 7 3 2");
-    let set = per_combo_equity(&parse_range("QQ").unwrap(), &parse_range("AA").unwrap(), &board);
+    let (st, set) = per_combo_equity(&parse_range("QQ").unwrap(), &parse_range("AA").unwrap(), &board, Duration::from_secs(10), &no_cancel());
+    assert_eq!(st, EquityStatus::Ready);
     assert_eq!(set[combo("QcQd") as usize], 1.0);
     // swapping seats leaves every value unchanged
     let a = EquityRequest::single_pot(board.clone(), vec![player(0, "AA,KK,QQ,JJ,TT,AKs,AQs,54s", &board), player(1, "QQ,JJ,77,AKo,54o,T9s", &board)], EquityMode::Exact);
@@ -288,7 +292,8 @@ fn nonuniform_joint_weights_drive_the_shares() {
     assert!((share(&res, 0) - 10.0 / 13.0).abs() < 1e-6, "A: {} expected 10/13", share(&res, 0));
     assert!((share(&res, 1) - 3.0 / 13.0).abs() < 1e-6, "B: {} expected 3/13", share(&res, 1));
 
-    let eq_a = per_combo_equity(&a, &b, &board);
+    let (st_a, eq_a) = per_combo_equity(&a, &b, &board, Duration::from_secs(10), &no_cancel());
+    assert_eq!(st_a, EquityStatus::Ready);
     assert_eq!(eq_a[combo("AsAd") as usize], 1.0, "AsAd blocks AsAc and beats KsKc");
     assert_eq!(eq_a[combo("KhKd") as usize], 0.4, "KhKd ties 1.0 of 1.25 total villain weight");
 
@@ -363,7 +368,7 @@ fn equity_rejects_a_nan_weight() {
 fn per_combo_equity_checks_the_board_even_with_no_supported_hero_combo() {
     // Hero has no supported combo, so the per-combo loop never runs: the board must still be
     // rejected instead of returning 1326 zeros for an impossible request.
-    per_combo_equity(&Range1326::zero(), &parse_range("AA").unwrap(), &cards("2c3c4c5c6c7c"));
+    per_combo_equity(&Range1326::zero(), &parse_range("AA").unwrap(), &cards("2c3c4c5c6c7c"), Duration::from_secs(1), &no_cancel());
 }
 
 /// `terminal_payoff` = `equity * (pot - min(rate * pot, cap))`; a time charge takes no rake.
@@ -727,4 +732,159 @@ fn mc_partial_runs_keep_their_shares() {
     assert!((sum - 1.0).abs() < 1e-5, "shares sum to {sum}");
     assert!(matches!(res.method, Some(EquityMethod::MonteCarlo { .. })));
     assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 20 ms flag");
+}
+
+/// S9 (final review): the spec keeps EV in `f32` chips, but `terminal_payoff` must not do the
+/// *arithmetic* in `f32` -- above `2^24` the pot itself stops being representable, so narrowing it
+/// first loses a chip before the rake is even subtracted.
+///
+/// A pot of `2^24 + 1 = 16,777,217` with a 5% rake capped at 5,000 mchips is the smallest crisp
+/// case. `16_777_217u32 as f32` rounds to `16,777,216` (f32 steps by 2 in `[2^24, 2^25)`), so the
+/// f32 arithmetic returns `16,777,211`. Computed in f64 the payoff is `16,777,217 - 5 =
+/// 16,777,212`, which *is* exactly representable in f32 (it is even, and below `2^25`), so the one
+/// narrowing at the boundary returns it unchanged. One chip of the answer, recovered.
+#[test]
+fn terminal_payoff_computes_in_f64_and_narrows_once() {
+    let raked = Rake::PotRake { rate: 0.05, cap_mchips: 5000, no_flop_no_drop: false };
+    assert_eq!(
+        terminal_payoff(1.0, 16_777_217, &raked),
+        16_777_212.0,
+        "the pot must reach the subtraction unnarrowed; f32 arithmetic gives 16777211.0"
+    );
+    // Half the pot of the same spot: 0.5 * (16,777,217 - 5) = 8,388,606, exactly representable.
+    assert_eq!(terminal_payoff(0.5, 16_777_217, &raked), 8_388_606.0);
+    // And the bound the review asked for, at the magnitude it named: the f32 *return* steps by 8
+    // at 10^8, so half a chip is not achievable there; what is achievable, and what the f64
+    // intermediate buys, is that the error never exceeds that half step.
+    let pot = 100_000_000u32;
+    let got = terminal_payoff(1.0, pot, &raked);
+    let err = (f64::from(got) - (f64::from(pot) - 5.0)).abs();
+    assert!(err <= 4.0, "a pot of {pot} came back as {got}, off by {err} chips (half an f32 step is 4)");
+}
+
+/// T3 (final review): `monte_carlo` with `max_samples == 0` never entered its loop and then
+/// reported `BudgetExceeded` -- blaming the clock for a caller bug. `max_samples` is a caller's
+/// contract, not data, so it is an always-on assertion like the rest of `check_request`.
+#[test]
+#[should_panic(expected = "max_samples is at least one sample")]
+fn monte_carlo_rejects_a_zero_sample_cap() {
+    let board = cards("QsJd7h3c2d");
+    let req = EquityRequest::single_pot(
+        board.clone(),
+        vec![player(0, "AA", &board), player(1, "KK", &board)],
+        EquityMode::MonteCarlo { seed: 1, max_samples: 0 },
+    );
+    equity(&req, Duration::from_millis(50), &no_cancel());
+}
+
+/// T2 (final review): `equity_budget_respected` proves the exact path *stops* on budget, but
+/// nothing pinned its throughput, so S3's per-tuple allocation -- measured at 142.5 ns/tuple, about
+/// 70% of exact-enumeration wall time -- was invisible to the suite and so was any future
+/// regression. Spec section 7 selects exact enumeration when `exact_cost <= 2 * 10^7` and section
+/// 13.1 gives that selection a 0.5 s budget: an enumeration at that ceiling must actually finish
+/// inside the budget it was selected for.
+///
+/// Exhaustive-gated (spec 13.1): this is a throughput contract, not a correctness one, and it is
+/// two orders of magnitude more work than any other test in the file.
+#[cfg(feature = "exhaustive")]
+#[test]
+fn exact_enumeration_at_the_selection_ceiling_finishes_inside_the_budget() {
+    let board = cards("QsJd7h3c");
+    let mut hero = Range1326::uniform();
+    block_public(&mut hero, &board);
+    // Every third combo: a support size chosen to put `exact_cost` just under the section 7 ceiling.
+    let mut villain = Range1326::from_fn(|i| if i % 3 == 0 { 1.0 } else { 0.0 });
+    block_public(&mut villain, &board);
+    let req = EquityRequest::single_pot(
+        board,
+        vec![PlayerRange { seat: Seat(0), range: hero }, PlayerRange { seat: Seat(1), range: villain }],
+        EquityMode::Exact,
+    );
+    let cost = exact_cost(&req);
+    // 1,128 hero combos x 404 villain combos x 44 turn runouts = 20,051,328: the section 7 ceiling,
+    // marginally above `2 * 10^7`, so this test is if anything stricter than the spec requires.
+    assert_eq!(cost, 20_051_328, "the fixture must sit at the section 7 selection ceiling, not below it");
+    let budget = Duration::from_millis(500);
+    let start = Instant::now();
+    let res = equity(&req, budget, &no_cancel());
+    let took = start.elapsed();
+    assert_eq!(
+        res.status,
+        EquityStatus::Ready,
+        "an enumeration spec 7 selects (exact_cost {cost}) must finish inside its 0.5 s budget; it stopped after {took:?} at {} evaluations",
+        res.samples
+    );
+    let sum: f32 = res.shares.iter().map(|s| s.value).sum();
+    assert!((sum - 1.0).abs() < 1e-5, "shares sum to {sum}");
+}
+
+/// S10 (final review): `per_combo_equity` was the one public entry point of `core-eval` that could
+/// not be cancelled and had no caller-supplied budget -- up to 1,326 exact enumerations behind a
+/// hard-coded one-hour deadline and a permanently-false flag. Spec section 5 requires the work to
+/// be abandonable when hero's decision changes, so it now takes the caller's clock and answers it
+/// with `equity`'s own status semantics.
+#[test]
+fn per_combo_equity_reports_a_stop_with_equity_status_semantics() {
+    let board = cards("QsJd7h3c2d");
+    let hero = parse_range("AA,KK,QQ").unwrap();
+    let villain = parse_range("QQ,JJ,54o").unwrap();
+
+    // An already-raised flag stops the call before any work, like `exact`'s entry poll.
+    let cancelled = AtomicBool::new(true);
+    let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_secs(10), &cancelled);
+    assert_eq!(status, EquityStatus::Cancelled);
+    assert!(out.iter().all(|v| *v == 0.0), "a cancelled call reports no equity at all");
+
+    // A zero budget is exhausted on the first poll whatever the timer's resolution reports.
+    let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::ZERO, &no_cancel());
+    assert_eq!(status, EquityStatus::BudgetExceeded);
+    assert!(out.iter().all(|v| *v == 0.0));
+
+    // An empty support on either side is a statement about the ranges, not about the clock.
+    let (status, _) = per_combo_equity(&Range1326::zero(), &villain, &board, Duration::from_secs(10), &no_cancel());
+    assert_eq!(status, EquityStatus::InvalidRanges);
+    let (status, _) = per_combo_equity(&hero, &Range1326::zero(), &board, Duration::from_secs(10), &no_cancel());
+    assert_eq!(status, EquityStatus::InvalidRanges);
+
+    // The river fast path still completes, inside a budget a decision can actually wait for.
+    let start = Instant::now();
+    let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_millis(500), &no_cancel());
+    let took = start.elapsed();
+    assert_eq!(status, EquityStatus::Ready, "the river fast path must finish inside 500 ms; it took {took:?}");
+    assert!(took < Duration::from_millis(500), "finished in {took:?}");
+    assert!(out[combo("AcAd") as usize] > 0.0, "a supported hero combo is scored");
+    assert_eq!(out[combo("2h2d") as usize], 0.0, "an unsupported hero combo scores 0");
+}
+
+/// S10: a flag raised while the enumerations are running is observed between hero combos, and the
+/// combos finished before it are kept -- the caller gets a partial answer, not an empty one.
+///
+/// Hero is the full 1,081-combo river range against a broad villain range, which is far more work
+/// than the 20 ms the flag allows, so the run must stop part-way through.
+#[test]
+fn per_combo_equity_observes_a_flag_raised_mid_run_and_keeps_what_it_finished() {
+    let board = cards("QsJd7h3c2d");
+    let mut hero = Range1326::uniform();
+    block_public(&mut hero, &board);
+    let mut villain = Range1326::uniform();
+    block_public(&mut villain, &board);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let setter = cancel_after(&cancel, Duration::from_millis(20));
+    let start = Instant::now();
+    let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_secs(60), &cancel);
+    let took = start.elapsed();
+    setter.join().unwrap();
+    assert_eq!(status, EquityStatus::Cancelled, "stopped after {took:?}");
+    assert!(took < Duration::from_millis(500), "cancelled {took:?} after a 20 ms flag");
+    let scored = out.iter().filter(|v| **v > 0.0).count();
+    assert!(scored > 0, "the combos finished before the flag are kept");
+    assert!(scored < 1081, "the run stopped before scoring every hero combo: {scored}");
+
+    // The same run under a budget rather than a flag reports `BudgetExceeded`, partially filled.
+    let start = Instant::now();
+    let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_millis(20), &no_cancel());
+    let took = start.elapsed();
+    assert_eq!(status, EquityStatus::BudgetExceeded, "stopped after {took:?}");
+    assert!(took < Duration::from_millis(200), "stopped {took:?} after a 20 ms budget");
+    assert!(out.iter().filter(|v| **v > 0.0).count() < 1081);
 }

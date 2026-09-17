@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use proto::{combo_cards, Card, ComboIndex, EquityMethod, Rake, Range1326, Seat, COMBOS};
 
-use crate::evaluator::{BinaryEvaluator, Evaluator};
+use crate::evaluator::{BinaryEvaluator, Evaluator, PartialHand};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlayerRange { pub seat: Seat, pub range: Range1326 }
@@ -31,7 +31,16 @@ pub enum EquityStatus { Ready, Cancelled, BudgetExceeded, InvalidRanges }
 pub struct EquityShare { pub pot_index: u8, pub seat: Seat, pub value: f32, pub std_err: f32 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct EquityResult { pub status: EquityStatus, pub method: Option<EquityMethod>, pub shares: Vec<EquityShare>, pub samples: u64, pub elapsed: Duration }
+pub struct EquityResult {
+    pub status: EquityStatus,
+    pub method: Option<EquityMethod>,
+    pub shares: Vec<EquityShare>,
+    /// Rank evaluations on the exact path; accepted joint tuples on the Monte Carlo path. The two
+    /// are **not comparable** -- they differ by a factor of the player count -- and only the Monte
+    /// Carlo value is the `n` behind `EquityShare::std_err` (review S4).
+    pub samples: u64,
+    pub elapsed: Duration,
+}
 
 impl EquityRequest {
     pub fn single_pot(board: Vec<Card>, players: Vec<PlayerRange>, mode: EquityMode) -> EquityRequest { EquityRequest { board, players, mode, pots: vec![] } }
@@ -158,16 +167,24 @@ pub fn exact_cost(req: &EquityRequest) -> u64 {
 /// `equity * (pot - rake)`; rake = min(rate * pot, cap) for pot rake and 0 for a time charge
 /// (spec section 6). `no_flop_no_drop` selects whether the caller rakes this pot at all, which
 /// is a property of the hand's history, not of the amount: it never changes this formula.
+/// The output stays `f32` chips per spec section 2, but the arithmetic is done in `f64` and narrowed
+/// exactly once, at the return (review S9): `pot as f32` is already lossy above `2^24`, so
+/// narrowing first threw away part of the pot before the rake was even subtracted. At a pot of
+/// `2^24 + 1` that cost a full chip of the answer.
 pub fn terminal_payoff(equity: f32, pot: u32, rake: &Rake) -> f32 {
-    let pot = pot as f32;
-    let r = match rake { Rake::PotRake { rate, cap_mchips, .. } => (rate * pot).min(*cap_mchips as f32 / 1000.0), Rake::TimeCharge => 0.0 };
-    equity * (pot - r)
+    let pot = f64::from(pot);
+    let r = match rake {
+        Rake::PotRake { rate, cap_mchips, .. } => (f64::from(*rate) * pot).min(f64::from(*cap_mchips) / 1000.0),
+        Rake::TimeCharge => 0.0,
+    };
+    (f64::from(equity) * (pot - r)) as f32
 }
 
 /// Budget and cancellation clock.
 ///
 /// Two counters, polled on the same 4096 cadence but kept apart on purpose:
-/// `evals` counts rank evaluations and is what `EquityResult::samples` reports, while `work`
+/// `evals` counts rank evaluations and is what `EquityResult::samples` reports **on the exact
+/// path** (the Monte Carlo path reports accepted joint tuples instead; review S4), while `work`
 /// counts units of search that produce no evaluation at all. A search whose deeper players always
 /// collide finishes no runout, so it would never reach an evaluation-only poll and could run for
 /// an unbounded time past its budget (spec section 7, and the 50 ms overrun limit of section 13.1).
@@ -246,17 +263,29 @@ pub(crate) fn result(status: EquityStatus, method: Option<EquityMethod>, shares:
     EquityResult { status, method, shares, samples, elapsed }
 }
 
-struct ExactRun<'a> {
+struct ExactRun<'a, 'd, 'c> {
     req: &'a EquityRequest,
-    supports: Vec<Support>,
+    supports: &'a [Support],
     used: [bool; 52],
     chosen: Vec<[Card; 2]>,
     ranks: Vec<u16>,
     tally: Tally,
-    deadline: Deadline<'a>,
+    deadline: &'d mut Deadline<'c>,
+    /// `5 - board.len()`: runout cards still to deal, hoisted out of the innermost loop.
+    k: usize,
+    // Reusable buffers. `runouts` is the innermost statement of the whole enumeration and spec
+    // section 7 admits requests of up to `2 * 10^7` evaluations inside a 0.5 s budget, so it must
+    // allocate nothing per tuple (review S3). `mc.rs` already keeps its deck and board this way.
+    deck: Vec<Card>,
+    board_cards: Vec<Card>,
+    idx: Vec<usize>,
+    /// The board pre-combined once for the whole run. On the river (`k == 0`) the board is complete
+    /// and identical for every tuple, so this is the `PartialHand` every showdown evaluates against
+    /// and `BinaryEvaluator::partial` is never called again.
+    board_partial: PartialHand,
 }
 
-impl ExactRun<'_> {
+impl ExactRun<'_, '_, '_> {
     /// Depth-first over the players in request order; `used` keeps every tuple pairwise disjoint
     /// and disjoint from the board, so no invalid card set ever reaches the evaluator.
     fn assign(&mut self, player: usize, weight: f64) -> Option<EquityStatus> {
@@ -280,28 +309,43 @@ impl ExactRun<'_> {
     }
 
     /// Enumerates every runout for the chosen holes and awards each one with `weight`.
+    ///
+    /// Allocation-free: the deck, the runout index and the board vector are `ExactRun`'s own
+    /// buffers, refilled in place. On the river there is no runout at all, so neither the deck nor
+    /// the board is touched and the pre-combined `board_partial` is evaluated directly (review S3).
     fn runouts(&mut self, weight: f64) -> Option<EquityStatus> {
-        let deck: Vec<Card> = (0..52u8).map(Card).filter(|c| !self.used[c.0 as usize]).collect();
-        let k = 5 - self.req.board.len();
-        let mut idx: Vec<usize> = (0..k).collect();
-        let mut board_cards = self.req.board.clone();
-        loop {
-            board_cards.truncate(self.req.board.len());
-            board_cards.extend(idx.iter().map(|i| deck[*i]));
-            let full = BinaryEvaluator.partial(&board_cards);
-            for (i, hole) in self.chosen.iter().enumerate() {
-                self.ranks[i] = BinaryEvaluator.rank_with(&full, hole);
+        let k = self.k;
+        if k == 0 {
+            for i in 0..self.chosen.len() {
+                self.ranks[i] = BinaryEvaluator.rank_with(&self.board_partial, &self.chosen[i]);
                 if let Some(s) = self.deadline.tick() { return Some(s); }
             }
             self.tally.award(&self.ranks, weight);
-            if k == 0 { return None; }
+            return None;
+        }
+        self.deck.clear();
+        for c in (0..52u8).map(Card) {
+            if !self.used[c.0 as usize] { self.deck.push(c); }
+        }
+        self.idx.clear();
+        self.idx.extend(0..k);
+        let board_len = self.req.board.len();
+        loop {
+            self.board_cards.truncate(board_len);
+            for t in 0..k { self.board_cards.push(self.deck[self.idx[t]]); }
+            let full = BinaryEvaluator.partial(&self.board_cards);
+            for i in 0..self.chosen.len() {
+                self.ranks[i] = BinaryEvaluator.rank_with(&full, &self.chosen[i]);
+                if let Some(s) = self.deadline.tick() { return Some(s); }
+            }
+            self.tally.award(&self.ranks, weight);
             let mut j = k;
             loop {
                 if j == 0 { return None; }
                 j -= 1;
-                if idx[j] < deck.len() - k + j {
-                    idx[j] += 1;
-                    for t in (j + 1)..k { idx[t] = idx[t - 1] + 1; }
+                if self.idx[j] < self.deck.len() - k + j {
+                    self.idx[j] += 1;
+                    for t in (j + 1)..k { self.idx[t] = self.idx[t - 1] + 1; }
                     break;
                 }
             }
@@ -311,27 +355,53 @@ impl ExactRun<'_> {
 
 pub(crate) fn exact(req: &EquityRequest, budget: Duration, cancel: &AtomicBool) -> EquityResult {
     check_request(req);
-    let pots = req.pot_list();
-    let deadline = Deadline::new(budget, cancel);
+    let mut deadline = Deadline::new(budget, cancel);
     // Entry poll, before any work: an already-cancelled or zero-budget request must never report
     // a result, and must never report `Ready`.
     if let Some(status) = deadline.check() { return result(status, None, vec![], 0, deadline.elapsed()); }
     let supports: Vec<Support> = req.players.iter().map(|p| support(&p.range, &req.board)).collect();
+    exact_with_supports(req, &supports, &mut deadline)
+}
+
+/// One exact enumeration against **caller-supplied** supports and a **caller-owned** clock.
+///
+/// `supports[i]` is the support actually enumerated for `req.players[i]`; the players' `range`
+/// fields are not read here at all, only their seats, the board and the pot list. That is what lets
+/// `per_combo_equity` build the villain's support once and vary only hero's one-combo support
+/// across 1,326 runs, on a single shared `Deadline`, instead of rebuilding both per combo behind a
+/// fresh one-hour budget (review S10).
+fn exact_with_supports(req: &EquityRequest, supports: &[Support], deadline: &mut Deadline<'_>) -> EquityResult {
+    assert_eq!(supports.len(), req.players.len(), "exact: one support per player");
+    let pots = req.pot_list();
     if supports.iter().any(|s| s.is_empty()) {
         let status = deadline.check().unwrap_or(EquityStatus::InvalidRanges);
         return result(status, None, vec![], 0, deadline.elapsed());
     }
     let n = req.players.len();
-    let mut run = ExactRun { req, supports, used: req.board_used(), chosen: Vec::with_capacity(n), ranks: vec![0; n], tally: Tally::new(req, &pots), deadline };
+    let mut run = ExactRun {
+        req,
+        supports,
+        used: req.board_used(),
+        chosen: Vec::with_capacity(n),
+        ranks: vec![0; n],
+        tally: Tally::new(req, &pots),
+        k: 5 - req.board.len(),
+        deck: Vec::with_capacity(52),
+        board_cards: req.board.clone(),
+        idx: Vec::with_capacity(5),
+        board_partial: BinaryEvaluator.partial(&req.board),
+        deadline,
+    };
     let stop = run.assign(0, 1.0);
     let elapsed = run.deadline.elapsed();
-    if let Some(status) = stop { return result(status, None, vec![], run.deadline.evals, elapsed); }
+    let evals = run.deadline.evals;
+    if let Some(status) = stop { return result(status, None, vec![], evals, elapsed); }
     // Final poll before reporting a terminal status. Without it a run that finished between two
     // polls could report `Ready` after cancellation, or `InvalidRanges` for a search that simply
     // ran out of budget before completing a single tuple.
-    if let Some(status) = run.deadline.check() { return result(status, None, vec![], run.deadline.evals, elapsed); }
-    if run.tally.empty() { return result(EquityStatus::InvalidRanges, None, vec![], run.deadline.evals, elapsed); }
-    result(EquityStatus::Ready, Some(EquityMethod::Exact), run.tally.shares(req, &pots, None), run.deadline.evals, elapsed)
+    if let Some(status) = run.deadline.check() { return result(status, None, vec![], evals, elapsed); }
+    if run.tally.empty() { return result(EquityStatus::InvalidRanges, None, vec![], evals, elapsed); }
+    result(EquityStatus::Ready, Some(EquityMethod::Exact), run.tally.shares(req, &pots, None), evals, elapsed)
 }
 
 /// Spec 3.5 entry point: exact enumeration or time-bounded Monte Carlo per `req.mode`.
@@ -353,18 +423,53 @@ pub fn equity(req: &EquityRequest, budget: Duration, cancel: &AtomicBool) -> Equ
 /// combos by the enumeration's disjointness, so hero's cards never enter the public range itself
 /// (spec section 2). Unsupported hero combos — zero weight, or blocked by the board — score 0.
 ///
+/// Budget and cancellation are the caller's, with the same status semantics as [`equity`] (review
+/// S10): `Cancelled` or `BudgetExceeded` is returned with whatever combos were finished before the
+/// stop, and spec section 5 requires exactly that, because hero's decision can change while up to
+/// 1,326 enumerations are still running. A hero combo that collides with every villain combo has no
+/// showdown and simply scores 0, like an unsupported one; it never ends the run.
+///
 /// # Panics
 /// Panics on an invalid board (`check_board`) or an out-of-domain weight in either range
 /// (`support`).
-pub fn per_combo_equity(hero: &Range1326, villain: &Range1326, board: &[Card]) -> [f32; COMBOS] {
+pub fn per_combo_equity(
+    hero: &Range1326,
+    villain: &Range1326,
+    board: &[Card],
+    budget: Duration,
+    cancel: &AtomicBool,
+) -> (EquityStatus, [f32; COMBOS]) {
     check_board(board);
     let mut out = [0f32; COMBOS];
-    let never = AtomicBool::new(false);
-    for (i, _, _) in support(hero, board) {
-        let one = Range1326::from_fn(|j| if j == i { 1.0 } else { 0.0 });
-        let req = EquityRequest::single_pot(board.to_vec(), vec![PlayerRange { seat: Seat(0), range: one }, PlayerRange { seat: Seat(1), range: villain.clone() }], EquityMode::Exact);
-        let res = exact(&req, Duration::from_secs(3600), &never);
-        if res.status == EquityStatus::Ready { out[i as usize] = res.shares.iter().find(|s| s.seat == Seat(0)).map(|s| s.value).unwrap_or(0.0); }
+    let mut deadline = Deadline::new(budget, cancel);
+    // Entry poll, before any work, as `exact` and `monte_carlo` do.
+    if let Some(status) = deadline.check() { return (status, out); }
+    let hero_support = support(hero, board);
+    let villain_support = support(villain, board);
+    if hero_support.is_empty() || villain_support.is_empty() {
+        return (deadline.check().unwrap_or(EquityStatus::InvalidRanges), out);
     }
-    out
+    // One request and one villain support for the whole call; only hero's one-combo support is
+    // rewritten per iteration, in place.
+    let req = EquityRequest::single_pot(
+        board.to_vec(),
+        vec![PlayerRange { seat: Seat(0), range: hero.clone() }, PlayerRange { seat: Seat(1), range: villain.clone() }],
+        EquityMode::Exact,
+    );
+    let mut supports: Vec<Support> = vec![Vec::with_capacity(1), villain_support];
+    for &(i, cards, _) in &hero_support {
+        // One poll per hero combo: the only place a stop can be observed between enumerations.
+        if let Some(status) = deadline.check() { return (status, out); }
+        supports[0].clear();
+        supports[0].push((i, cards, 1.0));
+        let res = exact_with_supports(&req, &supports, &mut deadline);
+        match res.status {
+            EquityStatus::Ready => {
+                out[i as usize] = res.shares.iter().find(|s| s.seat == Seat(0)).map(|s| s.value).unwrap_or(0.0);
+            }
+            EquityStatus::InvalidRanges => {}
+            stop => return (stop, out),
+        }
+    }
+    (EquityStatus::Ready, out)
 }

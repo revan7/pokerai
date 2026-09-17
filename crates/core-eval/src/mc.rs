@@ -184,9 +184,12 @@ pub fn sample_joint_holes(req: &EquityRequest, seed: u64, count: usize) -> Vec<V
 /// budget or the flag stops it and reports that (review T25-R2).
 ///
 /// # Panics
-/// Panics on a structurally invalid request; see `check_request`.
+/// Panics on a structurally invalid request; see `check_request`. Also panics on
+/// `max_samples == 0`: that is a caller bug, not a data condition, and a run that never enters its
+/// loop would otherwise report `BudgetExceeded` and blame the clock for it (review T3).
 pub fn monte_carlo(req: &EquityRequest, seed: u64, max_samples: u32, budget: Duration, cancel: &AtomicBool) -> EquityResult {
     check_request(req);
+    assert!(max_samples > 0, "monte_carlo: max_samples is at least one sample");
     let pots = req.pot_list();
     let mut deadline = Deadline::new(budget, cancel);
     // Entry poll, before any work: an already-cancelled or zero-budget request must never compute,
