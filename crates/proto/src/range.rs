@@ -1,5 +1,5 @@
 use serde::de::{self, SeqAccess, Visitor};
-use serde::ser::SerializeSeq;
+use serde::ser::{self, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use crate::cards::{ComboIndex, COMBOS};
@@ -30,6 +30,15 @@ impl fmt::Debug for Range1326 {
 
 impl Serialize for Range1326 {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // Validate every weight before opening the sequence so a malformed
+        // range never reaches the wire as valid-looking (or `null`) JSON.
+        for (i, w) in self.0.iter().enumerate() {
+            if !w.is_finite() || !(0.0..=1.0).contains(w) {
+                return Err(ser::Error::custom(format!(
+                    "weight {w} at combo {i} is outside [0, 1]"
+                )));
+            }
+        }
         let mut seq = s.serialize_seq(Some(COMBOS))?;
         for w in self.0.iter() { seq.serialize_element(w)?; }
         seq.end()
@@ -44,7 +53,14 @@ impl<'de> Visitor<'de> for RangeVisitor {
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Range1326, A::Error> {
         let mut out = [0f32; COMBOS];
         for (i, slot) in out.iter_mut().enumerate() {
-            let w: f32 = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(i, &self))?;
+            // Read as f64 first and validate the *wide* value: narrowing to f32
+            // before checking would let e.g. 1.00000001 round to 1.0 and
+            // -1e-50 round to -0.0, silently admitting out-of-domain input.
+            let raw: f64 = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(i, &self))?;
+            if !raw.is_finite() || !(0.0..=1.0).contains(&raw) {
+                return Err(de::Error::custom(format!("weight {raw} at combo {i} is outside [0, 1]")));
+            }
+            let w = raw as f32;
             if !w.is_finite() || !(0.0..=1.0).contains(&w) {
                 return Err(de::Error::custom(format!("weight {w} at combo {i} is outside [0, 1]")));
             }
@@ -81,5 +97,67 @@ mod tests {
         assert!(serde_json::from_str::<Range1326>("[null]").is_err());
         assert_eq!(Range1326::uniform().0.iter().sum::<f32>(), 1326.0);
         assert_eq!(format!("{:?}", Range1326::zero()), "Range1326(support=0, mass=0)");
+    }
+
+    #[test]
+    fn range_serde_round_trips_zero_and_uniform() {
+        let zero = Range1326::zero();
+        let text = serde_json::to_string(&zero).unwrap();
+        let back: Range1326 = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, zero);
+
+        let uniform = Range1326::uniform();
+        let text = serde_json::to_string(&uniform).unwrap();
+        let back: Range1326 = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, uniform);
+    }
+
+    #[test]
+    fn range_serialize_rejects_non_finite_and_out_of_domain_weights() {
+        let mut r = Range1326::zero();
+        r.0[5] = f32::NAN;
+        assert!(serde_json::to_string(&r).is_err());
+
+        let mut r = Range1326::zero();
+        r.0[5] = f32::INFINITY;
+        assert!(serde_json::to_string(&r).is_err());
+
+        let mut r = Range1326::zero();
+        r.0[5] = f32::NEG_INFINITY;
+        assert!(serde_json::to_string(&r).is_err());
+
+        let mut r = Range1326::zero();
+        r.0[5] = -0.1;
+        assert!(serde_json::to_string(&r).is_err());
+
+        let mut r = Range1326::zero();
+        r.0[5] = 1.5;
+        assert!(serde_json::to_string(&r).is_err());
+    }
+
+    fn array_json_with_first_token(tok: &str) -> String {
+        let mut s = String::from("[");
+        s.push_str(tok);
+        for _ in 1..COMBOS {
+            s.push_str(",0");
+        }
+        s.push(']');
+        s
+    }
+
+    #[test]
+    fn range_deserialize_rejects_rounding_boundary_values() {
+        // 1.00000001 narrows to f32 1.0 and -1e-50 narrows to f32 -0.0 if the
+        // decoder validates only after narrowing; both must be rejected because
+        // the original f64 tokens are outside [0, 1].
+        assert!(serde_json::from_str::<Range1326>(&array_json_with_first_token("1.00000001")).is_err());
+        assert!(serde_json::from_str::<Range1326>(&array_json_with_first_token("-1e-50")).is_err());
+    }
+
+    #[test]
+    fn range_deserialize_accepts_domain_controls() {
+        assert!(serde_json::from_str::<Range1326>(&array_json_with_first_token("0")).is_ok());
+        assert!(serde_json::from_str::<Range1326>(&array_json_with_first_token("1")).is_ok());
+        assert!(serde_json::from_str::<Range1326>(&array_json_with_first_token("0.5")).is_ok());
     }
 }
