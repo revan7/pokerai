@@ -182,6 +182,14 @@ fn compare_rejects_materialized_length_mismatch() {
     assert!(compare(&e, &t, 100, 500, 5000).is_none());
 }
 
+// Fix round 1 (review R1): swapping only one side also puts that side's path out of step with
+// the other side's positionally-zipped path, so these two tests are also (and, on their own,
+// ambiguously) caught by the ordinary per-node `a.path != b.path` check, not demonstrably by the
+// `sorted_by_path` guard itself. Kept as ordinary "some reordering is rejected" coverage, but
+// `compare_rejects_matching_unsorted_order_on_both_sides` and
+// `compare_rejects_duplicate_path_present_on_both_sides` below are the tests that isolate the
+// sortedness guard: both sides carry the identical (unsorted) path sequence, so the per-node
+// checks all pass pairwise and only `sorted_by_path` can reject.
 #[test]
 fn compare_rejects_unsorted_entry_tree() {
     let mut unsorted = two_node_tree(50);
@@ -197,6 +205,33 @@ fn compare_rejects_unsorted_query_tree() {
     let mut unsorted = two_node_tree(50);
     unsorted.swap(0, 1);
     let t = query_tree(unsorted);
+    assert!(compare(&e, &t, 100, 500, 5000).is_none());
+}
+
+/// Isolates the `sorted_by_path` guard from the per-node path-equality check: both sides carry
+/// the *same* (reversed, unsorted) path sequence, so every positional pair is pairwise identical
+/// (`a.path == b.path`, `a.actor == b.actor`, etc. at every index) and only `sorted_by_path`
+/// rejects. Mutation-tested in fix round 1: removing both `sorted_by_path` checks from `compare`
+/// flips this test's result from `None` to `Some` (see task-3-report.md "Fix round 1").
+#[test]
+fn compare_rejects_matching_unsorted_order_on_both_sides() {
+    let mut reordered = two_node_tree(50);
+    reordered.reverse(); // [child(path=[1]), root(path=[])] on both sides identically
+    let e = minimal_entry(100, 500, 500, 5000, 0.0, reordered.clone());
+    let t = query_tree(reordered);
+    assert!(compare(&e, &t, 100, 500, 5000).is_none());
+}
+
+/// The matching duplicate-path case from the same isolation family: both sides list the same
+/// node twice at the same path. `sorted_by_path` uses a strict `<`, so an equal-path adjacent
+/// pair is itself unsorted; every positional pair is still pairwise identical, so only
+/// `sorted_by_path` rejects. Mutation-tested alongside the test above.
+#[test]
+fn compare_rejects_duplicate_path_present_on_both_sides() {
+    let node = MaterializedNode { path: vec![], street: Street::Flop, actor: "oop".into(), actions: vec![Action::Check], terminal_pots: vec![None] };
+    let duplicated = vec![node.clone(), node];
+    let e = minimal_entry(100, 500, 500, 5000, 0.0, duplicated.clone());
+    let t = query_tree(duplicated);
     assert!(compare(&e, &t, 100, 500, 5000).is_none());
 }
 
@@ -332,6 +367,48 @@ fn compare_rejects_wager_deviation_just_over_the_five_percent_boundary() {
     let t = query_tree(single_bet_tree(506));
     // dev = |506/100 - 500/100| = 0.06 > 0.05.
     assert!(compare(&e, &t, 100, 500, 5000).is_none());
+}
+
+/// Root (`Flop`, `Check`, no wager) and a `Turn` child with a single `Bet`.
+fn root_then_turn_wager_tree(turn_to: u32) -> Vec<MaterializedNode> {
+    vec![
+        MaterializedNode { path: vec![], street: Street::Flop, actor: "oop".into(), actions: vec![Action::Check], terminal_pots: vec![None] },
+        MaterializedNode { path: vec![0], street: Street::Turn, actor: "oop".into(), actions: vec![Action::Bet { to: turn_to }], terminal_pots: vec![None] },
+    ]
+}
+
+/// Fix round 1 (review R1): the previous two deviation tests both used a single-node,
+/// single-wager tree, so they could not show that `compare` walks *every* street rather than
+/// stopping at the root. Here the root is unchanged (`Check`, no wager) on both sides, and the
+/// only wager -- and the only source of deviation -- is on the `Turn` child.
+#[test]
+fn compare_rejects_wager_deviation_exceeding_threshold_on_a_later_street_with_root_unchanged() {
+    let e = minimal_entry(100, 500, 500, 5000, 0.0, root_then_turn_wager_tree(500));
+    let t = query_tree(root_then_turn_wager_tree(506));
+    // dev = |506/100 - 500/100| = 0.06 > 0.05, entirely from the Turn node.
+    assert!(compare(&e, &t, 100, 500, 5000).is_none());
+}
+
+/// Two wager nodes, `Flop` root then `Turn` child.
+fn two_street_wager_tree(flop_to: u32, turn_to: u32) -> Vec<MaterializedNode> {
+    vec![
+        MaterializedNode { path: vec![], street: Street::Flop, actor: "oop".into(), actions: vec![Action::Bet { to: flop_to }], terminal_pots: vec![None] },
+        MaterializedNode { path: vec![0], street: Street::Turn, actor: "oop".into(), actions: vec![Action::Bet { to: turn_to }], terminal_pots: vec![None] },
+    ]
+}
+
+/// Fix round 1 (review R1): proves `maximum` is accumulated with `.max(...)` across every wager
+/// in the tree, not overwritten by the latest one. The larger deviation (Flop, diff 3 -> 0.03) is
+/// encountered *before* a smaller one (Turn, diff 1 -> 0.01); if the accumulation were replaced
+/// by plain assignment of the latest deviation, the result would be the smaller, later 0.01, not
+/// the correct 0.03. Asserts the exact `menu_num`/`menu_den` alongside `max_dev`, not just the
+/// `f64` display value. Mutation-tested in fix round 1 (see task-3-report.md "Fix round 1").
+#[test]
+fn compare_accepts_when_the_largest_deviation_occurs_before_a_smaller_final_deviation() {
+    let e = minimal_entry(100, 500, 500, 5000, 0.0, two_street_wager_tree(500, 500));
+    let t = query_tree(two_street_wager_tree(503, 501));
+    let c = compare(&e, &t, 100, 500, 5000).expect("both deviations are within the 5% threshold");
+    assert_eq!(c, Comparison { delta: 0.0, max_dev: 0.03, delta_num: 0, delta_den: 500 * 100, menu_num: 300, menu_den: 100 * 100 });
 }
 
 // --- Comparison::rank ------------------------------------------------------------------------
