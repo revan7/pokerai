@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use crate::cards::Card;
 use crate::game::HandConfig;
+use crate::range::Range1326;
+use crate::tree::EffectiveTree;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -104,6 +106,16 @@ pub struct StreetRootSnapshot {
     pub projected_from: u8,
     pub history: Vec<(Seat, Action)>,
     pub bb_chips: u32,
+}
+
+/// Solve request sent to the engine/worker: financial root, both players' public ranges
+/// and the effective tree to solve against (spec section 2). Hero's cards never appear here.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SolveInput {
+    pub root: StreetRootSnapshot,
+    pub ranges: [Range1326; 2],
+    pub tree: EffectiveTree,
+    pub target_bp: u16,
 }
 
 /// Admission DTO of spec section 5 step 2: no `hand_id` (the engine assigns it),
