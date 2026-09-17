@@ -1,6 +1,6 @@
 pub mod evaluator;
 
-pub use evaluator::{BinaryEvaluator, Evaluator};
+pub use evaluator::{BinaryEvaluator, Evaluator, PartialHand};
 use proto::Card;
 
 pub fn rank(cards: &[Card]) -> u16 { BinaryEvaluator.rank(cards) }
