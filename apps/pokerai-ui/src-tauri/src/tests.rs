@@ -1,6 +1,124 @@
 use super::*;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+use tauri::{
+    ipc::{CallbackFn, InvokeBody},
+    test::{get_ipc_response, mock_builder, mock_context, noop_assets},
+    webview::InvokeRequest,
+};
+
+fn invoke(
+    window: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+    cmd: &str,
+    args: Value,
+) -> Result<Value, Value> {
+    get_ipc_response(
+        window,
+        InvokeRequest {
+            cmd: cmd.into(),
+            callback: CallbackFn(0),
+            error: CallbackFn(1),
+            url: "http://tauri.localhost".parse().unwrap(),
+            body: InvokeBody::Json(args),
+            headers: Default::default(),
+            invoke_key: tauri::test::INVOKE_KEY.into(),
+        },
+    )
+    .map(|body| body.deserialize::<Value>().unwrap())
+}
+
+#[test]
+fn commands_delegate_and_tag_is_unsupported() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let service = service::Service::spawn(Box::new(RecordingPort { calls: calls.clone() }));
+    let app = configure(mock_builder(), service).build(mock_context(noop_assets())).unwrap();
+    let w = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+    assert_eq!(invoke(&w, "presolver_status", json!({})).unwrap()["done"], 4);
+    for command in ["finish_hand", "abandon_hand", "presolver_pause", "presolver_resume"] {
+        assert_eq!(invoke(&w, command, json!({})).unwrap(), Value::Null);
+    }
+    invoke(&w, "cancel", json!({"decision_id":9})).unwrap();
+    let error = invoke(&w, "set_seat_tag", json!({"seat":2,"tag":"unknown"})).unwrap_err();
+    assert!(error.to_string().contains("phase 1"));
+    assert!(!calls.lock().unwrap().iter().any(|c| c == "set_seat_tag"));
+}
+
+// tests.rs additions: scripted values are transport fixtures, never a rules implementation.
+fn sample_hand() -> proto::HandState {
+    serde_json::from_value(json!({
+        "hand_id":10,"hand_revision":7,
+        "config":{"config_revision":1,"chip_label":"$1","sb_chips":5,"bb_chips":10,
+            "straddle":null,"rake":{"kind":"time_charge"}},
+        "phase":{"phase":"betting","street":"preflop"},"button":0,"hero":0,
+        "hero_cards":["As","Kd"],"dealt":[0,1,2,3,4,5],"stacks_start":vec![1000;6],
+        "board":[],"actions":[],
+        "derived":{"street":"preflop","to_act":3,"pot":15,
+            "committed_this_street":[0,5,10,0,0,0],"stacks_remaining":[1000,995,990,1000,1000,1000],
+            "folded":vec![false;6],"all_in":vec![false;6],"facing":10,"last_full_raise":10,"pots":[],
+            "legal":[{"kind":"fold"},{"kind":"call","cost":10}]}
+    })).unwrap()
+}
+fn sample_id() -> proto::DecisionIdentity {
+    proto::DecisionIdentity { hand_id: 10, hand_revision: 7, decision_id: 90, config_revision: 1, model_revision: 0 }
+}
+type Recorded = Arc<Mutex<Vec<(String, Value)>>>;
+struct ScriptPort { calls: Recorded, hand: proto::HandState, events: Vec<proto::RecommendationEvent> }
+impl service::EnginePort for ScriptPort {
+    fn dispatch(&mut self, op: service::Op) -> Result<Value, error::AppError> {
+        use service::Op;
+        let name = op.name().to_owned();
+        let (args, reply) = match op {
+            Op::Config(c) => (json!({"config":c}), serde_json::to_value(&c)?),
+            Op::Begin(b) => (json!({"begin":b}), serde_json::to_value(&self.hand)?),
+            Op::Hero(cards) => (json!({"cards":cards}), serde_json::to_value(&self.hand)?),
+            Op::Board(board) => (json!({"board":board}), serde_json::to_value(&self.hand)?),
+            Op::Action(action) => {
+                if matches!(action, proto::Action::Raise { to: 0 }) {
+                    return Err(error::AppError::Engine { message: "illegal raise".into() });
+                }
+                (json!({"action":action}), serde_json::to_value(&self.hand)?)
+            },
+            Op::Undo => (json!({}), serde_json::to_value(&self.hand)?),
+            Op::Recommend(channel) => {
+                for e in &self.events { channel.send(e.clone()).unwrap(); }
+                (json!({}), serde_json::to_value(sample_id())?)
+            },
+            Op::Cancel(id) => (json!({"decision_id":id}), Value::Null),
+            Op::PresolverStatus => (json!({}), json!({"paused":false})),
+            Op::Finish | Op::Abandon | Op::Pause | Op::Resume => (json!({}), Value::Null),
+        };
+        self.calls.lock().unwrap().push((name, args));
+        Ok(reply)
+    }
+    fn shutdown(&mut self) {}
+}
+#[test]
+fn all_state_command_arguments_and_engine_errors_cross_ipc() {
+    let calls = Arc::new(Mutex::new(vec![]));
+    let service = service::Service::spawn(Box::new(ScriptPort { calls: calls.clone(), hand: sample_hand(), events: vec![] }));
+    let app = configure(mock_builder(), service.clone()).build(mock_context(noop_assets())).unwrap();
+    let w = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+    let c = sample_hand().config;
+    let game = json!({"config_revision":c.config_revision,"chip_label":c.chip_label,"sb_chips":5,"bb_chips":10,
+        "straddle":null,"rake":c.rake,"seats":[{"seat":0,"tag":null,"facts":[]},{"seat":1,"tag":null,"facts":[]},
+        {"seat":2,"tag":null,"facts":[]}],"solver":{"threads":16,"target_bp":50,"flop_budget_s":10}});
+    let rows = [
+        ("set_game_config", json!({"config":game})),
+        ("begin_hand", json!({"begin":{"button":0,"hero":0,"dealt":[0,1,2,3,4,5],
+            "stacks":vec![1000;6],"hero_cards":null}})),
+        ("set_hero_cards", json!({"cards":["As","Kd"]})),
+        ("apply_action", json!({"action":{"kind":"raise","to":25}})),
+        ("set_board", json!({"board":["Kh","7d","2c"]})), ("undo", json!({})),
+    ];
+    for (name, args) in &rows { assert!(invoke(&w, name, args.clone()).is_ok(), "{name}"); }
+    assert_eq!(*calls.lock().unwrap(), rows.iter().map(|(n, a)| (n.to_string(), a.clone())).collect::<Vec<_>>());
+    let before = calls.lock().unwrap().len();
+    assert!(invoke(&w, "set_hero_cards", json!({"cards":["Zz","Kd"]})).is_err());
+    assert_eq!(calls.lock().unwrap().len(), before); // serde rejects before engine dispatch.
+    assert!(invoke(&w, "apply_action", json!({"action":{"kind":"raise","to":0}})).unwrap_err().to_string().contains("illegal raise"));
+    assert_eq!(invoke(&w, "undo", json!({})).unwrap(), serde_json::to_value(sample_hand()).unwrap());
+    service.stop();
+}
 
 struct RecordingPort {
     calls: Arc<Mutex<Vec<String>>>,
