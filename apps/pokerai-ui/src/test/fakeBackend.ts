@@ -25,7 +25,11 @@ export class FakeBackend implements Backend {
     for (const event of this.beforeIdentity) sink(event);
     return Promise.resolve(this.nextIdentity);
   }
-  emit(e: RecommendationEvent, request = this.sinks.length-1) { this.sinks[request]?.(e); }
+  emit(e: RecommendationEvent, request = this.sinks.length-1) {
+    const sink = this.sinks[request];
+    if (!sink) throw new Error(`FakeBackend.emit: no recommend sink at index ${request} (${this.sinks.length} registered)`);
+    sink(e);
+  }
   cancel(decision_id: number) { this.record('cancel',{decision_id}); return Promise.resolve(); }
   finish_hand() { this.record('finish_hand'); return Promise.resolve(); }
   abandon_hand() { this.record('abandon_hand'); return Promise.resolve(); }
