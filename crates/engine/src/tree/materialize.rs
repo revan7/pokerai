@@ -30,8 +30,12 @@ enum Prev { Root, Check, Chance, Wager }
 enum Kind { Opening, Donk, Facing }
 
 /// Mirror of upstream `BuildTreeInfo` plus the street/actor bookkeeping of the betting skeleton.
+///
+/// `wagers_this_street` counts observed wagers as well as template ones and an observed prefix may
+/// legally carry more wagers than `wager_cap` allows, so the counter is `usize`: a byte counter
+/// overflows on a 256-wager prefix in debug and wraps in release, which reopens capped raises.
 #[derive(Clone, Debug)]
-struct Walk { street: Street, actor: usize, prev: Prev, wagers_this_street: u8, allin: bool, oop_call: bool, stack: [i64; 2], prev_amount: i64, matched: i64 }
+struct Walk { street: Street, actor: usize, prev: Prev, wagers_this_street: usize, allin: bool, oop_call: bool, stack: [i64; 2], prev_amount: i64, matched: i64 }
 
 struct Operands { to_call: i64, pot: i64, max: i64, min: i64 }
 fn operands(w: &Walk, p: i64) -> Operands {
@@ -47,6 +51,54 @@ fn kind(w: &Walk) -> Kind {
     match w.prev { Prev::Chance if w.oop_call => Kind::Donk, Prev::Root | Prev::Check | Prev::Chance => Kind::Opening, Prev::Wager => Kind::Facing }
 }
 
+/// Validates the template's own numbers before any of them reaches a rounding or a narrowing.
+///
+/// `TemplateSpec`'s fields are public and the registry establishes no invariant on a template a
+/// caller builds itself, so this is the boundary: a menu coefficient must be inside the domain
+/// `proto::MenuSize` enforces on both serde directions (positive and finite — a value outside it
+/// could not even be serialized into the `EffectiveTree` the worker receives), a raise coefficient
+/// must in addition exceed 1.0, the two all-in thresholds must be finite and non-negative
+/// (upstream's own `ConfigError` rule, plus the finiteness upstream's `< 0.0` test misses for NaN),
+/// and the merge threshold stays pinned to 0.0 because upstream's `merge_bet_actions` step is not
+/// mirrored here.
+fn validate_template(t: &TemplateSpec) -> Result<(), UnsupportedReason> {
+    let sizes = |label: &'static str, v: &[MenuSize], street: Street, raise: bool| -> Result<(), UnsupportedReason> {
+        for s in v {
+            if let MenuSize::Pot(x) = s {
+                if !(x.is_finite() && *x > 0.0) {
+                    return Err(unsupported(format!("template {} has an out-of-domain {label} menu size {x:e} on {street:?}: a menu size must be positive and finite", t.id)));
+                }
+                // A raise coefficient multiplies the facing wager, so `<= 1.0` names a raise-to
+                // that does not exceed it. Upstream refuses such a size at parse time
+                // (`third_party/postflop-solver/src/bet_size.rs:164`, "Multiplier must be greater
+                // than 1.0") and never builds that node, whereas this mirror would push the amount
+                // through the min-raise clamp and materialize a raise the worker's realized tree
+                // cannot contain — the `tree_mismatch` the spec forbids the engine to cause.
+                if raise && *x <= 1.0 {
+                    return Err(unsupported(format!("template {} has a {label} menu size {x:e} on {street:?}: a raise size must be greater than 1.0", t.id)));
+                }
+            }
+        }
+        Ok(())
+    };
+    for (street, m) in &t.menus {
+        sizes("oop bet", &m.oop.bet, *street, false)?;
+        sizes("oop raise", &m.oop.raise, *street, true)?;
+        sizes("ip bet", &m.ip.bet, *street, false)?;
+        sizes("ip raise", &m.ip.raise, *street, true)?;
+        if let Some(donk) = &m.donk { sizes("donk", donk, *street, false)?; }
+    }
+    for (label, x) in [("add_allin_threshold", t.add_allin_threshold), ("force_allin_threshold", t.force_allin_threshold)] {
+        if !(x.is_finite() && x >= 0.0) {
+            return Err(unsupported(format!("template {} has an out-of-domain {label} {x:e}: a threshold must be non-negative and finite", t.id)));
+        }
+    }
+    if t.merging_threshold != 0.0 {
+        return Err(unsupported(format!("template {} has merging_threshold {:e}, which is pinned to 0.0", t.id, t.merging_threshold)));
+    }
+    Ok(())
+}
+
 /// The menu of a node: built, clamped, forced, sorted and deduplicated exactly as upstream `push_actions` (§4.6).
 fn menu(w: &Walk, t: &TemplateSpec, p: i64) -> Result<Vec<Action>, UnsupportedReason> {
     let o = operands(w, p);
@@ -54,7 +106,8 @@ fn menu(w: &Walk, t: &TemplateSpec, p: i64) -> Result<Vec<Action>, UnsupportedRe
     let side = if w.actor == OOP { &street.oop } else { &street.ip };
     let add = t.add_allin_threshold as f64;
     let force = t.force_allin_threshold as f64;
-    if t.merging_threshold != 0.0 { return Err(unsupported("merging_threshold is pinned to 0.0")); }
+    // Infallible after `validate_template`, which every path into this function runs first.
+    assert_eq!(t.merging_threshold, 0.0, "template {} reached menu() with an unpinned merging_threshold", t.id);
     let allin = Action::AllIn { to: chips(o.max) };
     let mut v: Vec<Action> = Vec::new();
     match kind(w) {
@@ -94,10 +147,16 @@ fn menu(w: &Walk, t: &TemplateSpec, p: i64) -> Result<Vec<Action>, UnsupportedRe
 }
 
 /// Observed action -> tree action at this node (§10.2 exact insertion, §4.6 all-in normalization).
-fn map_observed(k: Kind, o: &Operands, obs: &Action) -> Result<Action, UnsupportedReason> {
+///
+/// `facing_allin` is the node's `Walk::allin`: §4.6 leaves only fold and call against an all-in,
+/// and the pinned `ActionTree::add_line_recursive` refuses a "Bet action after all-in", so an
+/// observed wager there is rejected here instead of being normalized and inserted into a tree the
+/// worker could not realize.
+fn map_observed(k: Kind, o: &Operands, obs: &Action, facing_allin: bool) -> Result<Action, UnsupportedReason> {
     match obs {
         Action::Fold | Action::Check | Action::Call => Ok(*obs),
         Action::Bet { to } | Action::Raise { to } | Action::AllIn { to } => {
+            if facing_allin { return Err(unsupported(format!("wager to {to} faces an all-in, where only fold and call are legal"))); }
             let to = *to as i64;
             if to >= o.max { return Ok(Action::AllIn { to: chips(o.max) }); }   // equal to max is forced; above max is the deeper stack's uncontestable excess
             if matches!(obs, Action::AllIn { .. }) { return Err(unsupported(format!("all-in to {to} below the effective maximum {}", o.max))); }
@@ -152,6 +211,7 @@ pub struct Materialized { pub nodes: Vec<MaterializedNode>, pub inserted: Vec<(V
 pub fn materialize(inp: &MaterializeInput) -> Result<Materialized, UnsupportedReason> {
     if inp.starting_pot == 0 || inp.eff == 0 { return Err(unsupported("zero pot or zero effective stack")); }
     if (inp.starting_pot as u64) + 2 * (inp.eff as u64) >= (1u64 << 31) { return Err(unsupported("pot + stacks exceed 2^31")); }
+    validate_template(inp.template)?;
     let p = inp.starting_pot as i64;
     let root = Walk { street: inp.template.root_street, actor: OOP, prev: Prev::Root, wagers_this_street: 0, allin: false, oop_call: false, stack: [inp.eff as i64; 2], prev_amount: 0, matched: 0 };
     let mut out = Materialized::default();
@@ -170,7 +230,7 @@ fn walk(inp: &MaterializeInput, p: i64, w: &Walk, path: &mut OrdinalPath, chip: 
         if path.len() < inp.prefix.len() {
             let (actor, obs) = &inp.prefix[path.len()];
             if *actor != w.actor { return Err(unsupported(format!("prefix actor mismatch at step {}", path.len()))); }
-            let mapped = map_observed(kind(w), &operands(w, p), obs)?;
+            let mapped = map_observed(kind(w), &operands(w, p), obs, w.allin)?;
             if !menu.contains(&mapped) {
                 if matches!(mapped, Action::Fold | Action::Check | Action::Call) { return Err(unsupported(format!("{mapped:?} not available at step {}", path.len()))); }
                 menu.push(mapped);
@@ -185,7 +245,7 @@ fn walk(inp: &MaterializeInput, p: i64, w: &Walk, path: &mut OrdinalPath, chip: 
         }
     }
     // wager cap (§4.6): observed prefix actions are never removed
-    if w.wagers_this_street >= t.wager_cap {
+    if w.wagers_this_street >= usize::from(t.wager_cap) {
         menu.retain(|a| !matches!(a, Action::Bet { .. } | Action::Raise { .. }) || prefix_action.as_ref() == Some(a));
     }
     let children: Vec<Child> = menu.iter().map(|a| child(w, a, p)).collect();
@@ -347,5 +407,109 @@ mod tests {
         let t = local(sizes(256));
         let e = materialize(&MaterializeInput { template: &t, starting_pot: 100_000, eff: 1_000_000, prefix: &[] });
         assert!(matches!(&e, Err(proto::UnsupportedReason::UnsupportedHistory { reason }) if reason.contains("256")), "got {e:?}");
+    }
+
+    /// R1: an observed prefix may legally exceed the wager cap, so the counter that enforces the
+    /// cap must be wider than the number of wagers a prefix can carry. With `river_std_v1` at pot
+    /// 100 and stacks 1_000 the alternating wagers 1, 2, ..., n are each exactly the tree minimum
+    /// at their step and stay below the effective stack, so a 256-wager prefix is legal input: a
+    /// `u8` counter panics on it in debug and wraps in release, reoffering `Raise(640)` at the
+    /// decision node although the cap of three was passed 253 wagers earlier.
+    #[test]
+    fn observed_prefix_wider_than_a_byte_counter_still_keeps_the_cap() {
+        let prefix = |n: u32| (1..=n).map(|k| ((k as usize - 1) & 1, if k == 1 { bet(1) } else { raise(k) })).collect::<Vec<_>>();
+        for n in [255u32, 256] {
+            let p = prefix(n);
+            let m = mat("river_std_v1", 100, 1_000, &p);
+            assert_eq!(m.history.len(), n as usize, "n = {n}");
+            assert_eq!((m.history[0], *m.history.last().unwrap()), (bet(1), raise(n)), "n = {n}");
+            assert_eq!(m.decision_path.len(), n as usize, "n = {n}");
+            // past the cap the decision node offers no wager but the all-in
+            assert_eq!(node(&m, &m.decision_path).actions, vec![Action::Fold, Action::Call, allin(1_000)], "n = {n}");
+        }
+    }
+
+    /// R2: `TemplateSpec`'s fields are public, so a caller can hand the materializer a menu size or
+    /// threshold the wire form would refuse (`proto::MenuSize` admits only positive finite pot
+    /// fractions in both serde directions; upstream requires a non-negative threshold). Those
+    /// numbers are validated before any rounding or narrowing, instead of being turned into a
+    /// plausible tree: `Pot(-1.0)` and `Pot(NaN)` used to give `Bet(1)`, `Pot(INFINITY)` an all-in.
+    #[test]
+    fn invalid_template_numbers_are_refused_before_any_rounding() {
+        let run = |t: &super::TemplateSpec| materialize(&MaterializeInput { template: t, starting_pot: 100, eff: 500, prefix: &[] });
+        for x in [-1.0f32, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0] {
+            let e = run(&local(vec![proto::MenuSize::Pot(x)]));
+            assert!(matches!(&e, Err(proto::UnsupportedReason::UnsupportedHistory { reason }) if reason.contains("menu size")), "{x:e} -> {e:?}");
+        }
+        for bad in [-0.1f32, f32::NAN, f32::INFINITY] {
+            let mut t = local(vec![proto::MenuSize::Pot(0.5)]);
+            t.add_allin_threshold = bad;
+            let e = run(&t);
+            assert!(matches!(&e, Err(proto::UnsupportedReason::UnsupportedHistory { reason }) if reason.contains("add_allin_threshold")), "{bad:e} -> {e:?}");
+            let mut t = local(vec![proto::MenuSize::Pot(0.5)]);
+            t.force_allin_threshold = bad;
+            let e = run(&t);
+            assert!(matches!(&e, Err(proto::UnsupportedReason::UnsupportedHistory { reason }) if reason.contains("force_allin_threshold")), "{bad:e} -> {e:?}");
+        }
+        // the pinned merge threshold is still refused when it is not exactly zero
+        let mut t = local(vec![proto::MenuSize::Pot(0.5)]);
+        t.merging_threshold = 0.1;
+        assert!(matches!(&run(&t), Err(proto::UnsupportedReason::UnsupportedHistory { reason }) if reason.contains("merging_threshold")), "{:?}", run(&t));
+        // controls: a valid template of the same shape still materializes, and the large positive
+        // size of `oversized_menu_amount_saturates_into_the_all_in` is not caught by this gate
+        let m = run(&local(vec![proto::MenuSize::Pot(0.5)])).unwrap();
+        assert_eq!(node(&m, &[]).actions, vec![Action::Check, bet(50)]);
+        assert!(run(&local(vec![proto::MenuSize::Pot(4.694967296)])).is_ok());
+        assert!(run(&local(vec![proto::MenuSize::AllIn])).is_ok());
+    }
+
+    /// The `local` template with a raise menu on both sides (it has none by default).
+    fn with_raises(raises: Vec<proto::MenuSize>) -> super::TemplateSpec {
+        let mut t = local(vec![proto::MenuSize::Pot(0.5)]);
+        let m = t.menus.get_mut(&Street::River).unwrap();
+        m.oop.raise = raises.clone();
+        m.ip.raise = raises;
+        t
+    }
+
+    /// A raise coefficient multiplies the facing wager, so `<= 1.0` names a raise-to that does not
+    /// exceed it. Upstream refuses such a size at parse time (`src/bet_size.rs:164`, "Multiplier
+    /// must be greater than 1.0") and never builds that node, while this mirror would push it
+    /// through the min-raise clamp and materialize a raise the worker's realized tree cannot
+    /// contain. Bet and donk coefficients keep the plain positive-finite rule.
+    #[test]
+    fn raise_sizes_must_exceed_the_facing_wager() {
+        let run = |t: &super::TemplateSpec| materialize(&MaterializeInput { template: t, starting_pot: 100, eff: 500, prefix: &[] });
+        for x in [0.5f32, 1.0, f32::MIN_POSITIVE] {
+            let e = run(&with_raises(vec![proto::MenuSize::Pot(x)]));
+            assert!(matches!(&e, Err(proto::UnsupportedReason::UnsupportedHistory { reason }) if reason.contains("raise") && reason.contains("greater than 1.0")), "{x:e} -> {e:?}");
+        }
+        // the next representable f32 above 1.0 is already a legal raise size
+        assert!(run(&with_raises(vec![proto::MenuSize::Pot(1.0000001)])).is_ok());
+        assert!(run(&with_raises(vec![proto::MenuSize::Pot(2.5)])).is_ok());
+        assert!(run(&with_raises(vec![proto::MenuSize::AllIn])).is_ok());
+        // the same coefficient stays legal as a bet size, where it is a pot fraction
+        assert!(run(&local(vec![proto::MenuSize::Pot(0.5)])).is_ok());
+    }
+
+    /// R3: §4.6 allows only fold and call against an all-in, and the pinned
+    /// `ActionTree::add_line_recursive` independently refuses a "Bet action after all-in", so an
+    /// observed wager there must fail locally rather than be inserted into a tree the worker
+    /// cannot realize. `AllIn(100)` and `Bet(200)` are the cases that normalization would have
+    /// turned into a second all-in at the same amount.
+    #[test]
+    fn a_wager_facing_an_all_in_is_refused_but_the_all_in_prefix_still_resolves() {
+        for second in [bet(100), raise(100), allin(100), bet(200), raise(50)] {
+            let e = materialize(&MaterializeInput { template: Templates::get("river_std_v1").unwrap(), starting_pot: 100, eff: 100, prefix: &[(0, allin(100)), (1, second)] });
+            assert!(matches!(&e, Err(proto::UnsupportedReason::UnsupportedHistory { reason }) if reason.contains("all-in")), "{second:?} -> {e:?}");
+        }
+        // retained: the single all-in prefix reaches the opponent's fold/call decision
+        let m = mat("river_std_v1", 100, 100, &[(0, allin(100))]);
+        assert_eq!(m.history, vec![allin(100)]);
+        assert_eq!(node(&m, &m.decision_path).actions, vec![Action::Fold, Action::Call]);
+        // and a call facing the all-in is still admitted as an action: it is refused only because
+        // it closes the hand, which is a different error than the wager rejection above
+        let e = materialize(&MaterializeInput { template: Templates::get("river_std_v1").unwrap(), starting_pot: 100, eff: 100, prefix: &[(0, allin(100)), (1, Action::Call)] });
+        assert!(matches!(&e, Err(proto::UnsupportedReason::UnsupportedHistory { reason }) if reason.contains("closes the street")), "got {e:?}");
     }
 }
