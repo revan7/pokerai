@@ -153,5 +153,42 @@ fn range_hash_scale_invariant() {
     let one = |w: f32| Range1326::from_fn(|i| if i == 100 { w } else { 0.0 });
     assert_eq!(hash_scaled(&one(0.2)), hash_scaled(&one(0.9)), "a single supported combo normalizes to 1.0");
     assert_ne!(hash_scaled(&one(0.2)), hash_scaled(&Range1326::zero()));
-    assert_eq!(hash_scaled(&Range1326::zero()), hash_scaled(&Range1326::zero()));
+}
+
+/// Decodes a 64-hex-char sha256 digest literal into its 32 raw bytes.
+fn hex32(s: &str) -> [u8; 32] {
+    assert_eq!(s.len(), 64, "expected a 64-hex-char sha256 digest, got {} chars", s.len());
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    out
+}
+
+// T20-Q1 fix round 1: the removed `assert_eq!(hash_scaled(&Range1326::zero()),
+// hash_scaled(&Range1326::zero()))` compared the function with itself, so a wrong
+// all-zero branch (hashing 1.0 instead of 0.0) or a big-endian byte order would still
+// pass. These two tests pin independently computed expected digests instead. Both
+// digests were computed with Python `hashlib.sha256`/`struct.pack('<1326f', ...)` and
+// the zero digest was cross-checked with `dd if=/dev/zero bs=5304 count=1 | sha256sum`;
+// see the task report for the exact commands and output.
+
+#[test]
+fn hash_scaled_zero_range_matches_frozen_digest() {
+    // sha256 over 1326 little-endian f32 zero patterns (5304 zero bytes).
+    let expected = hex32("650334c621b6458c000e9fa79435730c304f4e4f12e48108590969e715006239");
+    assert_eq!(hash_scaled(&Range1326::zero()), expected);
+}
+
+#[test]
+fn hash_scaled_asymmetric_vector_matches_frozen_digest() {
+    // Two supported combos: index 100 at the max (normalizes to 1.0) and index 200 at
+    // half the max (normalizes to 0.5); every other combo at 0.0.
+    let r = Range1326::from_fn(|i| match i {
+        100 => 1.0,
+        200 => 0.5,
+        _ => 0.0,
+    });
+    let expected = hex32("c2d43116e02b952084a7ebccd3cf882bda59daec2daf3f54a98c0717aefbead8");
+    assert_eq!(hash_scaled(&r), expected);
 }
