@@ -19,7 +19,13 @@ from pathlib import Path
 
 from pokerkit import Automation, Mode, NoLimitTexasHoldem
 
-warnings.simplefilter("ignore")  # Mode.CASH_GAME warns on folds that face no wager; never recorded as legal
+# PokerKit warns (UserWarning) whenever a card handed to `deal_hole`/`deal_board` isn't the exact
+# next card in *its own* internal deck order. We deal from our own seeded, shuffled `DECK` instead
+# (see `generate_hand` below), so every dealt card is still genuine, undealt, and distinct -- the
+# warning is a known false positive for those two calls only. It is silenced narrowly, by category
+# and message, only around the call that triggers it (`_deal` below); nothing else is affected, and
+# no process-wide or pytest-wide filter is installed (see `test_gen_fixtures_warnings.py` for the guarantee).
+_UNRECOMMENDED_DEAL_RE = r"A card being dealt .* is not recommended to be dealt\."
 
 AUTOMATIONS = (
     Automation.ANTE_POSTING,
@@ -63,11 +69,25 @@ class SpecReopen:
         self.facing_at_last[i] = self.facing
 
 
+def _deal(fn, *args):
+    """Call a PokerKit dealing method (`state.deal_hole` / `state.deal_board`), narrowly silencing
+    only its expected "not recommended to be dealt" `UserWarning` (see the module docstring/comment
+    above `_UNRECOMMENDED_DEAL_RE`) for the duration of this one call. Any other warning raised
+    inside `fn` -- including a differently worded PokerKit warning -- still propagates normally.
+    """
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, message=_UNRECOMMENDED_DEAL_RE)
+        return fn(*args)
+
+
 def legal_triple(state) -> dict:
     i = state.actor_index
     facing = max(state.bets)
     owed = facing - state.bets[i]
-    fold = bool(state.can_fold()) and owed > 0
+    # `state.can_fold()` itself emits a `UserWarning` ("There is no reason for this player to
+    # fold.") when `owed == 0` (Mode.CASH_GAME). Test `owed > 0` first so the call -- and the
+    # warning -- never happens for a fold that would be illegal anyway.
+    fold = owed > 0 and bool(state.can_fold())
     cc = {"cost": min(owed, state.stacks[i])} if state.can_check_or_call() else None
     assert cc is None or cc["cost"] == state.checking_or_calling_amount
     rz = None
@@ -136,7 +156,7 @@ def generate_hand(seed: int) -> dict | None:
     rng.shuffle(deck)
     hole = [deck.pop() + deck.pop() for _ in range(n)]
     for h in hole:
-        state.deal_hole(h)
+        _deal(state.deal_hole, h)
     if straddle:
         # standard rule: the first full raise over a straddle is one straddle (min open 2S); must be set after hole dealing
         state.completion_betting_or_raising_amount = straddle
@@ -224,7 +244,7 @@ def generate_hand(seed: int) -> dict | None:
         elif state.can_deal_board():
             count = 3 if street_idx == 0 else 1
             cards = [deck.pop() for _ in range(count)]
-            state.deal_board("".join(cards))
+            _deal(state.deal_board, "".join(cards))
             street_idx += 1
             reopen.start_street(bb, 0)
             steps.append({"kind": "board", "cards": cards, "after": snapshot(state, ring, "betting", STREETS[street_idx])})
