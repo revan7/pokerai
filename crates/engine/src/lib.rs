@@ -4,6 +4,7 @@
 pub mod bench_support;
 pub mod clock;
 pub mod identity;
+pub mod log;
 pub mod tree;
 
 #[derive(Debug, thiserror::Error)]
