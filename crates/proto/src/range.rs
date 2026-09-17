@@ -46,7 +46,12 @@ impl Serialize for Range1326 {
     }
 }
 
-struct RangeVisitor;
+/// `human_readable` is captured from `Deserializer::is_human_readable()` before the sequence is
+/// entered (`Visitor::visit_seq` itself has no access to the `Deserializer`, only the
+/// `SeqAccess`), so the per-element wire width can be chosen once, up front, for the whole array.
+struct RangeVisitor {
+    human_readable: bool,
+}
 
 impl<'de> Visitor<'de> for RangeVisitor {
     type Value = Range1326;
@@ -54,10 +59,21 @@ impl<'de> Visitor<'de> for RangeVisitor {
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Range1326, A::Error> {
         let mut out = [0f32; COMBOS];
         for (i, slot) in out.iter_mut().enumerate() {
-            // Read as f64 first and validate the *wide* value: narrowing to f32
-            // before checking would let e.g. 1.00000001 round to 1.0 and
-            // -1e-50 round to -0.0, silently admitting out-of-domain input.
-            let raw: f64 = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(i, &self))?;
+            // Human-readable (JSON): read as f64 first and validate the *wide* value: narrowing
+            // to f32 before checking would let e.g. 1.00000001 round to 1.0 and -1e-50 round to
+            // -0.0, silently admitting out-of-domain input. Non-self-describing (bincode, the
+            // pinned cache storage format, spec 10.4): `Serialize` below already writes a native
+            // f32 on every format, so there is no wider source value to check and no narrowing
+            // step that could lose precision it did not already have -- read the f32 actually on
+            // the wire directly (still finiteness/domain checked, to reject a corrupted bit
+            // pattern), matching the identical split already established for `CachedNode`'s
+            // matrices in `crates/cache/src/entry.rs` and for every codec in `crate::numeric`.
+            let raw: f64 = if self.human_readable {
+                seq.next_element()?.ok_or_else(|| de::Error::invalid_length(i, &self))?
+            } else {
+                let native: f32 = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(i, &self))?;
+                native as f64
+            };
             if !raw.is_finite() || !(0.0..=1.0).contains(&raw) {
                 return Err(de::Error::custom(format!("weight {raw} at combo {i} is outside [0, 1]")));
             }
@@ -66,9 +82,10 @@ impl<'de> Visitor<'de> for RangeVisitor {
             // survive into the bit-exact layers, where `hash_scaled` hashes `0x80000000`
             // differently from `0x00000000`: a range and its own `range_to_string` round trip are
             // numerically identical yet produce different cache keys (review S5). Normalizing here,
-            // at the one ingestion boundary, leaves `hash_scaled`, `apply_range` and `canonicalize`
-            // bit-exact as ruled by T20/T21 -- including `iso_tiebreak_negative_zero_regression`,
-            // which builds its `-0.0` in memory and never crosses this boundary.
+            // at the one ingestion boundary -- every `Deserialize` call, not only JSON's -- leaves
+            // `hash_scaled`, `apply_range` and `canonicalize` bit-exact as ruled by T20/T21 --
+            // including `iso_tiebreak_negative_zero_regression`, which builds its `-0.0` in memory
+            // and never crosses this boundary.
             let w = (raw as f32) + 0.0;
             if !w.is_finite() || !(0.0..=1.0).contains(&w) {
                 return Err(de::Error::custom(format!("weight {w} at combo {i} is outside [0, 1]")));
@@ -83,7 +100,10 @@ impl<'de> Visitor<'de> for RangeVisitor {
 }
 
 impl<'de> Deserialize<'de> for Range1326 {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Range1326, D::Error> { d.deserialize_seq(RangeVisitor) }
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Range1326, D::Error> {
+        let human_readable = d.is_human_readable();
+        d.deserialize_seq(RangeVisitor { human_readable })
+    }
 }
 
 #[cfg(test)]

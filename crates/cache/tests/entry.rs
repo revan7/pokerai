@@ -525,18 +525,29 @@ fn validate_entry_rejects_asymmetric_stabilizer_signed_zero_regression() {
 
 // --- N1 (fix round 2): bincode wire uses native f32, JSON keeps the f64 wide-check ------------
 //
-// `CacheEntry` as a whole does not currently round-trip through bincode at all -- independent
-// of this fix -- because `proto::Action` is `#[serde(tag = "kind", ...)]` (internally tagged),
-// and serde's internally-tagged enum decoding requires `Deserializer::deserialize_any`, which
-// bincode 1.3.3 unconditionally refuses (`DeserializeAnyNotSupported`); `EffectiveTree` (and so
-// `CacheEntry`, which embeds it) carries `Action` values throughout `materialized`/`inserted`.
-// Confirmed directly: `bincode::deserialize::<proto::Action>(&bincode::serialize(&Action::Bet {
-// to: 50 }).unwrap())` returns `Err(DeserializeAnyNotSupported)`. This is a pre-existing defect
-// in `crates/proto/src/hand.rs`'s `Action` tagging, not something introduced or fixable by this
-// fix round (scope: `crates/cache/src/entry.rs` and `crates/cache/tests/entry.rs` only), so the
-// bincode round-trip tests below exercise `CachedNode` directly -- the actual type this fix's
-// codec lives on, and the only bincode-affected type this task owns -- rather than a full
-// `CacheEntry`. Flagged separately for a future task (see the spawned-task suggestion).
+// This fix round scoped the bincode round-trip tests below to `CachedNode` alone, because
+// `CacheEntry` as a whole did not round-trip through bincode at all: `proto::Action` is
+// `#[serde(tag = "kind", ...)]` (internally tagged), and serde's internally-tagged enum decoding
+// requires `Deserializer::deserialize_any`, which bincode 1.3.3 unconditionally refuses
+// (`DeserializeAnyNotSupported`) -- a pre-existing defect in `proto::Action`'s tagging, out of
+// that fix round's scope (`crates/cache/src/entry.rs` and its tests only), and flagged for a
+// future task.
+//
+// Task: P4.T2-followup fixed it, in `proto`: `Action` and `ApproxReason` (the two internally
+// tagged enums reachable from `CacheEntry`) now carry hand-written `Serialize`/`Deserialize`
+// that keep the JSON tagged-map form byte-for-byte and add a bincode-native encoding for every
+// non-human-readable format (`crates/proto/src/hand.rs`, `crates/proto/src/recommendation.rs`).
+// Two further, independent bincode incompatibilities reachable from `CacheEntry` were found and
+// fixed alongside it, using the same `is_human_readable()` split already established here for
+// `CachedNode`'s own matrices: `MenuSize`'s JSON union wire form used `deserialize_any` directly
+// (`crates/proto/src/tree.rs`), and `Range1326`'s `Deserialize` always read a wide `f64`
+// regardless of format, mismatching its own `Serialize`'s native `f32` write
+// (`crates/proto/src/range.rs`); a third, `PlayerMenus.donk`'s
+// `#[serde(skip_serializing_if = "Option::is_none")]` (`crates/proto/src/tree.rs`), omitted a
+// struct field from the wire on every format, not only human-readable ones, desyncing bincode's
+// positional field count. See `crates/proto/tests/bincode_wire.rs` for per-type coverage of all
+// of these, and `cache_entry_round_trips_through_bincode_with_the_support_fixture` below for the
+// acceptance test this whole chain blocked.
 
 /// A `CachedNode` with valid, in-domain matrices round-trips through bincode unchanged.
 #[test]
@@ -600,4 +611,51 @@ fn cached_node_bincode_decode_rejects_a_crafted_nan_bit_pattern() {
     let pos = bytes.windows(4).position(|w| w == needle).unwrap();
     bytes[pos..pos + 4].copy_from_slice(&f32::NAN.to_le_bytes());
     assert!(bincode::deserialize::<CachedNode>(&bytes).is_err());
+}
+
+/// Task: P4.T2-followup's acceptance test: the exact reproduction the brief's origin (task-2
+/// fix round 2's N1 comment above) named as the still-failing case -- a whole `CacheEntry`,
+/// built from the same `support::entry()` fixture every other test in this file uses, round
+/// tripping through bincode 1.3.3, the pinned cache storage format (spec 10.4). Before this
+/// task's fix this panicked with `DeserializeAnyNotSupported` (from `proto::Action`'s internal
+/// tag, reached first via `SourceInputs.ranges: [Range1326; 2]`'s own, independent bincode
+/// defect surfacing as a bogus domain-check panic before `Action` was ever reached); with only
+/// `Action`/`ApproxReason` fixed it instead panicked with `InvalidTagEncoding` (from
+/// `PlayerMenus.donk`'s `skip_serializing_if` desyncing bincode's field count). All of it must
+/// now round-trip byte-for-byte equal, field by field (the derived `CacheEntry` has no
+/// `PartialEq`, so equality is asserted per top-level field rather than as one struct compare).
+#[test]
+fn cache_entry_round_trips_through_bincode_with_the_support_fixture() {
+    let e = support::entry();
+    let bytes = bincode::serialize(&e).expect("a valid CacheEntry must serialize through bincode");
+    let back: CacheEntry = bincode::deserialize(&bytes).expect("a bincode-encoded CacheEntry must deserialize back");
+
+    assert_eq!(back.key.digest(), e.key.digest(), "key");
+    assert_eq!(back.source.pot, e.source.pot);
+    assert_eq!(back.source.stack_oop, e.source.stack_oop);
+    assert_eq!(back.source.stack_ip, e.source.stack_ip);
+    assert_eq!(back.source.bb_chips, e.source.bb_chips);
+    assert_eq!(back.source.cap_mchips, e.source.cap_mchips);
+    assert!(back.source.ranges[0].0.iter().zip(e.source.ranges[0].0.iter()).all(|(a, b)| a.to_bits() == b.to_bits()), "oop range, bit-exact");
+    assert!(back.source.ranges[1].0.iter().zip(e.source.ranges[1].0.iter()).all(|(a, b)| a.to_bits() == b.to_bits()), "ip range, bit-exact");
+    assert_eq!(back.tree, e.tree, "tree (EffectiveTree derives PartialEq)");
+    assert_eq!(back.fractions, e.fractions);
+    assert_eq!(back.covered_paths, e.covered_paths);
+    assert_eq!(back.nodes.len(), e.nodes.len());
+    for (a, b) in e.nodes.iter().zip(back.nodes.iter()) {
+        assert_eq!(a.path, b.path);
+        assert_eq!(a.actor, b.actor);
+        assert_eq!(a.probs, b.probs);
+        assert_eq!(a.ev_over_P, b.ev_over_P);
+        assert_eq!(a.available, b.available);
+    }
+    assert_eq!(back.exploitability_over_P, e.exploitability_over_P);
+    assert_eq!(back.target_bp, e.target_bp);
+    assert_eq!(back.iterations, e.iterations);
+    assert_eq!(back.mode, e.mode);
+    assert_eq!(back.export, e.export);
+    assert_eq!(back.reasons, e.reasons);
+    // The round-tripped entry must still pass every structural/numeric check `validate_entry`
+    // runs against a freshly built entry -- not just look equal field by field.
+    assert!(validate_entry(&back).is_ok(), "a bincode round trip must not produce an entry that fails validate_entry");
 }

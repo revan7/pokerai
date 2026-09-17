@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::hand::{Action, LegalAction, Seat, Street};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -12,22 +12,32 @@ pub struct DecisionIdentity { pub hand_id: u64, pub hand_revision: u32, pub deci
 // `Option<f32>` holding `Some(NaN)` silently round-trips to `None` -- the advice just vanishes.
 // `None` stays the one and only nullable value.
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
+/// `Serialize`/`Deserialize` are hand-written (Task: P4.T2-followup), for the same reason as
+/// `Action` (see its doc comment in `hand.rs`): `#[serde(tag = "kind")]` forces
+/// `Deserializer::deserialize_any` to find the tag, which bincode 1.3.3 (spec 10.4's pinned cache
+/// storage format) unconditionally refuses, and `ApproxReason` reaches `CacheEntry` directly via
+/// `CacheEntry::reasons`. `ApproxReasonJson` keeps the identical tagged-map derive (including
+/// every field's own `#[serde(with = "crate::numeric::...")]` codec, unchanged) for the
+/// human-readable path; `ApproxReasonBincode` drops only the container's `tag` attribute -- its
+/// fields keep the exact same `with = "crate::numeric::..."` codecs, which (Task:
+/// P4.T2-followup) now branch on `is_human_readable()` themselves, so reusing them here is
+/// already bincode-correct with no further change.
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "typescript", ts(tag = "kind"))]
 pub enum ApproxReason {
     BetTranslation {
         street: Street,
         seat: Seat,
-        #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] observed_pct: f32,
-        #[serde(with = "crate::numeric::mapped_sizes")] #[cfg_attr(feature = "typescript", ts(as = "Vec<(f32, f32)>"))] mapped: Vec<(f32, f32)>,
-        #[serde(with = "crate::numeric::probability")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] deviation: f32,
+        #[cfg_attr(feature = "typescript", ts(as = "f32"))] observed_pct: f32,
+        #[cfg_attr(feature = "typescript", ts(as = "Vec<(f32, f32)>"))] mapped: Vec<(f32, f32)>,
+        #[cfg_attr(feature = "typescript", ts(as = "f32"))] deviation: f32,
         prominent: bool,
     },
-    DepthBucket { seat: Seat, #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] actual_bb: f32, used_bb: u16, prominent: bool },
-    AsymmetricStacks { #[serde(with = "crate::numeric::finite_vec")] #[cfg_attr(feature = "typescript", ts(as = "Vec<f32>"))] stacks_bb: Vec<f32>, prominent: bool },
+    DepthBucket { seat: Seat, #[cfg_attr(feature = "typescript", ts(as = "f32"))] actual_bb: f32, used_bb: u16, prominent: bool },
+    AsymmetricStacks { #[cfg_attr(feature = "typescript", ts(as = "Vec<f32>"))] stacks_bb: Vec<f32>, prominent: bool },
     RakeProfileMapped { actual: String, used: String },
-    StraddleMapped { #[serde(with = "crate::numeric::finite_array3")] #[cfg_attr(feature = "typescript", ts(as = "[f32; 3]"))] posts: [f32; 3] },
+    StraddleMapped { #[cfg_attr(feature = "typescript", ts(as = "[f32; 3]"))] posts: [f32; 3] },
     ShortHandedMapped { dealt: u8 },
     DeadlineBestSoFar { reached_bp: u16, target_bp: u16 },
     ChartRounded,
@@ -35,9 +45,109 @@ pub enum ApproxReason {
     UnconditionedPriorStreet { street: Street, seat: Seat, cause: String },
     UnconditionedCurrentStreet,
     MultiwayStreetRoot { folded_this_street: u8, dead_this_street: u32 },
-    SprBucketed { #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] actual: f32, #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] used: f32 },
-    MenuRounded { #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] max_delta_pct: f32 },
-    BranchResidual { seat: Seat, #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] residual_mass_pct: f32, cause: String },
+    SprBucketed { #[cfg_attr(feature = "typescript", ts(as = "f32"))] actual: f32, #[cfg_attr(feature = "typescript", ts(as = "f32"))] used: f32 },
+    MenuRounded { #[cfg_attr(feature = "typescript", ts(as = "f32"))] max_delta_pct: f32 },
+    BranchResidual { seat: Seat, #[cfg_attr(feature = "typescript", ts(as = "f32"))] residual_mass_pct: f32, cause: String },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum ApproxReasonJson {
+    BetTranslation {
+        street: Street,
+        seat: Seat,
+        #[serde(with = "crate::numeric::finite")] observed_pct: f32,
+        #[serde(with = "crate::numeric::mapped_sizes")] mapped: Vec<(f32, f32)>,
+        #[serde(with = "crate::numeric::probability")] deviation: f32,
+        prominent: bool,
+    },
+    DepthBucket { seat: Seat, #[serde(with = "crate::numeric::finite")] actual_bb: f32, used_bb: u16, prominent: bool },
+    AsymmetricStacks { #[serde(with = "crate::numeric::finite_vec")] stacks_bb: Vec<f32>, prominent: bool },
+    RakeProfileMapped { actual: String, used: String },
+    StraddleMapped { #[serde(with = "crate::numeric::finite_array3")] posts: [f32; 3] },
+    ShortHandedMapped { dealt: u8 },
+    DeadlineBestSoFar { reached_bp: u16, target_bp: u16 },
+    ChartRounded,
+    EvReferenceUnverified,
+    UnconditionedPriorStreet { street: Street, seat: Seat, cause: String },
+    UnconditionedCurrentStreet,
+    MultiwayStreetRoot { folded_this_street: u8, dead_this_street: u32 },
+    SprBucketed { #[serde(with = "crate::numeric::finite")] actual: f32, #[serde(with = "crate::numeric::finite")] used: f32 },
+    MenuRounded { #[serde(with = "crate::numeric::finite")] max_delta_pct: f32 },
+    BranchResidual { seat: Seat, #[serde(with = "crate::numeric::finite")] residual_mass_pct: f32, cause: String },
+}
+
+#[derive(Serialize, Deserialize)]
+enum ApproxReasonBincode {
+    BetTranslation {
+        street: Street,
+        seat: Seat,
+        #[serde(with = "crate::numeric::finite")] observed_pct: f32,
+        #[serde(with = "crate::numeric::mapped_sizes")] mapped: Vec<(f32, f32)>,
+        #[serde(with = "crate::numeric::probability")] deviation: f32,
+        prominent: bool,
+    },
+    DepthBucket { seat: Seat, #[serde(with = "crate::numeric::finite")] actual_bb: f32, used_bb: u16, prominent: bool },
+    AsymmetricStacks { #[serde(with = "crate::numeric::finite_vec")] stacks_bb: Vec<f32>, prominent: bool },
+    RakeProfileMapped { actual: String, used: String },
+    StraddleMapped { #[serde(with = "crate::numeric::finite_array3")] posts: [f32; 3] },
+    ShortHandedMapped { dealt: u8 },
+    DeadlineBestSoFar { reached_bp: u16, target_bp: u16 },
+    ChartRounded,
+    EvReferenceUnverified,
+    UnconditionedPriorStreet { street: Street, seat: Seat, cause: String },
+    UnconditionedCurrentStreet,
+    MultiwayStreetRoot { folded_this_street: u8, dead_this_street: u32 },
+    SprBucketed { #[serde(with = "crate::numeric::finite")] actual: f32, #[serde(with = "crate::numeric::finite")] used: f32 },
+    MenuRounded { #[serde(with = "crate::numeric::finite")] max_delta_pct: f32 },
+    BranchResidual { seat: Seat, #[serde(with = "crate::numeric::finite")] residual_mass_pct: f32, cause: String },
+}
+
+macro_rules! approx_reason_convert {
+    ($src:ident, $dst:ident, $v:expr) => {
+        match $v {
+            $src::BetTranslation { street, seat, observed_pct, mapped, deviation, prominent } =>
+                $dst::BetTranslation { street, seat, observed_pct, mapped, deviation, prominent },
+            $src::DepthBucket { seat, actual_bb, used_bb, prominent } => $dst::DepthBucket { seat, actual_bb, used_bb, prominent },
+            $src::AsymmetricStacks { stacks_bb, prominent } => $dst::AsymmetricStacks { stacks_bb, prominent },
+            $src::RakeProfileMapped { actual, used } => $dst::RakeProfileMapped { actual, used },
+            $src::StraddleMapped { posts } => $dst::StraddleMapped { posts },
+            $src::ShortHandedMapped { dealt } => $dst::ShortHandedMapped { dealt },
+            $src::DeadlineBestSoFar { reached_bp, target_bp } => $dst::DeadlineBestSoFar { reached_bp, target_bp },
+            $src::ChartRounded => $dst::ChartRounded,
+            $src::EvReferenceUnverified => $dst::EvReferenceUnverified,
+            $src::UnconditionedPriorStreet { street, seat, cause } => $dst::UnconditionedPriorStreet { street, seat, cause },
+            $src::UnconditionedCurrentStreet => $dst::UnconditionedCurrentStreet,
+            $src::MultiwayStreetRoot { folded_this_street, dead_this_street } => $dst::MultiwayStreetRoot { folded_this_street, dead_this_street },
+            $src::SprBucketed { actual, used } => $dst::SprBucketed { actual, used },
+            $src::MenuRounded { max_delta_pct } => $dst::MenuRounded { max_delta_pct },
+            $src::BranchResidual { seat, residual_mass_pct, cause } => $dst::BranchResidual { seat, residual_mass_pct, cause },
+        }
+    };
+}
+
+impl From<ApproxReason> for ApproxReasonJson {
+    fn from(a: ApproxReason) -> Self { approx_reason_convert!(ApproxReason, ApproxReasonJson, a) }
+}
+impl From<ApproxReasonJson> for ApproxReason {
+    fn from(a: ApproxReasonJson) -> Self { approx_reason_convert!(ApproxReasonJson, ApproxReason, a) }
+}
+impl From<ApproxReason> for ApproxReasonBincode {
+    fn from(a: ApproxReason) -> Self { approx_reason_convert!(ApproxReason, ApproxReasonBincode, a) }
+}
+impl From<ApproxReasonBincode> for ApproxReason {
+    fn from(a: ApproxReasonBincode) -> Self { approx_reason_convert!(ApproxReasonBincode, ApproxReason, a) }
+}
+
+impl Serialize for ApproxReason {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() { ApproxReasonJson::from(self.clone()).serialize(s) } else { ApproxReasonBincode::from(self.clone()).serialize(s) }
+    }
+}
+impl<'de> Deserialize<'de> for ApproxReason {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<ApproxReason, D::Error> {
+        if d.is_human_readable() { ApproxReasonJson::deserialize(d).map(ApproxReason::from) } else { ApproxReasonBincode::deserialize(d).map(ApproxReason::from) }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -58,13 +58,40 @@ pub(crate) fn widen_checked(v: f32, domain: Domain, what: &str) -> Result<f32, S
     Ok(v)
 }
 
+/// Checks a value already at its native (non-widened) width -- the bincode path, where the wire
+/// value already is an `f32` (there is no wider source representation to validate before
+/// narrowing, and no narrowing step at all: see `crates/cache/src/entry.rs`'s identical helper
+/// and rationale, the established precedent this module now follows for every codec below).
+pub(crate) fn native_checked(v: f32, domain: Domain, what: &str) -> Result<f32, String> {
+    if !v.is_finite() || !domain(v as f64) {
+        return Err(format!("{what} {v} is outside its valid domain"));
+    }
+    Ok(v)
+}
+
 /// Generates the `#[serde(with = "...")]` module for a required `f32` field of one domain.
+///
+/// Bincode 1.3.3 (the pinned cache storage format, spec 10.4) is not self-describing: whatever
+/// primitive type a `Deserializer` call asks for is read at that exact wire width, with no type
+/// tag to check against. `serialize` here already writes a native `f32` on every format (JSON's
+/// `serialize_f32` and bincode's both encode the value at `f32` width), so only `deserialize`
+/// needs to branch: a human-readable format (JSON) still reads the wider `f64` first and checks
+/// the *wide* value's domain before narrowing (a JSON number can arrive with more precision than
+/// f32, e.g. `1.00000001`, and narrowing before checking would silently admit it -- unchanged
+/// from before this fix); a non-self-describing format (bincode) reads the `f32` actually on the
+/// wire directly, since there is no wider source value to check and no narrowing step that could
+/// lose precision it did not already have -- it still rejects a corrupted (e.g. hand-crafted NaN)
+/// bit pattern via `native_checked`.
 macro_rules! scalar_codec {
     ($name:ident, $domain:path, $what:literal) => {
         pub(crate) mod $name {
             use super::*;
             pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
-                narrow_checked(f64::deserialize(d)?, $domain, $what).map_err(DeError::custom)
+                if d.is_human_readable() {
+                    narrow_checked(f64::deserialize(d)?, $domain, $what).map_err(DeError::custom)
+                } else {
+                    native_checked(f32::deserialize(d)?, $domain, $what).map_err(DeError::custom)
+                }
             }
             pub(crate) fn serialize<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
                 s.serialize_f32(widen_checked(*v, $domain, $what).map_err(SerError::custom)?)
@@ -75,14 +102,23 @@ macro_rules! scalar_codec {
 
 /// Generates the `#[serde(with = "...")]` module for an `Option<f32>` field. `None` is the one
 /// nullable value; `Some(x)` out of domain is an error on both directions, never a silent `null`.
+/// Same human-readable/native split as `scalar_codec!` (see its doc comment); `serialize` is
+/// already format-agnostic (native `f32` on the wire either way), only `deserialize` branches.
 macro_rules! option_codec {
     ($name:ident, $domain:path, $what:literal) => {
         pub(crate) mod $name {
             use super::*;
             pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
-                match Option::<f64>::deserialize(d)? {
-                    None => Ok(None),
-                    Some(x) => narrow_checked(x, $domain, $what).map(Some).map_err(DeError::custom),
+                if d.is_human_readable() {
+                    match Option::<f64>::deserialize(d)? {
+                        None => Ok(None),
+                        Some(x) => narrow_checked(x, $domain, $what).map(Some).map_err(DeError::custom),
+                    }
+                } else {
+                    match Option::<f32>::deserialize(d)? {
+                        None => Ok(None),
+                        Some(x) => native_checked(x, $domain, $what).map(Some).map_err(DeError::custom),
+                    }
                 }
             }
             pub(crate) fn serialize<S: Serializer>(v: &Option<f32>, s: S) -> Result<S::Ok, S::Error> {
@@ -111,10 +147,17 @@ option_codec!(non_negative_opt, domain_non_negative, "a non-negative value");
 pub(crate) mod finite_vec {
     use super::*;
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> {
-        Vec::<f64>::deserialize(d)?
-            .into_iter()
-            .map(|x| narrow_checked(x, domain_finite, "a finite value").map_err(DeError::custom))
-            .collect()
+        if d.is_human_readable() {
+            Vec::<f64>::deserialize(d)?
+                .into_iter()
+                .map(|x| narrow_checked(x, domain_finite, "a finite value").map_err(DeError::custom))
+                .collect()
+        } else {
+            Vec::<f32>::deserialize(d)?
+                .into_iter()
+                .map(|x| native_checked(x, domain_finite, "a finite value").map_err(DeError::custom))
+                .collect()
+        }
     }
     pub(crate) fn serialize<S: Serializer>(v: &[f32], s: S) -> Result<S::Ok, S::Error> {
         let mut seq = s.serialize_seq(Some(v.len()))?;
@@ -129,19 +172,36 @@ pub(crate) mod finite_vec {
 pub(crate) mod finite_array3 {
     use super::*;
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; 3], D::Error> {
-        let raw = <[f64; 3]>::deserialize(d)?;
         let mut out = [0f32; 3];
-        for (slot, x) in out.iter_mut().zip(raw) {
-            *slot = narrow_checked(x, domain_finite, "a straddle post").map_err(DeError::custom)?;
+        if d.is_human_readable() {
+            let raw = <[f64; 3]>::deserialize(d)?;
+            for (slot, x) in out.iter_mut().zip(raw) {
+                *slot = narrow_checked(x, domain_finite, "a straddle post").map_err(DeError::custom)?;
+            }
+        } else {
+            let raw = <[f32; 3]>::deserialize(d)?;
+            for (slot, x) in out.iter_mut().zip(raw) {
+                *slot = native_checked(x, domain_finite, "a straddle post").map_err(DeError::custom)?;
+            }
         }
         Ok(out)
     }
     pub(crate) fn serialize<S: Serializer>(v: &[f32; 3], s: S) -> Result<S::Ok, S::Error> {
-        let mut seq = s.serialize_seq(Some(3))?;
+        // A fixed-size array's `Deserialize` (both branches above, `<[f64; 3]>`/`<[f32; 3]>`)
+        // goes through serde's tuple deserialization (a statically known arity, no length
+        // prefix), not its seq deserialization (a dynamic length, length-prefixed under
+        // bincode) -- `serialize_seq` here would write a length prefix `deserialize_tuple` never
+        // reads back, desyncing bincode's byte stream by 8 bytes (observed directly: decoding
+        // `StraddleMapped { posts: [0.5, 1.0, 1.0] }` through bincode silently produced `[4e-45,
+        // 0.0, 0.5]`, the length-prefix bytes misread as data). `serialize_tuple` matches the
+        // read side on every format; serde_json's `SerializeTuple` and `SerializeSeq` both write
+        // a plain JSON array, so this is not a wire-format change for the human-readable path.
+        use serde::ser::SerializeTuple;
+        let mut tup = s.serialize_tuple(3)?;
         for x in v {
-            seq.serialize_element(&widen_checked(*x, domain_finite, "a straddle post").map_err(SerError::custom)?)?;
+            tup.serialize_element(&widen_checked(*x, domain_finite, "a straddle post").map_err(SerError::custom)?)?;
         }
-        seq.end()
+        tup.end()
     }
 }
 
@@ -151,14 +211,25 @@ pub(crate) mod finite_array3 {
 pub(crate) mod mapped_sizes {
     use super::*;
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<(f32, f32)>, D::Error> {
-        Vec::<(f64, f64)>::deserialize(d)?
-            .into_iter()
-            .map(|(size, weight)| {
-                let size = narrow_checked(size, domain_finite, "a mapped menu size").map_err(DeError::custom)?;
-                let weight = narrow_checked(weight, domain_unit_interval, "a mapped weight").map_err(DeError::custom)?;
-                Ok((size, weight))
-            })
-            .collect()
+        if d.is_human_readable() {
+            Vec::<(f64, f64)>::deserialize(d)?
+                .into_iter()
+                .map(|(size, weight)| {
+                    let size = narrow_checked(size, domain_finite, "a mapped menu size").map_err(DeError::custom)?;
+                    let weight = narrow_checked(weight, domain_unit_interval, "a mapped weight").map_err(DeError::custom)?;
+                    Ok((size, weight))
+                })
+                .collect()
+        } else {
+            Vec::<(f32, f32)>::deserialize(d)?
+                .into_iter()
+                .map(|(size, weight)| {
+                    let size = native_checked(size, domain_finite, "a mapped menu size").map_err(DeError::custom)?;
+                    let weight = native_checked(weight, domain_unit_interval, "a mapped weight").map_err(DeError::custom)?;
+                    Ok((size, weight))
+                })
+                .collect()
+        }
     }
     pub(crate) fn serialize<S: Serializer>(v: &[(f32, f32)], s: S) -> Result<S::Ok, S::Error> {
         let mut seq = s.serialize_seq(Some(v.len()))?;
@@ -175,11 +246,19 @@ pub(crate) mod mapped_sizes {
 pub(crate) mod action_weights_opt {
     use super::*;
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<(Action, f32)>>, D::Error> {
-        let Some(raw) = Option::<Vec<(Action, f64)>>::deserialize(d)? else { return Ok(None) };
-        raw.into_iter()
-            .map(|(a, w)| narrow_checked(w, domain_unit_interval, "a range-mix weight").map(|w| (a, w)).map_err(DeError::custom))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some)
+        if d.is_human_readable() {
+            let Some(raw) = Option::<Vec<(Action, f64)>>::deserialize(d)? else { return Ok(None) };
+            raw.into_iter()
+                .map(|(a, w)| narrow_checked(w, domain_unit_interval, "a range-mix weight").map(|w| (a, w)).map_err(DeError::custom))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some)
+        } else {
+            let Some(raw) = Option::<Vec<(Action, f32)>>::deserialize(d)? else { return Ok(None) };
+            raw.into_iter()
+                .map(|(a, w)| native_checked(w, domain_unit_interval, "a range-mix weight").map(|w| (a, w)).map_err(DeError::custom))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some)
+        }
     }
     pub(crate) fn serialize<S: Serializer>(v: &Option<Vec<(Action, f32)>>, s: S) -> Result<S::Ok, S::Error> {
         let Some(v) = v else { return s.serialize_none() };
@@ -195,15 +274,23 @@ pub(crate) mod action_weights_opt {
 /// non-negative but not bounded by 1.
 fn narrow_mass(m: f64) -> Result<f32, String> { narrow_checked(m, domain_non_negative, "a range mass") }
 fn widen_mass(m: f32) -> Result<f32, String> { widen_checked(m, domain_non_negative, "a range mass") }
+fn native_mass(m: f32) -> Result<f32, String> { native_checked(m, domain_non_negative, "a range mass") }
 
 /// `Vec<(Seat, String, f32)>` (`Assumptions::ranges_used`).
 pub(crate) mod mass_triples {
     use super::*;
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<(Seat, String, f32)>, D::Error> {
-        Vec::<(Seat, String, f64)>::deserialize(d)?
-            .into_iter()
-            .map(|(seat, name, mass)| narrow_mass(mass).map(|mass| (seat, name, mass)).map_err(DeError::custom))
-            .collect()
+        if d.is_human_readable() {
+            Vec::<(Seat, String, f64)>::deserialize(d)?
+                .into_iter()
+                .map(|(seat, name, mass)| narrow_mass(mass).map(|mass| (seat, name, mass)).map_err(DeError::custom))
+                .collect()
+        } else {
+            Vec::<(Seat, String, f32)>::deserialize(d)?
+                .into_iter()
+                .map(|(seat, name, mass)| native_mass(mass).map(|mass| (seat, name, mass)).map_err(DeError::custom))
+                .collect()
+        }
     }
     pub(crate) fn serialize<S: Serializer>(v: &[(Seat, String, f32)], s: S) -> Result<S::Ok, S::Error> {
         let mut seq = s.serialize_seq(Some(v.len()))?;
@@ -218,16 +305,27 @@ pub(crate) mod mass_triples {
 pub(crate) mod mass_pair {
     use super::*;
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[(Seat, String, f32); 2], D::Error> {
-        let [a, b] = <[(Seat, String, f64); 2]>::deserialize(d)?;
-        let narrow = |(seat, name, mass): (Seat, String, f64)| narrow_mass(mass).map(|mass| (seat, name, mass)).map_err(DeError::custom);
-        Ok([narrow(a)?, narrow(b)?])
+        if d.is_human_readable() {
+            let [a, b] = <[(Seat, String, f64); 2]>::deserialize(d)?;
+            let narrow = |(seat, name, mass): (Seat, String, f64)| narrow_mass(mass).map(|mass| (seat, name, mass)).map_err(DeError::custom);
+            Ok([narrow(a)?, narrow(b)?])
+        } else {
+            let [a, b] = <[(Seat, String, f32); 2]>::deserialize(d)?;
+            let native = |(seat, name, mass): (Seat, String, f32)| native_mass(mass).map(|mass| (seat, name, mass)).map_err(DeError::custom);
+            Ok([native(a)?, native(b)?])
+        }
     }
     pub(crate) fn serialize<S: Serializer>(v: &[(Seat, String, f32); 2], s: S) -> Result<S::Ok, S::Error> {
-        let mut seq = s.serialize_seq(Some(2))?;
+        // Same fixed-arity tuple-vs-seq framing mismatch as `finite_array3` (see its comment):
+        // a fixed-size array deserializes as a tuple (no length prefix), so this must serialize
+        // as one too, or bincode's length prefix would desync the reader. Identical JSON output
+        // either way (`serde_json` renders both as a plain array).
+        use serde::ser::SerializeTuple;
+        let mut tup = s.serialize_tuple(2)?;
         for (seat, name, mass) in v {
-            seq.serialize_element(&(seat, name, widen_mass(*mass).map_err(SerError::custom)?))?;
+            tup.serialize_element(&(seat, name, widen_mass(*mass).map_err(SerError::custom)?))?;
         }
-        seq.end()
+        tup.end()
     }
 }
 
@@ -236,10 +334,17 @@ pub(crate) mod mass_pair {
 /// `NodeStrategy::ev_chips` (finite only). Matrix shape/row-length/path validation stays
 /// `validate_solution`'s job; this only guards the numeric domain of each element.
 pub(crate) fn deserialize_matrix<'de, D: Deserializer<'de>>(d: D, domain: Domain, what: &str) -> Result<Vec<Vec<f32>>, D::Error> {
-    let raw: Vec<Vec<f64>> = Deserialize::deserialize(d)?;
-    raw.into_iter()
-        .map(|row| row.into_iter().map(|x| narrow_checked(x, domain, what).map_err(DeError::custom)).collect())
-        .collect()
+    if d.is_human_readable() {
+        let raw: Vec<Vec<f64>> = Deserialize::deserialize(d)?;
+        raw.into_iter()
+            .map(|row| row.into_iter().map(|x| narrow_checked(x, domain, what).map_err(DeError::custom)).collect())
+            .collect()
+    } else {
+        let raw: Vec<Vec<f32>> = Deserialize::deserialize(d)?;
+        raw.into_iter()
+            .map(|row| row.into_iter().map(|x| native_checked(x, domain, what).map_err(DeError::custom)).collect())
+            .collect()
+    }
 }
 
 pub(crate) fn serialize_matrix<S: Serializer>(v: &[Vec<f32>], s: S, domain: Domain, what: &str) -> Result<S::Ok, S::Error> {
