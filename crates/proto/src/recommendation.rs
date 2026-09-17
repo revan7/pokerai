@@ -9,7 +9,7 @@ pub struct DecisionIdentity { pub hand_id: u64, pub hand_revision: u32, pub deci
 pub enum ApproxReason {
     BetTranslation { street: Street, seat: Seat, observed_pct: f32, mapped: Vec<(f32, f32)>, deviation: f32, prominent: bool },
     DepthBucket { seat: Seat, actual_bb: f32, used_bb: u16, prominent: bool },
-    AsymmetricStacks { stacks_bb: Vec<f32> },
+    AsymmetricStacks { stacks_bb: Vec<f32>, prominent: bool },
     RakeProfileMapped { actual: String, used: String },
     StraddleMapped { posts: [f32; 3] },
     ShortHandedMapped { dealt: u8 },
@@ -138,5 +138,18 @@ mod tests {
         assert_eq!(serde_json::from_str::<RecommendationEvent>(&serde_json::to_string(&ev).unwrap()).unwrap(), ev);
         let est = EquityEstimate { value: Some(0.25), availability: Availability::Ready, method: Some(EquityMethod::MonteCarlo { samples: 100_000, std_err: 0.0014 }) };
         assert_eq!(serde_json::from_str::<EquityEstimate>(&serde_json::to_string(&est).unwrap()).unwrap(), est);
+    }
+
+    #[test]
+    fn asymmetric_stacks_prominent_flag_roundtrips() {
+        let not_prominent = ApproxReason::AsymmetricStacks { stacks_bb: vec![100.0, 104.0], prominent: false };
+        let text = serde_json::to_string(&not_prominent).unwrap();
+        assert!(text.contains(r#""prominent":false"#), "expected prominent:false in {text}");
+        assert_eq!(serde_json::from_str::<ApproxReason>(&text).unwrap(), not_prominent);
+
+        let prominent = ApproxReason::AsymmetricStacks { stacks_bb: vec![100.0, 110.0], prominent: true };
+        let text = serde_json::to_string(&prominent).unwrap();
+        assert!(text.contains(r#""prominent":true"#), "expected prominent:true in {text}");
+        assert_eq!(serde_json::from_str::<ApproxReason>(&text).unwrap(), prominent);
     }
 }
