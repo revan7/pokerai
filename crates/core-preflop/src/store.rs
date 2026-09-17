@@ -63,6 +63,7 @@ pub fn checked_envelope(info: &BundleInfo, raw: &[u8]) -> Result<Envelope, Bundl
         return Err(BundleError::Hash);
     }
     let e = decode(raw)?;
+    check_depths(&info.depths)?;
     if e.bundle_id != info.bundle_id
         || e.depth_bb != info.depth_bb
         || e.rake_profile != info.rake_profile
@@ -78,6 +79,25 @@ pub fn checked_envelope(info: &BundleInfo, raw: &[u8]) -> Result<Envelope, Bundl
         return Err(BundleError::Content("chart bundle must not carry EV data".into()));
     }
     Ok(e)
+}
+
+/// Every acquired depth a manifest declares is at least one bb (P3.T8 fix round 1, R2).
+///
+/// A zero is a malformed declaration, not a coverage gap: admitted, `[0]` would look like an
+/// ordinary `MissingPreflopNode` and `[0, 100]` would silently behave like `[100]`, leaving corrupt
+/// input active and apparently healthy; the depth labels would also divide by it. Rejecting it here
+/// -- inside the admission path both `load_bundle` and a direct `checked_envelope` caller go
+/// through -- means the store's existing quarantine-and-banner behaviour applies (spec section 8.2:
+/// "A failing bundle is quarantined (renamed `.bad`) with a startup banner; remaining bundles stay
+/// active") instead of the rule being silently repaired at lookup time.
+///
+/// The envelope's own singular `depth_bb` is validated by `validate::check_envelope`; this is the
+/// manifest's `depths` list, which nothing else checks.
+pub fn check_depths(depths: &[u16]) -> Result<(), BundleError> {
+    match depths.iter().position(|&d| d == 0) {
+        Some(i) => Err(BundleError::Content(format!("depths[{i}] is 0; every acquired depth is at least 1 bb"))),
+        None => Ok(()),
+    }
 }
 
 /// The manifest's `source_blinds` field at its original wide `f64` precision -- unlike

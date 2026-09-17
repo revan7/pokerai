@@ -70,9 +70,22 @@ fn config(sb: u32, bb: u32, straddle: Option<u32>, rake: Rake) -> HandConfig {
 }
 
 /// The fixture's own profile (5%, cap 0.5 bb, no-flop-no-drop) expressed in chips at `unit` chips
-/// per source unit, so `rake_reason` sees an exact match and emits nothing.
+/// per source unit, so `rake_reason` sees an exact match and emits nothing. `unit * 500` is
+/// `0.5 * unit` chips in thousandths, exact for an odd unit too.
 fn exact_rake(unit: u32) -> Rake {
-    Rake::PotRake { rate: 0.05, cap_mchips: unit / 2 * 1000, no_flop_no_drop: true }
+    Rake::PotRake { rate: 0.05, cap_mchips: unit * 500, no_flop_no_drop: true }
+}
+
+/// A copy of the committed bundle under a temporary directory, with `depths` replaced.
+fn temp_bundle(case: &str, depths: &[u16]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("core_preflop_p3t8_{case}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("synthetic")).expect("temp bundle dir");
+    let mut manifest: serde_json::Value = serde_json::from_str(MANIFEST).expect("the committed manifest deserializes");
+    manifest["depths"] = serde_json::json!(depths);
+    std::fs::write(dir.join("synthetic/manifest.json"), serde_json::to_string(&manifest).unwrap()).expect("manifest");
+    std::fs::copy(fixture_dir().join("nodes.json"), dir.join("synthetic/nodes.json")).expect("nodes");
+    dir
 }
 
 fn dealt_seats(n: usize) -> Vec<Seat> {
@@ -108,10 +121,28 @@ fn act(state: &HandState, actions: &[Action]) -> HandState {
     next
 }
 
+/// A `HandState` in the shape a deserialized one has -- the only way a format `core-model` refuses
+/// to admit can reach a query at all, and exactly what `check_straddle` exists to reject.
+fn raw_state(cfg: HandConfig, dealt: Vec<Seat>, stacks_start: Vec<u32>, button: Seat) -> HandState {
+    HandState {
+        hand_id: 1,
+        hand_revision: 0,
+        config: cfg,
+        phase: HandPhase::Betting { street: Street::Preflop },
+        button,
+        hero: dealt[0],
+        hero_cards: None,
+        dealt,
+        stacks_start,
+        board: vec![],
+        actions: vec![],
+        derived: Derived::default(),
+    }
+}
+
 /// A straddled hand at its first decision. `begin_hand` is used wherever the model admits the
-/// table; the configurations it refuses -- a short post, a short-handed straddle -- are built in
-/// the shape an externally deserialized state has, which is the only way they can reach a query at
-/// all and exactly what `check_straddle` exists to reject.
+/// table; the configurations it refuses -- a short post, a short-handed straddle -- fall back to
+/// [`raw_state`].
 fn straddled_state(sb: u32, bb: u32, s: u32, dealt: usize, stacks: u32) -> HandState {
     let cfg = config(sb, bb, Some(s), Rake::TimeCharge);
     let seats = dealt_seats(dealt);
@@ -124,20 +155,7 @@ fn straddled_state(sb: u32, bb: u32, s: u32, dealt: usize, stacks: u32) -> HandS
         stacks_start: stacks_start.clone(),
         hero_cards: None,
     };
-    core_model::begin_hand(&cfg, begin).unwrap_or(HandState {
-        hand_id: 1,
-        hand_revision: 0,
-        config: cfg,
-        phase: HandPhase::Betting { street: Street::Preflop },
-        button: button_of(dealt),
-        hero: Seat(0),
-        hero_cards: None,
-        dealt: seats,
-        stacks_start,
-        board: vec![],
-        actions: vec![],
-        derived: Derived::default(),
-    })
+    core_model::begin_hand(&cfg, begin).unwrap_or_else(|_| raw_state(cfg, seats, stacks_start, button_of(dealt)))
 }
 
 #[test]
@@ -546,6 +564,221 @@ fn a_postflop_prefix_or_a_foreign_config_is_unsupported() {
     assert!(root.node.is_some(), "truncating to the preflop root answers: {root:?}");
     assert_eq!(root.actor, Some(Seat(2)));
     assert!(store.query(&cfg, &flop, 12).unsupported.is_some(), "a prefix past the history is unsupported");
+}
+
+/// R1: a malformed straddle format is a typed rejection on the public `query` path, decided before
+/// the prefix is reconstructed -- `prefix_state` -> `core_model::derive` would panic on exactly
+/// these states, because model admission refuses them.
+#[test]
+fn query_rejects_malformed_straddle_formats_without_unwinding() {
+    let store = synthetic_store();
+    for (expected, state) in [
+        ("short straddle post", straddled_state(1, 2, 3, 6, 400)),
+        ("straddle requires six dealt seats", straddled_state(1, 2, 4, 5, 400)),
+        ("straddler's starting stack does not cover the straddle", straddled_state(1, 2, 4, 6, 3)),
+    ] {
+        let cfg = state.config.clone();
+        let answer = store.query(&cfg, &state, 0);
+        match answer.unsupported {
+            Some(UnsupportedReason::FormatUnsupported { ref detail }) => {
+                assert!(detail.contains(expected), "expected {expected:?} in {detail:?}")
+            }
+            ref other => panic!("{expected}: expected FormatUnsupported, got {other:?}"),
+        }
+        assert!(answer.node.is_none() && answer.bundle.is_none(), "{answer:?}");
+    }
+    // A stack vector that does not match the dealt seats is refused for the same reason: it is the
+    // shape `start_stack` and the model replay both require.
+    let cfg = config(1, 2, Some(4), Rake::TimeCharge);
+    let mismatched = raw_state(cfg.clone(), dealt_seats(6), vec![400; 5], Seat(5));
+    let answer = store.query(&cfg, &mismatched, 0);
+    match answer.unsupported {
+        Some(UnsupportedReason::FormatUnsupported { ref detail }) => {
+            assert!(detail.contains("starting stacks"), "{detail:?}")
+        }
+        ref other => panic!("expected FormatUnsupported, got {other:?}"),
+    }
+    // Control: a legal straddle answers normally on the same path.
+    let unit = 2000u32;
+    let legal = config(500, 1000, Some(unit), exact_rake(unit));
+    let answer = store.query(&legal, &table(&legal, 6, &vec![100 * unit; 6]), 0);
+    assert_eq!(answer.unsupported, None, "{answer:?}");
+}
+
+/// R2: a zero acquired depth is a malformed manifest, rejected at admission so the store's
+/// quarantine and banner path applies -- never silently skipped during ranking.
+#[test]
+fn manifest_depths_must_be_positive_at_admission() {
+    for (case, depths) in [("zero_only", vec![0u16]), ("zero_and_valid", vec![0, 100])] {
+        let dir = temp_bundle(case, &depths);
+        let err = load_bundle(&dir.join("synthetic/manifest.json"), &dir.join("synthetic/nodes.json"))
+            .err()
+            .unwrap_or_else(|| panic!("{case}: a zero acquired depth must be rejected at admission"));
+        assert!(err.to_string().contains("depths"), "{case}: {err}");
+        let (store, banners) = PreflopStore::open(&dir);
+        assert_eq!(store.bundles().len(), 0, "{case}: the malformed bundle stays out of the store");
+        assert_eq!(banners.len(), 1, "{case}: {banners:?}");
+        assert!(banners[0].contains("depths"), "{case}: {banners:?}");
+        assert!(dir.join("synthetic.bad").exists(), "{case}: the bundle is quarantined");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // Control: the committed depths list still admits.
+    let dir = temp_bundle("valid", &[100]);
+    assert!(load_bundle(&dir.join("synthetic/manifest.json"), &dir.join("synthetic/nodes.json")).is_ok());
+    let (store, banners) = PreflopStore::open(&dir);
+    assert_eq!((store.bundles().len(), banners.len()), (1, 0), "{banners:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R2's invariant for an in-memory `BundleInfo` no admission path produced: a zero declared depth
+/// is refused, never silently skipped.
+#[test]
+#[should_panic(expected = "bucket: acquired depth 0 is 0")]
+fn bucket_refuses_a_zero_declared_depth() {
+    let _ = core_preflop::bucket(100.0, &[0, 100]);
+}
+
+/// R3: a historical wager is resolved against the selected source's own menu at the corresponding
+/// prefix node, comparing exact chip amounts. Thousandth rounding is never what makes a match.
+#[test]
+fn historical_sizes_resolve_against_the_source_menu() {
+    // The half-chip rule itself, at the boundary the review's arithmetic probe pinned down.
+    assert!(core_preflop::size_matches(8, 2500, 3), "8 chips at a 3-chip unit is exactly half a chip from 2.5");
+    assert!(core_preflop::size_matches(24, 2450, 10), "exactly half a chip apart is inside the tolerance");
+    assert!(!core_preflop::size_matches(7501, 2500, 3000), "a full chip above the source size is off-menu");
+
+    let store = synthetic_store();
+    let source_open = |history| {
+        node_key(&PreflopNodeKey { depth_bb: 100, rake_profile: "5% cap 0.5bb".into(), straddle: false, history })
+    };
+
+    // Small unit: an 8-chip open at a 3-chip big blind is within half a chip of the source's
+    // 2.5 bb open, so it resolves onto 2500. Thousandth rounding would have emitted 2667.
+    let cfg = config(1, 3, None, exact_rake(3));
+    let opened = act(&table(&cfg, 6, &vec![300; 6]), &[Action::Raise { to: 8 }]);
+    let answer = store.query(&cfg, &opened, 1);
+    assert_eq!(answer.unsupported, None, "{answer:?}");
+    assert_eq!(answer.node.as_ref().map(|n| n.actor), Some(Position::Hj), "{answer:?}");
+    assert_eq!(answer.key, source_open(vec![(Position::Utg, PreflopStep::Raise { to_bb_x1000: 2500 })]));
+
+    // Large unit: 7501 chips at a 3000-chip big blind is a full chip above the source's
+    // 7500-chip size, so it stays off-menu for Tasks 10/13 and never selects the present 2500
+    // node -- which is exactly the key thousandth rounding would have produced.
+    let cfg = config(1500, 3000, None, exact_rake(3000));
+    let opened = act(&table(&cfg, 6, &vec![300_000; 6]), &[Action::Raise { to: 7501 }]);
+    let answer = store.query(&cfg, &opened, 1);
+    assert!(answer.node.is_none(), "{answer:?}");
+    assert!(matches!(answer.unsupported, Some(UnsupportedReason::MissingPreflopNode { .. })), "{answer:?}");
+    assert!(answer.notes.iter().any(|n| n.contains("off-menu")), "{:?}", answer.notes);
+    assert_ne!(
+        answer.key,
+        source_open(vec![(Position::Utg, PreflopStep::Raise { to_bb_x1000: 2500 })]),
+        "an off-menu size is never rounded into the source's key"
+    );
+
+    // A wager deeper in the history resolves against *that* node's menu, not the root's: at a
+    // 3-chip unit a 26-chip 3bet is within half a chip of the source's 8.75 bb size.
+    let cfg = config(1, 3, None, exact_rake(3));
+    let three_bet = act(&table(&cfg, 6, &vec![300; 6]), &[Action::Raise { to: 8 }, Action::Raise { to: 26 }]);
+    let answer = store.query(&cfg, &three_bet, 2);
+    assert_eq!(
+        answer.key,
+        source_open(vec![
+            (Position::Utg, PreflopStep::Raise { to_bb_x1000: 2500 }),
+            (Position::Hj, PreflopStep::Raise { to_bb_x1000: 8750 }),
+        ]),
+        "{answer:?}"
+    );
+    // A 3bet that node does not offer stays off-menu even though the open before it resolved.
+    let off = act(&table(&cfg, 6, &vec![300; 6]), &[Action::Raise { to: 8 }, Action::Raise { to: 40 }]);
+    let answer = store.query(&cfg, &off, 2);
+    assert!(answer.key.contains("off-menu"), "{}", answer.key);
+    assert!(answer.key.contains("2500"), "the resolved open is still visible: {}", answer.key);
+    assert!(matches!(answer.unsupported, Some(UnsupportedReason::MissingPreflopNode { .. })), "{answer:?}");
+    assert!(answer.node.is_none(), "{answer:?}");
+
+    // The inclusive boundary end to end: at a one-chip unit a 3-chip open is exactly half a chip
+    // from 2.5 bb and resolves; 4 chips is a chip and a half away and does not.
+    let cfg = config(1, 1, None, exact_rake(1));
+    let on = act(&table(&cfg, 6, &vec![100; 6]), &[Action::Raise { to: 3 }]);
+    let answer = store.query(&cfg, &on, 1);
+    assert_eq!(answer.node.as_ref().map(|n| n.actor), Some(Position::Hj), "{answer:?}");
+    assert_eq!(answer.key, source_open(vec![(Position::Utg, PreflopStep::Raise { to_bb_x1000: 2500 })]));
+    let off = act(&table(&cfg, 6, &vec![100; 6]), &[Action::Raise { to: 4 }]);
+    let answer = store.query(&cfg, &off, 1);
+    assert!(answer.node.is_none(), "{answer:?}");
+    assert!(matches!(answer.unsupported, Some(UnsupportedReason::MissingPreflopNode { .. })), "{answer:?}");
+}
+
+/// R4: the public hand domain is wider than the source-key domain, so a legal raise whose size has
+/// no `u32` thousandths representation is a typed unsupported answer, never a panic or a clamp.
+#[test]
+fn an_unrepresentable_source_size_is_typed_not_a_panic() {
+    let cfg = config(1, 2, None, exact_rake(2));
+    // Six 20,000,000-chip stacks total 120,000,000 -- well inside the aggregate chip bound -- and
+    // the 10,000,000-chip raise is not all-in.
+    let opened = act(&table(&cfg, 6, &vec![20_000_000; 6]), &[Action::Raise { to: 10_000_000 }]);
+    let answer = synthetic_store().query(&cfg, &opened, 1);
+    match answer.unsupported {
+        Some(UnsupportedReason::UnsupportedHistory { ref reason }) => {
+            assert!(reason.contains("representable"), "{reason:?}")
+        }
+        ref other => panic!("expected UnsupportedHistory, got {other:?}"),
+    }
+    assert!(answer.node.is_none(), "{answer:?}");
+    assert_eq!(answer.unit, 2);
+    assert!(!answer.reasons.is_empty(), "the mapping reasons accumulate before the history is resolved");
+}
+
+/// R5: the brief's per-invocation mapping cache. It lives in the caller's invocation object, never
+/// in the shared store, and Task 13's replay driver will own one per run.
+#[test]
+fn an_invocation_memoizes_mappings_and_resets_between_runs() {
+    let unit = 1000u32;
+    let cfg = config(unit / 2, unit, None, exact_rake(unit));
+    let store = synthetic_store();
+    let root = table(&cfg, 6, &vec![100 * unit; 6]);
+    let opened = act(&root, &[Action::Raise { to: 2500 }]);
+
+    let mut run = core_preflop::PreflopInvocation::new();
+    assert!(run.is_empty());
+    let first = run.answer(&store, &cfg, &opened, 1);
+    let second = run.answer(&store, &cfg, &opened, 1);
+    assert_eq!(first, second, "the second call is the memoized mapping");
+    assert_eq!(first, store.query(&cfg, &opened, 1), "the memo returns exactly what the store would");
+    assert_eq!((run.lookups(), run.hits(), run.len()), (2, 1, 1));
+
+    // A different prefix of the same hand, and a different branch-translated history, are separate
+    // entries rather than a reused mapping.
+    let _ = run.answer(&store, &cfg, &opened, 0);
+    let other_branch = act(&root, &[Action::Call]);
+    let limp = run.answer(&store, &cfg, &other_branch, 1);
+    assert_eq!((run.lookups(), run.hits(), run.len()), (4, 1, 3));
+    assert_ne!(limp.key, first.key, "a different translated history is a different mapping");
+
+    // Reset between runs: nothing carries over, and the next call is a fresh miss.
+    run.reset();
+    assert_eq!((run.lookups(), run.hits(), run.len()), (0, 0, 0));
+    assert!(run.is_empty());
+    let _ = run.answer(&store, &cfg, &opened, 1);
+    assert_eq!((run.lookups(), run.hits(), run.len()), (1, 0, 1));
+}
+
+/// `observed_history` stays the menu-unaware view of a prefix (Tasks 10/13 read branch histories
+/// through it); `query` uses the menu-aware resolution instead.
+#[test]
+fn observed_history_is_the_menu_unaware_view() {
+    let unit = 1000u32;
+    let cfg = config(unit / 2, unit, None, exact_rake(unit));
+    let opened = act(&table(&cfg, 6, &vec![100 * unit; 6]), &[Action::Raise { to: 2500 }, Action::Call]);
+    let prefix = core_preflop::prefix_state(&opened, 2);
+    let roles = core_preflop::physical_positions(&prefix);
+    assert_eq!(
+        core_preflop::observed_history(&prefix, &roles, false, unit),
+        vec![(Position::Utg, PreflopStep::Raise { to_bb_x1000: 2500 }), (Position::Hj, PreflopStep::Call)]
+    );
+    // The same actions under the virtual roles a straddle imposes.
+    assert_eq!(core_preflop::observed_history(&prefix, &roles, true, unit)[0].0, Position::Bb);
 }
 
 /// Why `query` screens for a postflop action *before* it reconstructs the prefix: `derive` cannot
