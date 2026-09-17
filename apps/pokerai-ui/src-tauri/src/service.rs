@@ -98,10 +98,21 @@ impl Service {
         Ok(serde_json::from_value(rx.await.map_err(|_| AppError::Closed)??)?)
     }
 
+    /// Nonblocking: sets the reserved shutdown signal and returns immediately, it does not
+    /// wait for the dispatch thread to notice it or for `port.shutdown()` to run. A full
+    /// queue cannot prevent signalling shutdown, since this never touches `tx`. The dispatch
+    /// loop's `recv_timeout(20ms)` bounds only its *idle* wait for the next queued command —
+    /// it does not bound, and cannot interrupt, a `port.dispatch(op)` call already in
+    /// progress; a stuck engine call delays `stopped()` becoming true until it returns.
+    /// Once the loop does observe the signal, any commands still queued at that point are
+    /// rejected with `AppError::Closed` rather than dispatched.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
 
+    /// True only after the dispatch thread has observed `stop`, drained the queue with
+    /// `AppError::Closed` replies, and called `port.shutdown()`. See `stop`'s doc comment for
+    /// the exact, non-instantaneous timing this implies.
     pub fn stopped(&self) -> bool {
         self.done.load(Ordering::Acquire)
     }
