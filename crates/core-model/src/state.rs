@@ -1,12 +1,13 @@
 //! The public hand-state API (spec 3.5, 4.3): the only way a caller starts a hand, records an action,
 //! enters a board or reads the derived view.
 //!
-//! Every function that returns a [`HandState`] rebuilds `phase` and `derived` by replaying the whole
-//! hand through [`simulate`], and returns [`Err`] rather than store a state that does not replay. That
-//! is what lets [`derive`] and [`settle_pots`] have no `Result` (spec 3.5): they are only ever called on
-//! states this crate produced. A `HandState` that came from outside the crate — deserialized, or built
-//! by a caller — must be admitted with [`crate::lifecycle::simulate`], which returns a `Result`, before
-//! either of them is called on it.
+//! Every fallible function here — [`begin_hand`], [`apply_action`], [`set_board`] and
+//! [`set_hero_cards`] — rebuilds `phase` and `derived` by replaying the whole hand through
+//! [`simulate`], and returns [`Err`] rather than store a state that does not replay. That is what lets
+//! [`derive`], [`settle_pots`] and [`abandon`] have no `Result` (spec 3.5): they *require* a state that
+//! replays — one this crate produced — and panic on any other. A `HandState` that came from outside the
+//! crate — deserialized, or built by a caller — must be admitted with [`crate::lifecycle::simulate`],
+//! which returns a `Result`, before any of the three is called on it.
 
 use proto::{Action, Card, CardParseError, Derived, HandConfig, HandPhase, HandState, Seat, Street, TakenAction};
 use crate::error::RulesError;
@@ -68,10 +69,11 @@ pub fn begin_hand(cfg: &HandConfig, begin: BeginHand) -> Result<HandState, Rules
     Ok(state)
 }
 
-/// Spec 3.5 gives `derive` no `Result`, so it is only ever called on a state this crate built
-/// (`begin_hand`, `apply_action`, `set_board`, `set_hero_cards` and `abandon` all refresh through
-/// `simulate` and return `Err` instead of storing an inconsistent state). Validate any externally
-/// supplied `HandState` with `lifecycle::simulate` first.
+/// Spec 3.5 gives `derive` no `Result`, so it is only ever called on a state this crate built: the
+/// four fallible entry points (`begin_hand`, `apply_action`, `set_board`, `set_hero_cards`) all refresh
+/// through `simulate` and return `Err` instead of storing an inconsistent state, and `abandon` requires
+/// the state it is handed to replay already. Validate any externally supplied `HandState` with
+/// `lifecycle::simulate` first.
 ///
 /// # Panics
 /// Panics (in every build profile) if `state` does not replay.
@@ -144,6 +146,11 @@ pub fn is_decision_point(state: &HandState) -> bool {
 }
 
 /// Abandons the hand (spec 4.3): the history is kept, no seat is to act and no action is legal again.
+///
+/// Same precondition as [`derive`], which it calls: only for a state that replays.
+///
+/// # Panics
+/// Panics (in every build profile) if `state` does not replay.
 pub fn abandon(state: &HandState) -> HandState {
     let mut next = state.clone();
     next.phase = HandPhase::Abandoned;
