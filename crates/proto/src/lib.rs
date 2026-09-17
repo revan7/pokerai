@@ -1,5 +1,10 @@
 //! Single source of truth for every serde type shared by the UI, the engine and the worker.
 
+/// Checked float codecs (wide validation before narrowing, symmetric on serialize) shared by every
+/// wire this crate defines. Private: the codecs are an implementation detail of the wire types,
+/// which is where every consumer meets them (review S1).
+pub(crate) mod numeric;
+
 pub mod cards;
 pub mod game;
 pub mod hand;

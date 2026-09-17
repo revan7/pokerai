@@ -103,7 +103,13 @@ fn parse_weight(text: &str) -> Result<f32, RangeError> {
     if !w64.is_finite() || !(0.0..=1.0).contains(&w64) {
         return Err(RangeError::Weight(format!("weight {text} is outside [0, 1]")));
     }
-    let w = w64 as f32;
+    // `+ 0.0` maps `-0.0` to `+0.0` and is the identity on every other in-domain value. `-0.0`
+    // passes the `[0, 1]` check above (`-0.0 == 0.0`) and would otherwise survive into the
+    // bit-exact layers, where `hash_scaled` hashes `0x80000000` differently from `0x00000000`: a
+    // range and its own `range_to_string` round trip would be numerically identical yet produce
+    // different cache keys (review S5). Normalizing here, at the one text ingestion boundary,
+    // leaves `hash_scaled`, `apply_range` and `canonicalize` bit-exact as ruled by T20/T21.
+    let w = (w64 as f32) + 0.0;
     if !w.is_finite() || !(0.0..=1.0).contains(&w) {
         return Err(RangeError::Weight(format!("weight {text} is outside [0, 1]")));
     }

@@ -268,3 +268,109 @@ fn validate_solution_rejects_actions_mismatch_with_content() {
     let err = validate_solution(&s, &tree()).unwrap_err();
     assert!(err.contains("actions"), "{err}");
 }
+
+// --- S2 (final review): validation must be linear in the materialized tree, not quadratic ---
+//
+// `resolve_chip_path` rebuilds an index of the whole materialized tree on every call, and
+// `validate_solution` / `validate_locks` called it once per node and then scanned the tree again
+// linearly, so validation cost Theta(nodes x materialized) against a declared cap of
+// `MAX_EXPORTED_NODES = 100_000`. Both entry points now build one index per call.
+
+use std::time::{Duration, Instant};
+
+/// A wide, shallow materialized tree of `1 + roots * (1 + kids)` nodes: a root with `roots`
+/// continuation actions, one child per action, and `kids` grandchildren under each child. Ordinal
+/// paths are at most two bytes, so every resolution is two edges and what the timings below measure
+/// is index construction, not path length.
+fn wide_tree(roots: u8, kids: u8) -> Vec<MaterializedNode> {
+    let act = |i: u8| Action::Bet { to: 1 + i as u32 };
+    let mut out = vec![MaterializedNode {
+        path: vec![],
+        street: Street::Flop,
+        actor: "oop".into(),
+        actions: (0..roots).map(act).collect(),
+        terminal_pots: vec![None; roots as usize],
+    }];
+    for i in 0..roots {
+        out.push(MaterializedNode {
+            path: vec![i],
+            street: Street::Flop,
+            actor: "ip".into(),
+            actions: (0..kids).map(act).collect(),
+            terminal_pots: vec![None; kids as usize],
+        });
+        for j in 0..kids {
+            out.push(MaterializedNode { path: vec![i, j], street: Street::Flop, actor: "oop".into(), actions: vec![], terminal_pots: vec![] });
+        }
+    }
+    out
+}
+
+/// Every grandchild's chip path, in materialized order.
+fn grandchild_paths(roots: u8, kids: u8) -> Vec<Vec<Action>> {
+    let act = |i: u8| Action::Bet { to: 1 + i as u32 };
+    (0..roots).flat_map(|i| (0..kids).map(move |j| vec![act(i), act(j)])).collect()
+}
+
+/// S2: 20,000 resolutions against a 20,101-node materialized tree share one index and finish in
+/// well under a second. Before the fix there was no way to share it -- every call rebuilt the whole
+/// index -- and the review measured 3.9987096 s for this shape in a **release** build.
+#[test]
+fn twenty_thousand_paths_resolve_against_one_shared_index() {
+    let materialized = wide_tree(100, 200);
+    assert_eq!(materialized.len(), 20_101);
+    let paths = grandchild_paths(100, 200);
+    assert_eq!(paths.len(), 20_000);
+    let index = index_materialized(&materialized);
+    let start = Instant::now();
+    let mut resolved = 0usize;
+    for (k, path) in paths.iter().enumerate() {
+        let ordinal = resolve_chip_path_indexed(&index, path).expect("every grandchild path resolves");
+        assert_eq!(ordinal, vec![(k / 200) as u8, (k % 200) as u8]);
+        resolved += 1;
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(resolved, 20_000);
+    assert!(elapsed < Duration::from_secs(2), "20,000 resolutions took {elapsed:?}; the shared index must make this linear");
+    // The wrapper keeps its old signature and its old answers, index or no index.
+    for path in paths.iter().take(8).chain(paths.iter().rev().take(8)) {
+        assert_eq!(resolve_chip_path(&materialized, path), resolve_chip_path_indexed(&index, path));
+    }
+    assert_eq!(resolve_chip_path_indexed(&index, &[Action::Check]), None, "an action outside the menu still does not resolve");
+}
+
+/// S2, at the public entry point plan 2 and plan 4 actually call: `validate_locks`' cost must be
+/// driven by the locks it is given, not by the size of the tree they are resolved against. The same
+/// 600 locks are validated against a 2,011-node tree and against a 20,101-node tree -- ten times
+/// larger. One index per call makes the two times essentially equal (the extra 18,090 index entries
+/// are dwarfed by the 795,600 probability rows both calls check); one index per lock made the
+/// second call ten times the first.
+#[test]
+fn validate_locks_cost_does_not_grow_with_the_materialized_tree() {
+    let small = wide_tree(10, 200);
+    let big = wide_tree(100, 200);
+    assert_eq!((small.len(), big.len()), (2_011, 20_101));
+    // Each grandchild is a leaf with an empty menu, so every lock row is the empty (all-zero) row.
+    let locks: Vec<NodeLock> = grandchild_paths(10, 200).iter().take(600)
+        .map(|p| NodeLock { path: p.clone(), actor: "oop".into(), probs: vec![Vec::new(); 1326] })
+        .collect();
+
+    let start = Instant::now();
+    let small_ordinals = validate_locks(&locks, &small).expect("every lock resolves against the small tree");
+    let small_elapsed = start.elapsed();
+
+    let start = Instant::now();
+    let big_ordinals = validate_locks(&locks, &big).expect("every lock resolves against the large tree");
+    let big_elapsed = start.elapsed();
+
+    assert_eq!(small_ordinals, big_ordinals, "the same locks resolve to the same ordinals in both trees");
+    assert_eq!(small_ordinals.len(), 600);
+    assert_eq!((small_ordinals[0].clone(), small_ordinals[599].clone()), (vec![0u8, 0], vec![2u8, 199]));
+    assert!(big_elapsed < Duration::from_secs(2), "validating 600 locks against 20,101 nodes took {big_elapsed:?}");
+    // 3x, not 10x: the slack absorbs timer noise on a small absolute measurement while still
+    // failing a per-lock index rebuild, which scales with the tenfold tree.
+    assert!(
+        big_elapsed < small_elapsed * 3 + Duration::from_millis(50),
+        "a tenfold materialized tree changed validate_locks from {small_elapsed:?} to {big_elapsed:?}: the index is being rebuilt per lock"
+    );
+}

@@ -1,6 +1,6 @@
 //! Worker protocol (spec 4.5): UTF-8 JSON Lines, `type`-tagged, lowercase tags, unknown fields rejected.
 use serde::de::Error as DeError;
-use serde::ser::{Error as SerError, SerializeSeq};
+use serde::ser::Error as SerError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::cards::Card;
 use crate::hand::Action;
@@ -9,54 +9,14 @@ use crate::tree::EffectiveTree;
 
 // --- Numeric wire validation (spec 4.5, standing ruling: validate wide, never clamp) ---
 //
-// Every f32 field on the wire is read as f64 and checked against its domain *before*
-// narrowing to f32, and the narrowed value is checked again (narrowing itself can overflow
-// a finite, in-domain f64 to a non-finite f32). The same domain is enforced on serialize, so
-// an invalid in-memory value (however constructed) can never reach the wire -- in particular
-// it can never surface as JSON `null`, which is serde_json's silent rendering of a non-finite
-// float and would be indistinguishable from a legitimate absent value.
+// The machinery itself -- the domain predicates and the `narrow_checked` / `widen_checked` pair --
+// lives in `crate::numeric`, which is where every other wire in this crate also draws it from
+// (review S1). What stays here is the mapping from *this* wire's field names to those domains, so
+// a worker-protocol error still names the worker-protocol field.
 
-/// No bound beyond finiteness (already checked by the caller): EV chips and exploitability.
-fn domain_finite(_: f64) -> bool { true }
-/// Probabilities (spec 4.1/4.5): closed unit interval.
-fn domain_unit_interval(x: f64) -> bool { (0.0..=1.0).contains(&x) }
-/// `rake_rate` (spec 2): a fraction, never a full rake (half-open at 1).
-fn domain_rake_rate(x: f64) -> bool { (0.0..1.0).contains(&x) }
-
-/// Reads a wire number as `f64`, checks it is finite and inside `domain`, and only then
-/// narrows to `f32`, re-checking the narrowed value against the same domain. This ordering
-/// is load-bearing: an f64 merely close to (but outside) the domain must never be admitted by
-/// rounding into it during narrowing (e.g. a probability `1.00000001` must not become `1.0`,
-/// `-1e-50` must not become `-0.0`), and a finite, in-domain f64 that overflows f32 on
-/// narrowing (e.g. `1e39`) must be rejected rather than silently becoming `inf`.
-fn narrow_checked(raw: f64, domain: fn(f64) -> bool, what: &str) -> Result<f32, String> {
-    if !raw.is_finite() || !domain(raw) {
-        return Err(format!("{what} {raw} is outside its valid domain"));
-    }
-    let narrowed = raw as f32;
-    if !narrowed.is_finite() || !domain(narrowed as f64) {
-        return Err(format!("{what} {raw} narrows to {narrowed:e}, outside its valid domain"));
-    }
-    Ok(narrowed)
-}
-
-/// The serialize-side counterpart of `narrow_checked`: rejects an in-memory value that is
-/// non-finite or out of domain instead of letting it reach the wire.
-fn widen_checked(v: f32, domain: fn(f64) -> bool, what: &str) -> Result<f32, String> {
-    if !v.is_finite() || !domain(v as f64) {
-        return Err(format!("{what} {v} is outside its valid domain"));
-    }
-    Ok(v)
-}
-
-fn deserialize_rake_rate<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
-    let raw = f64::deserialize(d)?;
-    narrow_checked(raw, domain_rake_rate, "rake_rate").map_err(DeError::custom)
-}
-fn serialize_rake_rate<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
-    let checked = widen_checked(*v, domain_rake_rate, "rake_rate").map_err(SerError::custom)?;
-    s.serialize_f32(checked)
-}
+use crate::numeric::{
+    deserialize_matrix, domain_finite, domain_unit_interval, narrow_checked, serialize_matrix, widen_checked,
+};
 
 /// Scalar, finite-only float (no domain bound beyond finiteness): used for
 /// `StreetSolution::exploitability_chips`, which is always present and never null.
@@ -88,28 +48,6 @@ fn serialize_required_nullable_f32<S: Serializer>(v: &Option<f32>, s: S) -> Resu
             s.serialize_some(&checked)
         }
     }
-}
-
-/// Validates every element of a `Vec<Vec<f32>>` wire matrix against `domain` before narrowing
-/// (see `narrow_checked`). Shared by `NodeLock::probs`, `NodeStrategy::probs` (unit interval)
-/// and `NodeStrategy::ev_chips` (finite only). Matrix shape/row-length/path validation stays
-/// Task 8's job (spec/brief); this only guards the numeric domain of each element.
-fn deserialize_matrix<'de, D: Deserializer<'de>>(d: D, domain: fn(f64) -> bool, what: &str) -> Result<Vec<Vec<f32>>, D::Error> {
-    let raw: Vec<Vec<f64>> = Deserialize::deserialize(d)?;
-    raw.into_iter()
-        .map(|row| row.into_iter().map(|x| narrow_checked(x, domain, what).map_err(DeError::custom)).collect())
-        .collect()
-}
-fn serialize_matrix<S: Serializer>(v: &[Vec<f32>], s: S, domain: fn(f64) -> bool, what: &str) -> Result<S::Ok, S::Error> {
-    let mut outer = s.serialize_seq(Some(v.len()))?;
-    for row in v {
-        let mut checked_row = Vec::with_capacity(row.len());
-        for x in row {
-            checked_row.push(widen_checked(*x, domain, what).map_err(SerError::custom)?);
-        }
-        outer.serialize_element(&checked_row)?;
-    }
-    outer.end()
 }
 
 fn deserialize_prob_matrix<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<f32>>, D::Error> {
@@ -144,7 +82,8 @@ pub const ADAPTER_VERSION: u16 = 1;
 pub struct SolveRequest {
     pub id: String, pub spot: String, pub board: Vec<Card>, pub oop_range: Range1326, pub ip_range: Range1326,
     pub pot: u32, pub stack_oop: u32, pub stack_ip: u32,
-    #[serde(deserialize_with = "deserialize_rake_rate", serialize_with = "serialize_rake_rate")]
+    #[serde(with = "crate::numeric::rake_rate")]
+    #[cfg_attr(feature = "typescript", ts(as = "f32"))]
     pub rake_rate: f32,
     pub rake_cap_mchips: u32,
     pub tree: EffectiveTree, pub history: Vec<Action>, pub target_bp: u16, pub deadline_ms: u32,
@@ -261,13 +200,19 @@ pub enum WorkerMessage {
 // entries are already domain-checked by the wire codecs, so this module reads them, never clamps.
 
 use crate::cards::COMBOS;
-use crate::tree::{resolve_chip_path, MaterializedNode, OrdinalPath};
+use crate::tree::{index_materialized, resolve_chip_path_indexed, MaterializedIndex, MaterializedNode, OrdinalPath};
 
 const ROW_TOLERANCE: f32 = 1e-3;
 
-fn resolve_node<'a>(materialized: &'a [MaterializedNode], what: &str, k: usize, path: &[Action], actor: &str) -> Result<(&'a MaterializedNode, OrdinalPath), String> {
-    let ordinal = resolve_chip_path(materialized, path).ok_or_else(|| format!("{what} {k}: chip path does not resolve against the materialized tree"))?;
-    let node = materialized.iter().find(|m| m.path == ordinal).expect("resolved paths are materialized");
+/// Resolves one node against an index built **once** per validation call (review S2).
+///
+/// Both the resolution and the lookup of the resolved node go through that one index: rebuilding it
+/// per node, and then scanning the tree linearly for the resolved ordinal, made validation
+/// Theta(nodes x materialized) against a declared cap of `MAX_EXPORTED_NODES = 100_000` nodes,
+/// inside the spec section 7 fast-path budget.
+fn resolve_node<'a>(index: &MaterializedIndex<'a>, what: &str, k: usize, path: &[Action], actor: &str) -> Result<(&'a MaterializedNode, OrdinalPath), String> {
+    let ordinal = resolve_chip_path_indexed(index, path).ok_or_else(|| format!("{what} {k}: chip path does not resolve against the materialized tree"))?;
+    let node = *index.get(ordinal.as_slice()).expect("resolved paths are materialized");
     if node.actor != actor { return Err(format!("{what} {k}: actor {actor:?} differs from the materialized actor {:?}", node.actor)); }
     Ok((node, ordinal))
 }
@@ -302,10 +247,12 @@ pub fn validate_solution(sol: &StreetSolution, materialized: &[MaterializedNode]
     if !sol.exploitability_chips.is_finite() || sol.exploitability_chips < 0.0 { return Err("exploitability_chips must be finite and non-negative".into()); }
     if sol.mode != "f32" && sol.mode != "i16" { return Err(format!("unknown mode {:?}", sol.mode)); }
     if sol.export != "street" && sol.export != "truncated" { return Err(format!("unknown export {:?}", sol.export)); }
+    // One index for the whole call, not one per node (review S2).
+    let index = index_materialized(materialized);
     let mut out = Vec::with_capacity(sol.nodes.len());
     for (k, node) in sol.nodes.iter().enumerate() {
         if sol.covered_paths[k] != node.path { return Err(format!("covered_paths[{k}] differs from nodes[{k}].path")); }
-        let (m, ordinal) = resolve_node(materialized, "node", k, &node.path, &node.actor)?;
+        let (m, ordinal) = resolve_node(&index, "node", k, &node.path, &node.actor)?;
         if m.actions != node.actions { return Err(format!("node {k}: actions differ from the materialized menu")); }
         let width = node.actions.len();
         if node.probs.len() != COMBOS || node.ev_chips.len() != COMBOS || node.available.len() != COMBOS {
@@ -336,9 +283,11 @@ pub fn validate_solution(sol: &StreetSolution, materialized: &[MaterializedNode]
 
 /// Lock validation (spec 4.5): every entry in [0, 1]; a row is all zero (the free-combo sentinel) or sums to 1 +- 1e-3.
 pub fn validate_locks(locks: &[NodeLock], materialized: &[MaterializedNode]) -> Result<Vec<OrdinalPath>, String> {
+    // One index for the whole call, not one per lock (review S2).
+    let index = index_materialized(materialized);
     let mut out = Vec::with_capacity(locks.len());
     for (k, lock) in locks.iter().enumerate() {
-        let (m, ordinal) = resolve_node(materialized, "lock", k, &lock.path, &lock.actor)?;
+        let (m, ordinal) = resolve_node(&index, "lock", k, &lock.path, &lock.actor)?;
         if lock.probs.len() != COMBOS { return Err(format!("lock {k}: probs must have exactly 1326 rows")); }
         for (c, row) in lock.probs.iter().enumerate() { check_row("lock", k, c, row, m.actions.len(), true, false)?; }
         out.push(ordinal);
