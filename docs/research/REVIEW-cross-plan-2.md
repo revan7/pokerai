@@ -1094,4 +1094,131 @@ All 48 zero-slack task nodes are starred in the tables; tied branches exist (for
 
 First wave: **P1.T1 only**. Once reviewed, wave 2 is **P1.T2, P1.T15, P2.T1**. The wave order is conditional on the corrections; it is not a claim that implementation has started.
 
+## 8. Verification, self-review and remaining decision
 
+### 8.1 Finding-by-finding falsification check
+
+| Finding | Self-review against the quoted authority / rejected false positive |
+|---|---|
+| F01 | Includes P3, not just requested P4/P5. Renaming log alone is insufficient because P2 appends the filename; directory semantics checked. |
+| F02 | StartupReport is publicly re-exported at P2:L6790; this is a consumer mismatch, not a missing warning capability. |
+| F03 | The two BeginHand types are intentional. Only the shell argument is wrong; no proto type deletion or second DTO is proposed. |
+| F04 | Read P2’s actual registry body, not just its Interfaces. with_extra already exists, uses test-templates, and ids includes extras. |
+| F05 | Same fully qualified engine function, same arguments, different return types and two bodies; genuine duplicated ownership. |
+| F06 | Trait itself matches. The failure is specifically Box versus the shared Arc/Mutex field cloned into Engine; constructor arity stays four. |
+| F07 | P2 emit has no pub(crate); P3 preflop.rs is a sibling and contains calls. No competing preflop-local helper is produced. |
+| F08 | Checked P2 setter’s validation, queued_config branch and config lock, not only its Result signature. P4’s replacement loses those behaviors. |
+| F09 | Checked engine-main’s actual mutex scope across serve_request. Independent UI dispatcher threads do not remove that engine lock wait. |
+| F10 | Status derives are already present in P4.T15; no claim that serialization is missing. Missing parent re-export and future helper are separate, verified details. |
+| F11 | All four actual P1 definitions located: UtgStraddle.amount_chips, IDENTITY, inverse, and postflop_order(button,dealt). No new aliases are necessary. |
+| F12 | Spec says no SolveInput, not merely no cache. Checked absent advice_rows against full P2 assembler. Actual-combo/BB/rake need explicit transfer. |
+| F13 | Searched every plan for bench_p95_ms. Only P4’s presumed-existing-field comment and reads exist; there is no field/loader producer. |
+| F14 | Spot is bench::suite::Spot with string ranges; engine owns the proposed generators. Defining another same-named Spot without an adapter would hide the type problem. |
+| F15 | Read every workspace dependency table. P5’s ts-rs is local to proto and cannot satisfy cache’s workspace inheritance; optional does not waive manifest resolution. |
+| F16 | P1 explicitly delegates the measurement to P2; P2 explicitly consumes P1’s check. Smoke construction time is not the required FLOP-FAST comparator. Checked P4 diagnostic and P5 staging paths too. |
+| F17 | P2 supplies contract_river.rs and worker_link.rs, not the two P4 target names. Five real required suites remain after replacement, including check-only. |
+| F18 | P3 records absent depth as a valid green-workspace outcome. P4 honestly fails incomplete release measurements; P5 packaging must not pretend absence is impossible. |
+| F19 | Spec explicitly includes every section-10.1 template and 47 cases. Phase-2 solve status is not a materialization-test exemption. |
+| F20 | Both incompatible outcomes occur in the same authoritative §13.2. P2 acknowledges choosing one; no later revision in the supplied authorities resolves it. |
+| F21 | P5.T14 is the chart UI acceptance test, distinct from bench e2e. GateInput lacks its evidence; final V22 therefore must follow it. |
+| F22 | Actual revised task headings establish T11/T23 ownership; older task numbers were not used to construct the graph. Re-exports were distinguished from absent free functions. |
+| F23 | Exact package names/paths agree; repeated glob-covered member declarations are metadata cleanup, not extra crate implementations. |
+| F24 | P2 already writes all six suite files and the same default-dated report. Regeneration/append is intended; the corrective edit is ownership wording/provenance preservation, not deletion of either benchmark stage. |
+
+The ledger was checked for every P2–P5 task; no matching-looking trait was substituted for a different receiver, error or result. File-structure claims and self-review declarations were checked against the task bodies. Intentional handoffs (snapshot replacement, generated TS derives, chart-suite regeneration, benchmarks extending existing files) were kept distinct from competing implementations.
+
+### 8.2 Actual verification output
+
+No crate exists yet. The repository’s requested default command was attempted:
+
+```text
+> cargo test --workspace
+error: could not find `Cargo.toml` in `D:\Documents\Projects\PokerAI` or any parent directory
+Exit code: 1
+```
+
+This is the expected pre-implementation repository state, **not a passed Rust test suite** and not an additional seam finding. No npm/Python/worker tests are claimed to have run.
+
+A read-only Node document validator parsed the current sources and the written report. It checked task counts, all 84 paired finding quotes at their cited source lines, their 30-word maximum, all 89 consumer ledger rows, all 114 graph nodes, every edge against the sequential order and waves, the critical chain and Markdown fences. Real output:
+
+```text
+Task inventory: 25 + 30 + 19 + 26 + 14 = 114
+Findings: 24 (BLOCKER=1, MAJOR=20, MINOR=3)
+Paired finding quotes verified against source lines: 84
+Consumes ledger rows: 89/89
+DAG: 114 nodes, 173 edges, acyclic
+Sequential order: 114 unique tasks; every prerequisite precedes its consumer
+Parallel waves: 44; every prerequisite is in an earlier wave
+Structural critical path: 44 tasks / 43 edges
+Markdown fences: balanced
+Document checks: PASS
+Exit code: 0
+```
+
+Command: the following PowerShell here-string piped to `node -` (no helper file was created):
+
+```powershell
+@'
+const fs = require('fs');
+const assert = require('assert/strict');
+const names = ['2026-09-10-plan-1-foundation.md','2026-09-10-plan-2-worker-engine.md','2026-09-10-plan-3-preflop-replay.md','2026-09-10-plan-4-flop-cache-presolver.md','2026-09-10-plan-5-ui.md'];
+const sources = Object.fromEntries(names.map((n,i) => ['P'+(i+1),fs.readFileSync('docs/superpowers/plans/'+n,'utf8').split(/\r?\n/)]));
+sources.S=fs.readFileSync('docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md','utf8').split(/\r?\n/);
+const report=fs.readFileSync('docs/research/REVIEW-cross-plan-2.md','utf8');
+const counts=names.map((n,i)=>sources['P'+(i+1)].filter(x=>/^#{2,3} Task \d+:/.test(x)).length);
+assert.deepEqual(counts,[25,30,19,26,14]);
+console.log('Task inventory: '+counts.join(' + ')+' = '+counts.reduce((a,b)=>a+b,0));
+const findingSection=report.split('## 2. Findings:')[1].split('## 3. Complete')[0];
+const findings=[...findingSection.matchAll(/^### (F\d+) \u2014 (BLOCKER|MAJOR|MINOR) \u2014 /gm)];
+assert.equal(findings.length,24);
+const severity=['BLOCKER','MAJOR','MINOR'].map(s=>s+'='+findings.filter(f=>f[2]===s).length);
+console.log('Findings: '+findings.length+' ('+severity.join(', ')+')');
+let quoteCount=0;
+for(const m of findingSection.matchAll(/^- \*\*(P\d|S)(?:\.T\d+\/[^:]+)?:L(\d+)\*\*: \u201c(.*)\u201d$/gm)){
+ const [,key,line,q]=m;assert(sources[key][+line-1].includes(q),'quote '+key+':'+line);
+ assert(q.trim().split(/\s+/).length<=30);quoteCount++;
+}
+assert.equal(quoteCount,84);console.log('Paired finding quotes verified against source lines: '+quoteCount);
+const ledger=report.split('## 3. Complete')[1].split('## 4. Explicit')[0];
+assert.equal([...ledger.matchAll(/^\| P[2-5]\.T\d+, L\d+ \|/gm)].length,89);
+console.log('Consumes ledger rows: 89/89');
+const graphBlock=report.split('### 7.1 Every task')[1].split('### 7.2')[0];
+const graph={};const waveByTask={};
+for(const m of graphBlock.matchAll(/^\| (?:\u2605 )?(\d+\.\d+) \u2014 .*? \| ([^|]+) \| (\d+) \|/gm)){
+ graph[m[1]]=m[2].trim()==='\u2014'?[]:m[2].trim().split(', ');
+ waveByTask[m[1]]=+m[3];
+}
+assert.equal(Object.keys(graph).length,114);
+const expected=new Set(counts.flatMap((n,p)=>Array.from({length:n},(_,i)=>(p+1)+'.'+(i+1))));
+assert.deepEqual(new Set(Object.keys(graph)),expected);
+for(const [t,ds] of Object.entries(graph))for(const d of ds){assert(expected.has(d));assert(waveByTask[d]<waveByTask[t],t+' <- '+d);}
+const sequential=report.split('### 7.2 One complete')[1].split('### 7.3')[0].match(/\x60{3}text\n([\s\S]*?)\x60{3}/)[1].match(/\d+\.\d+/g);
+assert.equal(sequential.length,114);assert.deepEqual(new Set(sequential),expected);
+const pos=Object.fromEntries(sequential.map((x,i)=>[x,i]));
+for(const [t,ds] of Object.entries(graph))for(const d of ds)assert(pos[d]<pos[t]);
+const waveRows=report.split('### 7.3 Parallel waves')[1].split('### 7.4')[0];
+const seen=new Set();let nWaves=0;
+for(const m of waveRows.matchAll(/^\| (\d+) \| (.*) \|$/gm)){
+ nWaves++;for(const t of m[2].match(/\d+\.\d+/g)){assert(!seen.has(t));seen.add(t);assert.equal(waveByTask[t],+m[1]);}
+}
+assert.equal(nWaves,44);assert.equal(seen.size,114);
+const critical=report.split('### 7.4 Critical path')[1].match(/\x60{3}text\n([\s\S]*?)\x60{3}/)[1].match(/\d+\.\d+/g);
+assert.equal(critical.length,44);
+for(let i=1;i<critical.length;i++)assert(graph[critical[i]].includes(critical[i-1]));
+console.log('DAG: 114 nodes, '+Object.values(graph).reduce((n,x)=>n+x.length,0)+' edges, acyclic');
+console.log('Sequential order: 114 unique tasks; every prerequisite precedes its consumer');
+console.log('Parallel waves: 44; every prerequisite is in an earlier wave');
+console.log('Structural critical path: 44 tasks / 43 edges');
+assert.equal([...report.matchAll(/^\x60{3}/gm)].length%2,0);
+console.log('Markdown fences: balanced');
+console.log('Document checks: PASS');
+'@ | node -
+```
+
+`git -c safe.directory=D:/Documents/Projects/PokerAI diff --check` returned exit 0 with **no output**. The final status shows only `M docs/research/REVIEW-cross-plan-2.md`; the report's structure was also checked by the validator above. The rules, plans, spec, .gitignore and docs maintenance files were left untouched.
+
+### 8.3 Remaining decision and completion boundary
+
+The review deliverable is complete. Implementation readiness is not: first resolve **F20** in the authoritative spec, then apply E01–E06 with the required plan/spec changelogs in a separate task, and re-check the changed seams. The proposals preserve P2’s Paths/startup choices, assign every new helper to an existing numbered task, and keep 114 tasks; they do not make unmeasured timing, missing charts or a future release gate pass by assertion.
+
+After those corrections, the first execution wave is **P1.T1**. Until then, this report’s graph is a validated **proposed** dependency order rather than authorization to ignore the conflicting current plans.

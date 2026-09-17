@@ -1,5 +1,9 @@
 # Plan 1: Foundation Implementation Plan
 
+Revision 3 (2026-09-17): verification edits R7 from docs/research/REVIEW-cross-plan-3.md; changelog PLAN-1-CHANGELOG-3.md
+
+Revision 2 (2026-09-17): seam re-check edits E01/E06 from docs/research/REVIEW-cross-plan-2.md; changelog PLAN-1-CHANGELOG-2.md
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stand up the Cargo workspace and the five foundation crates (`proto`, `core-model`, `core-ranges`, `core-iso`, `core-eval`) with every §13.1 test for them green, plus the Python `tools/` oracles that generate `fixtures/hands` (PokerKit) and `fixtures/eval` (phevaluator).
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Rust 2021 on `stable-x86_64-pc-windows-msvc` (1.95; the MSVC C++ tools are installed, the user's global default stays GNU), `serde 1.0` + `serde_json 1.0`, `thiserror 2.0`, `sha2 0.10.9`, `holdem-hand-evaluator` (git, commit `d7b2a5bba4015f96855d5cd66d21f781d3cbcf9b`, MIT), Python 3.12 with `pokerkit==0.7.5`, `phevaluator==0.6.0`, `pytest`.
 
-**Spec:** `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md` (revision 6), sections 2, 3.2, 3.5, 3.6, 3.7, 4.1-4.6, 10.2, 13.0, 13.1. Decisions: `docs/design/2026-09-10-design-outline.md` §0b. Library facts: `docs/research/R3-libraries.md`. Cross-plan interface resolutions: `docs/research/REVIEW-cross-plan.md` §1-§2.
+**Spec:** `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md` (revision 7), sections 2, 3.2, 3.5, 3.6, 3.7, 4.1-4.6, 10.2, 13.0, 13.1. Decisions: `docs/design/2026-09-10-design-outline.md` §0b. Library facts: `docs/research/R3-libraries.md`. Cross-plan interface resolutions: `docs/research/REVIEW-cross-plan.md` §1-§2.
 
 ## Global Constraints
 
@@ -25,7 +29,7 @@
 - Worker wire (§4.5): UTF-8 JSON Lines, `#[serde(tag = "type")]`, lowercase tags, unknown fields rejected, ids as decimal strings; limits request line <= 1 MiB, result line <= 16 MiB, <= 100,000 exported nodes; matrix validation: `probs` and `ev_chips` exactly `[1326][actions.len()]`, finite, every probability in `[0, 1]`, available rows sum to `1 +- 1e-3`, unavailable rows all zero, `requested < nodes.len()`, `covered_paths[k] == nodes[k].path`, every chip path resolves against the materialized tree.
 - Build flags (§3.7): `.cargo/config.toml` sets `rustflags = ["-C", "target-feature=+avx2"]` for `x86_64-pc-windows-gnu` and `x86_64-pc-windows-msvc`.
 - Toolchain (§3.6, repo-wide): `rust-toolchain.toml` pins `stable-x86_64-pc-windows-msvc` for the **whole repository**, including `solver-worker` and `bench` in plans 2-5 (Tauri needs the MSVC target and a hello-world with the git evaluator, `serde` and `+avx2` was verified to build and link under MSVC on this machine). R8's solver figures were measured on GNU, so **V1 in plan 2 must re-verify them**: build and run the pinned-solver example on MSVC with `+avx2` and compare its FLOP-FAST time with the GNU figure in R8 §5. If the MSVC build fails or is more than 25% slower, the `solver-worker` binary **alone** is built with `cargo +stable-x86_64-pc-windows-gnu` through the documented target `scripts/build-worker-gnu.ps1` (Task 1), while the rest of the workspace stays MSVC. No timing is compared with R8 before that check runs.
-- Dependency versions: the root `[workspace.dependencies]` table is the single source for `serde`, `serde_json`, `thiserror`, `sha2` and `holdem-hand-evaluator`. Every crate of this plan and of plans 2-5 writes `sha2.workspace = true`, `thiserror.workspace = true`, `serde.workspace = true` (never its own version), and `version.workspace = true` / `edition.workspace = true` / `license.workspace = true` in `[package]`. `sha2 = "0.10.9"` (the version plan 4 verified for the cache-key digest) and `thiserror = "2.0"` are pinned once here so `hash_scaled` and the cache key use one `Digest` trait.
+- Dependency versions: the root `[workspace.dependencies]` table is the single source for `serde`, `serde_json`, `thiserror`, `sha2`, `hex`, `ts-rs` and `holdem-hand-evaluator` (F15: plan 2's `hex`, plan 4's `ts-rs` and plan 5's `ts-rs` version pin all assume this root declaration, which is added by Task 1). Every crate of this plan and of plans 2-5 writes `sha2.workspace = true`, `thiserror.workspace = true`, `serde.workspace = true` (never its own version), and `version.workspace = true` / `edition.workspace = true` / `license.workspace = true` in `[package]`. `sha2 = "0.10.9"` (the version plan 4 verified for the cache-key digest) and `thiserror = "2.0"` are pinned once here so `hash_scaled` and the cache key use one `Digest` trait. `hex = "0.4"` and `ts-rs = "=12.0.1"` are declared at the root for optional use; a root optional-use version declaration does not by itself enable ts-rs in `proto` or the worker.
 - Tests: `cargo test --workspace` green after every task; exhaustive suites behind `--features exhaustive`; Python tests with `pytest`. Commits: one per task, `feat(<crate>): ...` / `test(<crate>): ...` / `chore: ...`, trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 
 ## Verified environment and library facts (2026-09-10)
@@ -92,7 +96,7 @@
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: the workspace every later crate joins by creating a directory under `crates/`; `proto::PROTO_VERSION: u16 = 3`; the `[workspace.dependencies]` table that every crate of plans 1-5 inherits with `.workspace = true` (`serde 1.0`, `serde_json 1.0`, `thiserror 2.0`, `sha2 0.10.9`, `holdem-hand-evaluator` at the pinned rev); `scripts/build-worker-gnu.ps1`, the §3.6 fallback target plan 2's V1 check may activate. Plan 2 extends the root manifest with `"solver-worker"` in `members` and `exclude = ["third_party/postflop-solver"]`; `crates/*` already covers `crates/engine` and `crates/bench`, which plan 2 must not re-add.
+- Produces: the workspace every later crate joins by creating a directory under `crates/`; `proto::PROTO_VERSION: u16 = 3`; the `[workspace.dependencies]` table that every crate of plans 1-5 inherits with `.workspace = true` (`serde 1.0`, `serde_json 1.0`, `thiserror 2.0`, `sha2 0.10.9`, `hex 0.4`, `ts-rs =12.0.1`, `holdem-hand-evaluator` at the pinned rev; a root optional-use version declaration does not enable ts-rs in proto or the worker); `scripts/build-worker-gnu.ps1`, the §3.6 fallback target Plan 2 Task 1's V1 MSVC FLOP-FAST measurement may activate. Plan 2 Task 1 excludes the vendor; Plan 2 Task 7 creates `solver-worker`, extends the root manifest with `"solver-worker"` in `members` and `exclude = ["third_party/postflop-solver"]`, and adds that member; `crates/*` already covers `crates/engine` and `crates/bench`, which plan 2 must not re-add.
 
 - [ ] **Step 1: Write the workspace files**
 
@@ -114,6 +118,8 @@ serde_json = "1.0"
 thiserror = "2.0"
 sha2 = "0.10.9"
 holdem-hand-evaluator = { git = "https://github.com/b-inary/holdem-hand-evaluator", rev = "d7b2a5bba4015f96855d5cd66d21f781d3cbcf9b" }
+hex = "0.4"
+ts-rs = "=12.0.1"
 
 [profile.dev]
 opt-level = 1
@@ -124,6 +130,8 @@ opt-level = 3
 [profile.release]
 opt-level = 3
 ```
+
+`hex` and `ts-rs` are added to `[workspace.dependencies]` here (F15): plan 2's `hex.workspace = true`, plan 4's `ts-rs = { workspace = true, optional = true }` and plan 5's `version = "=12.0.1"` all assumed a root declaration that did not exist. `serde = "1.0"`, `serde_json = "1.0"`, `thiserror = "2.0"`, `sha2 = "0.10.9"` and the evaluator rev are unchanged. A root optional-use version declaration does not enable ts-rs in `proto` or the worker; each consuming crate still gates it behind its own `optional = true` / `feature = "typescript"`.
 
 `rust-toolchain.toml` (repo-wide pin; Tauri needs the MSVC target and plans 2-5 assume it — see Global Constraints for the V1 re-verification and the `solver-worker`-only GNU fallback):
 ```toml
@@ -215,7 +223,7 @@ Copy-Item $built "target\release\solver-worker.exe" -Force
 Write-Host "solver-worker.exe built with stable-x86_64-pc-windows-gnu and staged in target\release"
 ```
 
-Run: `powershell -NoProfile -File scripts/build-worker-gnu.ps1 -WhatIf` is **not** run in this task — `solver-worker` does not exist until plan 2 Task 1. Verify only that the file is written and that `rustup toolchain list` shows `stable-x86_64-pc-windows-gnu` (installed or installable).
+Run: `powershell -NoProfile -File scripts/build-worker-gnu.ps1 -WhatIf` is **not** run in this task. Do not execute the GNU worker build in this task: solver-worker is created in Plan 2 Task 7. Plan 2 Task 1 owns the V1 MSVC FLOP-FAST measurement and records the worker toolchain selection; this task only creates the fallback script. Every subsequent worker build, worker test and runtime staging step consumes that selection, while engine, bench and pokerai-app remain MSVC. Verify only that the file is written and that `rustup toolchain list` shows `stable-x86_64-pc-windows-gnu` (installed or installable).
 Expected: the file exists; `cargo test --workspace` is unaffected.
 
 - [ ] **Step 4: Commit**
@@ -5303,7 +5311,7 @@ git commit -m "feat(core-eval): Monte Carlo equity with joint disjoint sampling 
 ## Running everything
 
 - `cargo test --workspace` (green after every task). Budget **1-3 minutes** in the `dev` profile once the fixtures exist, not seconds: `core-eval`'s `oracle_map()` builds a 2,598,960-hand rank table (once per test binary, behind a `OnceLock`), `equity_mc_within_standard_error` performs roughly 2 x 10^7 evaluations, and `iso_class_count_1755` / `iso_orbit_sizes` each canonicalize 22,100 flops over 24 permutations.
-- `cargo test -p core-eval --features exhaustive` after `tools/.venv/Scripts/python tools/gen_eval_oracle.py --skip-5card --samples 10000000 --samples-name phevaluator_7card_10m.bin` (the file is gitignored; the `bench oracle` subcommand that wraps this belongs to **plan 4 Task 20**, cross-plan Or2 — plan 2's CLI is `run` / `gen-spots` / `materialize` only).
+- `cargo test -p core-eval --features exhaustive` after `tools/.venv/Scripts/python tools/gen_eval_oracle.py --skip-5card --samples 10000000 --samples-name phevaluator_7card_10m.bin` (the file is gitignored; the `bench oracle` subcommand that wraps this belongs to **plan 4 Task 23**, cross-plan Or2 (REVIEW-cross-plan-2 E06) — plan 2's CLI is `run` / `gen-spots` / `materialize` only).
 - `tools/.venv/Scripts/python -m pytest tools -q` (Python oracles and generators: 3 tests after Task 15, 8 after Task 16, 11 after Task 22).
 - Regenerating fixtures is deterministic: `tools/.venv/Scripts/python tools/gen_fixtures.py --out fixtures/hands` and `tools/.venv/Scripts/python tools/gen_eval_oracle.py --out-dir fixtures/eval` reproduce the committed bytes.
 - `rustup show active-toolchain` must name `stable-x86_64-pc-windows-msvc` (repo-wide, §3.6). `scripts/build-worker-gnu.ps1` is the fallback for the `solver-worker` binary alone and is run only if plan 2's V1 check rejects MSVC for the vendored solver.
@@ -5345,9 +5353,9 @@ The engine (plan 2) chooses `EquityMode::Exact` when `core_eval::exact_cost(&req
 - Plan 2 adds `bb_chips` to both `StreetRootSnapshot { .. }` literals (its own Task 4 Step 1 and Task 16 Step 1) (M9).
 - Plan 2 rewrites `crates/engine/src/equity.rs` and the `river_check_only_terminal_oracle` oracle against the `EquityRequest` / `EquityResult` shape above, reads `EquityResult.shares` / `.status`, and replaces its local `mode_for` with `core_eval::exact_cost` (M8).
 - Plans 2, 3 and 4 re-export `proto::resolve_chip_path` instead of defining `tree::resolve_chip_path` / `resolve_path` (M21, D2); plan 3's call site passes `&tree.materialized`.
-- Plans 2 and 4 take `serde`, `serde_json`, `thiserror` and `sha2` from `[workspace.dependencies]` with `.workspace = true`, and give `crates/engine` and `crates/cache` `version/edition/license.workspace = true` (M18, R6).
+- Plans 2 and 4 take `serde`, `serde_json`, `thiserror` and `sha2` from `[workspace.dependencies]` with `.workspace = true`, and give `crates/engine` and `crates/cache` `version/edition/license.workspace = true` (M18, R6). Plan 2 also takes `hex` (`hex.workspace = true`) and plan 4 takes `ts-rs` (`ts-rs = { workspace = true, optional = true }`) from the same root table added in Task 1 (F15, REVIEW-cross-plan-2 E01).
 - Plan 2 drops the "GNU toolchain for this plan" line from its Tech Stack; the repo-wide MSVC pin plus the V1 check above governs (M19, R1).
-- Plan 2 Task 1 adds only `"solver-worker"` to `members` and `exclude = ["third_party/postflop-solver"]`; `crates/*` already covers `engine` and `bench` (D9).
+- Plan 2 Task 1 excludes the vendor (`exclude = ["third_party/postflop-solver"]`); Plan 2 Task 7 creates `solver-worker` and adds that member to `members`; `crates/*` already covers `engine` and `bench` (D9; corrected per REVIEW-cross-plan-2 E06 — Task 1 does not add the `solver-worker` member).
 - Plan 2's `tools/gen_worker_fixtures.py` owes a cross-check test that `fixtures/worker/river_two_combo.jsonl` agrees combo-by-combo with `river_two_combo_ranges()` in `crates/proto/tests/wire_examples.rs` (D7).
 - Plan 5 registers `crate::Ready`, `crate::PlayerMenus`, `crate::SideMenu` and `crate::MenuSize` (with `ts(type = r#"number | "a""#)`) in the ts-rs registry, and does **not** add a `proto::BeginHand` of its own (M1, M4, Or4).
 
@@ -5414,10 +5422,10 @@ Deliberate deviations and cross-plan decisions (all named so later plans can rel
 8. The repo-wide MSVC pin of §3.6 is kept because Tauri needs it and a hello-world with the git evaluator was verified to build and link under MSVC here. R8's solver numbers are GNU, so plan 2's V1 must re-verify the pinned solver under MSVC with `+avx2` before any timing comparison, with `scripts/build-worker-gnu.ps1` as the `solver-worker`-only fallback at a >25% regression (review M7, cross-plan M19/R1).
 9. `[workspace.dependencies]` pins `sha2 = "0.10.9"` and `thiserror = "2.0"` for the whole workspace so `hash_scaled` and plan 4's cache-key digest share one `Digest` trait (cross-plan M18, R6).
 10. `fixtures/worker/*.jsonl` and `tools/gen_worker_fixtures.py` belong to plan 2; `river_two_combo_ranges()` in `crates/proto/tests/wire_examples.rs` is the definition of that data, and plan 2 owes the combo-by-combo cross-check (D7).
-11. The 10,000,000-sample 7-card check runs only with `--features exhaustive` against a locally generated, gitignored file (spec §13.0 revision 6, S17); its runner is `bench oracle` in plan 4 Task 20 (Or2).
+11. The 10,000,000-sample 7-card check runs only with `--features exhaustive` against a locally generated, gitignored file (spec §13.0 revision 6, S17); its runner is `bench oracle` in plan 4 Task 23 (Or2; corrected per REVIEW-cross-plan-2 E06).
 12. The PokerKit generator applies **three** documented normalizations (straddle minimum open `2S`; fold-out survivor bet split; pot layers folded into `layer_pots`' rule) and drops seeds where PokerKit's reopening rule diverges from §4.3 (1 in 201). Spec §13.1 revision 6 records them (S5), and Task 18's fixture policy states which side a mismatch is fixed on.
 13. `Derived` per-seat vectors are indexed by `Seat.0` with undealt seats marked folded; `HandState.stacks_start` is aligned with `HandState.dealt` (spec §4.3 revision 6, S6).
-14. `ts-rs` bindings are plan 5's (per the series brief), gated behind `feature = "typescript"` so `cargo test --workspace` for plans 1-4 is unaffected.
+14. `ts-rs` bindings are plan 5's (per the series brief), gated behind `feature = "typescript"` so `cargo test --workspace` for plans 1-4 is unaffected. `ts-rs = "=12.0.1"` is now pinned once in the root `[workspace.dependencies]` (F15) so plan 5 does not declare a second version; the root declaration alone does not enable it anywhere.
 
 ### 2. Placeholder scan
 

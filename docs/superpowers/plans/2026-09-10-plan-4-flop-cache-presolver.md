@@ -1,5 +1,9 @@
 ﻿# Plan 4: Flop path, cache and pre-solver Implementation Plan
 
+Revision 3 (2026-09-17): verification edits R2, R3, R5, R7 from docs/research/REVIEW-cross-plan-3.md; changelog PLAN-4-CHANGELOG-3.md
+
+Revision 2 (2026-09-17): seam re-check edits E04/E06 from docs/research/REVIEW-cross-plan-2.md; changelog PLAN-4-CHANGELOG-2.md
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Complete the flop decision path, pot-normalized flop/turn cache, resumable idle pre-solver, and reproducible flop/e2e/fault baseline gates.
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Rust edition 2021, stable Rust 1.95 or newer, MSVC pinned by Plan 1's `rust-toolchain.toml`, std threads/channels, serde, thiserror, SHA-256, bincode + zstd; Python 3.12, PokerKit 0.7.5, pytest.
 
-**Spec:** `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md`, revision 6, §§2, 3.2–3.5, 4.2–4.6, 5 step 7, 6, 7, 9, 10.1–10.6, 12, 13.1/13.3/13.5, 14.4 V3/V21/V22. Approval: `docs/design/2026-09-10-design-outline.md` §0b and amended §6. Measurements: `docs/research/R8-solver-bench.md`, especially A.2/A.5/A.7. Libraries: `docs/research/R3-libraries.md`. Cross-plan resolutions: `docs/research/REVIEW-cross-plan.md` §§1, 2, 4, 5.
+**Spec:** `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md`, revision 7, §§2, 3.2–3.5, 4.2–4.6, 5 step 7, 6, 7, 9, 10.1–10.6, 12, 13.1/13.3/13.5, 14.4 V3/V21/V22. Approval: `docs/design/2026-09-10-design-outline.md` §0b and amended §6. Measurements: `docs/research/R8-solver-bench.md`, especially A.2/A.5/A.7. Libraries: `docs/research/R3-libraries.md`. Cross-plan resolutions: `docs/research/REVIEW-cross-plan.md` §§1, 2. REVIEW-cross-plan §§4–5 are historical. Use REVIEW-cross-plan-2 §7 after its listed corrections are accepted.
 
 ## Global Constraints
 
@@ -37,7 +41,9 @@
 
 ## Interface ownership and execution order
 
-Execute after Plans 1–3. Consume the spec's public surfaces without renaming:
+Execute tasks against the hard prerequisites in REVIEW-cross-plan-2 §7 after the documented seam corrections are applied. Every prerequisite must be implemented, green and reviewed before a dependent task starts. A plan number alone is not an execution dependency. Plan 5 Task 14 precedes the final Plan 4 Task 26 release decision. Serialize edits to shared files when working in one checkout, and serialize measured benchmark/acceptance runs on the benchmark machine.
+
+Consume the spec's public surfaces without renaming:
 
 ```rust
 canonicalize(board: &[Card], ranges: &[&Range1326]) -> (CanonicalBoard, SuitPerm);
@@ -48,8 +54,10 @@ build_effective_tree(root: &StreetRootSnapshot, selection: &TemplateSelection)
 replay(input: ReplayInput<'_>) -> ReplayOutput;
 PreflopStore::query(&self, cfg: &HandConfig, state: &HandState, prefix_len: usize)
     -> PreflopAnswer;
-register_snapshot(identity: &DecisionIdentity, snapshot: StreetSnapshot);
+Engine::register_snapshot(&mut self, &DecisionIdentity, StreetSnapshot) -> bool;
 ```
+
+`Engine::register_snapshot(&mut self, &DecisionIdentity, StreetSnapshot) -> bool` is the Plan 3 Task 18 façade; live/cache internals use the same `SnapshotStore::register`. There is no free `engine::snapshots::register_snapshot` function.
 
 `proto::worker::validate_solution`, `WorkerLink`, the clock seam and engine admission/assembly belong to Plans 1–2. Their concrete argument wrappers come from those definitions: the spec does not supply complete Rust declarations. Do not create substitute validators or a second WorkerLink. Each integration task defines its new helper signatures and maps the existing boundary explicitly. Module filenames for extensions below are owned by this plan; import prerequisite items from their actual modules.
 
@@ -60,31 +68,37 @@ register_snapshot(identity: &DecisionIdentity, snapshot: StreetSnapshot);
 | Bet/raise menu types (M1) | Plan 1 Task 6: `MenuSize::{Pot(f32), AllIn}` (untagged wire `0.33` / `"a"`), `SideMenu { bet: Vec<MenuSize>, raise: Vec<MenuSize> }`, `PlayerMenus { oop: SideMenu, ip: SideMenu, donk: Option<Vec<MenuSize>> }`. `donk` is `None` on the root street and `Some(vec![])` after it (Plan 2 `spec()` helper). | Tasks 2, 8 |
 | Chip-path resolution (M21/D2) | Plan 1 Task 6: `proto::resolve_chip_path(&[MaterializedNode], &[Action]) -> Option<OrdinalPath>`. This plan re-exports it as `cache::entry::resolve_path`; it never re-implements the §2 rule. | Tasks 2, 7, 12 |
 | Worker constants (M5/Or6/m1) | Plan 1 Task 7: `proto::worker::{PROTO_VERSION: u16 = 3, SOLVER_COMMIT: &str = "9d1509fe5077d019825f833eed04b16d342dfda1", ADAPTER_VERSION: u16 = 1}`. | Tasks 2, 5, 8 |
-| `engine::Paths` (M13/Or5) | Plan 2 Task 21: `Paths { worker: PathBuf, preflop: PathBuf, cache: PathBuf, log: PathBuf }`. This plan reads `.cache`. | Tasks 6, 7 |
-| Deadlines (D5/M3) | Plan 2 Task 16: `Deadlines::for_request(t0_ms, Street, flop_budget_s)`, `street_budget_ms`, `final_delivery_ms`, `extraction_margin_ms`, `Deadlines::watchdog_fire_ms()`, `retry_admitted`. This plan adds **no** parallel deadline arithmetic. | Task 9 |
-| `Engine::set_config` (M10/M4) | Plan 2 Task 21, changed to `set_config(&mut self, GameConfig) -> Result<u32, EngineError>`. This plan supplies the validation body. | Task 9 |
-| `Engine::shutdown` (M11) | Plan 2 Task 21, changed to `shutdown(&mut self)` with an idempotent flag. | Task 16 |
+| `engine::Paths` (M13/Or5) | Plan 2 Task 29: `Paths { log_dir: PathBuf, worker_exe: PathBuf, preflop: PathBuf, cache: PathBuf }`. This plan reads `.cache`. `log_dir` is a directory; `DecisionLog` appends `decisions.jsonl` inside it. | Tasks 6, 7 |
+| Deadlines (D5/M3) | Plan 2 Task 20 owns `Deadlines` and watchdog arithmetic: `Deadlines::for_request(t0_ms, Street, flop_budget_s)`, `street_budget_ms`, `final_delivery_ms`, `extraction_margin_ms`, `Deadlines::watchdog_fire_ms()`, `retry_admitted`. This plan adds **no** parallel deadline arithmetic. | Task 9 |
+| `Engine::set_config` (M10/M4) | Plan 2 Task 29: `set_config(&mut self, GameConfig) -> Result<u32, EngineError>`. Plan 2 Task 29 already supplies validation and next-hand queuing; this plan adds tests. | Task 9 |
+| `Engine::shutdown` (M11) | Plan 2 Task 29: `shutdown(&mut self)` with an idempotent flag. | Task 16 |
 | `StreetRootSnapshot` (M9/S1) | Plan 1 Task 3 includes `bb_chips: u32`; every literal in this plan sets it. | Tasks 11, 12 |
-| Snapshot store (M15/D1) | Plan 3 Task 11 `core_replay::{SnapshotKey, SnapshotProvenance, StreetSnapshot, SnapshotStore}` replaces Plan 2's temporary `SolvedStreetStore`; `engine::snapshots` re-exports it and owns the single `register_snapshot(&DecisionIdentity, StreetSnapshot)` path. | Task 12 |
-| `engine::bench_support` (M17/R5) | Plan 2 Task 22 creates `crates/engine/src/bench_support.rs` re-exporting `core_ranges::{parse_range, block_public, hash_scaled}` so `bench` keeps only `proto` + `engine` dependencies. This plan **modifies** it. | Tasks 17–22 |
-| Test templates (M20/D10, B1) | Plan 2 Task 2 exposes one test-only registration seam on `Templates`; this plan registers `check_jam_test_v1`, `check_only_test_v1`, `menu_round_test_v1` through it (Task 8). Plan 2's `Templates::ids().len()` assertion stays 9 because the seam is `#[cfg(any(test, feature = "testing"))]` and additive at runtime only. | Task 8 |
+| Snapshot store (M15/D1) | Plan 3 Task 13 defines snapshot records; Task 14 replaces Plan 2 Task 27's `SolvedStreet` and `SnapshotStore` with `core_replay::{SnapshotKey, SnapshotProvenance, StreetSnapshot, SnapshotStore}`. `Engine::register_snapshot(&mut self, &DecisionIdentity, StreetSnapshot) -> bool` is the Plan 3 Task 18 façade; live/cache internals use the same `SnapshotStore::register`. | Task 12 |
+| `engine::bench_support` (M17/R5) | Plan 2 Task 5 creates `crates/engine/src/bench_support.rs` with `prepared_range` and `range_mass`; later tasks extend this file. This plan **modifies** it. | Tasks 17–22 |
+| Test templates (M20/D10, B1) | Plan 2 Task 2 owns `Templates::with_extra(&[TemplateSpec])`, `Templates::base_ids()` and the `test-templates` feature. This plan registers `check_jam_test_v1`, `check_only_test_v1`, `menu_round_test_v1` through `with_extra` (Task 8). `Templates::base_ids().len()` stays 9; `Templates::ids()` includes registered extras. | Task 8 |
+| Result assembly (M14) | Plan 2 Task 26 owns `final_from_solution` and the main recommendation assembler; `advice_rows` is not an upstream API. | Tasks 10, 11 |
+| Engine test doubles | The `testing` feature is declared in Plan 2 Task 2; `FakeClock`/`FakeWorker`/`RecordingSink` are produced in Task 19. | Tasks 8–12, 15–16, 21–22 |
 | Background jobs (R2) | Plan 2's `SolvePlan.background` is a real field; Plan 2 exercises only `false`. This plan sends `background: true` for pre-solver jobs. | Task 16 |
 
-Plan 2's available interface table specifies `validate_solution(sol: &StreetSolution, materialized: &[MaterializedNode]) -> Result<Vec<OrdinalPath>, String>`; use that exact call below. Plan 2's complete engine module list after its Task 21 is `clock, identity, tree/{mod,templates,materialize,effective,signature,resolve}, worker/{mod,link,process,ready}, deadline, watchdog, core, solve, coverage, equity, allin, assemble, log, snapshots, ranges, serve, engine`, plus `testing` behind `#[cfg(any(test, feature = "testing"))]`. Extend those modules at their named symbols rather than adding duplicate deadline/log/config/serve implementations. The flop route is cut into `engine/src/serve.rs` (`serve_request`) and `engine/src/solve.rs` (`run_solve`, `SolvePlan`), which is why both appear in this plan's file structure. Plan 3 provides `PreflopStore::open(dir: &Path) -> (Self, Vec<String>)`, `PreflopStore::query`, `replay(ReplayInput) -> ReplayOutput` and sibling chart manifests `<name>.manifest.json`.
+Plan 2's available interface table specifies `validate_solution(sol: &StreetSolution, materialized: &[MaterializedNode]) -> Result<Vec<OrdinalPath>, String>`; use that exact call below. Plan 2 Task 29 owns the public `Engine` façade (`new`, `startup_report`, `set_config`, `shutdown`, `set_hero_cards`, `begin_hand`, `Paths`); Task 21 owns `DecisionLog` only. Plan 2's complete engine module list after its Task 29 is `clock, identity, tree/{mod,templates,materialize,effective,signature,resolve}, worker/{mod,link,process,ready}, deadline, watchdog, core, solve, coverage, equity, allin, assemble, log, snapshots, ranges, serve, engine`, plus `testing` behind `#[cfg(any(test, feature = "testing"))]`. Extend those modules at their named symbols rather than adding duplicate deadline/log/config/serve implementations. The flop route is cut into `engine/src/serve.rs` (`serve_request`) and `engine/src/solve.rs` (`run_solve`, `SolvePlan`), which is why both appear in this plan's file structure. Plan 3 provides `PreflopStore::open(dir: &Path) -> (Self, Vec<String>)`, `PreflopStore::query`, `replay(ReplayInput) -> ReplayOutput` and sibling chart manifests `<name>.manifest.json`.
 
 Tagged proto enums cannot be deserialized directly by bincode. Task 5 uses a binary DTO with JSON metadata for tagged proto values and binary numeric matrices, preserving the normative JSON schema.
 
 Verified 2026-09-10: [bincode 1.3.3](https://docs.rs/bincode/1.3.3/bincode/), [zstd 0.13.3](https://docs.rs/zstd/0.13.3/zstd/), [sha2 0.10.9](https://docs.rs/sha2/0.10.9/sha2/), [thiserror 2.0.17](https://docs.rs/thiserror/2.0.17/thiserror/). Cache bincode 1.3.3 coexists with solver bincode 2.0.0-rc.3. Per cross-plan M18 the workspace pins one line of each shared crate in Plan 1's `[workspace.dependencies]` (`sha2 = "0.10.9"`, `thiserror = "2.0"`, `serde`, `serde_json`); `cache` and `engine` take them with `workspace = true` so `hash_scaled` and the cache key digest share one `Digest` trait.
 
-### Interface notes owed to Plan 2 (its cross-plan fix must land first)
+### Interface notes owed to Plan 2 — all seven are satisfied by the revised Plan 2
 
-1. `Templates` gains one test-only registration seam (Task 8 states the exact one-line addition against Plan 2 Task 2 Step 6).
-2. `Engine::set_config` returns `Result<u32, EngineError>` (Plan 2 Task 21; this plan implements the rejection body in Task 9).
-3. `engine::Paths` declares `{ worker, preflop, cache, log }` (Plan 2 Task 21; this plan reads `cache`).
-4. `crates/engine/src/bench_support.rs` is created by Plan 2 Task 22 (M17/R5) and extended here.
-5. `crates/bench/src/lib.rs` is added to Plan 2 Task 5 so `bench` integration tests can link its modules (D4).
-6. Plan 2 must not state "the engine always sends `background: false`" (R2); it exercises only that value.
-7. `Engine::shutdown(&mut self)` (M11) so Task 16's presolver shutdown can run from the engine handle.
+Nothing in this list is still owed. The revised Plan 2 already declares every one of them; this plan adapts to the declared shapes and adds no competing declaration (REVIEW-cross-plan-2 §4.1).
+
+| Note | Plan 2's declared shape | This plan's obligation |
+|---|---|---|
+| 1. Test-template seam | Plan 2 Task 2: `Templates::with_extra(&[TemplateSpec])`, `Templates::base_ids()`, feature `test-templates`. | Task 8 registers its three templates through `with_extra` and asserts `base_ids().len() == 9`. No Plan 2 registry rewrite, no second `Templates::get` patch. |
+| 2. Fallible `set_config` | Plan 2 Task 29: `set_config(&mut self, GameConfig) -> Result<u32, EngineError>`, with blind/thread/flop validation, revision allocation and next-hand queuing. | Task 9 preserves that body and adds tests plus `flop_budget_valid`. It never replaces the implementation. |
+| 3. Four `Paths` fields | Plan 2 Task 29: `Paths { log_dir, worker_exe, preflop, cache }`. | Tasks 6–7 read `.cache` and pass `log_dir` as a directory. The old `{ worker, preflop, cache, log }` spelling is gone. |
+| 4. `bench_support.rs` | Plan 2 Task 5: `engine::bench_support::{prepared_range, range_mass}`. | Tasks 17–22 extend that file; this plan does not claim `parse_range`/`block_public`/`hash_scaled` re-exports it does not own. |
+| 5. `crates/bench/src/lib.rs` | Plan 2 Task 5 declares the library target with `suite`, `gen_spots`, `materialize`, `runner`, `report`. | Task 20 adds `pub mod flop;` beside them. |
+| 6. Background parameter | Plan 2 Task 22 owns `SolvePlan.background`; Plan 2 exercises only `false`. | Task 16 sends `true`, through the single worker owner (see Tasks 15–16). Field availability is not a working background scheduler. |
+| 7. Idempotent `shutdown` | Plan 2 Task 29: `shutdown(&mut self)`, idempotent. | Task 16 extends cleanup without changing the receiver and without adding a second engine owner. |
 
 ## File structure
 
@@ -107,12 +121,12 @@ Generated paths expand to the inventories in Tasks 17–20. Modify existing modu
 | `crates/cache/tests/support/mod.rs` | Valid small fixtures |
 | `crates/cache/tests/{key,entry,lookup,storage,quota,presolver_queue}.rs` | Cache tests |
 | `crates/engine/Cargo.toml`, `crates/engine/src/lib.rs` | Wire cache into Engine |
-| `crates/engine/src/core.rs` (modify) | `EngineCore.cache`, `EngineCore.presolver`, cache route state |
-| `crates/engine/src/engine.rs` (modify) | `Paths.cache` resolution, failable `set_config`, presolver lifecycle and delegation |
+| `crates/engine/src/core.rs` (modify) | `EngineCore.cache`, `EngineCore.flop_policy`, cache route state |
+| `crates/engine/src/engine.rs` (modify) | `Paths.cache` resolution, `Engine.presolver` handle, presolver lifecycle and delegation |
 | `crates/engine/src/serve.rs` (modify) | Flop/Turn street dispatch, cache route, Provisional emission |
 | `crates/engine/src/solve.rs` (modify) | Retained-payload handoff and background plans |
 | `crates/engine/src/testing.rs` (modify), `crates/bench/Cargo.toml` (modify) | Extend request/test seams and enable the engine testing feature for bench |
-| `crates/engine/src/tree/templates.rs` (modify) | Test-only template registration seam used by T4 |
+| `crates/engine/src/tree/templates.rs` (modify) | `install_cache_test_templates()` helper for T4, built on Plan 2's `Templates::with_extra` |
 | `solver-worker/Cargo.toml`, `solver-worker/src/main.rs`, `solver-worker/src/memory.rs`, `solver-worker/tests/bench_mode.rs` | Opt-in diagnostic storage-mode measurements; unchanged production defaults |
 | `crates/engine/src/cache_bridge.rs` | Canonical query/store and bounded lookup |
 | `crates/engine/src/flop.rs` | Template and hit/provisional/live transitions |
@@ -121,7 +135,7 @@ Generated paths expand to the inventories in Tasks 17–20. Modify existing modu
 | `crates/engine/src/snapshots.rs` (modify) | Existing single registration path |
 | `crates/engine/src/presolve.rs` | Chart replay and background executor |
 | `crates/engine/src/log.rs` (modify) | Scenario hit rates and violations |
-| `crates/engine/src/bench_support.rs` (modify; created by Plan 2 Task 22) | Facade keeping bench dependencies downward |
+| `crates/engine/src/bench_support.rs` (modify; created by Plan 2 Task 5) | Facade keeping bench dependencies downward; owns `PreparedBenchSpot` |
 | `crates/engine/tests/support/mod.rs` | WorkerLink/fake-clock harness extensions |
 | `crates/engine/tests/cache_key_structural_identity.rs` | T4 with production materializer |
 | `crates/engine/tests/flop_path_golden.rs` | Hits, provisional, budgets and identity |
@@ -137,8 +151,8 @@ Generated paths expand to the inventories in Tasks 17–20. Modify existing modu
 | `tools/gen_fixtures.py`, `tools/e2e_hands.py` | PokerKit generator extensions |
 | `tools/tests/test_e2e_hands.py` | Inventory, legality and expectations |
 | `fixtures/hands/e2e/001.json` through `fixtures/hands/e2e/050.json`, `fixtures/hands/e2e/manifest.json` | Versioned inputs and hashes |
-| `bench/spots/{river_std,river_min,turn_std,turn_min,flop_fast,flop_min,sources}.json` | All six §13.5 baseline suites regenerated from chart replay, plus the source lock |
-| `docs/bench/2026-09-10-i7-13700K.md` | Measured V3/V21/V22 report |
+| `bench/spots/{river_std,river_min,turn_std,turn_min,flop_fast,flop_min}.json` (modify/regenerate; created by Plan 2 Task 5), `bench/spots/sources.json` (create) | All six §13.5 baseline suites regenerated from chart replay, plus the source lock |
+| `docs/bench/2026-09-10-i7-13700K.md` (modify/append; created by Plan 2 Task 30) | Measured V3/V21/V22 report, with R8 rows retained as separate reference evidence |
 
 ### Task 1: Introduce canonical cache keys and exact rational identity
 
@@ -988,7 +1002,7 @@ git commit -m 'feat(cache): add atomic writer replacement and LRU quota' -m 'Co-
 
 **Files:** Modify `crates/cache/src/{lib,lookup,label,entry}.rs`, `crates/cache/tests/lookup.rs`; create `crates/engine/src/cache_bridge.rs`; modify `crates/engine/Cargo.toml`, `crates/engine/src/{lib,core,engine}.rs`.
 
-**Interfaces:** Consumes `CacheEntry`, `compare`, `label`, `read_cell`, `validate_solution`, `Derived`, `engine::Paths.cache` (Plan 2 Task 21), `engine::tree::tree_signature`. Produces `CacheQuery`, `CacheHit`, `Lookup`, `ReadCommand`, `Cache::lookup(&CacheQuery)->Lookup`, `legal_menu(&[Action],&[LegalAction])->bool`, `map_rows`. Engine extensions `cache_bridge::make_cache_query(input:&SolveInput,derived:&Derived,bb_chips:u32,rake:&Rake,reasons:&[ApproxReason],signature:&str,perm:&SuitPerm,target_bp:u16,budget:Duration)->Result<CacheQuery,UnsupportedReason>` (query actor from the OOP/IP seat mapping and `Derived.to_act`) and `EngineCore` fields `pub cache: cache::Cache`, `pub presolver: Option<cache::presolver::scheduler::Presolver>` (populated in Task 16).
+**Interfaces:** Consumes `CacheEntry`, `compare`, `label`, `read_cell`, `validate_solution`, `Derived`, `engine::Paths.cache` (Plan 2 Task 29), `engine::tree::tree_signature`. Produces `CacheQuery`, `CacheHit`, `Lookup`, `ReadCommand`, `Cache::lookup(&CacheQuery)->Lookup`, `legal_menu(&[Action],&[LegalAction])->bool`, `map_rows`. Engine extensions `cache_bridge::make_cache_query(input:&SolveInput,derived:&Derived,bb_chips:u32,rake:&Rake,reasons:&[ApproxReason],signature:&str,perm:&SuitPerm,target_bp:u16,budget:Duration)->Result<CacheQuery,UnsupportedReason>` (query actor from the OOP/IP seat mapping and `Derived.to_act`) and the single `EngineCore` field `pub cache: cache::Cache` plus `EngineCore::with_cache`. This task adds **no** presolver field: the `Presolver` handle lives on `Engine` and is added by Task 16, so a status/pause/resume command never locks the solve owner.
 
 - [ ] **Step 1 (4 min): Add illegal-menu rejection test.**
 
@@ -1249,21 +1263,21 @@ pub fn make_cache_query(input:&SolveInput,derived:&Derived,bb_chips:u32,rake:&Ra
         else {return Err(unsupported("actor is neither street-root seat"))};
     Ok(CacheQuery{key,source,tree:input.tree.clone(),requested,actor:actor.into(),
         legal:derived.legal.clone(),target_bp,reasons:reasons.to_vec(),
-        inverse_perm:core_iso::invert(perm),budget})
+        inverse_perm:core_iso::inverse(perm),budget})
 }
 ```
 
-`core_iso::invert(&SuitPerm) -> SuitPerm` is Plan 1's inverse of a suit permutation; if Plan 1 named it differently, use `core_iso`'s actual inverse constructor at the same call site. Hero, `bb_chips`, `target_bp` and the requested path stay out of `KeyFields`; `TimeCharge` is the unraked `0/0` rake key. Add a `cargo test -p engine` unit case in `cache_bridge.rs` asserting that two inputs differing only in `bb_chips`, hero seat or `target_bp` produce the same `key.digest()`.
+`core_iso::inverse(&SuitPerm) -> SuitPerm` is Plan 1 Task 21's inverse of a suit permutation (`P1.T21`); that is the exact producer name. Hero, `bb_chips`, `target_bp` and the requested path stay out of `KeyFields`; `TimeCharge` is the unraked `0/0` rake key. Add a `cargo test -p engine` unit case in `cache_bridge.rs` asserting that two inputs differing only in `bb_chips`, hero seat or `target_bp` produce the same `key.digest()`.
 
 - [ ] **Step 5a (5 min): Own the cache handle in `EngineCore` and resolve `Paths.cache`.** (Blocker B3.)
 
 ```rust
-// crates/engine/src/core.rs — added fields and the cache constructor argument
+// crates/engine/src/core.rs — one added field and the cache constructor argument
 pub struct EngineCore {
     // ... existing fields (worker, clock, identity, watchdog, next_request_id,
-    //     memory_limit_bytes, bench_p95_ms, stage, log, snapshots, config, range_source)
+    //     memory_limit_bytes, stage, log, snapshots, config, range_source)
     pub cache: cache::Cache,
-    pub presolver: Option<cache::presolver::scheduler::Presolver>,   // installed by Task 16
+    // `flop_policy` is added by Task 9; no presolver field is ever added to EngineCore.
 }
 
 impl EngineCore {
@@ -1274,17 +1288,19 @@ impl EngineCore {
 }
 ```
 
-`EngineCore::new` initialises `cache: cache::Cache::disabled()` and `presolver: None`, so no Plan 2 test changes. `crates/engine/src/engine.rs` resolves the root once:
+`EngineCore::new` initialises `cache: cache::Cache::disabled()`, so no Plan 2 test changes. This task does **not** mention `Presolver`: Task 16 adds `Engine.presolver` as an independent handle so a UI command never waits behind a solve. `crates/engine/src/engine.rs` resolves the root once, inside Plan 2 Task 29's existing `Engine::new`, without altering its `Result<Engine, EngineError>` signature or its configuration handling:
 
 ```rust
-// crates/engine/src/engine.rs — inside Engine::new, after EngineCore::new
-let mut core = EngineCore::new(Box::new(worker), clock.clone(), identity.clone(),
-    DecisionLog::open(&paths.log));
-core.set_config(cfg.clone())?;
+// crates/engine/src/engine.rs — inside Plan 2 Task 29's Engine::new, after EngineCore::new
+// Plan 2 Task 29 already builds the core (including DecisionLog::open(&paths.log_dir)) and
+// applies the validated configuration. This plan adds only the cache handle and its banner.
 core.cache = cache::Cache::open(paths.cache.clone(), cache::CACHE_QUOTA_BYTES);
+if let Some(message) = core.cache.availability_warning() {
+    startup.banners.push(message);   // StartupReport.banners, surfaced by startup_report()
+}
 ```
 
-`Paths.cache` is declared by Plan 2 Task 21 as `{ worker, preflop, cache, log }` (cross-plan M13/Or5) and Plan 5 fills it with `local.join("cache/v3")`; when a caller constructs `Paths` by hand, `cache::default_cache_root()` produces the same `%LOCALAPPDATA%\PokerAI\cache\v3`. Add `cache = { path = "../cache" }` to `crates/engine/Cargo.toml` and `pub mod cache_bridge;` to `crates/engine/src/lib.rs`. A `Cache::disabled()` handle makes every lookup `Miss` and every store a no-op, so a missing or unwritable directory never blocks delivery (§12).
+`Paths.cache` is declared by Plan 2 Task 29 as `Paths { log_dir, worker_exe, preflop, cache }` (cross-plan M13/Or5, user decision) and Plan 5 fills it with `local.join("cache/v3")`; when a caller constructs `Paths` by hand, `cache::default_cache_root()` produces the same `%LOCALAPPDATA%\PokerAI\cache\v3`. Cache availability and error diagnostics are appended to the existing `StartupReport.banners`/`cache_state` during startup; `Engine::new` keeps returning `Result<Engine, EngineError>` and never gains a second return value. Add `cache = { path = "../cache" }` to `crates/engine/Cargo.toml` and `pub mod cache_bridge;` to `crates/engine/src/lib.rs`. A `Cache::disabled()` handle makes every lookup `Miss` and every store a no-op, so a missing or unwritable directory never blocks delivery (§12).
 
 - [ ] **Step 6 (3 min): Run green:** `cargo test -p cache`; `cargo test -p engine`; `cargo test --workspace`.
 - [ ] **Step 7 (2 min): Commit.**
@@ -1298,43 +1314,22 @@ git commit -m 'feat(cache): serve bounded validated query-tree node hits' -m 'Co
 
 **Files:** Create `crates/engine/tests/cache_key_structural_identity.rs`, `crates/engine/tests/golden/cache_scale.json`; modify `crates/engine/src/tree/templates.rs`, `crates/engine/tests/support/mod.rs`, `crates/cache/tests/{entry,lookup,storage}.rs`.
 
-**Interfaces:** Consumes production `build_effective_tree`, `Cache`, `CacheEntry`, `CacheQuery`, Plan 2's `Templates` registry. Produces `engine::tree::templates::register_test_template(TemplateSpec)->&'static TemplateSpec` and `engine::tree::templates::install_cache_test_templates()` (both `#[cfg(any(test, feature = "testing"))]`); test support `CacheRig::new(template:&str,p:u32,eff:u32,cap_mchips:u32)->CacheRig`, `CacheRig::query(p:u32,eff:u32,cap_mchips:u32,path:&[Action],actor:&str)->CacheQuery`, `CacheRig::hit(&CacheQuery)->CacheHit`, `CacheRig::miss(&CacheQuery)->bool`. Rig owns a temporary cache directory and `pub entry:CacheEntry`; it uses the real materializer and stores actor-distinct synthetic valid matrices, so no worker solve or timing noise enters T4.
+**Interfaces:** Consumes production `build_effective_tree`, `Cache`, `CacheEntry`, `CacheQuery`, and Plan 2 Task 2's `Templates::with_extra(&[TemplateSpec])` / `Templates::base_ids()` seam behind the `test-templates` feature. Produces only `engine::tree::templates::install_cache_test_templates()` (`#[cfg(any(test, feature = "test-templates"))]`); test support `CacheRig::new(template:&str,p:u32,eff:u32,cap_mchips:u32)->CacheRig`, `CacheRig::query(p:u32,eff:u32,cap_mchips:u32,path:&[Action],actor:&str)->CacheQuery`, `CacheRig::hit(&CacheQuery)->CacheHit`, `CacheRig::miss(&CacheQuery)->bool`. Rig owns a temporary cache directory and `pub entry:CacheEntry`; it uses the real materializer and stores actor-distinct synthetic valid matrices, so no worker solve or timing noise enters T4.
 
-**Plan 2 interface note (blocker B1, cross-plan M20/D10):** Plan 2 Task 2 Step 6 must add exactly one line to `Templates::get` — `.or_else(|| test_extra(id))` on the existing `Self::all().iter().find(...)` expression — and must keep `Templates::ids()` derived from `all()` alone, so its `assert_eq!(Templates::ids().len(), 9)` stays valid and the production selector never sees a test template. Everything else in the seam is added by this task.
+**Upstream seam (cross-plan M20/D10, resolved).** Plan 2 Task 2 already owns the extension mechanism: `Templates::with_extra(&[TemplateSpec])` registers extras, `Templates::base_ids()` returns the nine production ids, and `Templates::ids()` includes registered extras. Nothing is added to `Templates::get` here and no second registry exists. Every engine test command that builds `CacheRig` enables both `testing` and `test-templates` (`--features testing,test-templates`), and the engine's test-only self dependency enables the same pair. Production template selection (Task 9) is limited to its named production ids and never sees a test template.
 
 - [ ] **Step 1 (3 min): Copy this §10.4 scale check verbatim into the T4 test's contract comment.**
 - **Scale check** (contract, section 13.1 T4): pot/stack/cap 100/500/5000 mchips and 200/1000/10000 mchips with identical ranges, proportional quantum and identical fractional tree hit the same entry with identical frequencies and doubled chip EV, `Exact` (identical SPR rationals, identical realized fractions: every pot and stack doubles exactly, so `max(dev) = 0` at every node), at the root, at IP's node after Bet(50) versus Bet(100), and at OOP's node after Check, Bet(50) versus Check, Bet(100) (both actors at non-root nodes; a call closes the street, so the next decision lives in the next street's own root and is never requested from this entry, section 5); 100/500 versus 103/515 with a one-chip quantum has SPR `5 : 1` in both and rounds the root half-pot bet to 50 versus 52 chips (52/103 = 0.5049, a **root-action** deviation of 0.49%); the reported `MenuRounded{max_delta_pct}` is the maximum over the complete materialized list and is larger: after bet/call the turn pots are 200 and 207, the half-pot bets 100 and 104 (`104/103 - 100/100 = 0.0097`, 0.97%), and deeper nodes deviate further; T4 freezes the value computed from the two materialized lists (asserting `0.97 <= max_delta_pct < 5`), never the root number, and the candidate is `Approximate{MenuRounded}`, never `Exact`; 100/500 versus 100/508 (SPR 5.08, `delta = 1.6%`) is `SprBucketed` (and `MenuRounded` only if some realized size actually differs); 100/500 versus 100/511 (`delta = 2.2%`) misses; the `MenuRounded{2.0}` case is a specified pair of trees: test template `menu_round_test_v1` (single 0.33 bet, all-in-only raises, cap 1, add-all-in 1.5, force-all-in 0.15, flop root) at entry 100/500 versus query 20/100 (SPR `5 : 1` in both): the 0.33 bet is 33 chips (0.33) versus 7 chips (0.35) at every node with an unchanged pot (`dev = 0.02`), 55 versus 11 (0.55 in both) after bet/call, 91 versus 18 (0.91 versus 0.90) after bet/call/bet/call, the all-in raise-to amounts deviate by at most 0.02 (467 versus 93 after bet/call), and the river all-in is added in both trees after bet/call/bet/call (`412 <= 414`, `82 <= 84`) and in neither elsewhere, so the topologies agree and `max(dev) = 0.02`; a single-node comparison is never used, so a query whose root bet is exactly representable still carries `MenuRounded` when a deeper node rounds differently; a different canonical board always misses.
 
-- [ ] **Step 1a (5 min): Add the test-only template registration seam to `crates/engine/src/tree/templates.rs`.** Without it `CacheRig::new` cannot build a tree for the three §13.1 T4 templates and the T4 test cannot run (blocker B1). The registry is compiled only under `cfg(test)` or the `testing` feature, so the production selector and `Templates::ids()` are unchanged.
+- [ ] **Step 1a (5 min): Add `install_cache_test_templates` to `crates/engine/src/tree/templates.rs` over Plan 2's existing seam.** Without the three §13.1 T4 templates `CacheRig::new` cannot build their trees and the T4 test cannot run. The helper is compiled only under `cfg(test)` or the `test-templates` feature, so the production selector and `Templates::base_ids()` are unchanged. It adds no registry, no `register_test_template`, no `test_extra` and no replacement `Templates::get`: Plan 2 Task 2 owns `with_extra`.
 
 ```rust
 // appended to crates/engine/src/tree/templates.rs
-#[cfg(any(test, feature = "testing"))]
-static TEST_TEMPLATES: std::sync::Mutex<Vec<&'static TemplateSpec>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// Test-only extension point (§13.1 T4). Leaks one `TemplateSpec` per distinct id so
-/// `Templates::get` can keep returning `&'static TemplateSpec`; re-registering an id is a
-/// no-op, so parallel test binaries and repeated calls are safe.
-#[cfg(any(test, feature = "testing"))]
-pub fn register_test_template(spec: TemplateSpec) -> &'static TemplateSpec {
-    let mut guard = TEST_TEMPLATES.lock().expect("test template registry");
-    if let Some(existing) = guard.iter().find(|t| t.id == spec.id) { return existing; }
-    let leaked: &'static TemplateSpec = Box::leak(Box::new(spec));
-    guard.push(leaked);
-    leaked
-}
-
-#[cfg(any(test, feature = "testing"))]
-pub(crate) fn test_extra(id: &str) -> Option<&'static TemplateSpec> {
-    TEST_TEMPLATES.lock().expect("test template registry").iter().find(|t| t.id == id).copied()
-}
-#[cfg(not(any(test, feature = "testing")))]
-pub(crate) fn test_extra(_id: &str) -> Option<&'static TemplateSpec> { None }
-
 /// The three §13.1 T4 templates. `add`/`force` are literal spec values, `merging` is 0 and
 /// donk menus follow the §4.6 rule (`None` on the root street, explicit empty after it).
-#[cfg(any(test, feature = "testing"))]
+/// Registration goes through Plan 2 Task 2's `Templates::with_extra`; calling this more than
+/// once is safe because `with_extra` is idempotent per id.
+#[cfg(any(test, feature = "test-templates"))]
 pub fn install_cache_test_templates() {
     use proto::Street::{Flop, River, Turn};
     use proto::MenuSize::{AllIn, Pot};
@@ -1351,26 +1346,28 @@ pub fn install_cache_test_templates() {
         TemplateSpec { id, root_street: Flop, menus, add_allin_threshold: add,
             force_allin_threshold: force, merging_threshold: 0.0, wager_cap: 1 }
     };
-    // `a`-only bets, no ordinary raises: the §10.4 terminal rake-cap pair 500 / 504.
-    register_test_template(build("check_jam_test_v1", vec![AllIn], vec![], 0.0, 0.0));
-    // empty menus everywhere: isolates SPR 5.00 / 5.08 / 5.11 with identical realized menus.
-    register_test_template(build("check_only_test_v1", vec![], vec![], 0.0, 0.0));
-    // single 0.33 bet, `a`-only raises: the specified `MenuRounded{2.0}` pair 100/500 vs 20/100.
-    register_test_template(build("menu_round_test_v1", vec![Pot(0.33)], vec![AllIn], 1.5, 0.15));
+    // 1. `a`-only bets, no ordinary raises: the §10.4 terminal rake-cap pair 500 / 504.
+    // 2. empty menus everywhere: isolates SPR 5.00 / 5.08 / 5.11 with identical realized menus.
+    // 3. single 0.33 bet, `a`-only raises: the specified `MenuRounded{2.0}` pair 100/500 vs 20/100.
+    Templates::with_extra(&[
+        build("check_jam_test_v1", vec![AllIn], vec![], 0.0, 0.0),
+        build("check_only_test_v1", vec![], vec![], 0.0, 0.0),
+        build("menu_round_test_v1", vec![Pot(0.33)], vec![AllIn], 1.5, 0.15),
+    ]);
 }
 ```
 
-`Templates::get` gains the one-line fallback stated in the Plan 2 interface note above:
+`crates/engine/tests/support/mod.rs` calls `install_cache_test_templates()` from `CacheRig::new` behind a `std::sync::Once`. `crates/engine/Cargo.toml` carries `testing` from Plan 2 Task 2; the engine's test-only self dependency and every `CacheRig` test command enable `testing,test-templates` together. Add a unit assertion in `templates.rs` after `install_cache_test_templates()`:
 
 ```rust
-pub fn get(id: &str) -> Option<&'static TemplateSpec> {
-    Self::all().iter().find(|t| t.id == id).or_else(|| test_extra(id))
+assert_eq!(Templates::base_ids().len(), 9);
+for id in ["check_jam_test_v1", "check_only_test_v1", "menu_round_test_v1"] {
+    assert!(Templates::get(id).is_some());
+    assert!(Templates::ids().contains(&id));
 }
 ```
 
-`crates/engine/tests/support/mod.rs` calls `install_cache_test_templates()` from `CacheRig::new` behind a `std::sync::Once`, and `crates/engine/Cargo.toml` already carries the `testing` feature from Plan 2 Task 15. Add a unit assertion in `templates.rs` that `Templates::ids().len()` is still 9 after `install_cache_test_templates()` and that `Templates::get("check_jam_test_v1").is_some()`.
-
-- [ ] **Step 2 (5 min): Write the red scale/actor test.** `CacheRig::new` constructs root board Kh7d2c with OOP Seat(2), IP Seat(0), equal effective stacks, dead 0, `bb_chips: 2` and empty history, parses board-only public AA/KK ranges, calls the production template/materializer, exports all current-street nodes, and assigns `available` only to board-compatible supported combos. For node index n, use uniform legal probabilities and `EV(a)=10*n+a`, except fold = 0; this makes wrong actor/path selection observable. `hit` unwraps any non-Miss lookup. The three test templates reach `build_effective_tree` only through the `cfg`-gated seam of Step 1a; the production selector of Task 9 never names them.
+- [ ] **Step 2 (5 min): Write the red scale/actor test.** `CacheRig::new` constructs root board Kh7d2c with OOP Seat(2), IP Seat(0), equal effective stacks, dead 0, `bb_chips: 2` and empty history, parses board-only public AA/KK ranges, calls the production template/materializer, exports all current-street nodes, and assigns `available` only to board-compatible supported combos. For node index n, use uniform legal probabilities and `EV(a)=10*n+a`, except fold = 0; this makes wrong actor/path selection observable. `hit` unwraps any non-Miss lookup. The three test templates reach `build_effective_tree` only through Plan 2's `Templates::with_extra` under the `cfg`-gated helper of Step 1a; the production selector of Task 9 never names them.
 
 ```rust
 #[test]
@@ -1412,7 +1409,7 @@ fn cache_key_structural_identity() {
 }
 ```
 
-- [ ] **Step 3 (2 min): Run red:** `cargo test -p engine --test cache_key_structural_identity`; absent rig or failed assertion.
+- [ ] **Step 3 (2 min): Run red:** `cargo test -p engine --features testing,test-templates --test cache_key_structural_identity`; absent rig or failed assertion.
 - [ ] **Step 4 (5 min): Complete the rig, raw-fraction golden and all T4 mutation cases.** The three templates are exactly the ones registered in Step 1a. With `check_jam_test_v1` at P100 compare eff500 and504 at cap55200 (the terminal rake-cap pair). `check_only_test_v1` isolates SPR5.00/5.08/5.11 with identical realized menus. `menu_round_test_v1` supplies the specified `MenuRounded{2.0}` pair. Under a wagering template, AllIn500 versus AllIn508 can have dev0.08 and correctly fail the separate0.05 menu filter even though SPR passes; test that rejection too. Never bypass menu validation on an SPR hit. Test query mutations separately; each starts from a valid copy and changes only the indicated field:
 
 ```rust
@@ -1446,7 +1443,7 @@ assert_eq!(frozen,expected);
 
 Run once with `POKERAI_RECORD_GOLDENS=1`, review, unset it, then normal green tests. No automatic golden acceptance in CI. The cache-corruption mutations of Task 5 now run with these real fixtures, completing `cache_payload_validated`.
 
-- [ ] **Step 6 (3 min): Run green:** `cargo test -p engine --test cache_key_structural_identity`; `cargo test --workspace`.
+- [ ] **Step 6 (3 min): Run green:** `cargo test -p engine --features testing,test-templates --test cache_key_structural_identity`; `cargo test --workspace`.
 - [ ] **Step 7 (2 min): Commit.**
 
 ```powershell
@@ -1456,13 +1453,13 @@ git commit -m 'test(cache): freeze complete T4 scale actor and topology cases' -
 
 ### Task 9: Implement flop budget and evidence-based template selection
 
-**Files:** Create `crates/engine/src/flop.rs`; modify `crates/engine/src/{lib,engine,deadline}.rs`; create `crates/engine/tests/flop_path_golden.rs`.
+**Files:** Create `crates/engine/src/flop.rs`; modify `crates/engine/src/{lib,core,engine,deadline}.rs`; create `crates/engine/tests/flop_path_golden.rs`.
 
-**Interfaces:** Consumes `SolverPrefs`, `TakenAction`, and Plan 2 Task 16's `deadline::{Deadlines, street_budget_ms, final_delivery_ms, extraction_margin_ms}` unchanged; Produces `deadline::flop_budget_valid(u8)->bool`, `flop::{FlopPolicy{min_admitted:bool}, FlopPolicy::live_template(u32)->&'static str, FlopPolicy::from_v3(Option<f64>,Option<f64>)->FlopPolicy, preflop_wagers(&HandState)->u32}`, and the failable `Engine::set_config(&mut self, GameConfig) -> Result<u32, EngineError>` body.
+**Interfaces:** Consumes `SolverPrefs`, `TakenAction`, and Plan 2 Task 20's `deadline::{Deadlines, street_budget_ms, final_delivery_ms, extraction_margin_ms}` unchanged, plus Plan 2 Task 29's existing `Engine::set_config`/`apply_config`; Produces `deadline::flop_budget_valid(u8)->bool`, `flop::{FlopPolicy{min_admitted:bool}, FlopPolicy::live_template(u32)->&'static str, FlopPolicy::from_v3(Option<f64>,Option<f64>)->FlopPolicy, preflop_wagers(&HandState)->u32}`, `flop::{V3PolicyEvidence, load_v3_policy(path:&std::path::Path,expected:&V3PolicyEvidence)->FlopPolicy}`, the `EngineCore.flop_policy` field, and `Engine::config(&self)->GameConfig`. This task does **not** produce an `Engine::set_config` body.
 
-**Cross-plan D5/M3:** this task adds **no** parallel deadline function. `flop_deadlines` is deleted from the plan; every flop budget number comes from `Deadlines::for_request(t0_ms, Street::Flop, flop_budget_s)` and `Deadlines::watchdog_fire_ms()`, which Plan 2 already implements as `5_000 + budget * 1_000` for flop final delivery and a 100 ms watchdog lead.
+**Cross-plan D5/M3:** this task adds **no** parallel deadline function. `flop_deadlines` is deleted from the plan; every flop budget number comes from Plan 2 Task 20's `Deadlines::for_request(t0_ms, Street::Flop, flop_budget_s)` and `Deadlines::watchdog_fire_ms()`, which Plan 2 already implements as `5_000 + budget * 1_000` for flop final delivery and a 100 ms watchdog lead.
 
-**Plan 2 interface note (M4/M10/S15):** Plan 2 Task 21 must change `Engine::set_config(&mut self, GameConfig) -> u32` to `-> Result<u32, EngineError>`; §13.3 requires `set_config` to reject `flop_budget_s = 31` and a `u32` return cannot. Plan 5's `set_game_config` command already expects the `Result`. This task supplies the validation body.
+**Upstream configuration seam (M4/M10/S15, resolved).** Plan 2 Task 29 already declares and implements `Engine::set_config(&mut self, GameConfig) -> Result<u32, EngineError>`, including blind/thread/flop validation, revision allocation, next-hand queuing and the shared-config lock. This task preserves that body and adds tests plus `flop_budget_valid`; it never replaces it.
 
 - [ ] **Step 1 (4 min): Write `flop_budget_setting_golden` against Plan 2's `Deadlines`.**
 
@@ -1515,7 +1512,7 @@ fn set_config_rejects_out_of_range_flop_budget() {
 `support::engine_with_fake_worker()` builds `Engine::with_core(EngineCore::new(...))` from Plan 2's `FakeWorker`/`FakeClock`, and `support::game_config()` returns the 1/2 no-rake `GameConfig` of Plan 2's `testing::cfg_1_2()`. Add `pub fn config(&self) -> GameConfig` to `Engine` alongside the existing `state()` accessor.
 
 - [ ] **Step 2 (2 min): Run red:** `cargo test -p engine --features testing flop_budget_setting_golden`; `cargo test -p engine --features testing set_config_rejects_out_of_range_flop_budget`.
-- [ ] **Step 3 (5 min): Implement budget validation, the failable `set_config` and V3 admission.**
+- [ ] **Step 3 (5 min): Implement budget validation, the config getter and evidence-based V3 admission.**
 
 ```rust
 // crates/engine/src/deadline.rs — the only addition this plan makes to Plan 2's module
@@ -1527,6 +1524,7 @@ pub fn flop_budget_valid(flop_budget_s: u8) -> bool { (1..=30).contains(&flop_bu
 // crates/engine/src/flop.rs
 use proto::{Action, HandState, Street, TakenAction};
 
+#[derive(Clone,Copy,Debug,PartialEq)]
 pub struct FlopPolicy {pub min_admitted:bool}
 impl FlopPolicy {
     /// §10.1: three or more preflop wagers always use `flop_fast_v1`; a single-raised pot uses
@@ -1545,7 +1543,8 @@ impl FlopPolicy {
 /// first wager; each voluntary action that raises the facing amount adds one. Forced posts are
 /// not counted twice and calls/checks/folds never increment.
 pub fn preflop_wagers(state:&HandState)->u32 {
-    let mut wagers=1;let mut facing=state.config.straddle.unwrap_or(state.config.bb_chips);
+    let mut wagers=1;
+    let mut facing=state.config.straddle.as_ref().map_or(state.config.bb_chips,|s|s.amount_chips);
     for TakenAction{street,action,..} in &state.actions {
         if *street!=Street::Preflop {break;}
         if let Action::Raise{to}|Action::Bet{to}|Action::AllIn{to}=action {
@@ -1561,24 +1560,40 @@ pub fn is_limped(state:&HandState)->bool {preflop_wagers(state)==1}
 ```
 
 ```rust
-// crates/engine/src/engine.rs — the failable set_config of cross-plan M10
-pub fn set_config(&mut self, cfg: GameConfig) -> Result<u32, EngineError> {
-    if !crate::deadline::flop_budget_valid(cfg.solver.flop_budget_s) {
-        return Err(EngineError::Message(format!(
-            "flop_budget_s must be in 1..=30, got {}", cfg.solver.flop_budget_s)));
-    }
-    if cfg.solver.threads == 0 {
-        return Err(EngineError::Message("threads must be at least 1".into()));
-    }
-    let rev = self.identity.lock().unwrap().set_config();
-    self.config = GameConfig { config_revision: rev, ..cfg };
-    self.core.lock().unwrap().set_config(self.config.clone());
-    Ok(rev)
+// crates/engine/src/engine.rs — the only engine.rs addition of this task
+/// Settings UI reads the accepted next-hand configuration, not the frozen active one.
+pub fn config(&self) -> GameConfig {
+    self.queued_config.clone().unwrap_or_else(|| self.config.clone())
 }
-pub fn config(&self) -> GameConfig { self.config.clone() }
 ```
 
-Validation precedes `IdentityState::set_config()`, so a rejected configuration neither bumps the revision nor invalidates the active decision. `Engine::new` propagates the same error (`core.set_config(cfg.clone())?`). Active-hand money stays frozen in `HandConfig`; the solver preference is captured once at admission, so a later `set_config` cannot extend an already admitted request. Load V3 admission only from a report matching the exact template signature, solver/adapter/rules versions, mode policy, source hash and machine; absent or stale evidence defaults to `flop_fast_v1`.
+Preserve Plan 2 Task 29's `set_config` and `apply_config` bodies, including blind/thread/flop validation, revision allocation, next-hand queuing and the shared-config lock. Add `flop_budget_valid` only as a wrapper over the existing `FLOP_BUDGET_RANGE`. Rejected settings change neither revision nor active work. New serving helpers consume the one request configuration captured by `serve_request`; they do not lock `EngineCore` from a command. Active-hand money stays frozen in `HandConfig`; the solver preference is captured once at admission, so a later `set_config` cannot extend an already admitted request.
+
+**V3 policy evidence (owned by this task).** Task 9 owns `V3PolicyEvidence`, `load_v3_policy` and `EngineCore.flop_policy`. Evidence contains the exact template signature, solver commit, adapter/rules versions, storage-mode policy, source-lock hash, machine identity and finite positive p95 seconds at 100bb and 200bb. `load_v3_policy(path, expected_provenance)` returns `FlopPolicy::from_v3(Some(p95_100), Some(p95_200))` only when every provenance field matches; otherwise it returns `FlopPolicy::from_v3(None, None)`, with a startup diagnostic. `EngineCore::new` initializes that conservative value. `Engine::new` loads evidence off the recommendation path before `engine-main` starts. Task 24 serializes the matching evidence alongside its raw V3 measurements; Task 9's tests use synthetic evidence. Missing production evidence does not create a dependency cycle on Task 24.
+
+```rust
+// crates/engine/src/flop.rs — the provenance-checked policy record
+#[derive(Clone,Debug,serde::Serialize,serde::Deserialize,PartialEq)]
+pub struct V3PolicyEvidence {
+    pub template_signature:String,pub solver_commit:String,pub adapter_version:u16,
+    pub rules_version:u16,pub storage_mode_policy:String,pub source_lock_sha256:String,
+    pub machine_id:String,pub p95_100bb_s:f64,pub p95_200bb_s:f64,
+}
+pub fn load_v3_policy(path:&std::path::Path,expected:&V3PolicyEvidence)->FlopPolicy {
+    let Ok(bytes)=std::fs::read(path) else {return FlopPolicy::from_v3(None,None)};
+    let Ok(e)=serde_json::from_slice::<V3PolicyEvidence>(&bytes)
+        else {return FlopPolicy::from_v3(None,None)};
+    let provenance_matches=e.template_signature==expected.template_signature
+        &&e.solver_commit==expected.solver_commit&&e.adapter_version==expected.adapter_version
+        &&e.rules_version==expected.rules_version
+        &&e.storage_mode_policy==expected.storage_mode_policy
+        &&e.source_lock_sha256==expected.source_lock_sha256&&e.machine_id==expected.machine_id;
+    if provenance_matches {FlopPolicy::from_v3(Some(e.p95_100bb_s),Some(e.p95_200bb_s))}
+    else {FlopPolicy::from_v3(None,None)}
+}
+```
+
+Add `pub flop_policy: crate::flop::FlopPolicy` to `EngineCore`, initialized by `EngineCore::new` to `FlopPolicy::from_v3(None, None)`; derive `Clone`/`Debug` on `FlopPolicy` so it can be stored. Do not introduce a map of unqualified timings.
 
 - [ ] **Step 4 (4 min): Extend the fake-clock watchdog and worker-send tests.** Using Plan 2's `FakeClock`, assert the flop wire deadline at 250 ms of elapsed time (9,600 default / 29,600 maximum), the watchdog at 14,900 / 34,900 ms, a turn at maximum flop preference still at 14,900 with first attempt 6,000 and extraction 200, and flop extraction 600. Assert that calling `set_config` with a larger budget while a request is in flight does not move that request's `Deadlines` (the admitted `SolvePlan` owns its own copy).
 
@@ -1606,7 +1621,7 @@ git commit -m 'feat(engine): apply flop budgets and measured template policy' -m
 
 **Files:** Modify `crates/engine/src/{core,flop,cache_bridge,log,serve,solve}.rs`, `crates/engine/tests/{flop_path_golden,support/mod}.rs`; create `crates/engine/tests/golden/flop_path.json`.
 
-**Interfaces:** Consumes `Cache::lookup`, `Cache::store`, `cache_bridge::{key_and_source,make_cache_query}` (Task 7), Plan 2's `serve::serve_request`, `solve::{run_solve,SolvePlan,Terminal,SolveOutcome}`, `watchdog::Armed.retained`, `assemble::{accumulate,final_from_solution,hero_reach}`, `tree::{build_tree_full,tree_signature,TemplateSelection}`, Plan 3 Task 18's `Engine::register_snapshot` / `SnapshotStore::register`, `SolveInput`. Produces `flop::{CacheRoute::{Final(CacheHit),Refine{retained:Option<CacheHit>}}, choose_cache_route(Vec<Lookup>)->CacheRoute, cacheable(Street,bool,u16,bool)->bool, is_street_violation(Street,bool,bool,bool)->bool}`; `serve::{CACHE_BUDGET_MS, Probe, probe_cache, cache_phase, cache_label_for}`; `cache_bridge::{entry_from_solution(input:&SolveInput,solution:&StreetSolution,reasons:&[ApproxReason],bb_chips:u32,rake:&Rake,signature:&str,perm:&SuitPerm,elapsed_ms:u32,target_bp:u16)->Result<CacheEntry,UnsupportedReason>, snapshot_from_hit(identity:&DecisionIdentity,input:&SolveInput,hit:&CacheHit,origin:&str)->StreetSnapshot}`; and the `crates/engine/tests/support/mod.rs` harness `{run_flop_script(cache:Vec<Lookup>,raw:f32,status:&str)->Vec<RecommendationEvent>, final_count(&[RecommendationEvent])->usize, provisional_hit(raw_over_p:f64)->CacheHit, exact_hit()->Vec<Lookup>, approximate_hit()->Vec<Lookup>, provisional_route()->Vec<Lookup>, solve_input_for(&CacheQuery)->SolveInput}`. `run_flop_script` seeds the rig's cache directory so `Cache::lookup` really returns the scripted results, then drives Plan 2's existing fake worker with a complete validated payload; it never mocks the engine result.
+**Interfaces:** Consumes `Cache::lookup`, `Cache::store`, `cache_bridge::{key_and_source,make_cache_query}` (Task 7), Plan 2's `serve::serve_request`, `solve::{run_solve,SolvePlan,Terminal,SolveOutcome}`, `watchdog::Armed.retained`, `assemble::{accumulate,final_from_solution,hero_reach}`, `tree::{build_tree_full,tree_signature,TemplateSelection}`, Plan 3 Task 18's `Engine::register_snapshot` / `SnapshotStore::register`, `SolveInput`, and Task 9's `EngineCore.flop_policy`. Produces `flop::{CacheRoute::{Final(CacheHit),Refine{retained:Option<CacheHit>}}, choose_cache_route(Vec<Lookup>)->CacheRoute, cacheable(Street,bool,u16,bool)->bool, is_street_violation(Street,bool,bool,bool)->bool}`; `serve::{CACHE_BUDGET_MS, Probe, probe_cache, cache_phase, cache_label_for}` — `probe_cache`, `cache_phase` and `recommendation_from_hit` all take the request-captured `target_bp: u16` rather than reading `core.config`; `cache_bridge::{entry_from_solution(input:&SolveInput,solution:&StreetSolution,reasons:&[ApproxReason],bb_chips:u32,rake:&Rake,signature:&str,perm:&SuitPerm,elapsed_ms:u32,target_bp:u16)->Result<CacheEntry,UnsupportedReason>, snapshot_from_hit(identity:&DecisionIdentity,input:&SolveInput,hit:&CacheHit,origin:&str)->StreetSnapshot}`; and the `crates/engine/tests/support/mod.rs` harness `{run_flop_script(cache:Vec<Lookup>,raw:f32,status:&str)->Vec<RecommendationEvent>, final_count(&[RecommendationEvent])->usize, provisional_hit(raw_over_p:f64)->CacheHit, exact_hit()->Vec<Lookup>, approximate_hit()->Vec<Lookup>, provisional_route()->Vec<Lookup>, solve_input_for(&CacheQuery)->SolveInput}`. `run_flop_script` seeds the rig's cache directory so `Cache::lookup` really returns the scripted results, then drives Plan 2's existing fake worker with a complete validated payload; it never mocks the engine result.
 
 `cache::lookup::{Lookup, CacheHit}` gain `#[derive(Clone)]` in this task so a probe list can be inspected after routing.
 
@@ -1646,7 +1661,7 @@ fn provisional_hit_is_emitted_then_refined() {
 }
 ```
 
-- [ ] **Step 2 (2 min): Run red:** `cargo test -p engine --features testing deadline_best_so_far_labelling`; the newly added engine assertions must fail before routing changes.
+- [ ] **Step 2 (2 min): Run red:** `cargo test -p engine --features testing,test-templates deadline_best_so_far_labelling`; the newly added engine assertions must fail before routing changes.
 - [ ] **Step 3 (5 min): Implement cache-route selection with retained provisional evidence.**
 
 ```rust
@@ -1700,23 +1715,27 @@ pub const CACHE_BUDGET_MS: u64 = 500;
 pub struct Probe { pub template_id: String, pub tree: EffectiveTree, pub signature: String,
     pub pot: u32, pub result: Lookup }
 
+#[allow(clippy::too_many_arguments)]
 fn probe_cache(core:&EngineCore,root:&StreetRootSnapshot,ranges:&[Range1326;2],d:&Derived,
     state:&HandState,inherited:&[ApproxReason],perm:&core_iso::SuitPerm,template:&str,
-    budget:Duration)->Option<Probe> {
+    target_bp:u16,budget:Duration)->Option<Probe> {
     let build=build_tree_full(root,&TemplateSelection::from_history(template,&root.history)).ok()?;
     let signature=tree_signature(&build.tree,build.pot);
     let input=SolveInput{root:root.clone(),ranges:[ranges[0].clone(),ranges[1].clone()],
-        tree:build.tree.clone(),target_bp:core.config.solver.target_bp};
+        tree:build.tree.clone(),target_bp};
     let query:CacheQuery=make_cache_query(&input,d,state.config.bb_chips,&state.config.rake,
-        inherited,&signature,perm,core.config.solver.target_bp,budget).ok()?;
+        inherited,&signature,perm,target_bp,budget).ok()?;
     let result=core.cache.lookup(&query);
     Some(Probe{template_id:template.into(),tree:build.tree,signature,pot:build.pot,result})
 }
 
 /// Pre-solver template first, then a distinct live template, sharing one budget.
+/// `target_bp` is the request's captured value, forwarded from `serve_request`'s single
+/// `let config = core.config();`. Configuration is never recaptured mid-decision.
+#[allow(clippy::too_many_arguments)]
 fn cache_phase(core:&EngineCore,root:&StreetRootSnapshot,ranges:&[Range1326;2],d:&Derived,
     state:&HandState,inherited:&[ApproxReason],perm:&core_iso::SuitPerm,live_template:&str,
-    t0_ms:u64)->(CacheRoute,Vec<Probe>) {
+    target_bp:u16,t0_ms:u64)->(CacheRoute,Vec<Probe>) {
     let mut order:Vec<&str>=Vec::new();
     if root.street==Street::Flop {order.push(crate::flop::PRESOLVER_TEMPLATE);}
     if !order.contains(&live_template) {order.push(live_template);}
@@ -1725,7 +1744,7 @@ fn cache_phase(core:&EngineCore,root:&StreetRootSnapshot,ranges:&[Range1326;2],d
         let spent=core.clock.now_ms().saturating_sub(t0_ms);
         let left=CACHE_BUDGET_MS.saturating_sub(spent);
         if left==0 {break;}
-        let Some(p)=probe_cache(core,root,ranges,d,state,inherited,perm,template,
+        let Some(p)=probe_cache(core,root,ranges,d,state,inherited,perm,template,target_bp,
             Duration::from_millis(left)) else {continue};
         let terminal=matches!(p.result,Lookup::Exact{..}|Lookup::Approximate{..});
         probes.push(p);
@@ -1754,9 +1773,8 @@ fn cache_label_for(probes:&[Probe])->String {
 ```rust
 // crates/engine/src/serve.rs — inside serve_request, immediately after the `Classification::HuStreet`
 // destructuring, replacing Plan 2's flop rejection
-let policy=FlopPolicy::from_v3(
-    core.bench_p95_ms.get("flop_min_v1@100bb").map(|ms|*ms as f64/1000.0),
-    core.bench_p95_ms.get("flop_min_v1@200bb").map(|ms|*ms as f64/1000.0));
+// Task 9 owns the provenance-checked policy; it is loaded once at startup, never here.
+let policy=&core.flop_policy;
 let template=match root.street {
     Street::River=>"river_std_v1",
     Street::Turn=>"turn_std_v1",
@@ -1768,13 +1786,15 @@ let template=match root.street {
 ```rust
 // crates/engine/src/serve.rs — after the Fast event and the `fast-path` equity spawn,
 // before `build_tree_full`
+// `config` is `serve_request`'s existing single capture; `target_bp` travels with the request.
+let target_bp=config.solver.target_bp;
 let mut route=CacheRoute::Refine{retained:None};
-let mut perm=core_iso::SuitPerm::identity();
+let mut perm=core_iso::SuitPerm::IDENTITY;
 if matches!(root.street,Street::Flop|Street::Turn) {
     let (_,p)=core_iso::canonicalize(&root.board,&[&ranges.oop,&ranges.ip]);
     perm=p;
     let (r,probes)=cache_phase(core,&root,&[ranges.oop.clone(),ranges.ip.clone()],&d,
-        &req.state,&inherited,&perm,template,req.t0_ms);
+        &req.state,&inherited,&perm,template,target_bp,req.t0_ms);
     assumptions.cache=cache_label_for(&probes);
     if let Some(p)=probes.iter().find(|p|matches!(p.result,Lookup::Exact{..}|Lookup::Approximate{..}
         |Lookup::Provisional{..})) {
@@ -1789,9 +1809,9 @@ let retained_raw=match &route {
 };
 if let CacheRoute::Final(hit)=&route {
     let rec=recommendation_from_hit(core,&req,&ctx,hit,hero_public,hero_actor,&inherited,
-        &assumptions,Phase::Final);
+        &assumptions,target_bp,Phase::Final);
     let input=SolveInput{root:root.clone(),ranges:[ranges.oop.clone(),ranges.ip.clone()],
-        tree:hit.tree.clone(),target_bp:core.config.solver.target_bp};
+        tree:hit.tree.clone(),target_bp};
     let origin=match assumptions.cache.as_str() {"exact"=>"cache_exact",_=>"cache_approximate"};
     let active=core.identity.lock().unwrap().active().cloned();
     if let Some(a)=active {
@@ -1806,13 +1826,13 @@ if let CacheRoute::Final(hit)=&route {
 }
 ```
 
-`core_iso::SuitPerm::identity()` is Plan 1's identity permutation; the River branch never uses it. `recommendation_from_hit` is the shared assembler:
+`core_iso::SuitPerm::IDENTITY` is Plan 1 Task 21's identity-permutation constant (`pub const IDENTITY: SuitPerm = SuitPerm([0, 1, 2, 3]);`), not a constructor call; the River branch never uses it. `recommendation_from_hit` is the shared assembler:
 
 ```rust
 #[allow(clippy::too_many_arguments)]
 fn recommendation_from_hit(core:&EngineCore,req:&LiveRequest,ctx:&AssemblyCtx,hit:&CacheHit,
     hero_public:&Range1326,hero_actor:&str,inherited:&[ApproxReason],
-    assumptions:&Assumptions,phase:Phase)->Recommendation {
+    assumptions:&Assumptions,target_bp:u16,phase:Phase)->Recommendation {
     let requested=hit.solution.requested as usize;
     let mut a=assumptions.clone();
     a.source=format!("cache@{}",proto::worker::SOLVER_COMMIT);
@@ -1838,9 +1858,9 @@ if let CacheRoute::Refine{retained:Some(hit)}=&route {
     let mut provisional_assumptions=assumptions.clone();
     provisional_assumptions.cache="provisional".into();
     let rec=recommendation_from_hit(core,&req,&ctx,hit,hero_public,hero_actor,&inherited,
-        &provisional_assumptions,Phase::Provisional);
+        &provisional_assumptions,target_bp,Phase::Provisional);
     let input=SolveInput{root:root.clone(),ranges:[ranges.oop.clone(),ranges.ip.clone()],
-        tree:hit.tree.clone(),target_bp:core.config.solver.target_bp};
+        tree:hit.tree.clone(),target_bp};
     let active=core.identity.lock().unwrap().active().cloned();
     if let Some(a)=active {
         let snapshot=snapshot_from_hit(&req.identity,&input,hit,"cache_provisional");
@@ -1931,10 +1951,10 @@ if let (Terminal::Ok|Terminal::BestSoFar,Some(sol))=(&out.terminal,&out.solution
     let baseline=true;   // §10.4 model = baseline in phase 1
     if cacheable(root.street,false,sol.locks_applied,baseline) {
         let stored=SolveInput{root:root.clone(),ranges:[ranges.oop.clone(),ranges.ip.clone()],
-            tree:out.tree.clone(),target_bp:core.config.solver.target_bp};
+            tree:out.tree.clone(),target_bp};
         let signature=tree_signature(&out.tree,build.pot);
         match entry_from_solution(&stored,sol,&inherited,req.state.config.bb_chips,
-            &req.state.config.rake,&signature,&perm,elapsed,core.config.solver.target_bp) {
+            &req.state.config.rake,&signature,&perm,elapsed,target_bp) {
             Ok(entry)=>core.cache.store(&entry),
             Err(reason)=>core.log_cache_reject(&req.identity,&reason),
         }
@@ -1971,7 +1991,7 @@ fn cache_labels_are_recorded_for_every_route() {
 }
 ```
 
-- [ ] **Step 6 (3 min): Run green:** `cargo test -p engine --features testing --test flop_path_golden`; `cargo test --workspace`.
+- [ ] **Step 6 (3 min): Run green:** `cargo test -p engine --features testing,test-templates --test flop_path_golden`; `cargo test --workspace`.
 - [ ] **Step 7 (2 min): Commit.**
 
 ```powershell
@@ -1983,9 +2003,9 @@ git commit -m 'feat(engine): complete cache provisional and live flop routing' -
 
 Cross-plan Or1/R4 and review m6: no earlier plan builds the `experimental` block, so this task **creates** it for River, Turn and Flop and adds the §13.3 golden under its spec name.
 
-**Files:** Create `crates/engine/src/experimental.rs`, `crates/engine/tests/experimental_surrogate.rs`, `crates/engine/tests/golden/experimental_surrogate.json`; modify `crates/engine/src/{lib,serve,equity}.rs`, `crates/engine/tests/support/mod.rs`.
+**Files:** Create `crates/engine/src/experimental.rs`, `crates/engine/tests/experimental_surrogate.rs`, `crates/engine/tests/golden/experimental_surrogate.json`; modify `crates/engine/src/{lib,serve,solve}.rs`, `crates/engine/tests/support/mod.rs`.
 
-**Interfaces:** Consumes `proto::{ExperimentalHu, EXPERIMENTAL_NOTE, ActionAdvice, Derived, Seat, Range1326}`, `core_eval::{EquityRequest, PlayerRange, EquityMode, EquityStatus, equity, exact_cost}`, Plan 2's `deadline::Deadlines`, `solve::{run_solve, SolvePlan, Terminal}`, `tree::{materialize_at, Templates, TemplateSelection, build_tree_full}`, `assemble::advice_rows`. Produces `equity::range_vs_range(&Range1326,&Range1326,&[Card],Duration,&AtomicBool)->Option<f32>`; `experimental::{SurrogateInput{hero:Seat,opponent:Seat,pot:u32,stack:u32,hero_role:&'static str,template_id:String}, choose_opponent(hero:Seat,hero_public:&Range1326,others:&[(Seat,Range1326)],board:&[Card],budget:Duration,cancel:&AtomicBool)->Option<Seat>, surrogate_input(d:&Derived,state:&HandState,hero:Seat,opponent:Seat,street:Street,template_id:&str)->Option<SurrogateInput>, run_surrogate(core:&mut EngineCore,input:&SurrogateInput,ranges:[Range1326;2],board:&[Card],deadlines:&Deadlines,identity:&DecisionIdentity,sink:&SharedSink)->Option<ExperimentalHu>}`; and the `crates/engine/tests/support/mod.rs` helpers `{three_way_flop()->HandState, three_way_turn()->HandState, three_way_river()->HandState, three_way_flop_with_all_in_opponent()->HandState, street_root_public_ranges(&HandState)->RootRanges2{hero:Range1326,others:Vec<(Seat,Range1326)>}, run_three_way_flop_script(&HandState)->Vec<RecommendationEvent>, snapshot_count(&HandState)->usize, cache_entry_count()->usize}`, all built on Plan 2's `FakeWorker`/`FakeClock` and the rig's temporary cache directory.
+**Interfaces:** Consumes `proto::{ExperimentalHu, EXPERIMENTAL_NOTE, ActionAdvice, Derived, Seat, Range1326}`, Plan 2 Task 25's existing `engine::equity::range_vs_range(hero_public:&Range1326, opp_public:&Range1326, board:&[Card], budget:Duration, cancel:&AtomicBool) -> Option<(f32, EquityMethod)>`, Plan 2's `deadline::Deadlines`, `solve::{run_solve, SolvePlan, Terminal}`, `tree::{materialize_at, Templates, TemplateSelection, build_tree_full}`. This task creates **no** equity helper: Plan 2 Task 25 is the single owner of `range_vs_range` and its tuple result is consumed as-is. Produces `experimental::{SurrogateInput{hero:Seat,opponent:Seat,pot:u32,stack:u32,hero_role:&'static str,template_id:String}, choose_opponent(hero:Seat,hero_public:&Range1326,others:&[(Seat,Range1326)],board:&[Card],budget:Duration,cancel:&AtomicBool)->Option<Seat>, surrogate_input(d:&Derived,state:&HandState,hero:Seat,opponent:Seat,street:Street,template_id:&str)->Option<SurrogateInput>, run_surrogate(core:&mut EngineCore,input:&SurrogateInput,ranges:[Range1326;2],board:&[Card],hero_cards:[Card;2],bb_chips:u32,rake:&Rake,target_bp:u16,deadlines:&Deadlines,identity:&DecisionIdentity,sink:&SharedSink)->Option<ExperimentalHu>}`; and in `solve.rs` the shared internal transport extracted from `run_solve`, `solve_request_from_parts` and `send_solve_request`, with the exact `pub(crate)` signatures given in Step 4; and the `crates/engine/tests/support/mod.rs` helpers `{three_way_flop()->HandState, three_way_turn()->HandState, three_way_river()->HandState, three_way_flop_with_all_in_opponent()->HandState, street_root_public_ranges(&HandState)->RootRanges2{hero:Range1326,others:Vec<(Seat,Range1326)>}, run_three_way_flop_script(&HandState)->Vec<RecommendationEvent>, snapshot_count(&HandState)->usize, cache_entry_count()->usize}`, all built on Plan 2's `FakeWorker`/`FakeClock` and the rig's temporary cache directory.
 
 - [ ] **Step 1 (4 min): Write `experimental_surrogate_golden` with the spec's three-way flop.**
 
@@ -2047,22 +2067,7 @@ fn surrogate_is_skipped_when_the_opponent_is_all_in_or_stackless() {
 - [ ] **Step 2 (2 min): Run red:** `cargo test -p engine --features testing --test experimental_surrogate`; the module does not exist.
 - [ ] **Step 3 (5 min): Implement opponent selection and the synthetic root.**
 
-```rust
-// crates/engine/src/equity.rs — one added helper
-/// Range-vs-range equity through the same routine as §7, with the §7 exact/MC rule.
-pub fn range_vs_range(a:&proto::Range1326,b:&proto::Range1326,board:&[proto::Card],
-    budget:std::time::Duration,cancel:&std::sync::atomic::AtomicBool)->Option<f32> {
-    use core_eval::{equity,exact_cost,EquityMode,EquityRequest,EquityStatus,PlayerRange};
-    let players=vec![PlayerRange{seat:proto::Seat(0),range:a.clone()},
-                     PlayerRange{seat:proto::Seat(1),range:b.clone()}];
-    let probe=EquityRequest::single_pot(board.to_vec(),players.clone(),EquityMode::Exact);
-    let mode=if exact_cost(&probe)<=20_000_000 {EquityMode::Exact}
-        else {EquityMode::MonteCarlo{seed:7,max_samples:200_000}};
-    let result=equity(&EquityRequest::single_pot(board.to_vec(),players,mode),budget,cancel);
-    if result.status!=EquityStatus::Ready {return None;}
-    result.shares.iter().find(|s|s.seat==proto::Seat(0)).map(|s|s.value)
-}
-```
+No equity function is defined here. Plan 2 Task 25 already owns `engine::equity::range_vs_range`, including the §7 exact/Monte-Carlo selection rule, and returns `Option<(f32, EquityMethod)>`; the surrogate destructures that tuple and ignores the method.
 
 ```rust
 // crates/engine/src/experimental.rs
@@ -2089,8 +2094,9 @@ pub fn choose_opponent(hero:Seat,hero_public:&Range1326,others:&[(Seat,Range1326
     let mut best:Option<(Seat,f32)>=None;
     for (seat,range) in others {
         if *seat==hero {continue;}
-        let Some(equity)=crate::equity::range_vs_range(range,hero_public,board,per_seat,cancel)
-            else {continue};
+        let Some((equity,_method))=crate::equity::range_vs_range(
+            range,hero_public,board,per_seat,cancel
+        ) else {continue};
         if best.as_ref().map_or(true,|(_,b)|equity>*b) {best=Some((*seat,equity));}
     }
     best.map(|(seat,_)|seat)
@@ -2104,54 +2110,99 @@ pub fn surrogate_input(d:&Derived,state:&HandState,hero:Seat,opponent:Seat,stree
     let stack=(*d.stacks_remaining.get(hero.0 as usize)?)
         .min(*d.stacks_remaining.get(opponent.0 as usize)?);
     if stack==0||d.pot==0 {return None;}
-    let order=core_model::postflop_order(state);          // seats in postflop action order
+    // seats in postflop action order
+    let order=core_model::postflop_order(state.button,&state.dealt);
     let hero_first=order.iter().position(|s|*s==hero)?<order.iter().position(|s|*s==opponent)?;
     Some(SurrogateInput{hero,opponent,pot:d.pot,stack,
         hero_role:if hero_first {"oop"} else {"ip"},template_id:template_id.into()})
 }
 ```
 
-`core_model::postflop_order(&HandState) -> Vec<Seat>` is Plan 1's postflop ordering helper; when Plan 1 exposes it under another name, call that one at this single site. The surrogate never touches `SolveInput` of the main path, the cache or the snapshot store: it builds its own `StreetRootSnapshot` with `history: vec![]`, `dead_this_street: 0` and `projected_from` equal to the number of pot-eligible seats, and it always reads the root node when hero is OOP and the node after OOP's check when hero is IP.
+`core_model::postflop_order(button: Seat, dealt: &[Seat]) -> Vec<Seat>` is Plan 1 Task 9's postflop ordering helper; that is the exact producer signature and it takes the button and the dealt seats, not the whole state. The surrogate never constructs a `SolveInput` and never touches the cache or the snapshot store: it builds its own `StreetRootSnapshot` with `history: vec![]`, `dead_this_street: 0` and `projected_from` equal to the number of pot-eligible seats, and it always reads the root node when hero is OOP and the node after OOP's check when hero is IP.
 
 - [ ] **Step 4 (5 min): Run the isolated solve and attach the block.**
+
+**Surrogate contract (binding; this is a required interface repair, not a description of already-correct sample code).** `run_surrogate` receives the actual hero cards for advice extraction, the hand's `bb_chips` and `rake`, and the request-captured `target_bp`, in addition to its existing synthetic input, public ranges, board, deadline, identity and sink. The hero cards never condition those public solve ranges. Build the synthetic tree from pot, equal effective stacks and empty history, but **never construct `SolveInput`**. This task factors the existing worker request/response, validation, heartbeat, cancellation and deadline handling below `run_solve` into a shared internal transport function accepting a worker `SolveRequest`; `run_solve` continues to be the main-path `SolveInput` adapter, and the surrogate constructs its `SolveRequest` directly. Its output bypasses cache and snapshot registration. Validate the entire returned solution, resolve the root or check child for hero's role, select the actual hero combo row, and use `ev_chips / bb_chips` once to construct `ActionAdvice`. Preserve fold EV zero and unavailable/out-of-support handling; do **not** call `advice_rows` (no such upstream API exists — Plan 2 Task 26 owns `final_from_solution`) and never pass an empty reach vector to `final_from_solution`. Return only `ExperimentalHu`, with `EXPERIMENTAL_NOTE`; the main recommendation stays `Unsupported{MultiwayEv}` with `actions` empty. Use the real rake, never a hard-coded `TimeCharge`, and the real BB, never 2. Skip the surrogate on an all-in opponent, a zero stack, an exhausted equity/remaining budget or a worker failure.
+
+**Exact extracted transport signatures (binding):**
+
+```rust
+pub(crate) fn solve_request_from_parts(
+    core: &mut EngineCore,
+    root: &proto::StreetRootSnapshot,
+    ranges: &[proto::Range1326; 2],
+    target_bp: u16,
+    plan: &SolvePlan,
+    build: &crate::tree::TreeBuild,
+    deadline_ms: u32,
+) -> proto::worker::SolveRequest;
+
+pub(crate) fn send_solve_request(
+    core: &mut EngineCore,
+    request: proto::worker::SolveRequest,
+    plan: &SolvePlan,
+    build: &crate::tree::TreeBuild,
+    sink: &SharedSink,
+) -> SolveOutcome;
+```
+
+Plan 4 Task 11 owns these crate-visible extractions. The builder preserves Plan 2's request-id allocation, spot hash, memory limit, rake, history and background flag without constructing SolveInput. The sender shares one-attempt transport, whole-solution validation, identity checks, heartbeat, cancellation and absolute deadlines. Keep main-path requested-node/hero-actor checks and Task 23 retry/admission policy in run_solve; the surrogate validates its separately selected root/check-child advice row and skips on failure.
 
 ```rust
 #[allow(clippy::too_many_arguments)]
 pub fn run_surrogate(core:&mut EngineCore,input:&SurrogateInput,ranges:[Range1326;2],
-    board:&[Card],deadlines:&Deadlines,identity:&DecisionIdentity,sink:&SharedSink)
+    board:&[Card],hero_cards:[Card;2],bb_chips:u32,rake:&Rake,target_bp:u16,
+    deadlines:&Deadlines,identity:&DecisionIdentity,sink:&SharedSink)
     ->Option<ExperimentalHu> {
+    if bb_chips==0 {return None;}
     let root=StreetRootSnapshot{street:if board.len()==5 {Street::River}
             else if board.len()==4 {Street::Turn} else {Street::Flop},
         board:board.to_vec(),
         oop:if input.hero_role=="oop" {input.hero} else {input.opponent},
         ip:if input.hero_role=="oop" {input.opponent} else {input.hero},
         pot_root:input.pot,stack_oop_root:input.stack,stack_ip_root:input.stack,
-        dead_this_street:0,projected_from:2,bb_chips:2,history:vec![]};
+        dead_this_street:0,projected_from:2,bb_chips,history:vec![]};
     let build=build_tree_full(&root,
         &TemplateSelection::from_history(&input.template_id,&[])).ok()?;
-    let solve=SolveInput{root:root.clone(),ranges:ranges.clone(),tree:build.tree.clone(),
-        target_bp:core.config.solver.target_bp};
-    let plan=SolvePlan{identity:identity.clone(),deadlines:*deadlines,
+    // No SolveInput: the surrogate builds the worker request itself and sends it through the
+    // transport function shared with run_solve (spec §6 / S:L423 separate-contract rule).
+    let plan=SolvePlan{identity:identity.clone(),deadlines:deadlines.clone(),
         template_id:input.template_id.clone(),retry_template_id:None,
-        rake:Rake::TimeCharge,hero_actor:input.hero_role.into(),background:false};
-    let out=run_solve(core,&solve,&plan,sink);
+        rake:rake.clone(),hero_actor:input.hero_role.into(),background:false};
+    let deadline_ms=plan.deadlines.worker_deadline_ms(core.clock.now_ms(),plan.deadlines.street_deadline_ms)?;
+    let request=crate::solve::solve_request_from_parts(core,&root,&ranges,target_bp,
+        &plan,&build,deadline_ms);
+    let out=crate::solve::send_solve_request(core,request,&plan,&build,sink);
     let solution=match (&out.terminal,&out.solution) {
         (Terminal::Ok|Terminal::BestSoFar,Some(s))=>s.clone(),_=>return None};
+    proto::worker::validate_solution(&solution,&build.tree.materialized).ok()?;
     // hero reads the root when OOP, the node after OOP's check when IP
     let path:Vec<Action>=if input.hero_role=="oop" {vec![]} else {vec![Action::Check]};
     let ordinal=proto::resolve_chip_path(&build.tree.materialized,&path)?;
     let index=out.ordinal_paths.iter().position(|p|*p==ordinal)?;
     let node=solution.nodes.get(index)?;
+    // the actual hero combo row, never an empty reach vector
+    let combo=core_ranges::combo_index(hero_cards[0],hero_cards[1])?;
+    if !*node.available.get(combo)? {return None;}
+    let actions=node.actions.iter().enumerate().map(|(a,action)| {
+        let ev_chips=if matches!(action,Action::Fold) {0.0}
+            else {*node.ev_chips.get(combo).and_then(|row|row.get(a))?};
+        Some(ActionAdvice{action:action.clone(),
+            frequency:node.probs.get(combo).and_then(|row|row.get(a)).copied(),
+            ev_bb:Some(ev_chips/bb_chips as f32)})
+    }).collect::<Option<Vec<_>>>()?;
     Some(ExperimentalHu{opponent:input.opponent,hero_role:input.hero_role.into(),
         pot:input.pot,stack:input.stack,template_id:input.template_id.clone(),
         ranges_used:[(root.oop,core_ranges::range_to_string(&ranges[0]),core_ranges::mass(&ranges[0])),
                      (root.ip,core_ranges::range_to_string(&ranges[1]),core_ranges::mass(&ranges[1]))],
-        actions:crate::assemble::advice_rows(node,&[],2),
-        reached_bp:out.reached_bp,elapsed_ms:out.elapsed_ms,note:EXPERIMENTAL_NOTE.into()})
+        actions,reached_bp:out.reached_bp,elapsed_ms:out.elapsed_ms,
+        note:EXPERIMENTAL_NOTE.into()})
 }
 ```
 
-`crate::assemble::advice_rows(node, hero_reach, bb_chips) -> Vec<ActionAdvice>` is Plan 2 Task 19's row builder used by `final_from_solution`; the surrogate passes an empty hero reach because a synthetic root has no hero conditioning. In `serve.rs` the `Classification::Multiway { pot_eligible }` arm now builds the surrogate before emitting, using the **street-root unconditioned** public ranges of hero and the chosen opponent, the same template the street would use and the remaining street budget; it attaches the result to `rec.experimental` and leaves `rec.actions` empty. The surrogate is skipped when the equity phase overran its budget, when `surrogate_input` returns `None`, or when `run_solve` fails: in every case `experimental` stays `None` and the `Unsupported{MultiwayEv}` result is unchanged.
+`crates/engine/src/solve.rs` is therefore modified by this task: `solve_request_from_parts` and `send_solve_request` are the extracted transport seam, and `run_solve` keeps its existing signature by calling the same two functions. This plan adds no second `WorkerLink`, no second deadline arithmetic and no second validator.
+
+In `serve.rs` the `Classification::Multiway { pot_eligible }` arm now builds the surrogate before emitting, using the **street-root unconditioned** public ranges of hero and the chosen opponent, the hand's real `bb_chips` and `rake`, the request-captured `target_bp`, the same template the street would use and the remaining street budget; it attaches the result to `rec.experimental` and leaves `rec.actions` empty. The surrogate is skipped when the equity phase overran its budget, when `surrogate_input` returns `None`, or when the solve fails: in every case `experimental` stays `None` and the `Unsupported{MultiwayEv}` result is unchanged.
 
 - [ ] **Step 5 (4 min): Prove the isolation.** Assert that after a surrogate run the snapshot store for the hand is empty, the cache directory contains no `.bin` file, the main `actions` list carries no EV, and the coverage is never `Exact`. Repeat the golden for a three-way turn and a three-way river so all three streets are exercised, and add a case where the highest-equity opponent is all-in: the next-best seat is **not** substituted, the surrogate is skipped entirely.
 
@@ -2167,7 +2218,31 @@ fn surrogate_never_enters_cache_or_snapshots_on_any_street() {
         assert_eq!(support::cache_entry_count(),0);
     }
 }
+
+/// The surrogate uses the hand's real BB and the real hero combo, not 2 and not a blank reach.
+#[test]
+fn surrogate_uses_real_bb_and_the_actual_hero_combo_when_ip() {
+    let state=support::three_way_flop_ip_hero_bb_100();   // bb_chips = 100, hero acts IP
+    let events=support::run_three_way_flop_script(&state);
+    let last=events.iter().rev().find_map(|e|match e {
+        proto::RecommendationEvent::Final(r)=>Some(r),_=>None}).unwrap();
+    let experimental=last.experimental.as_ref().unwrap();
+    assert_eq!(experimental.hero_role,"ip");
+    // ev_bb is ev_chips / 100, never ev_chips / 2
+    let ev_bb=experimental.actions.iter().find_map(|a|a.ev_bb).unwrap();
+    assert!(ev_bb.abs()<experimental.stack as f32/100.0+1.0);
+    // a different hero combo in the same public spot yields a different advice row
+    let other=support::three_way_flop_ip_hero_bb_100_other_combo();
+    let other_events=support::run_three_way_flop_script(&other);
+    let other_last=other_events.iter().rev().find_map(|e|match e {
+        proto::RecommendationEvent::Final(r)=>Some(r),_=>None}).unwrap();
+    assert_ne!(other_last.experimental.as_ref().unwrap().actions,experimental.actions);
+    // the public ranges are identical: hero cards never condition them
+    assert_eq!(other_last.experimental.as_ref().unwrap().ranges_used,experimental.ranges_used);
+}
 ```
+
+Add `support::{three_way_flop_ip_hero_bb_100, three_way_flop_ip_hero_bb_100_other_combo}` to the helper list in this task's Interfaces block.
 
 - [ ] **Step 6 (3 min): Run green:** `cargo test -p engine --features testing --test experimental_surrogate`; `cargo test --workspace`. Record the golden once with `POKERAI_RECORD_GOLDENS=1`, review it, then unset the variable.
 - [ ] **Step 7 (2 min): Commit.**
@@ -2181,7 +2256,7 @@ git commit -m 'feat(engine): add the section 6 experimental synthetic-root surro
 
 **Files:** Modify `crates/engine/src/{cache_bridge,snapshots}.rs`, `crates/engine/tests/support/mod.rs`; create `crates/engine/tests/cache_snapshot_replay.rs`, `crates/engine/tests/golden/cache_snapshot_replay.json`.
 
-**Interfaces:** Consumes `core_replay::{SnapshotKey, SnapshotProvenance, StreetSnapshot, SnapshotStore, ReplayInput, replay}` (Plan 3 Tasks 11/14), `cache_bridge::snapshot_from_hit` (Task 10), Plan 3 Task 18's `Engine::register_snapshot(&mut self, active:&DecisionIdentity, snapshot:StreetSnapshot)->bool` and `SnapshotStore::register`. Produces the cached prior-street translation goldens and `snapshots::CACHE_ORIGINS: [&str; 3]`. This plan adds **no** second registration path (cross-plan M15/D1): the cache route calls the same `EngineCore.snapshots` store that live results use. Root hashes are the query public range hashes at that root; snapshot tree/nodes are query-sized, original-suit values.
+**Interfaces:** Consumes `core_replay::{SnapshotKey, SnapshotProvenance, StreetSnapshot, SnapshotStore, ReplayInput, replay}` (Plan 3 Task 13 defines snapshot records; Task 14 replaces Plan 2 Task 27's `SolvedStreet` and `SnapshotStore` with the `core_replay` types), `cache_bridge::snapshot_from_hit` (Task 10), Plan 3 Task 18's `Engine::register_snapshot(&mut self, active:&DecisionIdentity, snapshot:StreetSnapshot)->bool` and `SnapshotStore::register`. Produces the cached prior-street translation goldens and `snapshots::CACHE_ORIGINS: [&str; 3]`. This plan adds **no** second registration path and advertises no free `engine::snapshots::register_snapshot` function (cross-plan M15/D1): the cache route calls the same `EngineCore.snapshots` store that live results use. Root hashes are the query public range hashes at that root; snapshot tree/nodes are query-sized, original-suit values.
 
 - [ ] **Step 1 (5 min): Write cache-hit replay integration assertions.** Cache-hit Final at the flop root, append Bet50/Call and turn 4d: the root and the IP call likelihoods each condition once, the returned turn input uses replayed marginals, and no turn strategy is requested from the flop entry. Equivalent 100/500 and 200/1000 paths must produce equal normalized turn ranges. Then solve at prefix Check, append villain Bet73/Call against snapshot menus 50/100: expect a prior-street `BetTranslation`, and the turn solves from the turn root.
 
@@ -2215,7 +2290,7 @@ fn cache_hit_snapshot_keeps_query_identity_and_paths() {
 
 `StreetRootSnapshot` carries `bb_chips` (Plan 1 dev 1, spec S1, cross-plan M9); every literal in this plan sets it.
 
-- [ ] **Step 2 (2 min): Run red:** `cargo test -p engine --features testing --test cache_snapshot_replay`; cache origin/prefix/range assertions fail until registration is wired.
+- [ ] **Step 2 (2 min): Run red:** `cargo test -p engine --features testing,test-templates --test cache_snapshot_replay`; cache origin/prefix/range assertions fail until registration is wired.
 - [ ] **Step 3 (5 min): Prove the cache route uses the existing registration path.** Plan 3 Task 14 already made `crates/engine/src/snapshots.rs` a re-export of `core_replay::{SnapshotStore, StreetSnapshot, SnapshotKey, SnapshotProvenance}` and Plan 3 Task 18 added `Engine::register_snapshot`. This plan adds only the origin constant and the test that pins the shared behaviour.
 
 ```rust
@@ -2255,7 +2330,7 @@ assert_eq!(snapshot.provenance.identity_at_solve,identity_at_validation);
 assert_eq!(snapshot.covered_paths.len(),snapshot.nodes.len());
 ```
 
-- [ ] **Step 5 (3 min): Run green:** `cargo test -p engine --features testing --test cache_snapshot_replay`; `cargo test --workspace`.
+- [ ] **Step 5 (3 min): Run green:** `cargo test -p engine --features testing,test-templates --test cache_snapshot_replay`; `cargo test --workspace`.
 - [ ] **Step 6 (2 min): Commit.**
 
 ```powershell
@@ -2631,7 +2706,7 @@ git commit -m 'feat(cache): persist resumable verified presolver queue' -m 'Co-A
 
 **Files:** Create `crates/cache/src/presolver/scheduler.rs`; modify `crates/cache/src/presolver/{mod,queue}.rs`, `crates/cache/tests/presolver_queue.rs`, `crates/cache/Cargo.toml`.
 
-**Interfaces:** Consumes `Queue`, `QueueItem`, `Scenario`, `CacheEntry`, `SolveInput`. Produces `PreparedJob`, `JobPoll`, `PresolveExecutor` (defined here, distinct from `WorkerLink`), `PresolverStatus` (**`Serialize`/`Deserialize`/`Debug`/`Clone`/`Default`/`PartialEq`**, cross-plan Or7/M9), `PresolverCommand`, `Presolver::{start(dir:PathBuf,executor:Box<dyn PresolveExecutor>)->Presolver, pause(&self), resume(&self), status(&self)->PresolverStatus, notify_hand(&self,bool), notify_live_request(&self), shutdown(&self)}`, `eligible`, `next_action`. Cache never imports engine, replay or preflop; the executor is a downward callback supplied by Task 16.
+**Interfaces:** Consumes `Queue`, `QueueItem`, `Scenario`, `CacheEntry`, `SolveInput`. Produces `PreparedJob`, `JobPoll`, `PresolveExecutor` (defined here, distinct from `WorkerLink`), `PresolverStatus` (**`Serialize`/`Deserialize`/`Debug`/`Clone`/`Default`/`PartialEq`**, cross-plan Or7/M9), `PresolverCommand`, `Presolver::{start(dir:PathBuf,executor:Box<dyn PresolveExecutor>)->Presolver, pause(&self), resume(&self), status(&self)->PresolverStatus, notify_hand(&self,bool), notify_live_request(&self), shutdown(&self)}`, `eligible`, `next_action`, **`cache::presolver::remaining_seconds(pending:u32,measured_p50:Option<f64>)->Option<f64>`** and the parent re-export **`pub use scheduler::PresolverStatus;` in `cache::presolver`**, so `cache::presolver::PresolverStatus` is the path Plan 5 and Task 16 name. `remaining_seconds` is defined here, before the scheduler calls it; Task 16 only re-exports it. Cache never imports engine, replay or preflop; the executor is a downward callback supplied by Task 16.
 
 - [ ] **Step 1 (4 min): Write the 30 s gate and pause tests.**
 
@@ -2655,6 +2730,10 @@ fn presolver_status_round_trips_as_json() {
     let back:cache::presolver::scheduler::PresolverStatus=serde_json::from_str(&text).unwrap();
     assert_eq!(status,back);
     assert!(text.contains("\"tier_total\":[7020,14040,21060]"));
+    // the parent path Plan 5 and Engine::presolver_status name resolves to the same type
+    let parent:cache::presolver::PresolverStatus=status.clone();
+    assert_eq!(parent,status);
+    assert_eq!(cache::presolver::remaining_seconds(7,Some(27.0)),Some(189.0));
 }
 ```
 
@@ -2694,6 +2773,34 @@ pub fn next_action(active:Option<u64>,live:bool,can_start:bool)->ScheduleAction 
     match(active,live,can_start) {
         (Some(id),true,_)=>ScheduleAction::Cancel(id),
         (None,false,true)=>ScheduleAction::Launch,_=>ScheduleAction::Wait,
+    }
+}
+```
+
+```rust
+// crates/cache/src/presolver/mod.rs — the parent module of this task
+pub mod queue;
+pub mod scenarios;
+pub mod scheduler;
+
+/// Plan 5 and `Engine::presolver_status` name the parent path, so the status type is
+/// re-exported here; `scheduler::PresolverStatus` remains its single definition.
+pub use scheduler::PresolverStatus;
+
+/// Defined here, before `scheduler` calls it (the scheduler's status publication uses
+/// `crate::presolver::remaining_seconds`). `engine::log` re-exports it in Task 16.
+pub fn remaining_seconds(pending:u32,measured_p50:Option<f64>)->Option<f64> {
+    measured_p50.filter(|x|x.is_finite()&&*x>0.0).map(|x|pending as f64*x)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn remaining_seconds_needs_a_finite_positive_measurement() {
+        assert_eq!(super::remaining_seconds(7,Some(27.0)),Some(189.0));
+        assert_eq!(super::remaining_seconds(7,None),None);
+        assert_eq!(super::remaining_seconds(7,Some(0.0)),None);
+        assert_eq!(super::remaining_seconds(7,Some(f64::NAN)),None);
     }
 }
 ```
@@ -2861,7 +2968,9 @@ git commit -m 'feat(cache): schedule idle presolves with live cancellation' -m '
 
 **Files:** Create `crates/engine/src/presolve.rs`, `crates/engine/tests/presolver_engine.rs`; modify `crates/engine/src/{engine,core,serve,log}.rs`.
 
-**Interfaces:** Implements `cache::presolver::scheduler::PresolveExecutor` using the existing `Engine`/`WorkerLink`; Consumes `PreflopStore::query`, `replay(ReplayInput)`, `build_effective_tree`, `core_model::street_root`, the last-used `HandConfig`, `cache_bridge::entry_from_solution`, `Cache::store_tracked`. Produces `presolve::{BACKGROUND_DEADLINE_MS, BACKGROUND_TARGET_BP, BACKGROUND_TEMPLATE, EngineExecutor, scenario_hand(cfg:&HandConfig,scenario:&Scenario,board:&[Card],store:&PreflopStore)->Result<HandState,UnsupportedReason>, scenario_hit_rates(records:&[DecisionRecord])->Vec<(String,u64,u64)>}`; `log::{hit_rate, remaining_seconds}`; and the engine surface Plan 5 renders: `Engine::{presolver_status(&self)->cache::presolver::scheduler::PresolverStatus, presolver_pause(&mut self), presolver_resume(&mut self)}` (cross-plan M9).
+**Interfaces:** Implements `cache::presolver::scheduler::PresolveExecutor` using the existing `Engine`/`WorkerLink`; Consumes `PreflopStore::query`, `replay(ReplayInput)`, `build_effective_tree`, `core_model::street_root`, the last-used `HandConfig`, `cache_bridge::entry_from_solution`, `Cache::store_tracked`, and Task 15's `cache::presolver::{PresolverStatus, remaining_seconds}`. Produces `presolve::{BACKGROUND_DEADLINE_MS, BACKGROUND_TARGET_BP, BACKGROUND_TEMPLATE, EngineExecutor, scenario_hand(cfg:&HandConfig,scenario:&Scenario,board:&[Card],store:&PreflopStore)->Result<HandState,UnsupportedReason>, scenario_hit_rates(records:&[DecisionRecord])->Vec<(String,u64,u64)>}`; `log::hit_rate` plus the re-export `pub use cache::presolver::remaining_seconds;` in `engine::log`; the new field `Engine.presolver: Option<Arc<cache::presolver::scheduler::Presolver>>`; and the engine surface Plan 5 renders: `Engine::{presolver_status(&self)->cache::presolver::PresolverStatus, presolver_pause(&mut self), presolver_resume(&mut self)}` (cross-plan M9).
+
+**Presolver ownership contract (F09/F10; binding).** Task 7 adds only `EngineCore.cache` and `with_cache`, initializing `cache` to `Cache::disabled()`; it does not mention `Presolver`. Task 15 defines `remaining_seconds` in `cache::presolver` before `scheduler` uses it and adds `pub use scheduler::PresolverStatus` to `cache::presolver`. This task adds `Engine.presolver: Option<Arc<cache::presolver::scheduler::Presolver>>`, initialized to `None` by `with_core` and populated once in production startup. Status, pause, resume, hand notification and live notification use this independent handle directly and **never acquire `EngineCore`'s mutex**. `EngineExecutor` holds a command/completion endpoint to the existing single worker owner, not an `Arc<Mutex<EngineCore>>` used by UI control calls. That owner serializes live and background send/receive, confirms background terminal or exit before sending live work, and observes the presolver cancellation flag while background work is running. A background job has its own bookkeeping and never requires an active live `DecisionIdentity` or emits user recommendation events/snapshots. No second `ProcessWorker` is spawned. Shutdown signals background cancellation before waiting for `engine-main`, joins the presolver, stops cache threads, and then shuts down/kills the worker; repeated shutdown is a no-op.
 
 - [ ] **Step 1 (5 min): Write chart-replay equivalence and admission tests.** Construct tier 1 BTN/BB 100 with last config 1/2 and the same legal prefix manually; compare both 1326 vectors, range hashes, root pot/stacks, tree signature and reasons. Change hero cards: identical job identity. Change the chart bundle: new hashes and identity. At live admission during Solving, assert the background cancel precedes the live send and that no admission is released at `ack`.
 
@@ -2902,7 +3011,28 @@ fn engine_owns_the_presolver_lifecycle() {
     assert!(support::eventually(||engine.presolver_status().running.is_none()));
     engine.shutdown();
 }
+
+/// F09: the presolver handle is independent of the worker owner, so a running solve cannot
+/// block status, pause or the live-admission notification.
+#[test]
+fn presolver_commands_never_wait_for_a_running_solve() {
+    let mut engine=support::engine_with_worker_stuck_in_solve();   // never returns a terminal
+    let started=std::time::Instant::now();
+    let _=engine.presolver_status();
+    engine.presolver_pause();
+    engine.presolver_resume();
+    assert!(started.elapsed()<std::time::Duration::from_millis(200),
+        "UI control calls must not acquire EngineCore's mutex");
+    // live admission sets the synchronous flag and cancellation precedes live dispatch
+    let order=support::recommend_and_record_worker_order(&mut engine);
+    let cancel=order.iter().position(|e|e=="background_cancel").unwrap();
+    let live=order.iter().position(|e|e=="live_send").unwrap();
+    assert!(cancel<live,"background cancellation precedes the live send");
+    engine.shutdown();
+}
 ```
+
+Add `support::{engine_with_worker_stuck_in_solve, recommend_and_record_worker_order}` to the harness; both are built on Plan 2 Task 19's `FakeWorker`/`FakeClock`.
 
 - [ ] **Step 2 (2 min): Run red:** `cargo test -p engine --features testing --test presolver_engine`.
 - [ ] **Step 3 (5 min): Implement scenario prefixes using actual chart sizes.** Begin a six-seat synthetic hand with stacks `depth_bb * bb_chips`, the last-used blinds/rake/straddle and button Seat(0); use core-model legal order. Query each prefix through the active highest-precedence bundle; choose its resolved open/3-bet size, explicit folds by unused seats, and a Call by the named defender or opener. No generic percentage ranges and no guessed missing nodes. Set the flop through core-model, call `replay` with no postflop snapshots, use its public root marginals and accumulated reasons, derive the root and materialize the fast tree. If a needed prefix is absent, record the failure reason and keep it visible; replay's specified missing-prior-node fallback is allowed only when deliberately frozen in the source provenance, never silently invented.
@@ -2940,45 +3070,53 @@ impl cache::presolver::scheduler::PresolveExecutor for EngineExecutor {
 ```
 
 ```rust
-// crates/engine/src/engine.rs — the Presolver lifecycle (blocker B3)
+// crates/engine/src/engine.rs — the Presolver lifecycle (blocker B3, F09)
+pub struct Engine {
+    // ... Plan 2 Task 29's existing fields ...
+    /// Independent of the worker owner: a UI command never waits behind a running solve.
+    pub(crate) presolver: Option<std::sync::Arc<cache::presolver::scheduler::Presolver>>,
+}
+
 impl Engine {
-    fn start_presolver(&mut self) {
-        let executor=Box::new(crate::presolve::EngineExecutor::new(self.core.clone()));
-        let root=self.core.lock().unwrap().cache.root().to_path_buf();
-        if root.as_os_str().is_empty() {return;}          // disabled cache: no pre-solver
-        let presolver=cache::presolver::scheduler::Presolver::start(root,executor);
-        self.core.lock().unwrap().presolver=Some(presolver);
+    fn start_presolver(&mut self, cache_root: std::path::PathBuf) {
+        if cache_root.as_os_str().is_empty() {return;}    // disabled cache: no pre-solver
+        // The executor talks to the single worker owner through its command/completion
+        // endpoint; it does not capture an Arc<Mutex<EngineCore>> for UI control calls.
+        let executor=Box::new(crate::presolve::EngineExecutor::new(self.owner_endpoint()));
+        self.presolver=Some(std::sync::Arc::new(
+            cache::presolver::scheduler::Presolver::start(cache_root,executor)));
     }
-    pub fn presolver_status(&self)->cache::presolver::scheduler::PresolverStatus {
-        self.core.lock().unwrap().presolver.as_ref()
-            .map(|p|p.status()).unwrap_or_default()
+    pub fn presolver_status(&self)->cache::presolver::PresolverStatus {
+        self.presolver.as_ref().map(|p|p.status()).unwrap_or_default()
     }
     pub fn presolver_pause(&mut self) {
-        if let Some(p)=self.core.lock().unwrap().presolver.as_ref() {p.pause();}
+        if let Some(p)=&self.presolver { p.pause(); }
     }
     pub fn presolver_resume(&mut self) {
-        if let Some(p)=self.core.lock().unwrap().presolver.as_ref() {p.resume();}
+        if let Some(p)=&self.presolver { p.resume(); }
     }
     fn notify_presolver_hand(&self,in_progress:bool) {
-        if let Some(p)=self.core.lock().unwrap().presolver.as_ref() {p.notify_hand(in_progress);}
+        if let Some(p)=&self.presolver { p.notify_hand(in_progress); }
     }
 }
 ```
 
-`Engine::new` calls `start_presolver()` after `core.cache` is open. `begin_hand` calls `notify_presolver_hand(true)`; `finish_hand` and `abandon_hand` call `notify_presolver_hand(false)`, which restarts the idle timer. `recommend` calls `presolver.notify_live_request()` **before** pushing into the request slot, so the synchronous `live` flag is set at admission. `Engine::shutdown(&mut self)` (cross-plan M11) now runs, in order: stop the slot and join `engine-main`; `presolver.shutdown()` then `presolver.join_for_shutdown()`; `core.cache.shutdown()` (which stops `cache-writer` and `cache-reader`); the worker `Shutdown` message and `kill()`. An idempotent `stopped: bool` makes a second call a no-op, and no UI command path ever joins those threads.
+`Engine::with_core` initializes `presolver: None`; `Engine::new` calls `start_presolver(paths.cache.clone())` once, after `core.cache` is open. None of these four methods locks `EngineCore`.
+
+`begin_hand` calls `notify_presolver_hand(true)`; `finish_hand` and `abandon_hand` call `notify_presolver_hand(false)`, which restarts the idle timer. `recommend` calls `self.presolver.notify_live_request()` **before** pushing into the request slot, so the synchronous `live` flag is set at admission without touching the worker owner. `Engine::shutdown(&mut self)` (cross-plan M11) extends Plan 2 Task 29's idempotent body, in order: signal background cancellation; stop the slot and join `engine-main`; `presolver.shutdown()` then `presolver.join_for_shutdown()`; `core.cache.shutdown()` (which stops `cache-writer` and `cache-reader`); the worker `Shutdown` message and `kill()`. Plan 2's existing `stopped: bool` makes a second call a no-op, the receiver is unchanged, and no UI command path ever joins those threads.
 
 - [ ] **Step 5 (5 min): Extend the decision record and status computation.** Log every actual decision's input record and identity, the scenario id and tier when matched, the cache result (`miss|exact|approximate|provisional`), the raw reached exploitability, the selected template and mode, street and final deadline violations, and elapsed time. The existing log stays at `%LOCALAPPDATA%\PokerAI\decisions.jsonl` with 50 MiB × 10 rotation. Match by the real preflop line, depth and config; never call a mismatching line a scenario hit. The hit-rate numerator counts at-target exact/approximate cache Finals; the denominator includes matching requests with misses and provisionals; provisionals are disclosed separately. Aggregate from the decision log, never from fabricated queue coverage.
 
 ```rust
+// crates/engine/src/log.rs
 pub fn hit_rate(hits:u64,requests:u64)->Option<f64> {
     (requests>0).then(||hits as f64/requests as f64)
 }
-pub fn remaining_seconds(pending:u32,measured_p50:Option<f64>)->Option<f64> {
-    measured_p50.filter(|x|x.is_finite()&&*x>0.0).map(|x|pending as f64*x)
-}
+/// Task 15 owns the body in `cache::presolver`; this task only re-exports it for the report.
+pub use cache::presolver::remaining_seconds;
 ```
 
-`remaining_seconds` lives in `cache::presolver` (the scheduler calls it) and is re-exported by `engine::log` for the report. Report measured time-to-target by scenario, template and mode; recompute `1755 × p50` and sum the remaining counts. Initial R8 estimates must be labelled unmeasured production estimates: 100bb `1755 × 27 s ≈ 13 h` per scenario, tier 1 `≈ 52 h`; 200bb `1755 × 52 s ≈ 25 h` per scenario; tier 2 adds `≈ 62 h`; phase-2 `flop_full_v1` `≈ 112 h` per scenario is excluded. Tier 1 starts now and continues after release; a successful scheduler test never claims the tier is complete. Completion of tiers 2 and 3 is not a release requirement.
+`remaining_seconds` is defined in `cache::presolver` by Task 15 (the scheduler calls it there) and is only re-exported by `engine::log` for the report; this task contains no second definition. Report measured time-to-target by scenario, template and mode; recompute `1755 × p50` and sum the remaining counts. Initial R8 estimates must be labelled unmeasured production estimates: 100bb `1755 × 27 s ≈ 13 h` per scenario, tier 1 `≈ 52 h`; 200bb `1755 × 52 s ≈ 25 h` per scenario; tier 2 adds `≈ 62 h`; phase-2 `flop_full_v1` `≈ 112 h` per scenario is excluded. Tier 1 starts now and continues after release; a successful scheduler test never claims the tier is complete. Completion of tiers 2 and 3 is not a release requirement.
 
 - [ ] **Step 6 (3 min): Run green:** `cargo test -p engine --features testing --test presolver_engine`; `cargo test --workspace`.
 - [ ] **Step 7 (2 min): Commit.**
@@ -2992,7 +3130,7 @@ git commit -m 'feat(engine): drive chart-replay presolves and measured hit rates
 
 Cross-plan §5 splits the original 236-line fixture task into three review-gated units; this is (a) the source and manifest lock.
 
-**Files:** Create `tools/chart_sources.py`, `tools/tests/test_chart_sources.py`, `bench/spots/sources.json`; modify `tools/gen_fixtures.py` (a `sources` subcommand), `crates/engine/src/bench_support.rs` (created by Plan 2 Task 22, cross-plan M17).
+**Files:** Create `tools/chart_sources.py`, `tools/tests/test_chart_sources.py`, `bench/spots/sources.json`; modify `tools/gen_fixtures.py` (a `sources` subcommand), `crates/engine/src/bench_support.rs` (created by Plan 2 Task 5, cross-plan M17).
 
 **Interfaces:** Consumes Plan 3's inspected chart bundles `fixtures/charts/<name>.json` and `<name>.manifest.json`, and Plan 3 Task 4's acquisition record `fixtures/charts/sources.manifest.json`, whose per-depth rows are `available` or `unsupported`. Produces `chart_sources.{available_depths(repo:Path)->dict, freeze_sources(repo:Path)->dict, write_sources(repo:Path)->None}`, CLI `python tools/gen_fixtures.py sources [--check]`; `engine::bench_support::{SourceLock, load_source_lock(&Path)->Result<SourceLock,String>, verify_source_lock(&SourceLock,&Path)->Result<(),String>}`.
 
@@ -3477,9 +3615,29 @@ git commit -m 'test(bench): generate and freeze the fifty recorded decisions' -m
 
 Cross-plan Or8/R3: §13.5 requires chart-replay ranges on **all six** baseline suites, and no other plan regenerates the river and turn suites; Plan 2 Task 5 only produced the `--source r8` uniform set.
 
-**Files:** Modify `crates/bench/src/{main,gen_spots,report}.rs`, `crates/bench/src/lib.rs`, `crates/engine/src/bench_support.rs`; create `crates/bench/src/flop.rs`, `crates/bench/tests/flop.rs`, `bench/spots/{river_std,river_min,turn_std,turn_min,flop_fast,flop_min}.json`; modify `solver-worker/Cargo.toml`, `solver-worker/src/{main,memory}.rs` only for an opt-in diagnostic storage-mode launch flag; add `solver-worker/tests/bench_mode.rs`.
+**Files:** Modify `crates/bench/src/{main,gen_spots,report,suite,runner}.rs`, `crates/bench/src/lib.rs`, `crates/engine/src/bench_support.rs`; create `crates/bench/src/flop.rs`, `crates/bench/tests/flop.rs`; **modify/regenerate** the six suite files `bench/spots/{river_std,river_min,turn_std,turn_min,flop_fast,flop_min}.json`, which Plan 2 Task 5's `bench gen-spots --source r8 --out bench/spots` already created (this is intended replacement of the R8 data, not a second creation); modify `solver-worker/Cargo.toml`, `solver-worker/src/{main,memory}.rs` only for an opt-in diagnostic storage-mode launch flag; add `solver-worker/tests/bench_mode.rs`.
 
-**Interfaces:** Consumes `scenario_hand`, `replay`, `SolveInput`, the frozen `sources.json` and `verify_source_lock` through the engine facade `bench_support::{generate_flop_spots(source:&Path)->Result<Vec<FlopBenchSpot>,EngineError>, generate_street_spots(street:Street,template:&str,source:&Path)->Result<Vec<Spot>,EngineError>}`; bench depends only on `engine` and `proto`. Produces `FlopBenchSpot{line_id:String,depth_bb:u16,pot_class:String,input:SolveInput,source_hashes:Vec<String>}`, `RunConfig{template:String,threads:u8,mode:String,cold:bool,reps:u32}`, `flop_matrix()->Vec<RunConfig>`, CLI `bench gen-spots [--suite all|<name>]` and `bench run --suite river_std|river_min|turn_std|turn_min|flop_fast|flop_min|e2e --threads N --reps R [--mode f32|i16|auto] [--temperature cold|warm] [--deadline-trials] --out docs/bench/` (review m8: every flag invoked in Tasks 24–25 is declared here).
+**Interfaces:** Consumes `scenario_hand`, `replay`, `SolveInput`, the frozen `sources.json` and `verify_source_lock` through the engine facade below; bench depends only on `engine` and `proto`, and **engine never imports `bench::suite::Spot`**. Produces the engine-owned DTO and both generators:
+
+```rust
+// crates/engine/src/bench_support.rs — owned by this task
+pub struct PreparedBenchSpot {
+    pub line_id: String,
+    pub depth_bb: u16,
+    pub pot_class: String,
+    pub input: Option<proto::SolveInput>,
+    pub rake: proto::Rake,
+    pub source_hashes: Vec<String>,
+    pub inherited_reasons: Vec<proto::ApproxReason>,
+    pub unavailable_reason: Option<String>,
+}
+pub fn generate_flop_spots(source: &Path)
+    -> Result<Vec<PreparedBenchSpot>, EngineError>;
+pub fn generate_street_spots(street: Street, template: &str, source: &Path)
+    -> Result<Vec<PreparedBenchSpot>, EngineError>;
+```
+
+There is no `FlopBenchSpot` and the facade never returns `bench`'s `Spot`. Also produces `RunConfig{template:String,threads:u8,mode:String,cold:bool,reps:u32}`, `flop_matrix()->Vec<RunConfig>`, CLI `bench gen-spots [--suite all|<name>]` and `bench run --suite river_std|river_min|turn_std|turn_min|flop_fast|flop_min|e2e --threads N --reps R [--mode f32|i16|auto] [--temperature cold|warm] [--deadline-trials] --out docs/bench/` (review m8: every flag invoked in Tasks 24–25 is declared here).
 
 - [ ] **Step 1 (4 min): Write suite cardinality and exact-template assertions.**
 
@@ -3515,6 +3673,15 @@ fn all_six_suites_use_chart_replay_ranges() {
 
 - [ ] **Step 2 (2 min): Run red:** `cargo test -p bench --test flop`; the suites still carry Plan 2's `r8_uniform` source.
 - [ ] **Step 3 (5 min): Implement gen-spots for all six suites using the frozen source lock.** Six flop line definitions as above: open/call and open/BB-3bet/opener-call with all explicit folds, actual chart-resolved sizes, 100/200bb. The river and turn suites replay the same six lines forward to their street roots (flop check/check, then turn check/check for the river suites) so their ranges are chart-conditioned rather than uniform. Call the same engine scenario/replay facade as the live and pre-solver paths, retain the missing-node fallback reasons already frozen in `sources.json`, board-block the canonical public ranges and derive the financial root. Encode full 1326 vectors rather than substituting uniform chart-like strings. Attach the source hashes, exact history, range hashes, counts and masses, P/stacks/cap, template signature and expected inherited reasons. `verify_source_lock` runs first: a hash mismatch aborts generation. Each suite file contains six scenario entries; the flop suites expand to three board variants and 18 concrete solve inputs.
+
+**Bench adapts the engine DTO; the engine never imports bench's schema (F14).** `bench` converts `PreparedBenchSpot` into its own persisted `Spot`. Change `Spot`'s `oop_range`/`ip_range` from `String` to a serde-untagged `RangeSpec` with `Text(String)` and `Weights(Range1326)` variants. R8 inputs remain `Text` and use `prepared_range`; chart inputs serialize full `Weights` arrays. Add source hashes, inherited reasons and an explicit unavailable reason field. An unavailable prepared spot has `input = None` and must never be executed or counted as a measurement. Update `Suite::load`/`save`, `run_spot` and `gen-spots` together, preserving the old R8 JSON reading and enforcing chart provenance.
+
+```rust
+// crates/bench/src/suite.rs — the range representation both sources share
+#[derive(Clone,serde::Serialize,serde::Deserialize)]
+#[serde(untagged)]
+pub enum RangeSpec { Text(String), Weights(proto::Range1326) }
+```
 
 ```rust
 pub const BOARDS:[&str;3]=["Kh7d2c","Jh9h6c","8s8d3c"];
@@ -3732,7 +3899,7 @@ git commit -m 'test(bench): enforce final delivery under worker disk and clock f
 
 **Interfaces:** Consumes Plan 2's `report`/`SpotResult` plus Tasks 20–22 run records. Produces `GateInput`, `GateResult{passed:bool,failures:Vec<String>}`, `evaluate(&GateInput)->GateResult`, `percentile`, `bound`, `gate_exit`; `oracle::{OracleSuite, run_oracles(out:&Path)->OracleReport, OracleReport{suites:Vec<(String,bool,String)>,passed:bool}}`; CLI `bench gate --report <path>` and `bench oracle [--out docs/bench/]`. The Markdown report includes a machine-readable JSON block with exact unrounded measurements so gates never parse rounded table cells.
 
-**Cross-plan Or2 / review M1:** `bench oracle` is invoked in Task 25 and is produced here. Nothing else in the series implements it, and the gate's `analytic_oracles_ok` input has no other producer.
+**Cross-plan Or2 / review M1:** `bench oracle` is created by Plan 4 Task 23 (this task) and invoked in Task 25. Nothing else in the series implements it, and the gate's `analytic_oracles_ok` input has no other producer. Plan 1 Task 22 supplies fixture generation and exhaustive test inputs, not this subcommand; Plan 2 Tasks 5/30 implement `materialize`/`gen-spots`/`run`, not `oracle`.
 
 - [ ] **Step 1 (4 min): Write inclusive-boundary, missing-evidence and oracle-wiring tests.**
 
@@ -3750,8 +3917,8 @@ fn oracle_report_lists_every_required_suite() {
     assert_eq!(names,vec![
         "core-eval exhaustive (13.1 T1)",
         "core-iso exhaustive (13.1 T2)",
-        "solver-worker analytic river (13.2)",
-        "solver-worker ev convention and conservation (13.2)",
+        "solver-worker contract_river (13.2)",
+        "engine river check-only terminal oracle (13.2)",
         "engine facing_allin_golden (13.3)"]);
     // a suite that was never run is a failure, never an implicit pass
     let report=bench::oracle::OracleReport{suites:vec![],passed:false};
@@ -3777,6 +3944,10 @@ pub struct GateInput {
     pub supported_numeric_and_coverage_ok:bool,pub analytic_oracles_ok:bool,
     pub inventory_hashes_ok:bool,pub required_matrix_complete:bool,pub fault_matrix_complete:bool,
     pub presolver_verified_entries:usize,
+    /// §14.4 V22 also requires UI acceptance evidence. Sourced **only** from Plan 5 Task 14's
+    /// actual named chart E2E test result, with the same worker/source/config provenance as
+    /// the release candidate. Missing evidence is `false`.
+    pub chart_ui_e2e_ok:bool,
 }
 pub struct GateResult {pub passed:bool,pub failures:Vec<String>,pub informational:Vec<String>}
 pub fn evaluate(g:&GateInput)->GateResult {
@@ -3793,6 +3964,7 @@ pub fn evaluate(g:&GateInput)->GateResult {
         ("22 supported fixtures have numeric EV and expected coverage",g.supported_count==22&&g.supported_numeric_and_coverage_ok),
         ("T1 and analytic river within tolerances",g.analytic_oracles_ok),
         ("frozen inputs and full required measurements",g.inventory_hashes_ok&&g.required_matrix_complete),
+        ("chart UI E2E",g.chart_ui_e2e_ok),
     ];
     // Not a §13.5 condition (review m7): tier-1 coverage is progress, not a release blocker,
     // so a fresh install with an empty pre-solver queue must not fail V22 on it.
@@ -3816,24 +3988,47 @@ pub const REQUIRED_SUITES:[OracleSuite;5]=[
         args:&["test","-p","core-eval","--features","exhaustive","--release"]},
     OracleSuite{name:"core-iso exhaustive (13.1 T2)",program:"cargo",
         args:&["test","-p","core-iso","--features","exhaustive","--release"]},
-    OracleSuite{name:"solver-worker analytic river (13.2)",program:"cargo",
-        args:&["test","-p","solver-worker","--release","--test","river_analytic"]},
-    OracleSuite{name:"solver-worker ev convention and conservation (13.2)",program:"cargo",
-        args:&["test","-p","solver-worker","--release","--test","ev_contracts"]},
+    // Plan 2 Task 15 owns `solver-worker/tests/contract_river.rs`; there is no
+    // `river_analytic` or `ev_contracts` target anywhere in the series.
+    OracleSuite{name:"solver-worker contract_river (13.2)",program:"cargo",
+        args:&["test","-p","solver-worker","--release","--test","contract_river"]},
+    // Plan 2 Task 18 owns `engine/tests/worker_link.rs::river_check_only_terminal_oracle`.
+    OracleSuite{name:"engine river check-only terminal oracle (13.2)",program:"cargo",
+        args:&["test","-p","engine","--release","--test","worker_link",
+               "river_check_only_terminal_oracle","--","--exact"]},
     OracleSuite{name:"engine facing_allin_golden (13.3)",program:"cargo",
         args:&["test","-p","engine","--features","testing","--release","facing_allin_golden"]},
 ];
 pub struct OracleReport {pub suites:Vec<(String,bool,String)>,pub passed:bool}
 
-/// Generates the 10,000,000-sample 7-card oracle if it is absent (it is gitignored, spec
-/// §13.0 / S17), then runs every §13.1 exhaustive suite and §13.2 analytic contract test and
-/// writes their pass/fail into the report's machine-readable JSON block.
+/// Actually generates the 10,000,000-sample 7-card oracle when it is absent (it is gitignored,
+/// spec §13.0 / S17) — this is an executed command with a checked exit code, not a promise in a
+/// comment — then runs every §13.1 exhaustive suite and §13.2 analytic contract test and writes
+/// their pass/fail into the report's machine-readable JSON block.
 pub fn run_oracles(out:&std::path::Path)->OracleReport {
     let mut suites=Vec::new();
+    if !oracle_fixture_present() {
+        let generated=std::process::Command::new("tools/.venv/Scripts/python")
+            .args(["tools/gen_eval_oracle.py","--skip-5card","--samples","10000000",
+                   "--samples-name","phevaluator_7card_10m.bin"]).status();
+        match generated {
+            Ok(status) if status.success()=>{}
+            other=>{
+                suites.push(("10M 7-card oracle generation".to_string(),false,
+                    format!("{other:?}")));
+                crate::report::append_oracle_block(out,&suites);
+                return OracleReport{suites,passed:false};   // do not proceed on failure
+            }
+        }
+    }
     for suite in REQUIRED_SUITES {
-        let output=std::process::Command::new(suite.program).args(suite.args).output();
+        // The solver-worker command runs under the Plan 2 Task 1 V1-selected toolchain/target,
+        // with the selected executable supplied through POKERAI_WORKER.
+        let output=std::process::Command::new(suite.program)
+            .args(worker_toolchain_args(suite)).output();
         let (ok,detail)=match output {
-            Ok(o)=>(o.status.success(),format!("exit {:?}",o.status.code())),
+            Ok(o)=>(o.status.success()&&executed_test_count(&o)>0,
+                    format!("exit {:?}; tests {}",o.status.code(),executed_test_count(&o))),
             Err(e)=>(false,format!("failed to launch: {e}")),
         };
         suites.push((suite.name.to_string(),ok,detail));
@@ -3844,7 +4039,7 @@ pub fn run_oracles(out:&std::path::Path)->OracleReport {
 }
 ```
 
-`report::append_oracle_block(&Path,&[(String,bool,String)])` appends the results to the dated report's JSON block under the key `analytic_oracles`, and the gate reads `analytic_oracles_ok` from exactly that key: a missing key is `false`, never an implicit pass. A launch failure is recorded as a failure with its message.
+`report::append_oracle_block(&Path,&[(String,bool,String)])` appends the results to the dated report's JSON block under the key `analytic_oracles`, and the gate reads `analytic_oracles_ok` from exactly that key: a missing key is `false`, never an implicit pass. A launch failure is recorded as a failure with its message. Record the full command, the exit code and the executed-test count for every suite: an ignored, skipped or zero-test run cannot satisfy `analytic_oracles_ok`. The five-card committed oracle remains required. Dispatch every suite through `worker_toolchain_args(suite: &OracleSuite) -> Vec<&'static str>`, which reads and validates the V1 selection from `docs/bench/worker-toolchain.json` and returns the complete Cargo argument vector for that suite; call `.args(worker_toolchain_args(suite))` once, without appending `suite.args` again. For the GNU worker suite it returns `["+stable-x86_64-pc-windows-gnu", "test", "-p", "solver-worker", "--release", "--target", "x86_64-pc-windows-gnu", "--test", "contract_river"]`; otherwise it returns `suite.args` unchanged — `--target` must follow the `test` subcommand, never precede it. Set `POKERAI_WORKER` to the selected built executable; no ordinary workspace command may rebuild the rejected worker.
 
 - [ ] **Step 4 (5 min): Extend the report fields and evidence provenance.** Report path `docs/bench/<date>-i7-13700K.md` (first dated 2026-09-10). Include CPU/RAM/OS, toolchain, commit/adapter/rules/proto versions, `+avx2`, source hashes and the node-fallback inventory, fixture hashes, template signatures, thread count, cold/warm and f32/i16. Per baseline and store suite: p50/p95/max wall time to target 50, separate time-to-target and admission-to-terminal/Final, `memory_usage` estimates, peak total RSS, cancel latency, Exact/Approximate/Unsupported counts and proportions, raw reached exploitability, mode, and first-terminal and final-delivery violation counts. Time-to-target is null/censored when the target was not reached, never the deadline duration.
 
@@ -3856,7 +4051,7 @@ pub struct AccuracyObservation {
 }
 ```
 
-Include the V3 admission decision for `flop_min_v1` at both depths, forced-mode diagnostic flags, crossover probes, throughput `1755 × p50`, tier counts and observed decision-log hit rates. Show V21 and V22 separately: V21 is e2e p95 <= 15 / zero final violations / every supported numeric fixture; V22 is all baseline bounds and analytic values. V9 is deferred: the store section reads exactly `not run: V9 deferred`, never a zero-time pass and never a blocker for the baseline. An acquired-data gate later uses identical bounds and the `pokerdata_*` tests; failing it keeps the chart baseline.
+Include the V3 admission decision for `flop_min_v1` at both depths, forced-mode diagnostic flags, crossover probes, throughput `1755 × p50`, tier counts and observed decision-log hit rates. Record the V1-selected worker toolchain on every measured row. Show V21 and V22 separately: V21 is e2e p95 <= 15 / zero final violations / every supported numeric fixture; V22 is all baseline bounds, the analytic values **and** Plan 5 Task 14's `chart_ui_e2e` evidence. V9 is deferred: the store section reads exactly `not run: V9 deferred`, never a zero-time pass and never a blocker for the baseline. An acquired-data gate later uses identical bounds and the `pokerdata_*` tests; failing it keeps the chart baseline.
 
 Analytic acceptance: facing-all-in T1 AhAd on QsJd7h3c2d versus QQ+54o weight 1/12 yields equity 0.25, W 246, call EV −11.5 unraked / −12.75 capped at 5000 mchips; 54o 0.25 yields +50 / +47.5; −2.30 bb at BB 5. Use a 1e−3 chip tolerance for exact analytic values. Polarized river: value-bet QQ 100%, bluff 54o 50 ± 3 pp, call 50 ± 3 pp, IP 75 ± 1 / OOP 25 ± 1 chips, raw exploitability <= 0.1% of pot. Check-only and non-root contract tests keep their stated 1e−3 tolerances. Plan 2 supplies these tests; `bench oracle` runs them and the gate records their actual results.
 
@@ -3871,7 +4066,18 @@ fn empty_presolver_queue_is_informational_only() {
     assert!(result.passed,"tier-1 coverage is progress, not a release condition");
     assert_eq!(result.informational.len(),1);
 }
+
+#[test]
+fn missing_chart_ui_evidence_fails_v22() {
+    let mut input=passing_gate_input();
+    input.chart_ui_e2e_ok=false;             // Plan 5 Task 14 did not run, or failed
+    let result=evaluate(&input);
+    assert!(!result.passed);
+    assert!(result.failures.iter().any(|f|f=="chart UI E2E"));
+}
 ```
+
+**V21/V22 split (F21).** V21 and the bench-only bounds may be reported independently from bench evidence alone. V22 **additionally** requires `chart_ui_e2e_ok`. Never claim V22 from bench-only data.
 
 A failure reduces the versioned template size or the declared scope and reruns the affected measurements; it never loosens the definition of success. Report tier-1 progress honestly: 7,020 jobs are the four-scenario coverage condition, not a prerequisite for claiming that the scheduler implementation works.
 
@@ -3887,7 +4093,7 @@ git commit -m 'feat(bench): add the oracle runner and the measured V21 and V22 g
 
 Cross-plan §5 splits the hours-long measurement task; this is batch 1. Each checklist item starts or reviews one bounded batch and appends its own rows to the report.
 
-**Files:** Create `docs/bench/2026-09-10-i7-13700K.md`; modify generated `bench/spots/{river_std,river_min,turn_std,turn_min,flop_fast,flop_min,sources}.json` only if deterministic generation differs before measurement. No golden is auto-updated in this task.
+**Files:** Modify/append `docs/bench/2026-09-10-i7-13700K.md`, which Plan 2 Task 30 Step 4 already created; measurements are appended with their own provenance and Plan 2's R8-labelled rows are retained as explicitly separate reference evidence, never overwritten. Modify generated `bench/spots/{river_std,river_min,turn_std,turn_min,flop_fast,flop_min,sources}.json` only if deterministic generation differs before measurement. No golden is auto-updated in this task.
 
 **Interfaces:** Consumes every preceding task. Produces the flop half of the reviewed baseline report and the V3 policy evidence.
 
@@ -3900,9 +4106,9 @@ cargo test -p bench --test gate
 cargo test -p bench --test oracle
 cargo test -p cache
 cargo test -p cache --features exhaustive
-cargo test -p engine --features testing --test cache_key_structural_identity
-cargo test -p engine --features testing --test cache_snapshot_replay
-cargo test -p engine --features testing --test flop_path_golden
+cargo test -p engine --features testing,test-templates --test cache_key_structural_identity
+cargo test -p engine --features testing,test-templates --test cache_snapshot_replay
+cargo test -p engine --features testing,test-templates --test flop_path_golden
 cargo test -p engine --features testing --test experimental_surrogate
 cargo test -p engine --features testing --test presolver_engine
 cargo test --workspace
@@ -3911,16 +4117,24 @@ python tools/gen_fixtures.py sources --check
 python tools/gen_fixtures.py e2e --check
 ```
 
-- [ ] **Step 2 (3 min): Build the production and diagnostic workers with the pinned MSVC toolchain and regenerate the suites.**
+- [ ] **Step 2 (3 min): Build the production and diagnostic workers with the V1-selected worker toolchain and regenerate the suites.**
 
 ```powershell
-cargo build --release -p solver-worker
-cargo build --release -p solver-worker --features bench-mode --target-dir target/bench-mode
+$selection = Get-Content -LiteralPath 'docs/bench/worker-toolchain.json' -Raw | ConvertFrom-Json
+if ($selection.worker_toolchain -eq 'stable-x86_64-pc-windows-gnu') {
+    $tc = '+stable-x86_64-pc-windows-gnu'; $target = @('--target','x86_64-pc-windows-gnu')
+} elseif ($selection.worker_toolchain -eq 'stable-x86_64-pc-windows-msvc') {
+    $tc = '+stable-x86_64-pc-windows-msvc'; $target = @('--target','x86_64-pc-windows-msvc')
+} else { throw 'Missing or invalid V1 worker toolchain selection' }
+cargo $tc build --release -p solver-worker @target
+cargo $tc build --release -p solver-worker --features bench-mode @target --target-dir target/bench-mode
 cargo run --release -p bench -- gen-spots --suite all
 git diff --stat bench/spots
 ```
 
-Require that `ready` reports `avx2`, the expected versions and the requested thread count. The diagnostic override capability must not appear in the normal worker. Refuse any source or input that does not match the frozen hashes. Plan 1's MSVC pin takes precedence over earlier GNU feasibility notes (cross-plan M19/R1); no `rustup default` or config mutation.
+Build production and diagnostic workers using the V1-selected worker toolchain/target; keep `bench` and the UI on MSVC. The diagnostic build uses a separate target directory and must not overwrite the production binary. Report the selected toolchain on every measured row. Regenerate all six chart suites before baseline measurements and retain prior R8 rows as explicitly separate reference evidence. Require that `ready` reports `avx2`, the expected versions and the requested thread count. The diagnostic override capability must not appear in the normal worker. Refuse any source or input that does not match the frozen hashes. No `rustup default` or config mutation, and no ordinary workspace command may rebuild a rejected worker.
+
+Also serialize the matching `V3PolicyEvidence` (Task 9) alongside the raw V3 measurements, so production startup can load an admission decision whose provenance actually matches this run.
 
 - [ ] **Step 3 (3 min per launch, then review each batch): Run the exact-template flop matrix.** The `--mode`, `--temperature` and `--deadline-trials` switches are declared in Task 20. Each command creates separate raw rows in the report's machine-readable block. Reps 5 in each cold/warm cell, threads 8/16/24, then the production-auto-mode deadline trials.
 
@@ -3955,7 +4169,7 @@ Batch 2 of the measurement split.
 
 **Files:** Modify `docs/bench/2026-09-10-i7-13700K.md`.
 
-**Interfaces:** Consumes Tasks 20–23 runners and Plan 2's analytic river and turn suites. Produces the remaining measured evidence for V21 and V22.
+**Interfaces:** Consumes Tasks 20–23 runners and Plan 2 Task 15's `solver-worker/tests/contract_river.rs` plus Plan 2 Task 18's engine check-only terminal oracle. Produces the remaining measured evidence for V21 and V22 (UI acceptance evidence is Plan 5 Task 14's, consumed by Task 26).
 
 **Expected wall-clock (review m10).** The four street suites are `4 × 6 spots × 5 reps` at 0.3–6 s per solve, about **20 minutes total**. The two e2e passes are `36 runnable records × 5 reps` at up to 15 s, about **90 minutes each**; the `presolved` pass additionally pre-solves the 8 supported flop spots to target, which is **3–6 hours** on this machine. The fault suite is deterministic on the fake clock and finishes in **seconds**. `bench oracle` runs the exhaustive suites and generates the 10,000,000-sample 7-card oracle on first use: allow **2–4 hours**. Every command appends and skips already-present rows, so each may be resumed.
 
@@ -3984,7 +4198,7 @@ cargo run --release -p bench -- fault --out docs/bench/
 cargo run --release -p bench -- oracle --out docs/bench/
 ```
 
-This is the only producer of `analytic_oracles_ok`. A launch failure or a failing suite is recorded as a failure in the report's JSON block.
+This is the only producer of `analytic_oracles_ok`. It generates the 10,000,000-sample 7-card oracle first when it is absent, checks that generation's exit code and stops on failure. A launch failure, a failing suite or a zero-test run is recorded as a failure in the report's JSON block. The `solver-worker` suite runs under the V1-selected toolchain/target with `POKERAI_WORKER` pointing at the selected binary.
 
 - [ ] **Step 4 (4 min): Review the measured evidence.** Verify supported 22 of total 50, every prescribed fault in all required phases, zero final-delivery violations, raw versus display accuracy, the source locks, the V3 `flop_min_v1` admission choice, the mode switch points, pre-solver entry durability and status, and hit-rate denominators. Record the actual tier-1 progress; do not wait 52 h merely to test scheduler completion logic. Confirm that no cache, queue or log failure altered a delivered recommendation. Keep measured failures visible in the report.
 - [ ] **Step 5 (2 min): Commit the measured evidence.**
@@ -4000,18 +4214,22 @@ Batch 3 of the measurement split: the executable V21/V22 decision.
 
 **Files:** Modify `docs/bench/2026-09-10-i7-13700K.md`.
 
-**Interfaces:** Consumes the complete report of Tasks 24–25 and `bench gate`. Produces the explicit V21/V22 outcome.
+**Interfaces:** Consumes the complete report of Tasks 24–25, **Plan 5 Task 14's recorded `chart_ui_e2e` evidence** and `bench gate`. Produces the explicit V21/V22 outcome and is the sole final V22 decision.
 
-- [ ] **Step 1 (3 min): Run the gate against the measured report.**
+**Execution order (F21).** Plan 5 Task 14 precedes this task. Plan 5 may start from supplied surfaces without waiting for this final gate; this task cannot complete without Plan 5 Task 14's actual named chart E2E result.
+
+- [ ] **Step 1 (3 min): Record Plan 5 Task 14's chart UI evidence, then run the gate against the measured report.**
 
 ```powershell
+# chart_ui_e2e_ok is set only from Plan 5 Task 14's actual named test result, with the same
+# worker/source/config provenance as this release candidate. Missing evidence stays false.
 cargo run --release -p bench -- gate --report docs/bench/2026-09-10-i7-13700K.md
 "gate exit code: $LASTEXITCODE"
 ```
 
-Exit 0 only when every §13.5 condition holds. The informational pre-solver line (Task 23) is printed but never changes the exit code.
+Exit 0 only when every §13.5 condition holds, including `chart UI E2E`. The informational pre-solver line (Task 23) is printed but never changes the exit code.
 
-- [ ] **Step 2 (4 min): Record the V21 and V22 outcome in the report.** State each condition with its measured value, the pass/fail verdict, and — for any failure — the versioned template or scope reduction that follows, never a loosened definition. State the tier-1 coverage figure as progress.
+- [ ] **Step 2 (4 min): Record the V21 and V22 outcome in the report.** State each condition with its measured value, the pass/fail verdict, and — for any failure — the versioned template or scope reduction that follows, never a loosened definition. State the tier-1 coverage figure as progress. V21 and the bench-only bounds may be reported independently; V22 additionally requires the chart UI E2E evidence, and a missing or failed UI result blocks V22. Never claim V22 from bench-only data.
 - [ ] **Step 3 (3 min): Run the final workspace check.**
 
 ```powershell
@@ -4053,10 +4271,10 @@ git commit -m 'test(bench): record the release-gate evidence and the V21/V22 out
 |§13.5 chart locks, actual50 inputs, gen-spots for all six suites, e2e/fault/report/gate|17–26|
 |§14.4 V3/V21/V22 exact baseline bounds|20–26|
 
-**Placeholder scan:** No unresolved implementation markers. Task numbering is sequential 1–26, every task has Files/Interfaces, red/green steps and one required-trailer commit, and code fences are balanced. The four integrations the review called prose — the flop route (Task 10), `Cache::lookup` and `make_cache_query` (Task 7), the durable `Queue` (Task 14) and the `Presolver` thread (Task 15) — are now written as code in their own tasks. This review checks plan text; implementation commands have not been run while writing it. Fixtures and source locks are generated and committed before measurements and their expected outcomes are not derived from benchmark results. Storage tests use the Task 2 fixture immediately, so they never depend on later T4 materialization. Bench module exports are introduced only when their source files exist, and `crates/engine/src/bench_support.rs` is created by Plan 2 Task 22 (cross-plan M17) before Task 17 modifies it.
+**Placeholder scan:** No unresolved implementation markers. Task numbering is sequential 1–26, every task has Files/Interfaces, red/green steps and one required-trailer commit, and code fences are balanced. The four integrations the review called prose — the flop route (Task 10), `Cache::lookup` and `make_cache_query` (Task 7), the durable `Queue` (Task 14) and the `Presolver` thread (Task 15) — are now written as code in their own tasks. This review checks plan text; implementation commands have not been run while writing it. Fixtures and source locks are generated and committed before measurements and their expected outcomes are not derived from benchmark results. Storage tests use the Task 2 fixture immediately, so they never depend on later T4 materialization. Bench module exports are introduced only when their source files exist, and `crates/engine/src/bench_support.rs` is created by Plan 2 Task 5 (cross-plan M17) before Task 17 modifies it.
 
-**Type consistency:** `CacheEntry` stores ordinal `CachedNode.path` and `ev_over_P`; the wire `NodeStrategy` retains chip paths and `ev_chips`; `CacheHit` reconstructs query chips and inverse suits before validation and snapshot registration. `key_and_source` is the single builder shared by `make_cache_query` and `entry_from_solution`, so a stored entry and a query cannot disagree on the key. `resolve_path` is a re-export of `proto::resolve_chip_path` (cross-plan M21), so the §2 chip-path rule has one implementation. Menu types are Plan 1's resolved `SideMenu`/`MenuSize` (cross-plan M1) with `donk: None` on the root street. `StreetRootSnapshot` literals carry `bb_chips` (spec S1). `Range1326` stays public. `StreetSnapshot` is the exact `core_replay` type and `engine::snapshots::register_snapshot` is the single registration path (cross-plan M15). `Deadlines` is Plan 2's only deadline arithmetic; this plan adds `flop_budget_valid` alone (cross-plan D5). `PresolveExecutor` is a downward-dependency callback, distinct from `WorkerLink`. `PresolverStatus` derives `Serialize`/`Deserialize`/`PartialEq` and an optional `ts-rs` binding for Plan 5 (cross-plan Or7). `ApproxReason` names and fields retain the spec spelling. No target/hero/request/seat/raw-chip field enters `KeyFields`. JSON metadata avoids bincode's internally tagged-enum incompatibility. Mode forcing is diagnostic-only and cannot alter the production wire or default admission.
+**Type consistency (revision 2; the revision-1 claim of exact consistency was disproved by REVIEW-cross-plan-2 F04–F14 and the listed items below are the corrections, not pre-existing properties).** `CacheEntry` stores ordinal `CachedNode.path` and `ev_over_P`; the wire `NodeStrategy` retains chip paths and `ev_chips`; `CacheHit` reconstructs query chips and inverse suits before validation and snapshot registration. `key_and_source` is the single builder shared by `make_cache_query` and `entry_from_solution`, so a stored entry and a query cannot disagree on the key. `resolve_path` is a re-export of `proto::resolve_chip_path` (cross-plan M21), so the §2 chip-path rule has one implementation. Menu types are Plan 1's resolved `SideMenu`/`MenuSize` (cross-plan M1) with `donk: None` on the root street. `StreetRootSnapshot` literals carry `bb_chips` (spec S1) and the surrogate's literal carries the hand's real `bb_chips`, never 2. `Range1326` stays public. `StreetSnapshot` is the exact `core_replay` type; `Engine::register_snapshot(&mut self, &DecisionIdentity, StreetSnapshot) -> bool` (Plan 3 Task 18) is the façade and `SnapshotStore::register` the single internal path — there is no free `engine::snapshots::register_snapshot` (cross-plan M15, F22). Foundation calls use the exact producer names: `core_iso::inverse`, `core_iso::SuitPerm::IDENTITY`, `core_model::postflop_order(Seat, &[Seat])` and `UtgStraddle.amount_chips` (F11). `engine::equity::range_vs_range` is Plan 2 Task 25's single owner returning `Option<(f32, EquityMethod)>`; this plan defines no second body (F05). The surrogate never constructs `SolveInput` and never calls `advice_rows`, which is not an upstream API (F12); Plan 2 Task 26 owns `final_from_solution`. `Templates::with_extra`/`base_ids` behind `test-templates` is Plan 2 Task 2's seam; this plan adds no registry and no `Templates::get` patch (F04). `Engine::set_config` keeps Plan 2 Task 29's validating, queuing body; this plan adds only `flop_budget_valid` and `Engine::config` (F08). `Deadlines` is Plan 2 Task 20's only deadline arithmetic (cross-plan D5). `EngineCore.flop_policy` with `V3PolicyEvidence`/`load_v3_policy` replaces the unowned `bench_p95_ms` lookup (F13). `PresolveExecutor` is a downward-dependency callback, distinct from `WorkerLink`. The `Presolver` handle lives on `Engine`, never on `EngineCore`, so status/pause/resume/notify never lock the solve owner (F09). `cache::presolver::PresolverStatus` re-exports `scheduler::PresolverStatus` and `cache::presolver::remaining_seconds` is defined in Task 15 before the scheduler uses it (F10). `PresolverStatus` derives `Serialize`/`Deserialize`/`PartialEq` and an optional `ts-rs` binding for Plan 5 (cross-plan Or7). `engine::bench_support::PreparedBenchSpot` is the engine-owned DTO; engine never imports `bench::suite::Spot` (F14). `ApproxReason` names and fields retain the spec spelling. No target/hero/request/seat/raw-chip field enters `KeyFields`. JSON metadata avoids bincode's internally tagged-enum incompatibility. Mode forcing is diagnostic-only and cannot alter the production wire or default admission.
 
-**Coverage gaps:** No planned omission within Plan 4's scope. The actual MSVC build, the source-bundle audit and hero support, the V3 timings, the fifty-hand outcomes, the V21/V22 pass status and tier-1 coverage remain implementation-time evidence, not claims made by this planning document. V9 acquisition and conversion, the exploit slice, UI and WebDriver tests, and completed tiers 2 and 3 are intentionally owned elsewhere or deferred. Tier-1 completion is reported as the coverage condition, while resumable tier-1 execution is delivered here.
+**Coverage gaps:** No planned omission within Plan 4's scope. The actual worker build on the V1-selected toolchain, the source-bundle audit and hero support, the V3 timings, the fifty-hand outcomes, the V21/V22 pass status and tier-1 coverage remain implementation-time evidence, not claims made by this planning document. **Release completeness is not claimed from bench data alone:** V22 additionally requires Plan 5 Task 14's chart UI E2E evidence, consumed by Task 26 (F21). V9 acquisition and conversion, the exploit slice, the rest of the UI and WebDriver tests, and completed tiers 2 and 3 are intentionally owned elsewhere or deferred. Tier-1 completion is reported as the coverage condition, while resumable tier-1 execution is delivered here.
 
-**Interfaces owed to Plan 2** (repeated from the header so the cross-plan re-check can reconcile them): the one-line `Templates::get` fallback for the test-only template registry (Task 8); `Engine::set_config -> Result<u32, EngineError>` (Task 9); `engine::Paths { worker, preflop, cache, log }` (Task 7); `crates/engine/src/bench_support.rs` created in Plan 2 Task 22 (Task 17); `crates/bench/src/lib.rs` declared in Plan 2 Task 5 (Task 20); `SolvePlan.background` documented as a real field Plan 2 merely never sets to `true` (Task 16); `Engine::shutdown(&mut self)` (Task 16).
+**Interfaces owed to Plan 2: none remain.** All seven notes are satisfied by the revised Plan 2 (REVIEW-cross-plan-2 §4.1), and this plan now consumes their declared shapes: `Templates::with_extra`/`base_ids` behind `test-templates` from Plan 2 Task 2 (Task 8); `Engine::set_config -> Result<u32, EngineError>` with its own validation and next-hand queuing body from Plan 2 Task 29 (Task 9 adds tests only); `engine::Paths { log_dir, worker_exe, preflop, cache }` from Plan 2 Task 29 (Task 7); `crates/engine/src/bench_support.rs` with `prepared_range`/`range_mass` created in Plan 2 Task 5 (Task 17); `crates/bench/src/lib.rs` declared in Plan 2 Task 5 (Task 20); `SolvePlan.background` as a real Plan 2 Task 22 field that Plan 2 merely never sets to `true` (Task 16, whose single-owner background execution is specified in this plan's Task 16 ownership contract); `Engine::shutdown(&mut self)` from Plan 2 Task 29 (Task 16 extends cleanup without changing the receiver).

@@ -1,20 +1,25 @@
 # Plan 2: Solver worker and engine river/turn path Implementation Plan
 
+Revision 3 (2026-09-17): verification edits R1, R2, R7 from docs/research/REVIEW-cross-plan-3.md; changelog PLAN-2-CHANGELOG-3.md
+
+Revision 2 (2026-09-17): seam re-check edits E02/E06 from docs/research/REVIEW-cross-plan-2.md; changelog PLAN-2-CHANGELOG-2.md
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Vendor the pinned postflop-solver, build the `solver-worker` binary (spec §4.5 protocol, §10.3 adapter, §4.6 cross-check and wager cap), and build the `engine` crate's river/turn path (identity, admission, worker client with absolute deadlines and watchdog, tree templates and materializer, coverage classifier, facing-all-in fallback, result assembly, decision log) plus the `bench` river/turn suites and the worker wire fixtures.
 
 **Architecture:** `solver-worker` is an AGPL process with three threads (`control` reads stdin in every state, `writer` serializes stdout, `executor` owns the `PostFlopGame` and the rayon pool); it only depends on `proto` and the vendored library, and every request runs Building -> Solving -> Extracting with cancel checkpoints between steps. `engine` owns the worker process behind the `WorkerLink` trait (a `ProcessWorker` in production, a scripted `FakeWorker` with a `FakeClock` in tests), materializes every tree itself with the pinned §4.6 rules (the worker only cross-checks), and assembles `Recommendation`s under a `DecisionIdentity` that every event carries. `bench` drives the worker through the engine's link on fixed spot files and writes the §13.5 report.
 
-**Tech Stack:** Rust 2021 on `stable-x86_64-pc-windows-msvc` (1.95), pinned repo-wide by plan 1 Task 1's `rust-toolchain.toml`; ordinary `cargo` commands, no per-plan toolchain override. Vendored `postflop-solver` at `9d1509fe` (features `bincode`, `rayon`, `zstd`), `serde`/`serde_json`, `sha2`, `hex`, `thiserror`, `rayon 1` (worker only) — all from `[workspace.dependencies]`; `libc`-free Win32 FFI via `extern "system"` declarations; Python 3.12 + `pytest` for `tools/gen_worker_fixtures.py`.
+**Tech Stack:** Rust 2021 on `stable-x86_64-pc-windows-msvc` (1.95), pinned repo-wide by plan 1 Task 1's `rust-toolchain.toml`; Task 1 owns the §3.6 V1 measurement that may select `stable-x86_64-pc-windows-gnu` for `solver-worker` alone. Vendored `postflop-solver` at `9d1509fe` (features `bincode`, `rayon`, `zstd`); `serde`, `serde_json`, `sha2`, `hex` and `thiserror` inherit workspace versions. `rayon = "1"` is a worker-local dependency. `libc`-free Win32 FFI via `extern "system"` declarations; Python 3.12 + `pytest` for `tools/gen_worker_fixtures.py`.
 
-**Spec:** `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md` (revision 6), sections 2, 3.1-3.7, 4.4-4.6, 5, 6, 7, 10.1-10.3, 10.6, 12, 13.0, 13.2, 13.3, 13.5. Decisions: `docs/design/2026-09-10-design-outline.md` §0b. Measured facts: `docs/research/R8-solver-bench.md` §2-§4 and addendum A.5. Cross-plan resolutions: `docs/research/REVIEW-cross-plan.md` sections 1-5.
+**Spec:** `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md` (revision 7), sections 2, 3.1-3.7, 4.4-4.6, 5, 6, 7, 10.1-10.3, 10.6, 12, 13.0, 13.2, 13.3, 13.5. Decisions: `docs/design/2026-09-10-design-outline.md` §0b. Measured facts: `docs/research/R8-solver-bench.md` §2-§4, §5 and addendum A.5. Cross-plan resolutions: `docs/research/REVIEW-cross-plan.md` sections 1-3. REVIEW-cross-plan §§4-5 are historical. Use REVIEW-cross-plan-2 §7 after its listed corrections are accepted.
 
 ## Global Constraints
 
 - Pinned upstream commit `9d1509fe5077d019825f833eed04b16d342dfda1`; features default (`bincode` + `rayon`) plus `zstd`; `custom-alloc` never used. Patches: (1) `Cargo.toml` pins `bincode = "=2.0.0-rc.3"`, `bincode_derive = "=2.0.0-rc.3"`; (2) `src/action_tree.rs` lines 393/396/408 `&*(*node).children[i].lock()` -> `&*(&(*node).children)[i].lock()`.
 - AVX2 is a build requirement: `.cargo/config.toml` (plan 1) sets `-C target-feature=+avx2` for both Windows targets; `solver-worker/build.rs` fails when `CARGO_CFG_TARGET_FEATURE` lacks `avx2`; the engine refuses a worker whose `ready.build_features` lacks `avx2` (`EngineError("worker built without AVX2")`).
-- Toolchain: the workspace is pinned to `stable-x86_64-pc-windows-msvc` by plan 1 Task 1's `rust-toolchain.toml`. This plan uses ordinary `cargo` commands and never sets a per-plan toolchain override. Plan 1's V1 check builds the vendored solver on MSVC and, if that fails or is more than 25% slower than the GNU build, falls back to building **only** `solver-worker` with `+stable-x86_64-pc-windows-gnu` (spec §3.6); that check is referenced, never duplicated here. If it selects the GNU fallback, the only change to this plan is the `cargo build`/`cargo test` invocations for `-p solver-worker`, which then carry `+stable-x86_64-pc-windows-gnu`; every engine, bench and workspace command stays MSVC.
+- Toolchain (§3.6): the workspace is pinned to `stable-x86_64-pc-windows-msvc` by plan 1 Task 1's `rust-toolchain.toml`, and this plan adds no second `rust-toolchain.toml`. **Task 1 of this plan performs the V1 toolchain check; no earlier task has performed it.** It builds the pinned solver with AVX2 on MSVC, then runs the same FLOP-FAST workload and measurement convention as R8 §3.1/§3.3 (whose toolchain R8 §5 records as GNU). `vendor_smoke` is a correctness smoke test and is **not** the performance comparator. If the MSVC build fails, or its comparable solve time is more than 1.25 times the GNU value, Task 1 selects GNU for `solver-worker` only; otherwise it selects MSVC. Task 1 writes `docs/bench/worker-toolchain.json` with `worker_toolchain` and `worker_target` strings and the measurement provenance. The allowed pairs are `stable-x86_64-pc-windows-msvc` / `x86_64-pc-windows-msvc` and `stable-x86_64-pc-windows-gnu` / `x86_64-pc-windows-gnu`. Missing selection evidence blocks later worker timing; it never silently defaults to MSVC. Every later worker build, worker test, bench run, oracle run and runtime staging step in this and every later plan consumes that selection; engine, bench and `pokerai-app` stay MSVC.
+- Series-wide green/build rule under the selection (§3.6): on the MSVC branch run `cargo test --workspace --release`. On the GNU branch run `cargo test --workspace --exclude solver-worker --release` under the pinned MSVC toolchain, then `cargo +stable-x86_64-pc-windows-gnu test -p solver-worker --release --target x86_64-pc-windows-gnu`. Both commands must pass; this partitions the workspace by selected compiler and skips no package. Build/stage the GNU worker through `scripts/build-worker-gnu.ps1` (plan 1 Task 1) and set `POKERAI_WORKER` to that selected binary for process tests. No ordinary workspace command may rebuild the rejected MSVC worker. Every `-p solver-worker` command written out in this plan is the **MSVC-branch** form: on the GNU branch prefix it with `+stable-x86_64-pc-windows-gnu` and add `--target x86_64-pc-windows-gnu`. Apply this rule to all later plan test gates, bench oracle, diagnostic workers and staging.
 - Dependency versions come from plan 1's `[workspace.dependencies]`: every crate this plan creates writes `serde.workspace = true`, `serde_json.workspace = true`, `sha2.workspace = true`, `hex.workspace = true`, `thiserror.workspace = true`, plus `version.workspace = true`, `edition.workspace = true`, `license.workspace = true` (except `solver-worker`, which declares `license = "AGPL-3.0"` explicitly). Never a second `sha2` or `thiserror` major (cross-plan M18/R6).
 - Workspace membership: plan 1's root manifest uses `members = ["crates/*"]`, so `crates/engine` (Task 2) and `crates/bench` (Task 5) become members the moment their manifests exist. `solver-worker` is outside `crates/`, so Task 7 adds `"solver-worker"` to `members`. Task 1 adds only `exclude = ["third_party/postflop-solver"]` (cross-plan D9). No task ever lists a member whose manifest does not yet exist.
 - `background` is a per-request parameter of the solve path (`SolvePlan.background` -> `SolveRequest.background`), never an engine invariant. This plan exercises only `false`; plan 4's pre-solver sends `true` with `deadline_ms: 600000` (spec §10.5, cross-plan R2).
@@ -28,7 +33,7 @@
 - Tree rules (§4.6): action order Fold, Check, Call, bets/raises ascending by `to`, AllIn; `rules_version` 3; `merging_threshold` 0.0; donk menus on turn and river are the explicit empty list; `matched` and `pot` accumulate from the tree root; wager cap on non-all-in wagers per street with the observed prefix never removed.
 - Headline (§4.4): highest EV only when every action has `ev_bb` (ties by higher frequency, then menu order), else highest-frequency headline only when every action has `frequency` and `unresolved_mass == 0`, else none. Reasons accumulate and are never removed. Exploitability compared with the target in raw chips.
 - Commits: one per task, `feat(<crate>): ...` / `test(<crate>): ...` / `chore: ...`, trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`. Rust edition 2021; `thiserror` for error enums; `rayon` only in the worker; engine threads are std threads.
-- **Per-task green command: `cargo test --workspace --release`.** It must pass at the end of every task, with no `--skip` and no known-failing test left in the tree. Release is mandatory because the vendored library is about 30x slower in debug and §13.2's timing assertions assume optimized code; the root manifest additionally carries `[profile.dev.package.postflop-solver] opt-level = 3` (Task 7) so an ad-hoc debug run is not pathological. Any test that needs an artifact built by a `cargo build` step (the `solver-worker.exe` used by `crates/engine/tests/worker_link.rs`) discovers it through `POKERAI_WORKER` or the standard target directory and `#[ignore]`s itself when the binary is absent, so the workspace command never fails on a missing artifact.
+- **Per-task green command: `cargo test --workspace --release`** on the MSVC branch, or the two-command GNU partition above once Task 1 has selected GNU. It must pass at the end of every task, with no `--skip` and no known-failing test left in the tree. Release is mandatory because the vendored library is about 30x slower in debug and §13.2's timing assertions assume optimized code; the root manifest additionally carries `[profile.dev.package.postflop-solver] opt-level = 3` (Task 7) so an ad-hoc debug run is not pathological. Any test that needs an artifact built by a `cargo build` step (the `solver-worker.exe` used by `crates/engine/tests/worker_link.rs`) discovers it through `POKERAI_WORKER` or the standard target directory and `#[ignore]`s itself when the binary is absent, so the workspace command never fails on a missing artifact.
 
 ---
 
@@ -60,7 +65,8 @@ These are the **resolved** names of `docs/research/REVIEW-cross-plan.md` section
 | Path | Responsibility |
 |---|---|
 | `Cargo.toml` (modify) | Task 1 adds `exclude = ["third_party/postflop-solver"]`; Task 7 adds the member `"solver-worker"` and `[profile.dev.package.postflop-solver] opt-level = 3`. `crates/engine` and `crates/bench` are covered by plan 1's `members = ["crates/*"]` glob |
-| `third_party/postflop-solver/` | vendored library at the pinned commit with the two patches; `LICENSE`, `PINNED_COMMIT`, `PATCHES.md` |
+| `third_party/postflop-solver/` | vendored library at the pinned commit with the two patches; `LICENSE`, `PINNED_COMMIT`, `PATCHES.md`; `tests/vendor_smoke.rs` (correctness) and `tests/v1_flop_fast.rs` (the §3.6 V1 FLOP-FAST comparator, `#[ignore]`) |
+| `docs/bench/worker-toolchain.json` | Task 1's §3.6 V1 selection: `worker_toolchain`, `worker_target` and the measurement provenance. The single artefact every later worker build, worker test, bench run, oracle run and runtime staging step in plans 2, 4 and 5 reads |
 | `solver-worker/Cargo.toml`, `build.rs` | AGPL crate; AVX2 build check |
 | `solver-worker/src/main.rs` | argument parsing (`--threads N`), rayon pool, thread wiring, exit codes |
 | `solver-worker/src/lib.rs` | module wiring, `ADAPTER_CAPABILITIES`, `ready_message(threads)` |
@@ -96,8 +102,9 @@ These are the **resolved** names of `docs/research/REVIEW-cross-plan.md` section
 | `crates/engine/src/allin.rs` | facing-all-in analytic fallback |
 | `crates/engine/src/assemble.rs` | `Recommendation` assembly, headline, reason accumulation, `Equity` merge |
 | `crates/engine/src/log.rs` | `DecisionLog` JSONL with rotation |
-| `crates/engine/src/snapshots.rs` | `SnapshotStore` of validated `SolvedStreet`s keyed by identity: the **single** registration path (spec §9.2) that plan 3 Task 11 wraps into `core_replay::StreetSnapshot` |
-| `crates/engine/src/core.rs` | `EngineCore` (worker, clock, log, snapshots, identity, watchdog), `EventSink`, `serve_request` for river/turn |
+| `crates/engine/src/snapshots.rs` | `SnapshotStore` of validated `SolvedStreet`s keyed by identity: the **single** registration path (spec §9.2) that plan 3 Task 14 replaces with `core_replay::StreetSnapshot` |
+| `crates/engine/src/core.rs` | `EngineCore` (worker, clock, log, snapshots, identity, watchdog), `EventSink` |
+| `crates/engine/src/serve.rs` | `serve_request` for river/turn, `LiveRequest`, and the `pub(crate) emit` helper plan 3 Task 17's `preflop.rs` imports |
 | `crates/engine/src/engine.rs` | public `Engine` API of §3.5 (threads `engine-main`, `fast-path`), request slot of depth 1 |
 | `crates/engine/tests/golden/*.json` | expected values for the §13.3 goldens |
 | `crates/engine/tests/{tree_builder,coverage,facing_allin,assembly,identity_race,final_delivery,worker_link}.rs` | engine tests |
@@ -111,13 +118,13 @@ These are the **resolved** names of `docs/research/REVIEW-cross-plan.md` section
 ## Task 1: Vendor postflop-solver at the pinned commit with the two patches
 
 **Files:**
-- Create: `third_party/postflop-solver/` (full source tree of the pinned commit, `target/` excluded), `third_party/postflop-solver/PINNED_COMMIT`, `third_party/postflop-solver/PATCHES.md`
+- Create: `third_party/postflop-solver/` (full source tree of the pinned commit, `target/` excluded), `third_party/postflop-solver/PINNED_COMMIT`, `third_party/postflop-solver/PATCHES.md`, `docs/bench/worker-toolchain.json`
 - Modify: `Cargo.toml` (workspace root, from plan 1)
-- Test: `third_party/postflop-solver/tests/vendor_smoke.rs`
+- Test: `third_party/postflop-solver/tests/vendor_smoke.rs`, `third_party/postflop-solver/tests/v1_flop_fast.rs`
 
 **Interfaces:**
-- Consumes: nothing from the workspace.
-- Produces: path dependency `postflop-solver = { path = "../third_party/postflop-solver", features = ["zstd"] }` exposing `ActionTree`, `TreeConfig`, `BetSizeOptions`, `DonkSizeOptions`, `BetSize`, `BoardState`, `Action`, `CardConfig`, `Range`, `PostFlopGame`, `solve_step`, `compute_exploitability`, `finalize`, `card_from_str`, `NOT_DEALT`.
+- Consumes: nothing from the workspace. `scripts/build-worker-gnu.ps1` (plan 1 Task 1) is the fallback target this task may select; the R8 comparator is §3.1/§3.3 of `docs/research/R8-solver-bench.md`, measured on GNU (R8 §5).
+- Produces: path dependency `postflop-solver = { path = "../third_party/postflop-solver", features = ["zstd"] }` exposing `ActionTree`, `TreeConfig`, `BetSizeOptions`, `DonkSizeOptions`, `BetSize`, `BoardState`, `Action`, `CardConfig`, `Range`, `PostFlopGame`, `solve_step`, `compute_exploitability`, `finalize`, `card_from_str`, `flop_from_str`, `NOT_DEALT`. **This task also produces the §3.6 V1 worker-toolchain selection**: `docs/bench/worker-toolchain.json` `{ worker_toolchain: String, worker_target: String, ... }` — the single artefact every later worker build, worker test, bench run, oracle run and runtime staging step in plans 2, 4 and 5 reads. No earlier task performs this check.
 
 - [ ] **Step 1: Copy the pinned sources**
 
@@ -181,7 +188,9 @@ fn river_tree_root_menu_matches_r8() {
 }
 ```
 
-- [ ] **Step 5: Run it**
+- [ ] **Step 5: Run the smoke test, then perform the V1 toolchain measurement and record the selection**
+
+First the correctness smoke test. It is **not** the performance comparator.
 
 Run: `cargo test --manifest-path third_party/postflop-solver/Cargo.toml --release --test vendor_smoke`
 Expected: PASS; `cargo tree --manifest-path third_party/postflop-solver/Cargo.toml -i bincode` shows `bincode v2.0.0-rc.3`.
@@ -191,12 +200,97 @@ Then confirm the workspace still loads and is green:
 Run: `cargo test --workspace --release`
 Expected: plan 1's tests pass, unchanged (the vendored tree is excluded and is not a member).
 
-This is also the task where plan 1's V1 toolchain check is consumed: if that check selected the GNU fallback for the solver (MSVC build failure, or more than 25% slower), prefix the two `--manifest-path` commands above and every later `-p solver-worker` command with `+stable-x86_64-pc-windows-gnu`. Record which branch was taken in `third_party/postflop-solver/PATCHES.md` under a `## Toolchain` heading (one line: the toolchain, the two measured `vendor_smoke --release` wall times, and the ratio). Do not add a second `rust-toolchain.toml`.
+**The V1 check (spec §3.6) is performed here; no earlier task has performed it.** R8 measured the solver on `stable-x86_64-pc-windows-gnu` (R8 §5: VS 2022 on that machine had no C++ build tools, so MSVC could never be compared). Its FLOP-FAST comparator is R8 §3.3 row `-C target-cpu=native (AVX2), 24 thr`: **6.2 s to 0.5 % of the pot** (7.7 s to 0.3 %), on the §3 FLOP-FAST tree — board `Qs Jh 2h`, flop root, pot 180, effective stack 910, 52 % bets and 2.5x raises on every street, `add_allin 1.0`, `force_allin 0.15`, `merging_threshold 0.1`, the `examples/basic.rs` ranges (OOP 179 combos, IP 264 combos), exploitability checked every 10 iterations. Reproduce exactly that workload on MSVC.
+
+Write `third_party/postflop-solver/tests/v1_flop_fast.rs` (a second test file beside `vendor_smoke.rs`; no vendored source is changed, so `PATCHES.md`'s "no other source change" still holds):
+
+```rust
+//! Spec 3.6 V1: the FLOP-FAST comparator of R8 section 3.3 (GNU, AVX2, 24 threads: 6.2 s to 0.5 %).
+//! `#[ignore]` so the ordinary smoke run stays fast; the V1 step runs it explicitly with `--ignored`.
+use postflop_solver::*;
+use std::time::Instant;
+
+#[test]
+#[ignore]
+fn flop_fast_time_to_target() {
+    let bet = BetSizeOptions::try_from(("52%", "2.5x")).unwrap();
+    let cfg = TreeConfig {
+        initial_state: BoardState::Flop, starting_pot: 180, effective_stack: 910, rake_rate: 0.0, rake_cap: 0.0,
+        flop_bet_sizes: [bet.clone(), bet.clone()], turn_bet_sizes: [bet.clone(), bet.clone()], river_bet_sizes: [bet.clone(), bet],
+        turn_donk_sizes: None, river_donk_sizes: None,
+        add_allin_threshold: 1.0, force_allin_threshold: 0.15, merging_threshold: 0.1,
+    };
+    let cards = CardConfig {
+        range: ["66+,A8s+,A5s-A4s,AJo+,K9s+,KQo,QTs+,JTs,96s+,85s+,75s+,65s,54s".parse().unwrap(),
+                "QQ-22,AQs-A2s,ATo+,K5s+,KJo+,Q8s+,J8s+,T7s+,96s+,86s+,75s+,64s+,53s+".parse().unwrap()],
+        flop: flop_from_str("QsJh2h").unwrap(), turn: NOT_DEALT, river: NOT_DEALT,
+    };
+    let mut game = PostFlopGame::with_config(cards, ActionTree::new(cfg).unwrap()).unwrap();
+    game.allocate_memory(false);
+    let target = 180.0 * 0.005;                       // R8's 0.5 % of the pot, in chips
+    let t0 = Instant::now();
+    let (mut iters, mut expl) = (0u32, f32::INFINITY);
+    while iters < 1000 {
+        solve_step(&game, iters);
+        iters += 1;
+        if iters % 10 == 0 {
+            expl = compute_exploitability(&game);
+            if expl <= target { break; }
+        }
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    println!("V1_FLOP_FAST secs={secs:.3} iterations={iters} exploitability_chips={expl:.4} \
+              memory_bytes={}", game.memory_usage().0);
+    assert!(expl <= target, "did not reach 0.5 % in 1000 iterations (reached {expl:.4} chips)");
+}
+```
+
+Run (repo root, so the workspace `.cargo/config.toml` supplies `-C target-feature=+avx2`):
+
+```powershell
+rustc -Vv
+cargo +stable-x86_64-pc-windows-msvc test --manifest-path third_party/postflop-solver/Cargo.toml --release --target x86_64-pc-windows-msvc --test v1_flop_fast -- --ignored --nocapture
+```
+
+Expected: the build succeeds and the line `V1_FLOP_FAST secs=... iterations=... exploitability_chips=...` is printed. Run it three times and take the **best** wall time (R8 §3.4: three of ~20 runs on this box were 1.3-2.6x slower than their repeats, so a single measurement is not a comparator). Call that `msvc_secs`.
+
+**The 25 % rule.** `gnu_secs = 6.2` (R8 §3.3, AVX2, 24 threads, 0.5 % target). Select GNU for `solver-worker` alone when the MSVC build fails **or** `msvc_secs > 1.25 * gnu_secs` (that is, `> 7.75 s`); otherwise select MSVC. If the pinned solver cannot be built or run under MSVC at all, or the R8 comparator cannot be reproduced or identified on this machine, **report the missing measurement fact and stop** — never substitute tree-construction or `vendor_smoke` wall time for it.
+
+On the GNU branch, verify the fallback target before depending on it:
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-gnu --no-self-update
+cargo +stable-x86_64-pc-windows-gnu test --manifest-path third_party/postflop-solver/Cargo.toml --release --target x86_64-pc-windows-gnu --test v1_flop_fast -- --ignored --nocapture
+```
+
+`scripts/build-worker-gnu.ps1` (plan 1 Task 1) is the only command that builds a GNU `solver-worker`; it is first runnable at Task 7, when that crate exists.
+
+Write the selection to `docs/bench/worker-toolchain.json` (the one artefact every later worker build, test, bench run, oracle run and staging step reads):
+
+```json
+{
+  "worker_toolchain": "stable-x86_64-pc-windows-msvc",
+  "worker_target": "x86_64-pc-windows-msvc",
+  "measured_at": "2026-09-17",
+  "rustc_version": "<full `rustc -Vv` output, one line>",
+  "solver_commit": "9d1509fe5077d019825f833eed04b16d342dfda1",
+  "rustflags": "-C target-feature=+avx2",
+  "workload": "R8 FLOP-FAST: QsJh2h, flop root, pot 180, eff 910, 52%/2.5x, add_allin 1.0, force_allin 0.15, merge 0.1, basic.rs ranges 179/264, target 0.5% of pot, exploitability every 10 iterations",
+  "msvc_secs": 0.0,
+  "gnu_comparator_secs": 6.2,
+  "gnu_comparator_source": "R8-solver-bench.md section 3.3, -C target-cpu=native (AVX2), 24 threads",
+  "ratio": 0.0,
+  "threshold": 1.25,
+  "decision": "msvc within 25% of the GNU comparator"
+}
+```
+
+The two allowed `(worker_toolchain, worker_target)` pairs are `stable-x86_64-pc-windows-msvc` / `x86_64-pc-windows-msvc` and `stable-x86_64-pc-windows-gnu` / `x86_64-pc-windows-gnu`; any other value is invalid and blocks every later worker step. Record the same facts in `third_party/postflop-solver/PATCHES.md` under a `## Toolchain` heading: `rustc -Vv`, the target, the solver commit, the flags, the workload, `msvc_secs`, the R8 GNU comparator and the ratio. Do not add a second `rust-toolchain.toml`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add third_party Cargo.toml
+git add third_party Cargo.toml docs/bench/worker-toolchain.json
 git commit -m "chore: vendor postflop-solver at 9d1509fe with the bincode pin and autoref patch
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
@@ -452,7 +546,7 @@ fn spec(id: &'static str, root: Street, streets: &[(Street, &[MenuSize])], raise
         // Donk menus (§4.6): `None` on the root street, the explicit empty list on every later street.
         // A root-street `None` is legal and is never sent to the library: upstream ignores `turn_donk_sizes`
         // at a turn root because `prev_action` is `None` there, so no donk node exists to size. Only a LATER
-        // street's `None` is a defect, and Tasks 8 and 13 reject exactly that. Recorded as a deviation.
+        // street's `None` is structurally invalid input, and Tasks 8 and 13 reject exactly that (spec §13.2).
         let donk = if *s == root { None } else { Some(vec![]) };
         menus.insert(*s, pm(bets, raise, donk));
     }
@@ -1102,7 +1196,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `engine::tree::{materialize_at, Templates}`, `engine::bench_support::prepared_range`; `proto::{Action, Card, Rake, Range1326, Street}`.
 - Produces: `engine::bench_support::{prepared_range(text: &str, board: &[Card]) -> Result<Range1326, String>, range_mass(&Range1326) -> f32}` — the **only** way `bench` reaches range parsing and board blocking, because spec §3.2 fixes `bench`'s dependencies to `proto` and `engine` (cross-plan M17/R5). `bench::suite::{Spot { id: String, template_id: String, root_street: Street, board: Vec<Card>, oop_range: String, ip_range: String, pot: u32, stack_oop: u32, stack_ip: u32, rake: Rake, history: Vec<Action>, target_bp: u16, range_source: String }, Suite { suite: String, spots: Vec<Spot> }, Suite::load(&Path) -> Result<Suite, String>, Suite::save(&self, &Path)}`; `crates/bench/src/lib.rs` re-exporting `pub mod {suite, gen_spots, materialize}` so plan 4's integration tests can link them (cross-plan D4); CLI `bench materialize --template ID --pot P --eff E [--prefix oop:bet:73,ip:raise:200]` printing `{"tree": EffectiveTree, "history": [Action], "decision_path": [u8]}` to stdout; `bench gen-spots --source r8 --out bench/spots`.
 
-**Range source (spec §13.5, cross-plan Or8/R3, orchestrator decision 4):** §13.5 defines the six baseline suites on **chart-replay** ranges. This task can only emit the R8 uniform ranges, so `--source r8` writes `range_source: "r8_uniform"` into every spot and the resulting suites are an explicitly labelled **interim** set: any `docs/bench/*.md` section produced from them is a pre-baseline reference run and does not satisfy the V2/V22 gate. `--source chart` is added when plan 3's chart bundles are wired into `bench gen-spots`, and plan 4 Task 17 regenerates all six `bench/spots/*.json` from chart replay before the gate is claimed. `generate` therefore rejects every source other than `r8` with a message naming `chart`, so the interim status cannot be forgotten.
+**Range source (spec §13.5, cross-plan Or8/R3, orchestrator decision 4):** §13.5 defines the six baseline suites on **chart-replay** ranges. This task can only emit the R8 uniform ranges, so `--source r8` writes `range_source: "r8_uniform"` into every spot and the resulting suites are an explicitly labelled **interim** set: any `docs/bench/*.md` section produced from them is a pre-baseline reference run and does not satisfy the V2/V22 gate. `--source chart` is added when plan 3's chart bundles are wired into `bench gen-spots`. Plan 4 Task 17 freezes the chart source hashes; plan 4 **Task 20** regenerates all six chart-replay `bench/spots/*.json` before the gate is claimed. `generate` therefore rejects every source other than `r8` with a message naming `chart`, so the interim status cannot be forgotten.
 
 - [ ] **Step 1: Failing tests**
 
@@ -1232,7 +1326,7 @@ pub struct Spot {
     pub id: String, pub template_id: String, pub root_street: Street, pub board: Vec<Card>,
     pub oop_range: String, pub ip_range: String, pub pot: u32, pub stack_oop: u32, pub stack_ip: u32,
     pub rake: Rake, pub history: Vec<Action>, pub target_bp: u16,
-    /// "r8_uniform" (this plan's labelled interim) | "chart_replay" (the §13.5 baseline, plan 3 bundles + plan 4 Task 17) | "store_replay" (V9)
+    /// "r8_uniform" (this plan's labelled interim) | "chart_replay" (the §13.5 baseline, plan 3 bundles + plan 4 Task 20) | "store_replay" (V9)
     pub range_source: String,
 }
 
@@ -1258,7 +1352,7 @@ use crate::suite::{Spot, Suite};
 use proto::{Card, Rake, Street};
 
 // R8 addendum A.1 ranges (uniform weights). INTERIM: spec §13.5's baseline set uses chart-replay ranges,
-// which arrive with plan 3's bundles (`--source chart`) and are regenerated for all six suites by plan 4 Task 17.
+// which arrive with plan 3's bundles (`--source chart`); plan 4 Task 17 freezes the source hashes and Task 20 regenerates all six suites.
 // Note: A.1 publishes combo counts 646 / 804 for these two strings; the strings as published expand to 634 / 720
 // (recomputed in Task 6). The strings, not A.1's counts, are the definition here and in the fixture generator.
 pub const BTN_OPEN: &str = "22+,A2s+,K2s+,Q2s+,J3s+,T6s+,96s+,86s+,75s+,65s,54s,43s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o";
@@ -1272,9 +1366,9 @@ fn cards(s: &str, n: usize) -> Vec<Card> { s.as_bytes().chunks(2).take(n).map(|c
 
 pub fn generate(suite: &str, source: &str) -> Result<Suite, String> {
     // §13.5's baseline set is chart-replay; `r8` is the labelled interim of this plan. `chart` is accepted only
-    // once plan 3's bundles are wired in, and plan 4 Task 17 regenerates all six suites before the gate is claimed.
+    // once plan 3's bundles are wired in; plan 4 Task 17 freezes source hashes and Task 20 regenerates all six suites before the gate.
     if source != "r8" {
-        return Err(format!("source {source:?} is not available in this plan: only \"r8\" (uniform R8 addendum A.1 ranges, interim) is implemented; the \"chart\" replay baseline of spec section 13.5 arrives with plan 3's bundles and is regenerated for all six suites by plan 4"));
+        return Err(format!("source {source:?} is not available in this plan: only \"r8\" (uniform R8 addendum A.1 ranges, interim) is implemented; the \"chart\" replay baseline of spec section 13.5 arrives with plan 3's bundles and is regenerated for all six suites by plan 4 Task 20"));
     }
     let (street, template, n) = match suite {
         "river_std" => (Street::River, "river_std_v1", 5), "river_min" => (Street::River, "river_min_v1", 5),
@@ -1390,7 +1484,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `bench materialize` (Task 5) through `subprocess`; the §4.5 definitions.
-- Produces: the five JSONL fixtures. Each fixture holds engine -> worker lines only; expectations live in the Rust tests. Line ids: `river_two_combo`: `solve 41`, `cancel 42 -> 41`, `shutdown 48`; `flop_cancel`: `solve 43`, `cancel 44 -> 43`; `flop_best_so_far`: `solve 45`; `lock_river`: `lock 47`, `solve 51` (same `spot`), `shutdown 52`; `materialization_cases`: one object per case `{"case", "template_id", "pot", "eff", "prefix": [[actor, action]], "tree", "history", "decision_path"}` (43 cases).
+- Produces: the five JSONL fixtures. Each fixture holds engine -> worker lines only; expectations live in the Rust tests. Line ids: `river_two_combo`: `solve 41`, `cancel 42 -> 41`, `shutdown 48`; `flop_cancel`: `solve 43`, `cancel 44 -> 43`; `flop_best_so_far`: `solve 45`; `lock_river`: `lock 47`, `solve 51` (same `spot`), `shutdown 52`; `materialization_cases`: one object per case `{"case", "template_id", "pot", "eff", "prefix": [[actor, action]], "tree", "history", "decision_path"}` (**47 cases**: the §13.2 five-point sweep over all seven §10.1 templates, `flop_full_v1` included, plus the twelve `facing_test_v1`/cap/insert/pinned cases).
 - This generator is the **single definition** of the two-combo river ranges (cross-plan D7): plan 1's `crates/proto/tests/wire_examples.rs` loads `fixtures/worker/river_two_combo.jsonl` rather than restating them in Rust, so the two can never drift. Nothing here re-derives them.
 
 - [ ] **Step 1: Failing Python tests `tools/tests/test_gen_worker_fixtures.py`**
@@ -1444,8 +1538,8 @@ def test_write_all_with_stub_materializer(tmp_path):
     names = sorted(p.name for p in written)
     assert names == ["flop_best_so_far.jsonl", "flop_cancel.jsonl", "lock_river.jsonl", "materialization_cases.jsonl", "river_two_combo.jsonl"]
     cases = [json.loads(l) for l in (tmp_path / "materialization_cases.jsonl").read_text().splitlines()]
-    #        6 phase-1 templates x 5 points, 1 flop_full point, 7 facing stacks, facing_350_full, cap1, cap3, insert_73, basic_turn_std
-    assert len(cases) == 6 * 5 + 1 + 7 + 1 + 1 + 1 + 1 + 1 == 43
+    #        7 section-10.1 templates x 5 points, 7 facing stacks, facing_350_full, cap1, cap3, insert_73, basic_turn_std
+    assert len(cases) == 7 * 5 + 7 + 1 + 1 + 1 + 1 + 1 == 47
     lock = [json.loads(l) for l in (tmp_path / "lock_river.jsonl").read_text().splitlines()]
     assert lock[0]["type"] == "lock" and lock[1]["type"] == "solve" and lock[0]["spot"] == lock[1]["spot"]
     rows = lock[0]["locks"][0]["probs"]
@@ -1624,9 +1718,9 @@ def flop_lines(materializer):
     return cancel, best
 
 
-# flop_full_v1 is phase-2 only (spec section 10.1) and its (180, 910) skeleton is roughly 3,000 nodes, so it gets a
-# single small rules case instead of the five-point sweep the phase-1 templates get.
-TEMPLATES = ["flop_fast_v1", "flop_min_v1", "turn_std_v1", "turn_min_v1", "river_std_v1", "river_min_v1"]
+# All seven section-10.1 templates receive the section-13.2 five-point sweep.
+TEMPLATES = ["flop_fast_v1", "flop_min_v1", "flop_full_v1",
+             "turn_std_v1", "turn_min_v1", "river_std_v1", "river_min_v1"]
 
 
 def materialization_cases(materializer):
@@ -1634,7 +1728,6 @@ def materialization_cases(materializer):
     for t in TEMPLATES:
         for pot, eff in [(100, 100), (100, 150), (180, 910), (100, 149), (100, 151)]:
             cases.append((f"{t}_{pot}_{eff}", t, pot, eff, []))
-    cases.append(("flop_full_v1_100_100", "flop_full_v1", 100, 100, []))
     for eff in [350, 400, 401, 340, 341, 240, 100]:
         cases.append((f"facing_{eff}", "facing_test_v1", 100, eff, [["oop", action("bet", 100)]]))
     cases.append(("facing_350_full", "facing_test_v1", 100, 350, []))
@@ -1673,7 +1766,7 @@ Run: `cd tools && python -m pytest tests/test_gen_worker_fixtures.py -q`
 Expected: 4 passed.
 
 Run (repo root, needs Task 5's `bench`): `python tools/gen_worker_fixtures.py`
-Expected: five files under `fixtures/worker/`; `river_two_combo.jsonl` is three lines; `materialization_cases.jsonl` has 43 lines; the `flop_*` solve lines carry a `flop_fast_v1` tree rooted at `flop` with `history: []`.
+Expected: five files under `fixtures/worker/`; `river_two_combo.jsonl` is three lines; `materialization_cases.jsonl` has **47** lines, four of which are the added `flop_full_v1` points `(100, 150)`, `(180, 910)`, `(100, 149)` and `(100, 151)`; the `flop_*` solve lines carry a `flop_fast_v1` tree rooted at `flop` with `history: []`. These are materialization/cross-check skeletons only — no case here is ever solved, so `flop_full_v1`'s large `(180, 910)` skeleton costs tree construction, not a solve.
 
 - [ ] **Step 5: Commit**
 
@@ -1998,10 +2091,19 @@ fn main() {
 
 - [ ] **Step 5: Run and commit**
 
+Read `worker_toolchain` from `docs/bench/worker-toolchain.json` (Task 1) and run the branch it names. A missing or invalid file blocks this step; it never silently defaults to MSVC.
+
+**MSVC branch:**
+
 Run: `cargo test -p solver-worker --release` then `cargo test --workspace --release`
 Expected: `named_combo_roundtrip` and `ready_reports_features` pass; the workspace stays green now that `solver-worker` is a member.
 
-(If plan 1's V1 check selected the GNU fallback, the first command is `cargo +stable-x86_64-pc-windows-gnu test -p solver-worker --release`; the workspace command stays MSVC and simply skips nothing, because `cargo test --workspace` builds `solver-worker` with the pinned toolchain and the AVX2 `build.rs` check is toolchain-independent.)
+**GNU branch:**
+
+Run: `cargo test --workspace --exclude solver-worker --release` (pinned MSVC toolchain), then `cargo +stable-x86_64-pc-windows-gnu test -p solver-worker --release --target x86_64-pc-windows-gnu`
+Expected: both commands pass. This partitions the workspace by selected compiler and **skips no package**: `--exclude solver-worker` is what keeps an ordinary workspace command from rebuilding the rejected MSVC worker, and the AVX2 `build.rs` check runs on the GNU build instead. Build and stage the worker binary with `powershell -NoProfile -File scripts/build-worker-gnu.ps1` (plan 1 Task 1), which copies it to `target\release\solver-worker.exe`, and set `POKERAI_WORKER` to that path for every process test from Task 15 on.
+
+This two-branch rule is the series-wide green/build rule of the Global Constraints and applies to every later task in this plan and to plans 4 and 5 (test gates, bench runs, `bench oracle`, diagnostic workers and runtime staging).
 
 ```bash
 git add solver-worker Cargo.toml
@@ -2023,9 +2125,11 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Consumes: `cards` (Task 7); fixtures (Task 6); `postflop_solver::{Action as LibAction, ActionTree, BetSize, BetSizeOptions, BoardState, DonkSizeOptions, TreeConfig, PostFlopGame}`; `proto::{Action, EffectiveTree, MaterializedNode, MenuSize, SideMenu, Street}`.
 - Produces: `tree_build::{to_lib_action(&Action) -> LibAction, from_lib_action(LibAction) -> Option<Action>, board_state(Street) -> BoardState, tree_config(&EffectiveTree, pot: u32, eff: u32, rake_rate: f32, rake_cap_mchips: u32) -> Result<TreeConfig, String>, build(&EffectiveTree, pot, eff, rake_rate, rake_cap_mchips, history: &[Action]) -> Result<ActionTree, String>, apply_wager_cap(&mut ActionTree, cap: u8, history: &[LibAction]) -> Result<(), String>, enumerate(&mut ActionTree, root_street: Street, starting_pot: u32) -> Result<Vec<MaterializedNode>, String>, cross_check(lib: &[MaterializedNode], expected: &[MaterializedNode]) -> Result<(), String>}`; `history::{history_to_lib(&[Action]) -> Vec<LibAction>, indices_for(&mut PostFlopGame, &[Action]) -> Result<Vec<usize>, String>}`; `testutil::{solve_request(fixture: &str, line: usize) -> SolveRequest, cases() -> Vec<Case>}` with `Case { case, template_id, pot, eff, prefix: Vec<(String, Action)>, tree: EffectiveTree, history: Vec<Action>, decision_path: Vec<u8> }`.
 
-**Two recorded readings of the donk rule (both in the self-review deviations list):**
-1. A **root-street** `donk` of `None` is legal and is never sent to the library: upstream ignores `turn_donk_sizes` at a turn root because `prev_action` is `None` there. `tree_config` and `precheck` therefore require `Some(vec![])` only for streets strictly after the root. Spec §13.2's "a `None` donk option produces `result{error{tree_mismatch}}`" is read as being about a later street.
-2. For a **later** street's `None`, §13.2 lists the case twice: once under `tree_materialization_matches_library` as `result{error{tree_mismatch}}` and once under `protocol_rejections` as "a typed rejection with `reason`". The spec is self-inconsistent here. This plan picks the **cheap** answer: the structural check is in `precheck`, so it costs no work and the reply is `ack{rejected, reason: "... donk option must be the explicit empty list, never None"}`. `tree_config` keeps the same check as a defence in depth for callers that bypass `precheck` (the in-process tests below), where it surfaces as `tree_mismatch`.
+**The donk rule (spec §13.2 as revised; no reading is left open here):**
+1. A **root-street** `donk` of `None` is legal and is never sent to the library: upstream ignores `turn_donk_sizes` at a turn root because `prev_action` is `None` there. A root-street `None` therefore means "empty donk menu" and is accepted. `tree_config` and `precheck` require `Some(vec![])` only for streets strictly **after** the root.
+2. A missing or `None` donk option on a street strictly **after** the root is **structurally invalid input**: `precheck` rejects it before any work and the reply is `ack{rejected, reason: "donk option missing for <street>"}`. No `solve` is admitted, no tree is built, the worker stays alive.
+3. `result{error{tree_mismatch}}` is reserved for a **realized tree that differs from `tree.materialized`** — a deliberately altered `materialized` entry, a `matched`-reset-per-street menu, or a missing terminal marker — detected by `cross_check` after the library has enumerated the tree. A later-street `None` never produces `tree_mismatch` on the wire, because `precheck` rejects the request first.
+4. `tree_config` retains the same structural check for **direct callers that bypass `precheck`** (the in-process tests below, and `bench materialize`). Its error travels the ordinary `tree_build::build` path, which `job::run` maps to `invalid_request`, never to `tree_mismatch`.
 
 - [ ] **Step 1: Failing unit tests (bottom of `solver-worker/src/tree_build.rs`)**
 
@@ -2051,7 +2155,8 @@ mod tests {
     #[test]
     fn every_materialization_case_matches_library() {
         let all = cases();
-        assert_eq!(all.len(), 43);
+        assert_eq!(all.len(), 47);
+        assert_eq!(all.iter().filter(|c| c.template_id == "flop_full_v1").count(), 5);
         for c in &all {
             let mut tree = build(&c.tree, c.pot, c.eff, 0.0, 0, &c.history).unwrap_or_else(|e| panic!("{}: {e}", c.case));
             let lib = enumerate(&mut tree, c.tree.root_street, c.pot).unwrap();
@@ -2085,9 +2190,24 @@ mod tests {
         reset[turn].actions = vec![Action::Check, Action::Bet { to: 100 }];
         reset[turn].terminal_pots = vec![None, None];
         assert!(cross_check(&lib, &reset).is_err());
+        // A LATER street's None is structurally invalid input for a direct caller that bypasses `precheck`.
+        // It is not a tree_mismatch: nothing is enumerated and `cross_check` is never reached.
         let mut none_donk = c.tree.clone();
         none_donk.menus.get_mut(&Street::Turn).unwrap().donk = None;
-        assert!(tree_config(&none_donk, c.pot, c.eff, 0.0, 0).is_err());
+        let e = tree_config(&none_donk, c.pot, c.eff, 0.0, 0).unwrap_err();
+        assert!(e.contains("donk option must be the explicit empty list"), "{e}");
+    }
+
+    #[test]
+    fn root_street_none_donk_is_legal() {
+        // `facing_test_v1` is flop-rooted, so the flop menu's donk is None by construction (§4.6) and is accepted;
+        // upstream ignores donk sizes at the root because `prev_action` is None there.
+        let c = cases().into_iter().find(|c| c.case == "facing_350_full").unwrap();
+        assert_eq!(c.tree.menus[&c.tree.root_street].donk, None);
+        tree_config(&c.tree, c.pot, c.eff, 0.0, 0).expect("root-street None donk is legal");
+        let mut tree = build(&c.tree, c.pot, c.eff, 0.0, 0, &c.history).unwrap();
+        let lib = enumerate(&mut tree, c.tree.root_street, c.pot).unwrap();
+        cross_check(&lib, &c.tree.materialized).unwrap();
     }
 }
 ```
@@ -2285,7 +2405,7 @@ pub fn cross_check(lib: &[MaterializedNode], expected: &[MaterializedNode]) -> R
 - [ ] **Step 4: Run and commit**
 
 Run: `cargo test -p solver-worker --release --lib` then `cargo test --workspace --release`
-Expected: `tree_build` tests pass (43 cases cross-checked, including the equality boundaries and the cross-street operand of §4.6); the workspace stays green.
+Expected: `tree_build` tests pass (47 cases cross-checked, including `flop_full_v1`'s five points, the equality boundaries and the cross-street operand of §4.6); the workspace stays green.
 
 ```bash
 git add solver-worker
@@ -3025,10 +3145,19 @@ fn protocol_rejections() {
     // `NaN` is not valid JSON, so the id can only come from `lenient_id`'s byte scan
     w.send(&with_id(&river[0], "4").replacen("\"pot\":100", "\"pot\":NaN", 1));
     assert_eq!(ack_of(&w, "4")["status"], "rejected");
+    // §13.2: a `None` donk option on a street strictly AFTER the root is structurally invalid input.
+    // It is `ack{rejected, reason}` with NO work — never `result{error{tree_mismatch}}`, which is reserved
+    // for a realized tree that differs from `tree.materialized` (Task 16).
     w.send(&edit(&with_id(&flop[0], "5"), |v| v["tree"]["menus"]["turn"]["donk"] = Value::Null));
     let a = ack_of(&w, "5");
     assert_eq!(a["status"], "rejected");
     assert!(a["reason"].as_str().unwrap().contains("donk"));
+    assert!(w.recv_until(S, |m| m["type"] == "result" && m["id"] == "5").is_none(), "a rejected request does no work");
+    // The root street's own `None` is legal: `flop_cancel` is flop-rooted and its flop menu carries `donk: null`.
+    w.send(&edit(&with_id(&flop[0], "6"), |v| v["tree"]["menus"]["flop"]["donk"] = Value::Null));
+    assert_eq!(ack_of(&w, "6")["status"], "accepted");
+    w.send(r#"{"type":"cancel","id":"7","target":"6"}"#);
+    assert_eq!(result_of(&w, "6", 5 * S)["status"], "cancelled");
     // busy: a long flop solve, then a river solve is rejected "busy"; a duplicate id of the live job is "duplicate"
     w.send(&with_id(&flop[0], "11"));
     assert_eq!(ack_of(&w, "11")["status"], "accepted");
@@ -3149,9 +3278,13 @@ fn precheck(req: &SolveRequest) -> Result<(), String> {
     let t = &req.tree;
     if t.materialized.is_empty() { return Err("materialized tree is empty".into()); }
     if t.root_street == Street::Preflop { return Err("root_street must be flop, turn or river".into()); }
+    // §13.2: a missing/None donk option on a street strictly AFTER the root is structurally invalid input and is
+    // answered `ack{rejected, reason}` with no work. The root street's own `None` is legal (empty donk menu).
     for s in [Street::Turn, Street::River] {
         if s > t.root_street {
-            match t.menus.get(&s).and_then(|m| m.donk.as_ref()) { Some(d) if d.is_empty() => {}, Some(_) => return Err(format!("{s:?} donk sizes must be empty")), None => return Err(format!("{s:?} donk option must be the explicit empty list, never None")) }
+            match t.menus.get(&s).and_then(|m| m.donk.as_ref()) { Some(d) if d.is_empty() => {}, Some(_) => return Err(format!("{s:?} donk sizes must be empty")), None => return Err(format!("donk option missing for {}", match s {
+                Street::Turn => "turn", Street::River => "river", _ => unreachable!()
+            })) }
         }
     }
     if t.materialized.iter().filter(|n| n.street == t.root_street).count() > crate::extract::MAX_EXPORTED_NODES { return Err("street node count exceeds 100000".into()); }
@@ -3549,7 +3682,7 @@ fn main() {
 }
 ```
 
-Run: `cargo run --release -p solver-worker --example gen_basic_fixture`
+Run (MSVC-branch form; on the GNU branch `cargo +stable-x86_64-pc-windows-gnu run --release -p solver-worker --target x86_64-pc-windows-gnu --example gen_basic_fixture`): `cargo run --release -p solver-worker --example gen_basic_fixture`
 Expected: `fixtures/solver/basic_0p3.json` and `fixtures/worker/basic_turn_std_request.jsonl` written; exploitability <= 0.6 chips.
 
 - [ ] **Step 2: Write the tests**
@@ -3719,7 +3852,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Files:**
 - Create: `solver-worker/tests/contract_tree.rs`
-- Modify: nothing in `tools/` (the case `("basic_turn_std", "turn_std_v1", 200, 900, [])` is already in Task 6's generator; 43 cases)
+- Modify: nothing in `tools/` (the case `("basic_turn_std", "turn_std_v1", 200, 900, [])` is already in Task 6's generator; 47 cases)
 - Test: `tree_materialization_matches_library`, `wager_cap_remove_lines`, `exact_size_insertion_no_prune`, `suit_permutation_metamorphic`, `pinned_example_fixture`
 
 **Interfaces:**
@@ -3744,7 +3877,8 @@ fn case(name: &str) -> Value { cases().into_iter().find(|c| c["case"] == name).u
 
 #[test]
 fn tree_materialization_matches_library() {
-    // equality is checked in-process for all 43 cases (Task 8); here every disagreement is result{error{tree_mismatch}} on the wire
+    // equality is checked in-process for all 47 cases (Task 8); here a REALIZED tree that differs from `tree.materialized`
+    // is result{error{tree_mismatch}} on the wire. A later-street None donk never reaches this path: precheck rejects it.
     let mut w = Worker::spawn(4); ready(&w);
     let river = &fixture_lines("river_two_combo")[0];
     w.send(&edit(river, |v| { v["id"] = json!("100"); v["tree"]["materialized"][2]["terminal_pots"][1] = json!(299); }));
@@ -3763,6 +3897,13 @@ fn tree_materialization_matches_library() {
     w.send(&edit(flop, |v| { v["id"] = json!("103"); v["pot"] = json!(100); v["stack_oop"] = json!(350); v["stack_ip"] = json!(350); v["tree"] = full["tree"].clone(); v["deadline_ms"] = json!(400); v["extraction_margin_ms"] = json!(200); }));
     let ok = result_of(&w, "103");
     assert!(ok["status"] == "ok" || ok["status"] == "best_so_far", "{ok}");                        // the unaltered facing_350 tree is accepted
+    // §13.2: the ROOT street's own `None` donk is legal and never a tree_mismatch. `facing_test_v1` is flop-rooted,
+    // so `menus.flop.donk` is already null here; setting it explicitly must change nothing.
+    w.send(&edit(flop, |v| { v["id"] = json!("104"); v["pot"] = json!(100); v["stack_oop"] = json!(350); v["stack_ip"] = json!(350); v["tree"] = full["tree"].clone(); v["tree"]["menus"]["flop"]["donk"] = Value::Null; v["deadline_ms"] = json!(400); v["extraction_margin_ms"] = json!(200); }));
+    let root_none = result_of(&w, "104");
+    assert!(root_none["status"] == "ok" || root_none["status"] == "best_so_far", "{root_none}");
+    // A later street's `None` is rejected before any work by `precheck` (Task 13's `protocol_rejections`),
+    // so it can never appear here as a `tree_mismatch`.
 }
 
 #[test]
@@ -3979,7 +4120,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `proto::worker::{EngineMessage, WorkerMessage, Ready, PROTO_VERSION, SOLVER_COMMIT, ADAPTER_VERSION}`; `core_eval::{equity, exact_cost, EquityRequest, EquityMode, EquityStatus, PlayerRange}` (oracle test only, using plan 1's resolved shape).
-- **Workspace-green rule (review M9b):** the oracle and process tests need `target/release/solver-worker.exe`, which no cargo dependency builds. They discover it through `POKERAI_WORKER` or the workspace target directory and return early with a printed reason when it is absent, so `cargo test --workspace --release` is green either way. CI and the task's own run step build it first.
+- **Workspace-green rule (review M9b):** the oracle and process tests need `target/release/solver-worker.exe`, which no cargo dependency builds. They discover it through `POKERAI_WORKER` or the workspace target directory and return early with a printed reason when it is absent, so `cargo test --workspace --release` is green either way. CI and the task's own run step build it first, always with the V1-selected toolchain of Task 1.
 - Produces: `worker::link::{WorkerLinkError::{Eof, Protocol(String), LineTooLong(usize), Spawn(String), Exit{code: i32}}, WorkerLink}` with `fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError>; fn recv(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError>; fn restart(&mut self) -> Result<(), WorkerLinkError>; fn kill(&mut self); fn ready(&self) -> Option<&Ready>; fn peak_working_set_bytes(&self) -> u64 { 0 }`; `worker::ready::{validate_ready(&Ready, threads: u8) -> Result<(), String>, cpu_lacks_avx2(&Ready) -> bool}`; `worker::process::{ProcessWorker::spawn(exe: &Path, threads: u8) -> Result<ProcessWorker, WorkerLinkError>, MAX_RESULT_LINE, STDERR_RING}`; `worker::job_object::assign(child: &Child) -> Result<JobHandle, String>` (16 GiB process memory limit, kill on close); `EventSink` trait in `lib.rs`: `pub trait EventSink: Send { fn emit(&mut self, ev: RecommendationEvent); }`.
 
 - [ ] **Step 1: Failing tests `crates/engine/tests/worker_link.rs`**
@@ -3995,7 +4136,7 @@ use std::time::Duration;
 /// The engine never links the worker (§3.2), so the binary is discovered, not built by this crate.
 /// Order: `POKERAI_WORKER`, then the release build next to this test's target directory, then the debug one.
 /// `None` means "not built in this run" and the caller `#[ignore]`s itself, so `cargo test --workspace --release`
-/// is green whether or not `cargo build --release -p solver-worker` has run.
+/// is green whether or not the V1-selected worker build has run.
 fn worker_exe() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("POKERAI_WORKER") { let p = PathBuf::from(p); if p.exists() { return Some(p); } }
     let name = if cfg!(windows) { "solver-worker.exe" } else { "solver-worker" };
@@ -4011,7 +4152,7 @@ fn worker_exe() -> Option<PathBuf> {
 fn require_exe() -> Option<PathBuf> {
     match worker_exe() {
         Some(p) => Some(p),
-        None => { eprintln!("skipping: solver-worker binary not found; run `cargo build --release -p solver-worker` or set POKERAI_WORKER"); None }
+        None => { eprintln!("skipping: solver-worker binary not found; build it with the V1-selected toolchain (docs/bench/worker-toolchain.json) and set POKERAI_WORKER"); None }
     }
 }
 
@@ -4067,7 +4208,7 @@ fn river_check_only_terminal_oracle() {
             rake_rate: 0.0, rake_cap_mchips: 0, tree: tree.clone(), history: vec![], target_bp: 1, deadline_ms: 2000, extraction_margin_ms: 200, memory_limit_bytes: 10 << 30, background: false })).unwrap();
         loop { if let Some(WorkerMessage::Result { solution, status, .. }) = w.recv(Duration::from_secs(5)).unwrap() { assert_eq!(status, proto::worker::ResultStatus::Ok); return solution.unwrap(); } }
     };
-    // `core-eval`'s shape (plan 1 Task 20): players are seat-tagged ranges, the result carries per-seat shares.
+    // `core-eval`'s shape (plan 1 Task 24): players are seat-tagged ranges, the result carries per-seat shares.
     // A fixed hero combo is a range with one supported combo; hero is seat 0 and the villain seat 1 in every query.
     let hero_equity = |hero_combo: usize, villain: &Range1326| -> f32 {
         let mut fixed = Range1326([0.0; 1326]); fixed.0[hero_combo] = 1.0;
@@ -4097,7 +4238,9 @@ fn river_check_only_terminal_oracle() {
 
 - [ ] **Step 2: Run to see them fail**
 
-Run: `cargo build --release -p solver-worker && cargo test -p engine --test worker_link`
+Build the worker with the **V1-selected toolchain** (`docs/bench/worker-toolchain.json`, Task 1) and export `POKERAI_WORKER`: on the MSVC branch `cargo +stable-x86_64-pc-windows-msvc build --release -p solver-worker --target x86_64-pc-windows-msvc`, on the GNU branch `powershell -NoProfile -File scripts/build-worker-gnu.ps1`. Never run an unconditional `cargo build -p solver-worker` under a GNU selection.
+
+Run: `cargo test -p engine --test worker_link`
 Expected: FAIL to compile.
 
 - [ ] **Step 3: Implement**
@@ -4339,7 +4482,7 @@ fn peak_ws(_child: Option<&Child>) -> u64 { 0 }
 
 - [ ] **Step 4: Run and commit**
 
-Run: `cargo build --release -p solver-worker && cargo test -p engine --test worker_link`, then `cargo test --workspace --release`
+Run (after the same V1-selected worker build as Step 2, with `POKERAI_WORKER` set): `cargo test -p engine --test worker_link`, then the per-task green command of the Global Constraints for the selected branch
 Expected: 3 passed (the oracle test compares the worker's terminal EVs with `core-eval`'s exact enumeration on 4 x 4 combos); the workspace stays green, and stays green in a clean tree where the two spawning tests skip themselves.
 
 ```bash
@@ -4865,6 +5008,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - **`EngineCore::new` takes four arguments from the start** (worker, clock, identity, log). The decision log is built in Task 21 precisely so this constructor never changes arity later (cross-plan section 4, green-workspace risk 1).
 - **`SolvePlan.background` is a parameter, not a constant** (cross-plan R2): this plan only ever passes `false`, plan 4's pre-solver passes `true` with `deadline_ms: 600000`. The test below pins that it reaches the wire.
 
+> Forward owner: Plan 4 Task 11 modifies crates/engine/src/solve.rs to extract solve_request_from_parts and send_solve_request with the exact signatures declared there. Plan 2 produces run_solve first; it does not produce these helpers early. The later extraction preserves run_solve's signature, identity/deadline/heartbeat/cancellation/validation behavior and Task 23 retry policy, and lets the synthetic surrogate bypass SolveInput, cache and snapshots. Plan 4 Task 11 owns both the extraction and its callers.
+
 - [ ] **Step 1: Failing tests `crates/engine/tests/solve_client.rs`**
 
 ```rust
@@ -5159,6 +5304,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: Task 22's `solve.rs`; `deadline::{retry_admitted, street_budget_ms}`.
 - Produces: `solve::cancel_or_kill(&mut EngineCore, target: &str)` and the final `run_solve` semantics. No new public types.
+- See Task 22's forward-owner note: Plan 4 Task 11 later extracts `solve_request_from_parts` and `send_solve_request` from this task's `run_solve`, preserving the retry policy fixed here.
 
 **Three corrections applied here (reviews B1, M3, M5):**
 1. **Naming.** The loop variable is `attempt_no` and the function it calls is `run_attempt`. Binding a `u8` named `attempt` in the same scope as `fn attempt` shadows the function in the value namespace, so `attempt(...)` becomes "expected function, found u8" and the crate does not compile.
@@ -5952,7 +6098,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 - Produces: `snapshots::{SolvedStreet { identity_at_solve: DecisionIdentity, street: Street, board: Vec<Card>, tree: EffectiveTree, nodes: Vec<NodeStrategy>, ordinal_paths: Vec<OrdinalPath>, exploitability_chips: f32, reasons: Vec<ApproxReason>, solved_prefix: Vec<(Seat, Action)> }, SnapshotStore::{new(), register(&mut self, active: &DecisionIdentity, s: SolvedStreet) -> bool, invalidate_hand(&mut self, hand_id: u64), for_hand(&self, hand_id: u64) -> Vec<&SolvedStreet>}}`; `ranges::{RootRanges { oop: Range1326, ip: Range1326, reasons: Vec<ApproxReason>, ranges_used: Vec<(Seat, String, f32)> }, RangeSource: Send { fn ranges_at_root(&self, state: &HandState, root: &StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason>; }, ExplicitRanges { oop: Option<Range1326>, ip: Option<Range1326> }}`; `EngineCore` fields `snapshots: Arc<Mutex<SnapshotStore>>`, `config: Arc<Mutex<GameConfig>>`, `range_source: Arc<Mutex<Box<dyn RangeSource>>>` plus `EngineCore::{config(&self) -> GameConfig, set_config(&self, GameConfig)}`.
 
 **The two seams plans 3 and 4 attach to (cross-plan M15, M16, D1, D6; orchestrator interface request g):**
-1. `engine::snapshots::SnapshotStore` is the **single** registration path of spec §9.2 for this plan's river/turn results. Plan 3 Task 11 wraps `SolvedStreet` into `core_replay::StreetSnapshot` (spec §9.1 field name `covered_paths`, prefix-based invalidation) and re-exports through `engine::snapshots`, keeping `register(&DecisionIdentity, _) -> bool` with the identical identity rule. It replaces this store in one commit, never across several, so `identity_race_golden` (Task 28) is never red between tasks.
+1. `engine::snapshots::SnapshotStore` is the **single** registration path of spec §9.2 for this plan's river/turn results. Plan 3 Task 14 replaces `SolvedStreet` with `core_replay::StreetSnapshot` (spec §9.1 field name `covered_paths`, prefix-based invalidation) and re-exports through `engine::snapshots`, keeping `register(&DecisionIdentity, _) -> bool` with the identical identity rule. It replaces this store in one commit, never across several, so `identity_race_golden` (Task 28) is never red between tasks.
 2. `engine::ranges::RangeSource::ranges_at_root` is the **only** root-range provider. Plan 3 implements `RangeSource` for a `ReplayRanges` type and installs it into `EngineCore.range_source`; its `prepare_root` becomes that method's body. There is no second entry point and no `postflop.rs`. The matching hook on the serve path is `serve_request`'s `Classification::Preflop` arm (Task 28), which plan 3 replaces with the preflop store lookup.
 
 - [ ] **Step 1: Failing tests**
@@ -6038,7 +6184,7 @@ use proto::{Action, ApproxReason, Card, DecisionIdentity, EffectiveTree, Ordinal
 pub struct SolvedStreet { pub identity_at_solve: DecisionIdentity, pub street: Street, pub board: Vec<Card>, pub tree: EffectiveTree, pub nodes: Vec<NodeStrategy>, pub ordinal_paths: Vec<OrdinalPath>, pub exploitability_chips: f32, pub reasons: Vec<ApproxReason>, pub solved_prefix: Vec<(Seat, Action)> }
 
 /// Validated solutions keyed by identity: the single registration path of §9.2 for live river/turn results.
-/// Plan 3 Task 11 replaces this with `core_replay::SnapshotStore`/`StreetSnapshot` in one commit and re-exports
+/// Plan 3 Task 14 replaces this with `core_replay::SnapshotStore`/`StreetSnapshot` in one commit and re-exports
 /// it from this module; the identity rule below is the contract that survives that swap.
 #[derive(Default)]
 pub struct SnapshotStore { items: Vec<SolvedStreet> }
@@ -6143,8 +6289,19 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: every earlier engine task; `core_model::{derive, street_root}`; `core_ranges::{hash_scaled, parse_range}`.
-- Produces: `serve::{LiveRequest { identity: DecisionIdentity, state: HandState, t0_ms: u64, sink: SharedSink }, serve_request(&mut EngineCore, LiveRequest)}`.
-- **Plan-3 hook:** `serve_request`'s `Classification::Preflop` arm is the single place a preflop path attaches; `core.range_source` is the single place replay attaches (Task 27).
+- Produces: `serve::{LiveRequest { identity: DecisionIdentity, state: HandState, t0_ms: u64, sink: SharedSink }, serve_request(&mut EngineCore, LiveRequest)}`, plus the crate-visible event helper
+
+```rust
+pub(crate) fn emit(
+    core: &EngineCore,
+    req: &LiveRequest,
+    delivered: Option<&AtomicBool>,
+    ev: RecommendationEvent,
+);
+```
+
+  This is a crate-visible engine helper, not public IPC: `pub(crate)` rather than private so plan 3 Task 17's sibling `crate::preflop` module can import it (`use crate::serve::emit;`) instead of duplicating the identity check and the `Final`-once guard.
+- **Plan-3 hook:** `serve_request`'s `Classification::Preflop` arm is the single place a preflop path attaches; `core.range_source` is the single place replay attaches (Task 27). Plan 3 Task 17 installs the preflop arm and imports `emit`; plan 3 Task 18 installs the replay `RangeSource` through the shared `Arc<Mutex<Box<dyn RangeSource>>>` that Task 27 owns.
 
 **Two spec readings recorded here and in the self-review:**
 - `assumptions.source_accuracy` is formatted in **basis points**, not raw chips: §4.4's vocabulary is `"unverified" | "exploitability <= x"` and §7 compares in raw chips but displays in bp, so the string is `format!("exploitability <= {reached_bp} bp")` and the raw chips stay in the decision log and the snapshot. (Review m14.)
@@ -6266,7 +6423,9 @@ use std::time::Duration;
 
 pub struct LiveRequest { pub identity: DecisionIdentity, pub state: HandState, pub t0_ms: u64, pub sink: SharedSink }
 
-fn emit(core: &EngineCore, req: &LiveRequest, delivered: Option<&AtomicBool>, ev: RecommendationEvent) {
+/// Crate-visible: plan 3 Task 17's `preflop.rs` imports this same helper (`use crate::serve::emit;`)
+/// rather than creating a second event-emission path. The identity check below stays in one place.
+pub(crate) fn emit(core: &EngineCore, req: &LiveRequest, delivered: Option<&AtomicBool>, ev: RecommendationEvent) {
     if !core.identity_active(&req.identity) { return; }
     if let Some(d) = delivered { if matches!(ev, RecommendationEvent::Final(_)) && d.swap(true, Ordering::SeqCst) { return; } }
     req.sink.lock().unwrap().emit(ev);
@@ -6438,11 +6597,13 @@ impl Engine {
 }
 ```
 
+**Not produced by this task (forward owners, F10):** Plan 4 Task 15 owns `cache::presolver::PresolverStatus`. Plan 4 Task 16 adds `Engine::presolver_status(&self) -> cache::presolver::PresolverStatus`, `Engine::presolver_pause(&mut self)` and `Engine::presolver_resume(&mut self)`. They are not produced by this task; plan 5's real adapter must depend on plan 4 Task 16. Do not create placeholder methods here and do not add `cache` to this crate before its crate exists.
+
 **Five resolved interface requirements implemented here:**
 - `set_config` returns `Result<u32, EngineError>` and **rejects `flop_budget_s` outside `1..=30`** (§13.3 requires 31 to be rejected; cross-plan M10, spec S15). While a hand is active the new config is **queued for the next hand** and the active hand keeps its frozen `HandConfig` (§4.2); the revision is allocated and returned immediately so the caller can display it.
 - `set_hero_cards(&mut self, [Card; 2]) -> Result<HandState, EngineError>` exists (§3.5 lists it as a Tauri command; cross-plan M14/Or3). It is a mutation: fresh revision, in-flight work invalidated, snapshots for the hand dropped.
 - `shutdown(&mut self)` takes `&mut self` and is idempotent, because Tauri managed state cannot move out of the handle (cross-plan M11, spec S15).
-- `Paths` declares all four directories up front: `log_dir` and `worker_exe` are used here, `preflop` is populated by plan 3 Task 14 and `cache` read by plan 4's `Cache::open` (cross-plan M13/Or5).
+- `Paths` declares all four directories up front: `log_dir` and `worker_exe` are used here, `preflop` is read by plan 3 Task 17's store loader and `cache` by plan 4's `Cache::open` (cross-plan M13/Or5).
 - `recommend` takes `Box<dyn EventSink>` (not `Box<dyn EventSink + Send>`); `EventSink: Send` already, and the two spellings are distinct types in Rust (cross-plan M12 — plan 5 follows this one).
 - `startup_report()` surfaces the §12 startup diagnostics plan 5 renders: worker features and capabilities, the "CPU lacks AVX2" banner of §3.7, bundle quarantine banners (filled by plan 3) and the cache state (filled by plan 4).
 
@@ -6998,15 +7159,32 @@ Expected: 3 passed; the workspace stays green.
 
 - [ ] **Step 4: Smoke run and commit**
 
-Run: `cargo build --release -p solver-worker && cargo run --release -p bench -- run --suite river_std --threads 16 --reps 2 --out docs/bench/`
+Build the worker with the **V1-selected toolchain** of Task 1 (`docs/bench/worker-toolchain.json`), never an unconditional MSVC build, and point `POKERAI_WORKER` at that binary; `bench` itself stays MSVC.
+
+```powershell
+$sel = Get-Content -LiteralPath 'docs/bench/worker-toolchain.json' -Raw | ConvertFrom-Json
+if ($sel.worker_toolchain -eq 'stable-x86_64-pc-windows-gnu') {
+    & powershell -NoProfile -File scripts/build-worker-gnu.ps1
+    if ($LASTEXITCODE -ne 0) { throw 'GNU worker build failed' }
+    $env:POKERAI_WORKER = 'target/release/solver-worker.exe'
+} elseif ($sel.worker_toolchain -eq 'stable-x86_64-pc-windows-msvc') {
+    cargo +stable-x86_64-pc-windows-msvc build --release -p solver-worker --target x86_64-pc-windows-msvc
+    if ($LASTEXITCODE -ne 0) { throw 'MSVC worker build failed' }
+    $env:POKERAI_WORKER = 'target/x86_64-pc-windows-msvc/release/solver-worker.exe'
+} else { throw 'Missing or invalid V1 worker toolchain selection' }
+```
+
+Run: `cargo run --release -p bench -- run --suite river_std --threads 16 --reps 2 --out docs/bench/`
 Expected: `docs/bench/2026-09-10-i7-13700K.md` with a `river_std` section; every river spot `ok` at target within 2 s (measured 4 ms on the R8 analogue); `cancel ack` well under 50 ms (or `n/a` if the spot finished first). Repeat for `river_min`, `turn_std`, `turn_min` (turn spots at 200bb with two sizes: about 1 s each).
 
-Write this sentence at the top of the generated file, before the first suite section, and keep it until plan 4 Task 17 regenerates the suites:
+Write this sentence at the top of the generated file, before the first suite section, and keep it until plan 4 Task 20 regenerates the suites:
 
 ```markdown
 > **Pre-baseline reference run.** These suites use `--source r8` (uniform R8 addendum A.1 ranges), not the
-> chart-replay baseline set that spec section 13.5 defines. The V2/V22 gate is measured only after plan 4 Task 17
+> chart-replay baseline set that spec section 13.5 defines. The V2/V22 gate is measured only after plan 4 Task 20
 > regenerates all six `bench/spots/*.json` from chart replay; nothing here satisfies that gate.
+> Worker toolchain: `<worker_toolchain>` / `<worker_target>`, as selected by the V1 check of Task 1 and
+> recorded in `docs/bench/worker-toolchain.json`. `bench` and the engine are MSVC.
 ```
 
 ```bash
@@ -7028,7 +7206,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 | §3.3 | AGPL boundary: `license = "AGPL-3.0"`, `LICENSE`/`PINNED_COMMIT`/`PATCHES.md` retained | 1, 7 |
 | §3.4 | worker threads `control`/`writer`/`executor`, rayon 16 by `--threads`, priority class by `background`; engine `engine-main`, `fast-path`, `watchdog`, `worker-stdout`/`worker-stderr` threads | 7, 11, 12, 18, 22, 28, 29 |
 | §3.5 | `Engine` API (river/turn) incl. `set_hero_cards`, validated `set_config`, four-field `Paths`, `startup_report`, `shutdown(&mut self)`; `build_effective_tree`; `bench run` CLI; worker exit codes | 4, 5, 7, 12, 29, 30 |
-| §3.6 | one toolchain: plan 1's `rust-toolchain.toml` (MSVC); this plan never overrides it and references plan 1's V1 MSVC/GNU check instead of duplicating it | Global Constraints, 1 |
+| §3.6 | one `rust-toolchain.toml` (MSVC, plan 1); **this plan owns the V1 MSVC-vs-GNU FLOP-FAST measurement**, the 25% rule, `docs/bench/worker-toolchain.json` and the two-branch green/build rule every later worker build, test, bench run and staging step consumes | Global Constraints, 1, 7, 30 |
 | §3.7 | pinned commit, features, two patches, AVX2 build check, `ready` features, engine refusal without AVX2, CPU-lacks-AVX2 banner, library lifecycle constraints | 1, 7, 11, 18, 29 |
 | §4.2 | `flop_budget_s` validated to `1..=30`; a config set during a hand applies from the next hand | 29 |
 | §4.4 | identity tuple, headline rules, reason accumulation, `Unsupported.partial`, event merging (`Equity` never downgrades), accuracy vocabulary in bp | 2, 26, 28 |
@@ -7044,7 +7222,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 | §10.6 | `best_so_far` labelled `DeadlineBestSoFar` with per-action EV | 17, 23, 26, 28 |
 | §12 | typed handling of `tree_mismatch`, `no_iteration`, exit/heartbeat, `tree_too_large`, cancel-not-confirmed, stale identity; startup diagnostics | 23, 28, 29 |
 | §13.0 | `fixtures/worker/*.jsonl` (all five consumed), `fixtures/solver/basic_0p3.json`, `bench/spots/*.json` | 5, 6, 15, 17 |
-| §13.2 | every contract test (see the deviations below for the placements) | 7, 8, 12, 13, 14, 15, 16, 17, 18 |
+| §13.2 | every contract test, including the 47-case five-point materialization sweep over all seven §10.1 templates and the `ack{rejected}` / `tree_mismatch` split of the donk rule (see the deviations below for the placements) | 6, 7, 8, 12, 13, 14, 15, 16, 17, 18 |
 | §13.3 | `tree_builder_golden`, `coverage_classification_golden`, `facing_allin_golden`, `recommendation_assembly_golden`, `identity_race_golden`, `final_delivery_independent_of_worker` | 4, 24, 25, 26, 28, 29 |
 | §13.5 | report columns, river/turn suites, cancel latency, violation counts (on the labelled interim range set) | 30 |
 
@@ -7053,17 +7231,17 @@ Gaps and deviations (all deliberate, each recorded in the task that carries it):
 1. `ev_convention_non_root_payoffs` (Task 15): the spec's OOP hand `AA` cannot have equity 1 on `Qs Jd 7h 3c 2d` (three queens beat aces); the stated `+200` / `-50` values are reproduced with OOP `QQ,66` through card removal. Spec revision 6 carries this correction (S7).
 2. `river_check_only_terminal_oracle` runs in `crates/engine/tests/worker_link.rs` (Task 18) because its oracle is `core-eval`, which `solver-worker` may not depend on; it still spawns the real binary (spec S8).
 3. `ev_conservation` (Task 15) checks the library's root EVs in-process through the adapter's mapping, because IP's root-range EV is not an actor-owned wire export (spec S9).
-4. `tree_materialization_matches_library` equality over the 43 cases is checked in-process (Task 8, `every_materialization_case_matches_library`); the wire test of Task 16 covers the `tree_mismatch` cases (spec S10).
-5. A **root-street** `donk` of `None` is legal and is never sent to the library (upstream ignores `turn_donk_sizes` at a turn root, where `prev_action` is `None`); only a later street's `None` is rejected. Recorded in Task 8.
-6. A later street's `None` donk is answered `ack{rejected}` rather than `result{error{tree_mismatch}}`: §13.2 lists the case under both `protocol_rejections` and `tree_materialization_matches_library`, and the cheap structural check in `precheck` costs no work. `tree_config` keeps the same check as defence in depth, where it surfaces as `tree_mismatch`. Recorded in Task 8.
+4. `tree_materialization_matches_library` equality over the 47 cases is checked in-process (Task 8, `every_materialization_case_matches_library`); the wire test of Task 16 covers the `tree_mismatch` cases (spec S10).
+5. A **root-street** `donk` of `None` is legal (an empty donk menu) and is never sent to the library: upstream ignores `turn_donk_sizes` at a turn root, where `prev_action` is `None`. This is the spec §13.2 rule, not a plan choice. Recorded in Task 8, asserted by `root_street_none_donk_is_legal` (Task 8), `protocol_rejections` id 6 (Task 13) and `tree_materialization_matches_library` id 104 (Task 16).
+6. A missing or `None` donk option on a street strictly after the root is invalid input: spec §13.2 answers it `ack{rejected, reason}` with **no work**, and `result{error{tree_mismatch}}` is reserved for a realized tree that differs from `tree.materialized` (altered `materialized` entry, `matched` reset per street, missing terminal marker). `precheck` (Task 13) performs the structural check on the wire; `tree_config` retains it for direct callers that bypass `precheck`, where `job::run` maps the `tree_build::build` error to `invalid_request`, never to `tree_mismatch`. Recorded in Task 8.
 7. `identity_race_golden`'s "hand B with the same displayed revision" is unreachable: §4.3's revision counter is monotonic and never reused, so hand B's revision is 9 where A's was 7. The test pins the property the scenario is about (A's identity refused, B's accepted) and records the clause as vacuously satisfied. Task 28.
 8. A tree action outside `Derived.legal` is reported with its frequency, no EV, `Unavailable::NotEvaluated` and an explicit note, not `NotInMenu` (§4.4 reserves that for the source's menu) and not §8.4's `MovedProbability{from}` (that mapping is plan 4's bet translation). Task 26.
-9. `SnapshotStore::register(&DecisionIdentity, SolvedStreet)` carries §9.2's identity rule; plan 3 Task 11 replaces it with `core_replay::SnapshotStore`/`StreetSnapshot` (`covered_paths`, prefix-based invalidation) in a single commit and re-exports through `engine::snapshots`. `RangeSource::ranges_at_root` and `serve_request`'s `Classification::Preflop` arm are the two other plan-3 seams. Tasks 27 and 28.
-10. Preflop and flop decisions answer `Final` `Unsupported{EngineError{"no ... path in this build"}}` until plans 3 and 4; multiway answers `Unsupported{MultiwayEv}` without the `experimental` block. The §6 experimental surrogate and `experimental_surrogate_golden` are **plan 4 Task 10's to create** (cross-plan Or1/R4), not to extend: nothing exists here to extend.
-11. `bench gen-spots --source r8` freezes uniform R8 ranges and labels every spot `r8_uniform`; §13.5's baseline set is chart-replay, so any `docs/bench/*.md` section produced here is a pre-baseline reference run. `--source chart` arrives with plan 3's bundles and plan 4 Task 17 regenerates all six suites before the V2/V22 gate is claimed (cross-plan Or8/R3).
+9. `SnapshotStore::register(&DecisionIdentity, SolvedStreet)` carries §9.2's identity rule; plan 3 Task 14 replaces it with `core_replay::SnapshotStore`/`StreetSnapshot` (`covered_paths`, prefix-based invalidation) in a single commit and re-exports through `engine::snapshots`. Plan 3 Task 17 loads the preflop store and installs preflop serving through `serve_request`'s `Classification::Preflop` arm (importing `pub(crate) serve::emit`); plan 3 Task 18 installs replay ranges through `RangeSource::ranges_at_root` and the shared `range_source` handle. Tasks 27 and 28.
+10. Preflop and flop decisions answer `Final` `Unsupported{EngineError{"no ... path in this build"}}` until plans 3 and 4; multiway answers `Unsupported{MultiwayEv}` without the `experimental` block. The section-6 experimental surrogate and `experimental_surrogate_golden` are created by **plan 4 Task 11** (cross-plan Or1/R4), not extended: nothing exists here to extend.
+11. `bench gen-spots --source r8` freezes uniform R8 ranges and labels every spot `r8_uniform`; §13.5's baseline set is chart-replay, so any `docs/bench/*.md` section produced here is a pre-baseline reference run. `--source chart` arrives with plan 3's bundles; plan 4 Task 17 freezes the source hashes and plan 4 Task 20 regenerates all six chart-replay suites before the V2/V22 gate is claimed (cross-plan Or8/R3).
 12. R8 addendum A.1 publishes 646 / 804 combos for `BTN_OPEN` / `BB_DEFEND`, but those strings expand to **634 / 720** under the documented grammar (`CO_CALL_3BET` 194 and `BTN_3BET` 138 match A.1 exactly, so the parser is right). The strings, not A.1's two counts, are the definition, in both the Python generator and `crates/bench/src/gen_spots.rs`. Task 6.
-13. `deadline_best_so_far_labelling` and `flop_budget_setting_golden` (§13.3) need the cache's `Provisional` and the flop budget and are plan 4's, as the brief assigns. `bench oracle` (§13.1) is plan 4 Task 20's (cross-plan Or2).
-14. `flop_full_v1` is phase-2 only (§10.1), so it gets one materialization case at `(100, 100)` instead of the five-point sweep the six phase-1 templates get: 43 cases in total. Task 6.
+13. `deadline_best_so_far_labelling` and `flop_budget_setting_golden` (§13.3) need the cache's `Provisional` and the flop budget and are plan 4's, as the brief assigns. `bench oracle` (§13.1) is created by plan 4 Task 23 (cross-plan Or2).
+14. All seven templates, including `flop_full_v1`, receive the five-point materialization sweep. Phase-2 solve selection does not exempt a template from section 13.2's rules tests: 47 cases in total, and no case is ever solved. Task 6.
 
 ### 2. Placeholder scan
 
@@ -7092,7 +7270,7 @@ Other plans consume exactly this and nothing else:
 - `engine::tree::{build_effective_tree, build_tree_full, materialize_at, node_at, resolve_chip_path, tree_signature, TemplateSelection, TemplateSpec, Templates, TreeBuild, RULES_VERSION}`; `Templates::with_extra` behind `cfg(any(test, feature = "test-templates"))`.
 - `engine::deadline::{Deadlines, street_budget_ms, final_delivery_ms, extraction_margin_ms, retry_admitted, DELIVERY_MARGIN_MS, PIPE_MARGIN_MS, WATCHDOG_LEAD_MS}` — plan 4 extends `Deadlines` for the flop budget rather than adding a parallel `flop_deadlines` (cross-plan D5).
 - `engine::worker::{WorkerLink, WorkerLinkError, ProcessWorker, ready::validate_ready}`; `engine::testing::{FakeClock, FakeWorker, FakeReply, IdRef, FakeState, RecordingSink, Recorded, uniform_solution, cfg_1_2, hand, play, board}` behind the `testing` feature.
-- `engine::snapshots::{SnapshotStore, SolvedStreet}` (replaced wholesale by plan 3 Task 11) and `engine::ranges::{RangeSource, RootRanges, ExplicitRanges}` (plan 3 installs its implementation).
+- `engine::snapshots::{SnapshotStore, SolvedStreet}` (replaced wholesale by plan 3 Task 14) and `engine::ranges::{RangeSource, RootRanges, ExplicitRanges}` (plan 3 Task 18 installs its implementation into the shared `Arc<Mutex<Box<dyn RangeSource>>>` of Task 27); `pub(crate) engine::serve::emit` (plan 3 Task 17 imports it).
 - `engine::assemble::{headline, accumulate, coverage_for_solve, final_from_solution, unsupported, fast, merge_equity, empty_assumptions, AssemblyCtx, HeadlineSource}` — plan 3 extends `headline`, it does not add a second entry point (cross-plan D8).
 - `engine::bench_support::{prepared_range, range_mass}` — the only path from `bench` to range handling.
 - `engine::solve::{run_solve, SolvePlan, SolveOutcome, Terminal, spot_hash}` and `engine::core::EngineCore`.
