@@ -340,3 +340,102 @@ These are orchestration decisions from `.superpowers/sdd/2026-09-10-plan-1-found
 - **Short-hash diff names:** review/fix diff package filenames use short commit hashes; two review dispatches (T8R, T24R) hit a packaging error from a full-hash alias mismatch and were relaunched with corrected short-hash paths, with no code change involved.
 - **Vendored-crate warnings out of the gate's scope:** compiler warnings originating in the vendored `holdem-hand-evaluator` dependency are not treated as this workspace's warning-gate findings (T14R Minor, deferred to the final review).
 - **SDD workspace retained:** this plan's `.superpowers/sdd/` workspace is kept after the final review (gitignored; the journal cites its review reports as evidence), contrary to the executing skill's default delete-on-completion step.
+
+---
+
+## Addendum (2026-09-17): final whole-branch review fixes
+
+Plan 1's final whole-branch review (`.superpowers/sdd/2026-09-10-plan-1-foundation/final-review.md`) found no Critical findings and four Important findings (S1, S2, S3, S10) against code the 25 task reviews above had already passed; the single fix round that followed (`final-fix-report.md`, commits `f270f53`, `c49a0a5`, `3b8607d`, `fbc4ee8`, plus the flake-fix `f13f8e0` and the residual gate fix `37bec95`) changed the interfaces and behaviours below relative to the plan's original Step-block text. As with every erratum above, the plan's own text is not rewritten and the plan stays at revision 4; this addendum is the record of what the code does instead.
+
+### S1 — checked float validation extended to `game.rs`, `tree.rs` thresholds, and all of `recommendation.rs`
+
+- **Task/step:** Task 3 Step 1, `crates/proto/src/game.rs`, `Rake::PotRake` (plan line 502); Task 6 Step 3, `crates/proto/src/tree.rs`, `EffectiveTree` (plan lines 1138-1140); Task 5 Step 1, `crates/proto/src/recommendation.rs`, `ActionAdvice` and the file's other `f32`/`Option<f32>` fields (plan line 921 representative).
+- **Plan text (<=25 words):** `PotRake { rate: f32, cap_mchips: u32, no_flop_no_drop: bool },` (line 502); `pub add_allin_threshold: f32, pub force_allin_threshold: f32, pub merging_threshold: f32,` (lines 1138-1140); `pub frequency: Option<f32>, pub ev_bb: Option<f32>,` (line 921) — all four plain derived serde, no domain check.
+- **What the code does instead:** the wide-then-narrow, symmetric-serialize float codecs already built for Task 4's `Range1326` and Task 6's `MenuSize`, and generalized in Task 7's worker wire, were promoted into a shared `proto::numeric` module and applied to every remaining `f32`/`Option<f32>` in these three files: `Rake::PotRake.rate` (domain `[0,1)`), `EffectiveTree`'s three thresholds (non-negative finite), and all of `recommendation.rs` (unit-interval or finite per field).
+- **Why:** final-review finding S1, Important — measured `PotRake` accepting `rate: 1e39` as `inf` and `rate: -0.5`; `EffectiveTree` accepting `add_allin_threshold: inf, force_allin_threshold: -1`; and `ActionAdvice{frequency: Some(NaN)}` silently round-tripping to `frequency: None` across the Tauri IPC boundary — the same class of defect the T4/T6/T7 fixes above closed, left open on three files the earlier task reviews didn't probe.
+- **Commit(s):** `f270f53`.
+
+### S2 — one materialized-path index per `validate_solution`/`validate_locks` call
+
+- **Task/step:** Task 8 Step 1, `crates/proto/src/worker.rs`, `validate_solution`/`validate_locks` (plan lines 1538-1539, 1562, 1592).
+- **Plan text (<=25 words):** `let ordinal = resolve_chip_path(materialized, path)...; let node = materialized.iter().find(|m| m.path == ordinal).expect(...)` (lines 1538-1539) — run once per solution/lock node, and `resolve_chip_path` (Task 6, line 1147) itself rebuilds a full index every call.
+- **What the code does instead:** `tree.rs` gained `index_materialized`/`resolve_chip_path_indexed`; `validate_solution` and `validate_locks` each build the index once at the top of the call and look up both the resolved path and the node in it, instead of rebuilding an index and running a second linear scan per node.
+- **Why:** final-review finding S2, Important — measured quadratic cost, on the order of 100s of pure path resolution at the declared 100,000-node `MAX_EXPORTED_NODES` cap, inside plan 2's and plan 4's per-result/per-cache-entry fast path.
+- **Commit(s):** `f270f53`.
+
+### S3 — allocation-free exact enumeration
+
+- **Task/step:** Task 24 Step 1, `crates/core-eval/src/equity.rs`, `ExactRun::runouts` (plan lines 4962, 4965).
+- **Plan text (<=25 words):** `let deck: Vec<Card> = (0..52u8).map(Card).filter(|c| !self.used[c.0 as usize]).collect();` and `let mut board_cards = self.req.board.clone();` (lines 4962, 4965) — both rebuilt on every leaf tuple, including on the river where `deck` is never read.
+- **What the code does instead:** `deck`, `board_cards` and `idx` became reusable buffers hoisted into `ExactRun`, cleared/refilled per tuple instead of reallocated; the river (`k == 0`) skips the deck build entirely and reuses a `PartialHand` combined once per run.
+- **Why:** final-review finding S3, Important — measured roughly 70% of exact-enumeration wall time as these two allocations on a river spot (175,252 disjoint tuples); `mc.rs` already used hoisted buffers and the exact path had never been given the same treatment.
+- **Commit(s):** `c49a0a5`.
+
+### S10 — `per_combo_equity` takes a caller-supplied budget and cancel flag
+
+- **Task/step:** Task 24 Step 1, `crates/core-eval/src/equity.rs`, `per_combo_equity` (plan lines 5015, 5021).
+- **Plan text (<=25 words):** `pub fn per_combo_equity(hero: &Range1326, villain: &Range1326, board: &[Card]) -> [f32; COMBOS] {` (line 5015) calling `let res = exact(&req, Duration::from_secs(3600), &never);` (line 5021) — a fixed one-hour budget, a permanently-false cancel flag.
+- **What the code does instead:** `per_combo_equity(hero, villain, board, budget: Duration, cancel: &AtomicBool) -> (EquityStatus, [f32; COMBOS])`, sharing one `Deadline` and one hoisted villain `Support` across all hero combos, polled once per hero combo, returning `Cancelled`/`BudgetExceeded` with the partial result on a stop.
+- **Why:** final-review finding S10, Important — the function was the only public `core-eval` entry point that could not be cancelled; spec §5's decision flow requires abandonable work when hero's decision changes, and fixing the signature after plan 2's `river_check_only_terminal_oracle` depends on it would be a breaking change.
+- **Commit(s):** `c49a0a5`.
+
+### S5 — `-0.0` normalized to `+0.0` at range ingestion
+
+- **Task/step:** Task 4 Step 1, `crates/proto/src/range.rs`, `RangeVisitor::visit_seq` (plan line 782); Task 19 Step 1, `crates/core-ranges/src/parse.rs`, `parse_weight` (plan lines 4012-4013).
+- **Plan text (<=25 words):** `let w: f32 = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(i, &self))?;` (line 782); `let w: f32 = text.trim().parse().map_err(|_| RangeError::Weight(format!("cannot parse weight {text:?}")))?;` (line 4012) — both accept `-0.0` as a valid, distinct weight once in `[0,1]`.
+- **What the code does instead:** both ingestion points map the validated weight through `(raw as f32) + 0.0` before storing it, folding `-0.0` to `+0.0` on the way in; `hash_scaled`, `apply_range` and `canonicalize` are unchanged and stay bit-exact, per the standing T20/T21 rulings.
+- **Why:** final-review finding S5, Minor — `-0.0` passes the existing `[0,1]` domain check and then hashes differently from `+0.0` via `hash_scaled`'s `to_le_bytes()`, so a range and its own `range_to_string` round-trip, though numerically identical, produced different cache keys; closes the T20 and T21 parked notes at their single common root cause.
+- **Commit(s):** `f270f53` (proto), `fbc4ee8` (core-ranges).
+
+### S9 — `terminal_payoff` computes its pot/rake arithmetic in `f64`
+
+- **Task/step:** Task 24 Step 1, `crates/core-eval/src/equity.rs`, `terminal_payoff` (plan lines 4874-4877).
+- **Plan text (<=25 words):** `let pot = pot as f32;` (line 4875) ... `equity * (pot - r)` (line 4877) — the pot itself, not only the `f32` return, carried through the arithmetic.
+- **What the code does instead:** widens `pot`, `rate` and `cap_mchips` to `f64` for the subtraction and multiplication, narrowing to `f32` once at the end; the public signature and spec §2's `f32` EV output are unchanged.
+- **Why:** final-review finding S9, Minor — measured `terminal_payoff(1.0, 100_000_001, TimeCharge) = 100_000_000`, an off-by-one-chip error, because `f32` loses precision above 2^24 and a pot of that size is reachable at the spec's chip scale.
+- **Commit(s):** `c49a0a5`.
+
+### S7 / S8 — always-on guards in `positions.rs` and `config.rs`
+
+**S7 — `positions.rs` seat-count guard**
+
+- **Task/step:** Task 9 Step 1, `crates/core-model/src/positions.rs` (plan line 1826).
+- **Plan text (<=25 words):** `debug_assert!((3..=6).contains(&n));` (line 1826) — the one survivor of standing ruling (b) left in the plan-1 tree, guarding a slice index the next line performs.
+- **What the code does instead:** `assert!((3..=6).contains(&n), "positions: {n} dealt seats; 3 to 6 are supported");`, always-on and naming the count.
+- **Why:** final-review finding S7, Minor — `positions` is `pub` and re-exported at the crate root with nothing forcing `validate_table` to run first; in release the guard compiled out and the next line panicked as a raw, unhelpful slice-index-out-of-range instead.
+- **Commit(s):** `3b8607d`.
+
+**S8 — `straddle_posts` zero-straddle guard**
+
+- **Task/step:** Task 9 Step 1, `crates/core-model/src/config.rs`, `straddle_posts` (plan lines 1862-1864).
+- **Plan text (<=25 words):** `cfg.straddle.map(|s| { let unit = s.amount_chips as f32; [cfg.sb_chips as f32 / unit, cfg.bb_chips as f32 / unit, 1.0] })` (lines 1862-1864) — divides by `amount_chips` with no precondition on it.
+- **What the code does instead:** adds `assert!(s.amount_chips > 0, "straddle_posts: the straddle amount is at least one chip");` as the closure's first statement, always-on per standing ruling (b).
+- **Why:** final-review finding S8, Minor — a zero `amount_chips` produced `posts = [inf, inf, 1.0]`, which then hit the same undeserializable-wire failure mode as S1 once serialized into `StraddleMapped`, even though `validate_table` already rejects `amount_chips < 2 * bb_chips` elsewhere.
+- **Commit(s):** `3b8607d`.
+
+### T3 — `monte_carlo` rejects a zero sample cap
+
+- **Task/step:** Task 25 Step 1, `crates/core-eval/src/mc.rs`, `monte_carlo` (plan line 5250).
+- **Plan text (<=25 words):** `pub fn monte_carlo(req: &EquityRequest, seed: u64, max_samples: u32, budget: Duration, cancel: &AtomicBool) -> EquityResult {` (line 5250) — no precondition on `max_samples`.
+- **What the code does instead:** adds `assert!(max_samples > 0, "monte_carlo: max_samples is at least one sample")` at the top, always-on in `check_request`'s existing style.
+- **Why:** final-review finding T3, Minor — `max_samples == 0` never entered the sampling loop and reported `EquityStatus::BudgetExceeded` with zero samples, blaming the clock for a caller error that `EquityStatus` (a plan-2 contract) has no honest value for.
+- **Commit(s):** `c49a0a5`.
+
+### Release-only gate on the exact-enumeration throughput test
+
+- **Task/step:** not a plan-text erratum — `exact_enumeration_at_the_selection_ceiling_finishes_inside_the_budget` is a test the S3/T2 fix round itself added to `crates/core-eval/tests/equity.rs` (see S3 above and `final-fix-report.md` §16), with no counterpart in the plan's own text to quote.
+- **Plan text (<=25 words):** n/a — the test did not exist in the plan; see above.
+- **What the code does instead:** the test is gated `#[cfg(all(feature = "exhaustive", not(debug_assertions)))]` instead of a plain `#[cfg(feature = "exhaustive")]`, so it runs only in the release profile.
+- **Why:** the scoped re-review's finding NEW-1 — spec §13.1's 0.5s budget for an enumeration at the §7 selection ceiling is a release-profile figure; measured in debug the fixture reaches only 14,151,680 of its 36,796,320 evaluations in 500ms (an earlier, marginal debug run had passed at 488ms, 12ms of headroom against a bound the spec never promised for that profile); release measures 405ms, 19% of headroom.
+- **Commit(s):** `37bec95`.
+
+### S6 — parked, not applied
+
+`Round` (`crates/core-model/src/betting.rs`) and `Sim` (`crates/core-model/src/lifecycle.rs`) keep public fields rather than gaining private fields with read accessors, as final-review finding S6, Minor, recommended. The orchestrator parked this as a plan-2 follow-up (`final-fix-report.md` §1 table: "Not applied — parked by the orchestrator"); no commit.
+
+### Parked for the user
+
+- Clippy component (`rustup component add clippy`) is not installed; no first-party lint evidence can exist until it is, and installing it is a machine-level change no agent should make (final-review §5 item 1).
+- A third vendored patch to `third_party/postflop-solver`, to silence its six `mismatched_lifetime_syntaxes` warnings, was considered and declined; spec §3.7 pins exactly two patches in `PATCHES.md`, and adding a third changes the vendored-fork contract, which is the user's call (final-review §5 item 2).
+- `SeCreateSymbolicLinkPrivilege` is needed for a plan-3 core-preflop symlink-containment test case and was not available in this environment; out of plan-1's scope, carried forward as a standing environment gap.
+- The gitignored 10M-record 7-card oracle fixture (`fixtures/eval/phevaluator_7card_10m.bin`) stays absent from the worktree by design (spec §13.0); anyone running the crate-wide `cargo test -p core-eval --features exhaustive` command rather than scoping to `--test equity` must first run `tools/gen_eval_oracle.py` (`final-fix-report.md` §18).
