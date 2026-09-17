@@ -1,0 +1,15 @@
+{
+  "worker_toolchain": "stable-x86_64-pc-windows-msvc",
+  "worker_target": "x86_64-pc-windows-msvc",
+  "measured_at": "2026-09-17",
+  "rustc_version": "rustc 1.95.0 (59807616e 2026-04-14) binary: rustc commit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860 commit-date: 2026-04-14 host: x86_64-pc-windows-msvc release: 1.95.0 LLVM version: 22.1.2",
+  "solver_commit": "9d1509fe5077d019825f833eed04b16d342dfda1",
+  "rustflags": "-C target-feature=+avx2",
+  "workload": "R8 FLOP-FAST: QsJh2h, flop root, pot 180, eff 910, 52%/2.5x, add_allin 1.0, force_allin 0.15, merge 0.1, basic.rs ranges 179/264, target 0.5% of pot, exploitability every 10 iterations",
+  "msvc_secs": 5.418,
+  "gnu_comparator_secs": 6.2,
+  "gnu_comparator_source": "R8-solver-bench.md section 3.3, -C target-cpu=native (AVX2), 24 threads",
+  "ratio": 0.874,
+  "threshold": 1.25,
+  "decision": "msvc within 25% of the GNU comparator"
+}
