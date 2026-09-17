@@ -1,8 +1,10 @@
 //! Engine: decision identity, the time source every deadline is measured against, and the
 //! solve-tree templates of spec section 10.1.
 
+pub mod allin;
 pub mod bench_support;
 pub mod clock;
+pub mod equity;
 pub mod identity;
 pub mod tree;
 
