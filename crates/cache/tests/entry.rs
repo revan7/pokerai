@@ -522,3 +522,82 @@ fn validate_entry_rejects_asymmetric_stabilizer_signed_zero_regression() {
     });
     assert!(validate_entry(&e).is_err());
 }
+
+// --- N1 (fix round 2): bincode wire uses native f32, JSON keeps the f64 wide-check ------------
+//
+// `CacheEntry` as a whole does not currently round-trip through bincode at all -- independent
+// of this fix -- because `proto::Action` is `#[serde(tag = "kind", ...)]` (internally tagged),
+// and serde's internally-tagged enum decoding requires `Deserializer::deserialize_any`, which
+// bincode 1.3.3 unconditionally refuses (`DeserializeAnyNotSupported`); `EffectiveTree` (and so
+// `CacheEntry`, which embeds it) carries `Action` values throughout `materialized`/`inserted`.
+// Confirmed directly: `bincode::deserialize::<proto::Action>(&bincode::serialize(&Action::Bet {
+// to: 50 }).unwrap())` returns `Err(DeserializeAnyNotSupported)`. This is a pre-existing defect
+// in `crates/proto/src/hand.rs`'s `Action` tagging, not something introduced or fixable by this
+// fix round (scope: `crates/cache/src/entry.rs` and `crates/cache/tests/entry.rs` only), so the
+// bincode round-trip tests below exercise `CachedNode` directly -- the actual type this fix's
+// codec lives on, and the only bincode-affected type this task owns -- rather than a full
+// `CacheEntry`. Flagged separately for a future task (see the spawned-task suggestion).
+
+/// A `CachedNode` with valid, in-domain matrices round-trips through bincode unchanged.
+#[test]
+fn cached_node_round_trips_through_bincode_with_bit_identical_matrices() {
+    let node = CachedNode {
+        path: vec![1, 0, 1],
+        actor: "ip".into(),
+        probs: vec![vec![0.25, 0.75], vec![0.0, 0.0]],
+        ev_over_P: vec![vec![0.0, 12.5], vec![-3.5, 0.0]],
+        available: vec![true, false],
+    };
+    let bytes = bincode::serialize(&node).unwrap();
+    let back: CachedNode = bincode::deserialize(&bytes).unwrap();
+    assert_eq!(back.path, node.path);
+    assert_eq!(back.actor, node.actor);
+    assert_eq!(back.probs, node.probs);
+    assert_eq!(back.ev_over_P, node.ev_over_P);
+    assert_eq!(back.available, node.available);
+}
+
+/// Bincode is non-human-readable (spec 10.4: the on-disk cache storage format), so the codec
+/// must write/read native `f32` (4 bytes/value), not `f64` (8 bytes/value). Isolate the
+/// per-element wire width by comparing two otherwise-identical nodes whose *only* difference is
+/// one extra value in a single `probs` row: the encoded-size delta is exactly that one value's
+/// wire width, independent of any other framing bincode adds (which is identical between the
+/// two encodings since nothing else about the shape changed).
+#[test]
+fn cached_node_bincode_wire_width_is_native_f32_not_f64() {
+    let base = CachedNode {
+        path: vec![],
+        actor: "oop".into(),
+        probs: vec![vec![0.0f32; 5]],
+        ev_over_P: vec![vec![0.0f32; 1]],
+        available: vec![true],
+    };
+    let mut grown = base.clone();
+    grown.probs[0].push(0.5); // exactly one more f32 value, in the same, only, row
+    let base_len = bincode::serialized_size(&base).unwrap();
+    let grown_len = bincode::serialized_size(&grown).unwrap();
+    assert_eq!(grown_len - base_len, 4, "one extra probability value must cost exactly 4 bytes (native f32) under bincode, not 8 (f64)");
+}
+
+/// Corrupting a *bincode-encoded* `CachedNode`'s bytes to a NaN bit pattern must be rejected on
+/// decode -- bincode carries no wider source value to check before narrowing (there is no
+/// narrowing step at all on this path), but the f32 actually read is still finiteness/domain
+/// checked.
+#[test]
+fn cached_node_bincode_decode_rejects_a_crafted_nan_bit_pattern() {
+    let sentinel = 12345.6789f32;
+    let node = CachedNode {
+        path: vec![],
+        actor: "oop".into(),
+        probs: vec![vec![0.5]],
+        ev_over_P: vec![vec![sentinel]],
+        available: vec![true],
+    };
+    let mut bytes = bincode::serialize(&node).unwrap();
+    let needle = sentinel.to_le_bytes();
+    let occurrences = bytes.windows(4).filter(|w| *w == needle).count();
+    assert_eq!(occurrences, 1, "sentinel float must appear exactly once in the encoded bytes");
+    let pos = bytes.windows(4).position(|w| w == needle).unwrap();
+    bytes[pos..pos + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+    assert!(bincode::deserialize::<CachedNode>(&bytes).is_err());
+}
