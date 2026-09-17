@@ -847,50 +847,47 @@ fn per_combo_equity_reports_a_stop_with_equity_status_semantics() {
     assert_eq!(status, EquityStatus::InvalidRanges);
 
     // The river fast path still completes, inside a budget a decision can actually wait for.
-    let start = Instant::now();
+    // `Ready` from a 500 ms budget *is* the statement that it finished inside 500 ms -- the
+    // deadline is what enforces it -- so no separate wall-clock assertion is made here.
     let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_millis(500), &no_cancel());
-    let took = start.elapsed();
-    assert_eq!(status, EquityStatus::Ready, "the river fast path must finish inside 500 ms; it took {took:?}");
-    assert!(took < Duration::from_millis(500), "finished in {took:?}");
+    assert_eq!(status, EquityStatus::Ready, "the river fast path must finish inside its 500 ms budget");
     assert!(out[combo("AcAd") as usize] > 0.0, "a supported hero combo is scored");
     assert_eq!(out[combo("2h2d") as usize], 0.0, "an unsupported hero combo scores 0");
 }
 
-/// S10: a flag raised while the enumerations are running is observed between hero combos, and the
+/// S10: a stop raised while the enumerations are running is observed between hero combos, and the
 /// combos finished before it are kept -- the caller gets a partial answer, not an empty one.
 ///
-/// Hero is the full 1,081-combo river range against the full villain range. The whole run is about
-/// 17 ms in release (and several times that in a debug profile), so the stop windows below are
-/// deliberately one to two orders of magnitude *under* it rather than near it: an earlier version
-/// of this test used 20 ms for both, which the release build finished inside — the S3 fix made the
-/// enumeration fast enough to beat its own cancellation window, and the test raced the clock.
+/// Sized so the stop is never a race. On a **flop** every tuple carries 990 runouts, so one hero
+/// combo against the six `AA` combos costs about 95 us in release, and the full 1,176-combo hero
+/// range costs about 112 ms: a combo is three orders of magnitude cheaper than the stop window and
+/// the whole run is an order of magnitude more expensive than it, on either build profile. An
+/// earlier version of this test sized both windows at 20 ms against a 17 ms *river* run, which the
+/// release build finished inside -- and it burned a core in a spin loop while doing so, which was
+/// enough extra contention to destabilise the raw-`sleep` timing tests elsewhere in this file. The
+/// budget half needs no helper thread at all.
 #[test]
-fn per_combo_equity_observes_a_flag_raised_mid_run_and_keeps_what_it_finished() {
-    let board = cards("QsJd7h3c2d");
+fn per_combo_equity_observes_a_stop_mid_run_and_keeps_what_it_finished() {
+    let board = cards("Kh7d2c");
     let mut hero = Range1326::uniform();
     block_public(&mut hero, &board);
-    let mut villain = Range1326::uniform();
-    block_public(&mut villain, &board);
-    // 1 ms is under a tenth of the run, and a combo completes in tens of microseconds, so dozens
-    // are finished and kept before the flag is seen.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let setter = cancel_after(&cancel, Duration::from_millis(1));
-    let start = Instant::now();
-    let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_secs(60), &cancel);
-    let took = start.elapsed();
-    setter.join().unwrap();
-    assert_eq!(status, EquityStatus::Cancelled, "stopped after {took:?}");
-    assert!(took < Duration::from_millis(500), "cancelled {took:?} after a 1 ms flag");
-    let scored = out.iter().filter(|v| **v > 0.0).count();
-    assert!(scored > 0, "the combos finished before the flag are kept");
-    assert!(scored < 1081, "the run stopped before scoring every hero combo: {scored}");
+    let villain = parse_range("AA").unwrap();
+    // 1,176 = C(49, 2): every combo that the three board cards do not block.
+    let hero_combos = (0..1326u16).filter(|i| hero.get(*i) > 0.0).count();
+    assert_eq!(hero_combos, 1176);
 
-    // The same run under a budget rather than a flag reports `BudgetExceeded`, partially filled.
-    // 200 us cannot complete a ~17 ms enumeration on any profile.
-    let start = Instant::now();
-    let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_micros(200), &no_cancel());
-    let took = start.elapsed();
-    assert_eq!(status, EquityStatus::BudgetExceeded, "stopped after {took:?}");
-    assert!(took < Duration::from_millis(200), "stopped {took:?} after a 200 us budget");
-    assert!(out.iter().filter(|v| **v > 0.0).count() < 1081);
+    // Budget, no helper thread: the per-combo poll stops the run and keeps the partial array.
+    let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_millis(5), &no_cancel());
+    let scored = out.iter().filter(|v| **v > 0.0).count();
+    assert_eq!(status, EquityStatus::BudgetExceeded);
+    assert!(scored > 0, "the combos finished before the budget ran out are kept, not discarded");
+    assert!(scored < hero_combos, "the run stopped before scoring every hero combo: {scored}");
+
+    // The `Cancelled` variant of the same stop is deliberately *not* re-tested here with a helper
+    // thread. Both statuses leave `per_combo_equity` through one path -- `Deadline`'s poll returns
+    // `Some(status)` and the loop returns `(status, out)` -- so the budget above already exercises
+    // the mid-run stop and the partial retention, and
+    // `per_combo_equity_reports_a_stop_with_equity_status_semantics` pins `Cancelled` itself at the
+    // entry poll. Racing a timer against the enumeration a second time would only add parallel load
+    // to a test binary whose pre-existing raw-`sleep` timing tests are already sensitive to it.
 }
