@@ -300,12 +300,23 @@ pub fn validate_solution(sol: &StreetSolution, materialized: &[MaterializedNode]
         if node.probs.len() != COMBOS || node.ev_chips.len() != COMBOS || node.available.len() != COMBOS {
             return Err(format!("node {k}: matrices must have exactly 1326 rows"));
         }
+        // Spec section 2: `EV(fold) = 0` exactly -- chips already in the pot are sunk. Enforced
+        // as a bit-exact comparison to positive zero (never `-0.0`, never a rounding-error
+        // near-zero), on every available row; unavailable rows are already required all-zero above.
+        let fold_cols: Vec<usize> = node.actions.iter().enumerate().filter(|(_, a)| **a == Action::Fold).map(|(i, _)| i).collect();
         for c in 0..COMBOS {
             check_row("node", k, c, &node.probs[c], width, false, !node.available[c])?;
             let ev = &node.ev_chips[c];
             if ev.len() != width { return Err(format!("node {k} combo {c}: ev row has {} entries, expected {width}", ev.len())); }
             if ev.iter().any(|x| !x.is_finite()) { return Err(format!("node {k} combo {c}: non-finite ev")); }
             if !node.available[c] && ev.iter().any(|x| *x != 0.0) { return Err(format!("node {k} combo {c}: unavailable combo has a non-zero ev row")); }
+            if node.available[c] {
+                for &fi in &fold_cols {
+                    if ev[fi].to_bits() != 0.0f32.to_bits() {
+                        return Err(format!("node {k} combo {c} action {fi}: fold EV must be exactly 0.0 (chips already in the pot are sunk), got {}", ev[fi]));
+                    }
+                }
+            }
         }
         out.push(ordinal);
     }
