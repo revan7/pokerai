@@ -4,7 +4,7 @@
 //! replays every recorded action through [`Round`] and compares the normalized action and the chips
 //! paid with what was recorded, so a state this crate did not build is an `Err` and never a panic.
 
-use proto::{CompleteReason, Derived, HandPhase, HandState, Pot, Seat, Street};
+use proto::{Action, Card, CardParseError, CompleteReason, Derived, HandPhase, HandState, Pot, Seat, Street};
 use crate::betting::Round;
 use crate::config::{initial_full_raise, posts};
 use crate::error::RulesError;
@@ -53,6 +53,24 @@ fn admit(state: &HandState) -> Result<(), RulesError> {
     if total > u64::from(u32::MAX) {
         return Err(invalid(format!("starting stacks sum to {total}, above the settlement bound of {}", u32::MAX)));
     }
+    admit_board(state)
+}
+
+/// Board admission (spec 4.3): `HandState.board` is a street board — 0, 3, 4 or 5 cards — of valid,
+/// distinct ids, none of them a card hero holds. Only the shape is checked here; that the board is the
+/// one the replay actually reaches is checked against the replayed street in [`simulate`], because it
+/// is not knowable before the actions are replayed.
+fn admit_board(state: &HandState) -> Result<(), RulesError> {
+    if !matches!(state.board.len(), 0 | 3 | 4 | 5) {
+        return Err(RulesError::BadBoard { reason: format!("{} board cards; a street board is 0, 3, 4 or 5", state.board.len()) });
+    }
+    for (k, card) in state.board.iter().enumerate() {
+        Card::checked(card.0)?;
+        if state.board[..k].contains(card) { return Err(CardParseError::Duplicate(*card).into()); }
+        if state.hero_cards.is_some_and(|hero| hero.contains(card)) {
+            return Err(RulesError::BadBoard { reason: format!("board card {card} is one of hero's cards") });
+        }
+    }
     Ok(())
 }
 
@@ -69,6 +87,36 @@ impl Sim {
     }
 
     fn check(&self) -> Result<(), RulesError> { check_conservation(&self.round.stacks, &self.round.committed, &self.pots, self.start_total) }
+
+    /// A fold changes pot eligibility at once, not at the next closure (spec 4.3). `contributed` is
+    /// untouched mid-street, so re-layering it under the new folded flags keeps every settled chip
+    /// where it is — the folded seat's contributions stay in the pot as dead money — and only narrows
+    /// the eligible sets, merging neighbouring layers that have become equal. The current street's
+    /// live commitments stay out of the settled pots until [`Sim::close`].
+    fn relayer_settled(&mut self) { self.pots = layer_pots(&self.contributed, &self.round.folded); }
+
+    /// Spec 4.3: a street closes when no pot-eligible player still owes a response. Beyond the two
+    /// cases [`Round`] reports (nobody left in `pending`, everyone but one folded), no response is
+    /// possible once at most one pot-eligible seat still has chips — nobody can bet into it and it
+    /// cannot be raised. It is then still a decision point only while that seat owes chips to the
+    /// outstanding wager (call or fold); a pending Check is not a decision, so the street is closed.
+    fn no_response_possible(&self) -> bool {
+        let r = &self.round;
+        let mut with_chips = (0..6).filter(|i| !r.folded[*i] && r.stacks[*i] > 0);
+        match (with_chips.next(), with_chips.next()) {
+            (_, Some(_)) => false,
+            (None, _) => true,
+            (Some(i), None) => r.committed[i] >= r.facing,
+        }
+    }
+
+    /// Settles the street if it is closed. Called at every point the round can change — after the
+    /// forced posts, after each replayed action and after a street is opened — so the returned
+    /// snapshot is never left inside a street that has no decision remaining.
+    fn settle_if_closed(&mut self) -> Result<(), RulesError> {
+        if self.round.eligible_count() == 1 || self.round.closed() || self.no_response_possible() { self.close()?; }
+        Ok(())
+    }
 
     /// Street closure (spec 4.3): refund the uncalled portion, settle the pots, choose the next phase.
     fn close(&mut self) -> Result<(), RulesError> {
@@ -121,6 +169,7 @@ pub fn simulate(state: &HandState) -> Result<Sim, RulesError> {
     admit(state)?;
     let mut sim = Sim::open_preflop(state);
     sim.check()?;
+    sim.settle_if_closed()?;
     let mut k = 0;
     loop {
         match sim.phase {
@@ -135,16 +184,26 @@ pub fn simulate(state: &HandState) -> Result<Sim, RulesError> {
                 if recorded != a.action || paid != a.paid {
                     return Err(RulesError::IllegalAction { reason: format!("action {k} recorded as {:?}/{} replays as {:?}/{}", a.action, a.paid, recorded, paid) });
                 }
+                if recorded == Action::Fold { sim.relayer_settled(); }
                 sim.check()?;
-                if sim.round.eligible_count() == 1 || sim.round.closed() { sim.close()?; }
+                sim.settle_if_closed()?;
             }
             HandPhase::AwaitingBoard { street } => {
-                if state.board.len() >= street.board_len() { sim.open_street(state, street); } else { break; }
+                if state.board.len() >= street.board_len() { sim.open_street(state, street); sim.settle_if_closed()?; } else { break; }
             }
             HandPhase::Complete { .. } | HandPhase::Abandoned => break,
         }
     }
     if k < state.actions.len() { return Err(RulesError::NotBetting); }
+    // The board must be exactly the one the replay reached: `round.street` is the street being bet, or
+    // the last street bet once the hand is awaiting a board or complete. A shorter board would leave a
+    // street unopened, a longer one would carry cards from a street this history never reached.
+    let reached = sim.round.street.board_len();
+    if state.board.len() != reached {
+        return Err(RulesError::BadBoard {
+            reason: format!("{} board cards recorded, but the replay reached {:?}, whose board is {reached} cards", state.board.len(), sim.round.street),
+        });
+    }
     if matches!(state.phase, HandPhase::Abandoned) { sim.phase = HandPhase::Abandoned; }
     Ok(sim)
 }
