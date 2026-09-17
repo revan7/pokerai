@@ -859,8 +859,11 @@ fn per_combo_equity_reports_a_stop_with_equity_status_semantics() {
 /// S10: a flag raised while the enumerations are running is observed between hero combos, and the
 /// combos finished before it are kept -- the caller gets a partial answer, not an empty one.
 ///
-/// Hero is the full 1,081-combo river range against a broad villain range, which is far more work
-/// than the 20 ms the flag allows, so the run must stop part-way through.
+/// Hero is the full 1,081-combo river range against the full villain range. The whole run is about
+/// 17 ms in release (and several times that in a debug profile), so the stop windows below are
+/// deliberately one to two orders of magnitude *under* it rather than near it: an earlier version
+/// of this test used 20 ms for both, which the release build finished inside — the S3 fix made the
+/// enumeration fast enough to beat its own cancellation window, and the test raced the clock.
 #[test]
 fn per_combo_equity_observes_a_flag_raised_mid_run_and_keeps_what_it_finished() {
     let board = cards("QsJd7h3c2d");
@@ -868,23 +871,26 @@ fn per_combo_equity_observes_a_flag_raised_mid_run_and_keeps_what_it_finished() 
     block_public(&mut hero, &board);
     let mut villain = Range1326::uniform();
     block_public(&mut villain, &board);
+    // 1 ms is under a tenth of the run, and a combo completes in tens of microseconds, so dozens
+    // are finished and kept before the flag is seen.
     let cancel = Arc::new(AtomicBool::new(false));
-    let setter = cancel_after(&cancel, Duration::from_millis(20));
+    let setter = cancel_after(&cancel, Duration::from_millis(1));
     let start = Instant::now();
     let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_secs(60), &cancel);
     let took = start.elapsed();
     setter.join().unwrap();
     assert_eq!(status, EquityStatus::Cancelled, "stopped after {took:?}");
-    assert!(took < Duration::from_millis(500), "cancelled {took:?} after a 20 ms flag");
+    assert!(took < Duration::from_millis(500), "cancelled {took:?} after a 1 ms flag");
     let scored = out.iter().filter(|v| **v > 0.0).count();
     assert!(scored > 0, "the combos finished before the flag are kept");
     assert!(scored < 1081, "the run stopped before scoring every hero combo: {scored}");
 
     // The same run under a budget rather than a flag reports `BudgetExceeded`, partially filled.
+    // 200 us cannot complete a ~17 ms enumeration on any profile.
     let start = Instant::now();
-    let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_millis(20), &no_cancel());
+    let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_micros(200), &no_cancel());
     let took = start.elapsed();
     assert_eq!(status, EquityStatus::BudgetExceeded, "stopped after {took:?}");
-    assert!(took < Duration::from_millis(200), "stopped {took:?} after a 20 ms budget");
+    assert!(took < Duration::from_millis(200), "stopped {took:?} after a 200 us budget");
     assert!(out.iter().filter(|v| **v > 0.0).count() < 1081);
 }
