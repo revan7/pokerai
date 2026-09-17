@@ -2,6 +2,8 @@
 
 pub mod cards;
 pub use cards::*;
+pub mod range;
+pub use range::*;
 
 /// Wire protocol version reported in `ready` (spec section 4.5).
 pub const PROTO_VERSION: u16 = 3;
