@@ -35,9 +35,16 @@ pub fn bounded_read(path: &Path) -> Result<Vec<u8>, BundleError> {
 /// Hashes `raw` (the node file's exact bytes) against `info.sha256`, decodes and structurally
 /// validates it (`decode`, which runs every rule in `validate.rs`), and cross-checks the
 /// envelope against its manifest: matching `bundle_id`/`depth_bb`/`rake_profile`/`straddle`,
-/// and the fixed source contract (`game = "nl"`, `version = 2`, `source_blinds = [0.5, 1.0]`,
-/// `ev_unit = "source_sb"`). A hash match alone never passes without content validation, and a
-/// content match alone never passes without the hash matching first.
+/// and the fixed source contract (`game = "nl"`, `version = 2`, `ev_unit = "source_sb"`). A
+/// hash match alone never passes without content validation, and a content match alone never
+/// passes without the hash matching first. `source_blinds` is checked exactly, at its
+/// original wide `f64` precision, by `check_exact_source_blinds` before `BundleInfo` is even
+/// produced (R4) -- `info.source_blinds` here is already narrowed and is not re-checked
+/// against `[0.5, 1.0]`, so this function is not itself a substitute for that earlier call.
+/// R3: a `ChartTranscription`-labelled envelope carrying any EV data is rejected here, at
+/// load time -- `ChartTranscription::lookup` additionally clears `ev_source_sb` on every
+/// result as a second, independent guarantee, but that lookup-time behavior is not a
+/// substitute for rejecting the bad bundle in the first place.
 pub fn checked_envelope(info: &BundleInfo, raw: &[u8]) -> Result<Envelope, BundleError> {
     let digest = format!("{:x}", Sha256::digest(raw));
     if digest != info.sha256 {
@@ -50,12 +57,35 @@ pub fn checked_envelope(info: &BundleInfo, raw: &[u8]) -> Result<Envelope, Bundl
         || e.straddle != info.straddle
         || info.game != "nl"
         || info.version != 2
-        || info.source_blinds != [0.5, 1.0]
         || info.ev_unit != "source_sb"
     {
         return Err(BundleError::Content("manifest/envelope mismatch".into()));
     }
+    if info.source == SourceKind::ChartTranscription && e.nodes.iter().any(|n| n.evs.is_some()) {
+        return Err(BundleError::Content("chart bundle must not carry EV data".into()));
+    }
     Ok(e)
+}
+
+/// The manifest's `source_blinds` field at its original wide `f64` precision -- unlike
+/// `BundleInfo::source_blinds` (already narrowed to `f32` by `crate::numeric`'s general
+/// positive-finite-ordered codec), so this task's exact `[0.5, 1.0]` contract (spec section
+/// 8.2) can be checked before narrowing could let a near-miss value (e.g. `[0.500000001,
+/// 1.000000001]`) round into the accepted pair (standing ruling (a): validate wide before
+/// narrowing). Run once, on the manifest's raw bytes, before `BundleInfo` is ever produced
+/// for the loader (R4) -- not a second, separately drifting copy of the blind-domain logic
+/// already in `numeric.rs`, which only checks positive/finite/ordered, not this exact pair.
+#[derive(serde::Deserialize)]
+struct WideSourceBlinds {
+    source_blinds: [f64; 2],
+}
+
+fn check_exact_source_blinds(manifest_bytes: &[u8]) -> Result<(), BundleError> {
+    let wide: WideSourceBlinds = serde_json::from_slice(manifest_bytes)?;
+    if wide.source_blinds != [0.5, 1.0] {
+        return Err(BundleError::Content(format!("source_blinds {:?} must be exactly [0.5, 1.0]", wide.source_blinds)));
+    }
+    Ok(())
 }
 
 /// `action_major[a][c] -> class_major[c][a]`: every row of `action_major` must be the same
@@ -118,24 +148,44 @@ fn acting_order(straddle: bool) -> [Position; 6] {
     }
 }
 
-/// Walks `history` confirming each step belongs to the seat whose turn it is (skipping folded
-/// seats in the fixed rotation) and that no seat acts again after folding. `history` here is
-/// always a single, strict, non-repeating pass through the rotation, which every node in this
-/// plan's fixtures observes -- a re-opened second orbit after a raise is out of this task's
-/// scope (later plan-3 lookup/translation work owns that).
-fn check_turn_order(history: &[(Position, PreflopStep)], straddle: bool) -> Result<(), BundleError> {
+/// Advances past every already-folded seat starting at `*idx`, bounded to at most six skips
+/// (there are only six seats) so a caller can never spin forever even on adversarial input.
+fn skip_folded(
+    order: &[Position; 6],
+    idx: &mut usize,
+    folded: &std::collections::HashSet<Position>,
+    history: &[(Position, PreflopStep)],
+) -> Result<(), BundleError> {
+    let mut skips = 0;
+    while folded.contains(&order[*idx % 6]) {
+        *idx += 1;
+        skips += 1;
+        if skips > 6 {
+            return Err(BundleError::Content(format!("no active actor left in history {history:?}")));
+        }
+    }
+    Ok(())
+}
+
+/// Walks `history` through the fixed six-seat rotation, skipping folded seats, and returns
+/// the next eligible actor: whichever position's turn it is after the last step in `history`
+/// (or the first position in the rotation if `history` is empty). Confirms each recorded step
+/// belongs to the seat whose turn it was, and that no seat acts again after folding.
+///
+/// Repeated orbits are supported, not excluded: a 3bet/4bet line legitimately revisits a seat
+/// a second time around (this plan's own HJ-vs-UTG-4bet fixture does exactly that, and is a
+/// required control for this), so `idx` simply keeps counting past 6 rather than being capped
+/// to one pass. R2: the caller compares this return value against the node's *declared*
+/// actor and rejects a mismatch (including a declared actor who has already folded) --
+/// checking only the steps already present in `history`, as an earlier version of this
+/// function did, would accept a node whose stated decision-maker is not actually who is next
+/// to act, or who is no longer in the hand at all.
+fn next_actor(history: &[(Position, PreflopStep)], straddle: bool) -> Result<Position, BundleError> {
     let order = acting_order(straddle);
     let mut folded = std::collections::HashSet::new();
     let mut idx = 0usize;
     for (pos, step) in history {
-        let mut skips = 0;
-        while folded.contains(&order[idx % 6]) {
-            idx += 1;
-            skips += 1;
-            if skips > 6 {
-                return Err(BundleError::Content(format!("no active actor left in history {history:?}")));
-            }
-        }
+        skip_folded(&order, &mut idx, &folded, history)?;
         if order[idx % 6] != *pos {
             return Err(BundleError::Content(format!("out-of-turn actor in history {history:?}")));
         }
@@ -144,7 +194,8 @@ fn check_turn_order(history: &[(Position, PreflopStep)], straddle: bool) -> Resu
         }
         idx += 1;
     }
-    Ok(())
+    skip_folded(&order, &mut idx, &folded, history)?;
+    Ok(order[idx % 6])
 }
 
 /// Replays the source posts (`SB = 1`, `BB = 2`, source-SB units -- spec section 2's blind
@@ -182,18 +233,24 @@ fn committed_before(history: &[(Position, PreflopStep)], actor: Position, depth_
 
 /// Builds the class-major node map for one already hash-and-content-validated envelope:
 /// action-major -> class-major transpose for `weights`/`evs`, turn-order and no-action-after-
-/// fold checks, and `committed_by_actor_sb` for each node's actor. A duplicate `node_key` (two
-/// nodes with the same `(depth_bb, rake_profile, straddle, history)`) is rejected.
+/// fold checks, the declared-actor-matches-the-next-eligible-actor check (R2), and
+/// `committed_by_actor_sb` for each node's actor. A duplicate `node_key` (two nodes with the
+/// same `(depth_bb, rake_profile, straddle, history)`) is rejected.
 pub fn build_node_map(info: &BundleInfo, e: &Envelope) -> Result<BTreeMap<String, PreflopNode>, BundleError> {
     let mut map = BTreeMap::new();
     for n in &e.nodes {
         let history = parse_history(&n.history)?;
-        check_turn_order(&history, info.straddle)?;
+        let expected_actor = next_actor(&history, info.straddle)?;
+        let actor = parse_position(&n.actor)?;
+        if actor != expected_actor {
+            return Err(BundleError::Content(format!(
+                "declared actor {actor:?} does not match the next eligible actor {expected_actor:?} for history {history:?}"
+            )));
+        }
         let mut unreachable = [false; 169];
         for &c in &n.unreachable_classes {
             unreachable[c] = true;
         }
-        let actor = parse_position(&n.actor)?;
         let node = PreflopNode {
             actor,
             actions: n.actions.iter().map(parse_step).collect::<Result<_, _>>()?,
@@ -248,15 +305,27 @@ impl PreflopSource for ChartTranscription {
     fn bundle_info(&self) -> &BundleInfo {
         &self.info
     }
+    /// R3: forces `ev_source_sb = None` on every result, regardless of what the stored
+    /// `PreflopNode` actually carries. `checked_envelope` already refuses to load a chart
+    /// bundle whose envelope carries EV data, but this is a second, independent guarantee
+    /// that holds even for a `ChartTranscription` built directly (bypassing `load_bundle`
+    /// entirely) rather than relying solely on that load-time check.
     fn lookup(&self, key: &PreflopNodeKey) -> Option<PreflopNode> {
-        self.nodes.get(&node_key(key)).cloned()
+        self.nodes.get(&node_key(key)).cloned().map(|mut node| {
+            node.ev_source_sb = None;
+            node
+        })
     }
 }
 
-/// Reads one bundle: manifest bytes -> `BundleInfo`, node bytes -> hash-checked,
-/// content-validated `Envelope`, then the class-major node map keyed by `node_key`.
+/// Reads one bundle: manifest bytes -> exact-wide-blinds check (R4) -> `BundleInfo`, node
+/// bytes -> hash-checked, content-validated `Envelope`, then the class-major node map keyed
+/// by `node_key`. The wide blind check runs on the manifest's raw bytes before `BundleInfo`
+/// is deserialized, so it sees the original `f64` values, never the narrowed `f32` ones.
 pub fn load_bundle(manifest: &Path, nodes: &Path) -> Result<Box<dyn PreflopSource>, BundleError> {
-    let info: BundleInfo = serde_json::from_slice(&bounded_read(manifest)?)?;
+    let manifest_bytes = bounded_read(manifest)?;
+    check_exact_source_blinds(&manifest_bytes)?;
+    let info: BundleInfo = serde_json::from_slice(&manifest_bytes)?;
     let envelope = checked_envelope(&info, &bounded_read(nodes)?)?;
     let map = build_node_map(&info, &envelope)?;
     Ok(match info.source {
@@ -265,12 +334,50 @@ pub fn load_bundle(manifest: &Path, nodes: &Path) -> Result<Box<dyn PreflopSourc
     })
 }
 
+/// True if `path`'s own directory entry is a symlink or reparse point (e.g. a Windows
+/// junction) -- checked with `symlink_metadata`, which never follows it. `Path::is_dir`/
+/// `File::open` do follow it; R1 closes exactly that gap by never calling either on anything
+/// on the path from a bundle's own directory entry to its two input files until this check
+/// has passed.
+fn is_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+}
+
+/// True if `path` exists at all, including as a symlink -- even a dangling one whose target
+/// is missing. Unlike `Path::exists` (which follows the link and reports `false` for a
+/// dangling target, treating it as a free name), this treats a dangling link as occupied.
+fn occupied(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
 fn quarantine_name(dir: &Path, bundle_id: &str) -> std::path::PathBuf {
     let first = dir.join(format!("{bundle_id}.bad"));
-    if !first.exists() {
+    if !occupied(&first) {
         return first;
     }
-    (1u32..).map(|n| dir.join(format!("{bundle_id}.{n}.bad"))).find(|p| !p.exists()).expect("a free quarantine name exists")
+    (1u32..).map(|n| dir.join(format!("{bundle_id}.{n}.bad"))).find(|p| !occupied(p)).expect("a free quarantine name exists")
+}
+
+/// `child` is a real (non-link) entry, canonicalizing to an immediate child of
+/// `canonical_dir`, whose own `manifest.json`/`nodes.json` are themselves real (non-link)
+/// files -- checked (R1) before `load_bundle` ever calls `File::open` on any of the three.
+/// Rejects, without reading through it, any link anywhere on that path: a directory link
+/// (e.g. a junction) planted inside the store's directory, or an individual input file that
+/// is itself a link -- either could otherwise resolve to content outside `canonical_dir`.
+fn load_contained_bundle(canonical_dir: &Path, child: &Path) -> Result<Box<dyn PreflopSource>, BundleError> {
+    if is_link(child) {
+        return Err(BundleError::Content("bundle entry is a symlink or reparse point".into()));
+    }
+    let resolved = std::fs::canonicalize(child)?;
+    if resolved.parent() != Some(canonical_dir) {
+        return Err(BundleError::Content("bundle entry escapes the preflop directory".into()));
+    }
+    let manifest = child.join("manifest.json");
+    let nodes = child.join("nodes.json");
+    if is_link(&manifest) || is_link(&nodes) {
+        return Err(BundleError::Content("bundle input file is a symlink or reparse point".into()));
+    }
+    load_bundle(&manifest, &nodes)
 }
 
 /// The independent-bundle store (spec section 8.1's `PreflopStore`): every bundle validated on
@@ -293,9 +400,19 @@ impl PreflopStore {
     }
 
     /// Returns the store plus one banner line per rejected bundle. A failure of one bundle
-    /// never removes another: every child is validated on its own bytes. Reads sorted
-    /// immediate children of `dir` only, skipping names already ending `.bad`.
+    /// never removes another: every child is validated on its own bytes, with link safety
+    /// (R1) checked before anything is opened -- see `load_contained_bundle`. Reads sorted
+    /// immediate children of `dir` only, skipping names already ending `.bad`; an ordinary
+    /// non-directory, non-link entry (e.g. a stray README) is skipped silently, exactly like
+    /// before, but a directory *link* is never silently accepted as one -- it is routed
+    /// through the same contained-load-or-quarantine path as any other bundle, so it can
+    /// never be read as valid and is quarantined (its own directory entry renamed, never its
+    /// target) exactly like any other invalid bundle.
     pub fn open(dir: &Path) -> (Self, Vec<String>) {
+        let canonical_dir = match std::fs::canonicalize(dir) {
+            Ok(d) => d,
+            Err(e) => return (Self { bundles: vec![] }, vec![format!("preflop dir {}: {e}", dir.display())]),
+        };
         let mut names: Vec<std::ffi::OsString> = match std::fs::read_dir(dir) {
             Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect(),
             Err(e) => return (Self { bundles: vec![] }, vec![format!("preflop dir {}: {e}", dir.display())]),
@@ -303,16 +420,26 @@ impl PreflopStore {
         names.sort();
         let (mut bundles, mut banners) = (Vec::new(), Vec::new());
         for name in names {
-            let child = dir.join(&name);
             let id = name.to_string_lossy().to_string();
-            if id.ends_with(".bad") || !child.is_dir() {
+            if id.ends_with(".bad") {
                 continue;
             }
-            match load_bundle(&child.join("manifest.json"), &child.join("nodes.json")) {
+            let child = dir.join(&name);
+            let meta = match std::fs::symlink_metadata(&child) {
+                Ok(m) => m,
+                Err(_) => continue, // vanished between read_dir and here; nothing to do
+            };
+            if !meta.file_type().is_symlink() && !meta.is_dir() {
+                continue; // an ordinary non-bundle file; not a failure, skipped as before
+            }
+            match load_contained_bundle(&canonical_dir, &child) {
                 Ok(source) => bundles.push(source),
                 Err(e) => {
                     let target = quarantine_name(dir, &id);
-                    // Both ends must stay immediate children of `dir`; never follow a link out.
+                    // `child`/`target` are always `dir.join(<a plain OS name, no
+                    // separators>)`, so this always holds by construction -- kept as
+                    // defense in depth, not the link-safety check itself (that already ran,
+                    // above, before anything was opened).
                     let inside = |p: &Path| p.parent() == Some(dir);
                     let renamed = if inside(&child) && inside(&target) {
                         std::fs::rename(&child, &target).map_err(|e| e.to_string())
