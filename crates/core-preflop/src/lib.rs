@@ -3,6 +3,7 @@
 //! that later plan-3 tasks implement against.
 
 pub mod envelope;
+mod numeric;
 pub mod validate;
 
 pub use envelope::*;

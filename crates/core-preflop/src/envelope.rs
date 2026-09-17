@@ -103,8 +103,13 @@ pub struct EnvelopeNode {
     pub history: Vec<(String, String, u32)>,
     pub actor: String,
     pub actions: Vec<EnvelopeAction>,
+    /// Wire numbers are read as `f64` and domain-checked (`[0, 1]`) before narrowing to
+    /// `f32`, and re-checked the same way on serialize (`crate::numeric`, standing ruling).
+    #[serde(deserialize_with = "crate::numeric::deserialize_weights", serialize_with = "crate::numeric::serialize_weights")]
     pub weights: Vec<Vec<f32>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Same wide-then-narrow domain check as `weights` (finite only; see `crate::numeric`),
+    /// applied per present cell -- `None` entries pass through untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::numeric::deserialize_evs", serialize_with = "crate::numeric::serialize_evs")]
     pub evs: Option<Vec<Vec<Option<f32>>>>,
     pub unreachable_classes: Vec<usize>,
 }
