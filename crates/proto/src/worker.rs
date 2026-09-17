@@ -237,3 +237,89 @@ pub enum WorkerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")] error: Option<WorkerError>,
     },
 }
+
+// --- Structural validation (spec 4.5), deliberately outside the wire codecs above ---
+//
+// The `narrow_checked`/`widen_checked`/`deserialize_matrix` machinery already guarantees every
+// float on the wire is finite and, for probability matrices, in the unit interval -- on both
+// serde directions, independent of how the value was constructed. What is left for this task is
+// structural: matrix shape against `actions.len()` and against `COMBOS` rows, per-row probability
+// sums, `available`/lock free-combo consistency, node-count and `requested` bounds, and path/actor
+// agreement against the materialized tree. Validation is always done in wide form (f64 for the
+// row sum) before any comparison against tolerance, per the standing ruling; the individual `f32`
+// entries are already domain-checked by the wire codecs, so this module reads them, never clamps.
+
+use crate::cards::COMBOS;
+use crate::tree::{resolve_chip_path, MaterializedNode, OrdinalPath};
+
+const ROW_TOLERANCE: f32 = 1e-3;
+
+fn resolve_node<'a>(materialized: &'a [MaterializedNode], what: &str, k: usize, path: &[Action], actor: &str) -> Result<(&'a MaterializedNode, OrdinalPath), String> {
+    let ordinal = resolve_chip_path(materialized, path).ok_or_else(|| format!("{what} {k}: chip path does not resolve against the materialized tree"))?;
+    let node = materialized.iter().find(|m| m.path == ordinal).expect("resolved paths are materialized");
+    if node.actor != actor { return Err(format!("{what} {k}: actor {actor:?} differs from the materialized actor {:?}", node.actor)); }
+    Ok((node, ordinal))
+}
+
+fn check_row(what: &str, k: usize, combo: usize, row: &[f32], width: usize, allow_all_zero: bool, must_be_zero: bool) -> Result<(), String> {
+    if row.len() != width { return Err(format!("{what} {k} combo {combo}: row has {} entries, expected {width}", row.len())); }
+    // Standing ruling: validate in wide form (f64) before narrowing or comparing sums. Each
+    // entry is already an in-domain f32 (checked by the wire codecs); widening to f64 for the
+    // accumulation and the tolerance comparison avoids compounding f32 rounding error across a
+    // long row before it is checked against `ROW_TOLERANCE`.
+    let mut sum = 0.0f64;
+    for x in row {
+        if !x.is_finite() { return Err(format!("{what} {k} combo {combo}: non-finite entry")); }
+        if *x < 0.0 || *x > 1.0 { return Err(format!("{what} {k} combo {combo}: probability {x} outside [0, 1]")); }
+        sum += *x as f64;
+    }
+    if must_be_zero {
+        if sum != 0.0 { return Err(format!("{what} {k} combo {combo}: unavailable combo has a non-zero probability row")); }
+        return Ok(());
+    }
+    if allow_all_zero && sum == 0.0 { return Ok(()); }
+    if (sum - 1.0).abs() > ROW_TOLERANCE as f64 { return Err(format!("{what} {k} combo {combo}: probability row sums to {sum}, expected 1")); }
+    Ok(())
+}
+
+/// Spec 4.5 matrix and structure validation; returns the ordinal path of every node.
+pub fn validate_solution(sol: &StreetSolution, materialized: &[MaterializedNode]) -> Result<Vec<OrdinalPath>, String> {
+    if sol.nodes.is_empty() { return Err("solution has no nodes".into()); }
+    if sol.nodes.len() > MAX_EXPORTED_NODES { return Err(format!("{} nodes exceed the export limit {MAX_EXPORTED_NODES}", sol.nodes.len())); }
+    if sol.requested as usize >= sol.nodes.len() { return Err(format!("requested {} is not below nodes.len() {}", sol.requested, sol.nodes.len())); }
+    if sol.covered_paths.len() != sol.nodes.len() { return Err(format!("covered_paths has {} entries for {} nodes", sol.covered_paths.len(), sol.nodes.len())); }
+    if !sol.exploitability_chips.is_finite() || sol.exploitability_chips < 0.0 { return Err("exploitability_chips must be finite and non-negative".into()); }
+    if sol.mode != "f32" && sol.mode != "i16" { return Err(format!("unknown mode {:?}", sol.mode)); }
+    if sol.export != "street" && sol.export != "truncated" { return Err(format!("unknown export {:?}", sol.export)); }
+    let mut out = Vec::with_capacity(sol.nodes.len());
+    for (k, node) in sol.nodes.iter().enumerate() {
+        if sol.covered_paths[k] != node.path { return Err(format!("covered_paths[{k}] differs from nodes[{k}].path")); }
+        let (m, ordinal) = resolve_node(materialized, "node", k, &node.path, &node.actor)?;
+        if m.actions != node.actions { return Err(format!("node {k}: actions differ from the materialized menu")); }
+        let width = node.actions.len();
+        if node.probs.len() != COMBOS || node.ev_chips.len() != COMBOS || node.available.len() != COMBOS {
+            return Err(format!("node {k}: matrices must have exactly 1326 rows"));
+        }
+        for c in 0..COMBOS {
+            check_row("node", k, c, &node.probs[c], width, false, !node.available[c])?;
+            let ev = &node.ev_chips[c];
+            if ev.len() != width { return Err(format!("node {k} combo {c}: ev row has {} entries, expected {width}", ev.len())); }
+            if ev.iter().any(|x| !x.is_finite()) { return Err(format!("node {k} combo {c}: non-finite ev")); }
+            if !node.available[c] && ev.iter().any(|x| *x != 0.0) { return Err(format!("node {k} combo {c}: unavailable combo has a non-zero ev row")); }
+        }
+        out.push(ordinal);
+    }
+    Ok(out)
+}
+
+/// Lock validation (spec 4.5): every entry in [0, 1]; a row is all zero (the free-combo sentinel) or sums to 1 +- 1e-3.
+pub fn validate_locks(locks: &[NodeLock], materialized: &[MaterializedNode]) -> Result<Vec<OrdinalPath>, String> {
+    let mut out = Vec::with_capacity(locks.len());
+    for (k, lock) in locks.iter().enumerate() {
+        let (m, ordinal) = resolve_node(materialized, "lock", k, &lock.path, &lock.actor)?;
+        if lock.probs.len() != COMBOS { return Err(format!("lock {k}: probs must have exactly 1326 rows")); }
+        for (c, row) in lock.probs.iter().enumerate() { check_row("lock", k, c, row, m.actions.len(), true, false)?; }
+        out.push(ordinal);
+    }
+    Ok(out)
+}
