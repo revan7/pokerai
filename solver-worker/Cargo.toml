@@ -1,0 +1,17 @@
+[package]
+name = "solver-worker"
+version.workspace = true
+edition.workspace = true
+license = "AGPL-3.0"
+build = "build.rs"
+
+[[bin]]
+name = "solver-worker"
+path = "src/main.rs"
+
+[dependencies]
+proto = { path = "../crates/proto" }
+postflop-solver = { path = "../third_party/postflop-solver", features = ["zstd"] }
+serde.workspace = true
+serde_json.workspace = true
+rayon = "1"

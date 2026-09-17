@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "solver-worker"]
 exclude = ["third_party/postflop-solver"]
 
 [workspace.package]
@@ -22,6 +22,11 @@ ts-rs = "=12.0.1"
 opt-level = 1
 
 [profile.dev.package.holdem-hand-evaluator]
+opt-level = 3
+
+# A debug test build of the workspace still exercises optimized solver code; the per-task green command
+# is `cargo test --workspace --release`, but an ad-hoc debug run must not take 30x as long.
+[profile.dev.package.postflop-solver]
 opt-level = 3
 
 [profile.release]
