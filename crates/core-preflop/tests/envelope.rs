@@ -3,7 +3,7 @@
 //! each numeric domain (probability bound `[0,1]`, sibling-sum tolerance `1e-3`, the
 //! unreachable-class index `<169`, the raise-amount `>0` rule, and `MAX_BUNDLE_BYTES`).
 
-use core_preflop::{decode, valid_step, validate, BundleError, Envelope, EnvelopeAction, MAX_BUNDLE_BYTES};
+use core_preflop::{decode, valid_step, validate, BundleError, Envelope, EnvelopeAction, PreflopSource, MAX_BUNDLE_BYTES};
 
 fn base_envelope() -> Envelope {
     Envelope {
@@ -349,6 +349,8 @@ fn decode_accepts_unreachable_class_with_exact_zero_control() {
 
 // --- P3.T2: `store` -- independent-bundle loading and per-bundle quarantine ---
 
+use std::path::Path;
+
 const MANIFEST_JSON: &[u8] = include_bytes!("../../../fixtures/preflop/synthetic_v2/manifest.json");
 const NODES_JSON: &[u8] = include_bytes!("../../../fixtures/preflop/synthetic_v2/nodes.json");
 
@@ -371,32 +373,74 @@ fn json_row(default: &str, overrides: &[(usize, &str)]) -> String {
     format!("[{}]", parts.join(","))
 }
 
-/// A single-node, empty-history, UTG-actor envelope as raw JSON text (not a typed `Envelope`,
-/// so a case can inject a value -- e.g. `1e400` -- that the checked codecs in `numeric.rs`
-/// would never let a typed value hold in the first place).
-fn nodes_json_text(bundle_id: &str, actions_json: &str, weights_json: &str, evs_json: Option<&str>, unreachable: &str) -> String {
+/// A single-node envelope as raw JSON text (not a typed `Envelope`, so a case can inject a
+/// value -- e.g. `1e400`, an out-of-domain weight, or an unknown history step token -- that
+/// the checked codecs in `numeric.rs`/the structural rules in `validate.rs` would never let a
+/// typed value hold in the first place). `history_json`/`actor` let R2's cases place a node
+/// whose declared actor does not match the next eligible actor for that history.
+fn nodes_json_text(
+    bundle_id: &str,
+    history_json: &str,
+    actor: &str,
+    actions_json: &str,
+    weights_json: &str,
+    evs_json: Option<&str>,
+    unreachable: &str,
+) -> String {
     let evs_part = match evs_json {
         Some(e) => format!(r#","evs":{e}"#),
         None => String::new(),
     };
     format!(
-        r#"{{"bundle_id":"{bundle_id}","depth_bb":100,"rake_profile":"5% cap 0.5bb","straddle":false,"class_order":"A-2 row-major, section 4.1","nodes":[{{"history":[],"actor":"UTG","actions":{actions_json},"weights":{weights_json}{evs_part},"unreachable_classes":{unreachable}}}]}}"#
+        r#"{{"bundle_id":"{bundle_id}","depth_bb":100,"rake_profile":"5% cap 0.5bb","straddle":false,"class_order":"A-2 row-major, section 4.1","nodes":[{{"history":{history_json},"actor":"{actor}","actions":{actions_json},"weights":{weights_json}{evs_part},"unreachable_classes":{unreachable}}}]}}"#
     )
 }
 
-fn minimal_manifest_json(bundle_id: &str, sha256: &str) -> String {
+/// The two-action ("fold","call"), empty-history, UTG-actor baseline used by most cases
+/// below: valid unless a case deliberately perturbs one field.
+fn baseline_actions() -> &'static str {
+    r#"[{"step":"fold"},{"step":"call"}]"#
+}
+fn baseline_weights() -> String {
+    format!("[{},{}]", json_row("1", &[]), json_row("0", &[]))
+}
+fn baseline_nodes_json_text(bundle_id: &str) -> String {
+    nodes_json_text(bundle_id, "[]", "UTG", baseline_actions(), &baseline_weights(), None, "[]")
+}
+
+fn minimal_manifest_json(bundle_id: &str, source: &str, blinds_json: &str, sha256: &str) -> String {
     format!(
-        r#"{{"bundle_id":"{bundle_id}","source":"PokerDataJson","depth_bb":100,"depths":[100],"source_blinds":[0.5,1.0],"rake_profile":"5% cap 0.5bb","rake":null,"straddle":false,"version":2,"game":"nl","ev_unit":"source_sb","ev_reference":"unverified","license_note":"n","accuracy":"unverified","sha256":"{sha256}"}}"#
+        r#"{{"bundle_id":"{bundle_id}","source":"{source}","depth_bb":100,"depths":[100],"source_blinds":{blinds_json},"rake_profile":"5% cap 0.5bb","rake":null,"straddle":false,"version":2,"game":"nl","ev_unit":"source_sb","ev_reference":"unverified","license_note":"n","accuracy":"unverified","sha256":"{sha256}"}}"#
     )
+}
+
+/// A single-node, two-action envelope with a large filler `label` on the "call" action (a
+/// free-form descriptive field `check_envelope` never inspects -- see `EnvelopeAction::label`
+/// in `envelope.rs`) so the JSON's total byte length can be tuned exactly, independent of its
+/// validity. Used by R5's oversized/boundary cases: content stays valid regardless of
+/// `label_len`, only the size changes.
+fn padded_valid_nodes_json_text(bundle_id: &str, label_len: usize) -> String {
+    let label = "x".repeat(label_len);
+    let actions = format!(r#"[{{"step":"fold"}},{{"step":"call","label":"{label}"}}]"#);
+    nodes_json_text(bundle_id, "[]", "UTG", &actions, &baseline_weights(), None, "[]")
+}
+
+/// Pads `padded_valid_nodes_json_text` to land at exactly `target_len` bytes.
+fn padded_valid_nodes_json_at_exactly(bundle_id: &str, target_len: usize) -> Vec<u8> {
+    let base = padded_valid_nodes_json_text(bundle_id, 0);
+    assert!(base.len() <= target_len, "target too small for the unpadded baseline");
+    let pad_len = target_len - base.len();
+    let text = padded_valid_nodes_json_text(bundle_id, pad_len);
+    assert_eq!(text.len(), target_len, "padding must land exactly on the target length");
+    text.into_bytes()
 }
 
 /// Writes a `good` sibling (the real committed fixture bytes, unmodified) and a `bad` sibling
-/// (`nodes_bytes`, with its manifest's `sha256` recomputed from those exact bytes unless
-/// `corrupt_hash` deliberately mismatches it) into a fresh temporary directory, runs
+/// (`manifest_text` + `nodes_bytes`) into a fresh temporary directory, runs
 /// `PreflopStore::open`, and asserts: exactly one banner, `bad.bad` quarantined, and the good
 /// sibling still answers a direct key lookup. Removes the directory afterward.
-fn run_quarantine_case(case_idx: usize, nodes_bytes: &[u8], corrupt_hash: bool) {
-    let dir = std::env::temp_dir().join(format!("core_preflop_p3t2_{}_{case_idx}", std::process::id()));
+fn run_quarantine_case_with_manifest(case_id: &str, manifest_text: &str, nodes_bytes: &[u8]) {
+    let dir = std::env::temp_dir().join(format!("core_preflop_p3t2_{}_{case_id}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("good")).unwrap();
     std::fs::create_dir_all(dir.join("bad")).unwrap();
@@ -404,81 +448,372 @@ fn run_quarantine_case(case_idx: usize, nodes_bytes: &[u8], corrupt_hash: bool) 
     std::fs::write(dir.join("good").join("manifest.json"), MANIFEST_JSON).unwrap();
     std::fs::write(dir.join("good").join("nodes.json"), NODES_JSON).unwrap();
 
-    let hash = if corrupt_hash { "0".repeat(64) } else { sha256_hex(nodes_bytes) };
-    let manifest_text = minimal_manifest_json("bad", &hash);
     std::fs::write(dir.join("bad").join("manifest.json"), manifest_text.as_bytes()).unwrap();
     std::fs::write(dir.join("bad").join("nodes.json"), nodes_bytes).unwrap();
 
     let (store, banners) = core_preflop::PreflopStore::open(&dir);
-    assert_eq!(banners.len(), 1, "case {case_idx}: expected exactly one banner, got {banners:?}");
-    assert!(dir.join("bad.bad").exists(), "case {case_idx}: expected a bad.bad quarantine directory");
+    assert_eq!(banners.len(), 1, "case {case_id}: expected exactly one banner, got {banners:?}");
+    assert!(dir.join("bad.bad").exists(), "case {case_id}: expected a bad.bad quarantine directory");
 
     let good_id = good_bundle_id();
-    let good = store.bundle_of(&good_id).unwrap_or_else(|| panic!("case {case_idx}: good sibling must still load, banners: {banners:?}"));
+    let good = store.bundle_of(&good_id).unwrap_or_else(|| panic!("case {case_id}: good sibling must still load, banners: {banners:?}"));
     let key = core_preflop::PreflopNodeKey { depth_bb: 100, rake_profile: "5% cap 0.5bb".into(), straddle: false, history: vec![] };
-    assert!(good.lookup(&key).is_some(), "case {case_idx}: good source must answer a direct key lookup");
+    assert!(good.lookup(&key).is_some(), "case {case_id}: good source must answer a direct key lookup");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The common case of `run_quarantine_case_with_manifest`: only the node content varies,
+/// with `PokerDataJson`/`[0.5,1.0]` blinds and a hash recomputed to match `nodes_bytes`
+/// (unless `corrupt_hash` deliberately mismatches it instead).
+fn run_quarantine_case(case_id: &str, nodes_bytes: &[u8], corrupt_hash: bool) {
+    let hash = if corrupt_hash { "0".repeat(64) } else { sha256_hex(nodes_bytes) };
+    let manifest_text = minimal_manifest_json("bad", "PokerDataJson", "[0.5,1.0]", &hash);
+    run_quarantine_case_with_manifest(case_id, &manifest_text, nodes_bytes);
 }
 
 #[test]
 fn bundle_validation_quarantine() {
     // The exact starter matrix (spec section 13.1's `bundle_validation_quarantine` row):
     // decode-level rejections for a malformed weight, a truncated document, and an unknown
-    // history step token.
-    let raw = NODES_JSON;
-    let mut v: serde_json::Value = serde_json::from_slice(raw).unwrap();
-    v["nodes"][0]["weights"][0][0] = serde_json::json!(0.4);
-    let malformed = serde_json::to_vec(&v).unwrap();
-    assert!(core_preflop::decode(&malformed).is_err());
-    assert!(core_preflop::decode(br#"{"nodes": ["#).is_err());
-    v["nodes"][0]["history"] = serde_json::json!([["UTG", "mystery", 0]]);
-    assert!(core_preflop::decode(&serde_json::to_vec(&v).unwrap()).is_err());
+    // history step token. R5: each assertion below uses a *fresh* copy of the base value, so
+    // the malformed-weight mutation from the first assertion can never be the actual reason
+    // a later assertion (the unknown history token) fails -- the original starter code
+    // reused one `v` across all three, so the third assertion would still fail even with
+    // token validation removed, entirely on the strength of the still-present first defect.
+    let base: serde_json::Value = serde_json::from_slice(NODES_JSON).unwrap();
 
-    // A valid hash alone must never pass: cases 1-5 below all carry a hash recomputed to
-    // match their (invalid) content, so only content validation is what rejects them.
+    let mut v1 = base.clone();
+    v1["nodes"][0]["weights"][0][0] = serde_json::json!(0.4);
+    assert!(core_preflop::decode(&serde_json::to_vec(&v1).unwrap()).is_err());
+
+    assert!(core_preflop::decode(br#"{"nodes": ["#).is_err());
+
+    let mut v3 = base.clone();
+    v3["nodes"][0]["history"] = serde_json::json!([["UTG", "mystery", 0]]);
+    assert!(core_preflop::decode(&serde_json::to_vec(&v3).unwrap()).is_err());
+
+    // A valid hash alone must never pass: every content case below carries a hash recomputed
+    // to match its (invalid) content, so only content validation is what rejects it.
 
     // Wrong action count: 3 declared actions, only 2 weight rows.
     let actions = r#"[{"step":"fold"},{"step":"call"},{"step":"raise","to_bb_x1000":2500}]"#;
-    let weights = format!("[{},{}]", json_row("1", &[]), json_row("0", &[]));
-    let text = nodes_json_text("bad", actions, &weights, None, "[]");
-    run_quarantine_case(1, text.as_bytes(), false);
+    let text = nodes_json_text("bad", "[]", "UTG", actions, &baseline_weights(), None, "[]");
+    run_quarantine_case("wrong_action_count", text.as_bytes(), false);
 
     // 168 entries: both weight rows one short of the required 169.
     let row168a = format!("[{}]", vec!["1".to_string(); 168].join(","));
     let row168b = format!("[{}]", vec!["0".to_string(); 168].join(","));
     let weights = format!("[{row168a},{row168b}]");
-    let actions = r#"[{"step":"fold"},{"step":"call"}]"#;
-    let text = nodes_json_text("bad", actions, &weights, None, "[]");
-    run_quarantine_case(2, text.as_bytes(), false);
+    let text = nodes_json_text("bad", "[]", "UTG", baseline_actions(), &weights, None, "[]");
+    run_quarantine_case("168_entries", text.as_bytes(), false);
 
     // 1e400: syntactically a valid JSON number, parses to f64::INFINITY -- rejected by the
     // EV finite check.
-    let weights = format!("[{},{}]", json_row("1", &[]), json_row("0", &[]));
     let evs = format!("[{},{}]", json_row("null", &[]), json_row("null", &[(0, "1e400")]));
-    let text = nodes_json_text("bad", actions, &weights, Some(&evs), "[]");
-    run_quarantine_case(3, text.as_bytes(), false);
+    let text = nodes_json_text("bad", "[]", "UTG", baseline_actions(), &baseline_weights(), Some(&evs), "[]");
+    run_quarantine_case("ev_1e400", text.as_bytes(), false);
 
     // [-0.1, 1.1]: sibling sum stays exactly 1.0 (isolating the per-element bound rule from
     // the sibling-sum rule), but each value is individually outside [0, 1].
     let weights = format!("[{},{}]", json_row("1", &[(0, "-0.1")]), json_row("0", &[(0, "1.1")]));
-    let text = nodes_json_text("bad", actions, &weights, None, "[]");
-    run_quarantine_case(4, text.as_bytes(), false);
+    let text = nodes_json_text("bad", "[]", "UTG", baseline_actions(), &weights, None, "[]");
+    run_quarantine_case("out_of_domain_weights", text.as_bytes(), false);
 
     // Undeclared all-zero class: class 0 sums to exactly 0 across both actions but is not
     // listed in `unreachable_classes`.
     let weights = format!("[{},{}]", json_row("1", &[(0, "0")]), json_row("0", &[]));
-    let text = nodes_json_text("bad", actions, &weights, None, "[]");
-    run_quarantine_case(5, text.as_bytes(), false);
+    let text = nodes_json_text("bad", "[]", "UTG", baseline_actions(), &weights, None, "[]");
+    run_quarantine_case("undeclared_zero_class", text.as_bytes(), false);
+
+    // The exact "0.4" starter-matrix defect (R5), now isolated through the store with
+    // another bundle active, not just through a bare `decode` call: class 0's first action
+    // weight becomes 0.4 while every other class still sums to 1.
+    let weights = format!("[{},{}]", json_row("1", &[(0, "0.4")]), json_row("0", &[]));
+    let text = nodes_json_text("bad", "[]", "UTG", baseline_actions(), &weights, None, "[]");
+    run_quarantine_case("malformed_weight_0_4", text.as_bytes(), false);
+
+    // Malformed/truncated JSON (R5), through the store: hashed correctly (a hash is well
+    // defined over any bytes), but `decode` fails to parse it at all.
+    run_quarantine_case("malformed_truncated_json", br#"{"nodes": ["#, false);
+
+    // Unknown history step token "mystery" (R5), through the store with a fresh valid
+    // control -- not the starter test's carried-over 0.4 sibling-sum defect.
+    let text = nodes_json_text("bad", r#"[["UTG","mystery",0]]"#, "HJ", baseline_actions(), &baseline_weights(), None, "[]");
+    run_quarantine_case("unknown_history_token", text.as_bytes(), false);
 
     // Hash mismatch: otherwise fully valid content, but the manifest's sha256 is wrong.
-    let weights = format!("[{},{}]", json_row("1", &[]), json_row("0", &[]));
-    let text = nodes_json_text("bad", actions, &weights, None, "[]");
-    run_quarantine_case(6, text.as_bytes(), true);
+    let text = baseline_nodes_json_text("bad");
+    run_quarantine_case("hash_mismatch", text.as_bytes(), true);
 
-    // 64 MiB + 1: rejected on size before any JSON parsing or hashing is attempted.
-    let oversized = vec![b' '; (MAX_BUNDLE_BYTES + 1) as usize];
-    run_quarantine_case(7, &oversized, false);
+    // 64 MiB + 1 (R5): padded via a free-form action `label`, not via invalidity, so
+    // removing the size gate would make this exact content decode successfully -- proving
+    // the rejection is genuinely about size, not an incidental JSON defect (the old version
+    // padded with `vec![b' '; N]`, which is *also* invalid JSON independent of its length).
+    let oversized = padded_valid_nodes_json_at_exactly("bad", (MAX_BUNDLE_BYTES + 1) as usize);
+    run_quarantine_case("oversized_otherwise_valid", &oversized, false);
+
+    // R2: an empty-history node whose declared actor is BB, not the next eligible actor
+    // (UTG) -- otherwise fully valid content.
+    let text = nodes_json_text("bad", "[]", "BB", baseline_actions(), &baseline_weights(), None, "[]");
+    run_quarantine_case("r2_empty_history_wrong_actor", text.as_bytes(), false);
+
+    // R2: history [(UTG, fold)] with actor UTG -- the same seat that just folded, so it is
+    // no longer eligible to act, let alone act again immediately.
+    let text = nodes_json_text("bad", r#"[["UTG","fold",0]]"#, "UTG", baseline_actions(), &baseline_weights(), None, "[]");
+    run_quarantine_case("r2_folded_actor", text.as_bytes(), false);
+
+    // R3: an otherwise byte-identical bundle, labelled ChartTranscription, whose envelope
+    // still carries EV data -- must be rejected at load time, not just filtered at lookup.
+    let hash = sha256_hex(NODES_JSON);
+    let manifest_text = minimal_manifest_json(&good_bundle_id(), "ChartTranscription", "[0.5,1.0]", &hash);
+    run_quarantine_case_with_manifest("r3_chart_with_ev", &manifest_text, NODES_JSON);
+
+    // R4: each source blind independently off by a value that rounds to the accepted `f32`
+    // on narrowing -- the wide `f64` check must catch this before `BundleInfo` narrows it.
+    let text = baseline_nodes_json_text("bad");
+    let hash = sha256_hex(text.as_bytes());
+    let manifest_text = minimal_manifest_json("bad", "PokerDataJson", "[0.500000001,1.0]", &hash);
+    run_quarantine_case_with_manifest("r4_blind_sb_near_miss", &manifest_text, text.as_bytes());
+
+    let manifest_text = minimal_manifest_json("bad", "PokerDataJson", "[0.5,1.000000001]", &hash);
+    run_quarantine_case_with_manifest("r4_blind_bb_near_miss", &manifest_text, text.as_bytes());
+}
+
+/// R5's positive boundary control for the 64 MiB size gate: otherwise-valid content at
+/// exactly `MAX_BUNDLE_BYTES` must load successfully (the gate is strictly greater-than).
+#[test]
+fn oversized_boundary_control_at_exactly_max_bytes_loads_successfully() {
+    let bundle_id = "boundary_ok";
+    let nodes_bytes = padded_valid_nodes_json_at_exactly(bundle_id, MAX_BUNDLE_BYTES as usize);
+    let manifest_text = minimal_manifest_json(bundle_id, "PokerDataJson", "[0.5,1.0]", &sha256_hex(&nodes_bytes));
+
+    let dir = std::env::temp_dir().join(format!("core_preflop_p3t2_boundary_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(bundle_id)).unwrap();
+    std::fs::write(dir.join(bundle_id).join("manifest.json"), manifest_text.as_bytes()).unwrap();
+    std::fs::write(dir.join(bundle_id).join("nodes.json"), &nodes_bytes).unwrap();
+
+    let (store, banners) = core_preflop::PreflopStore::open(&dir);
+    assert_eq!(banners.len(), 0, "an exactly-MAX_BUNDLE_BYTES, otherwise valid bundle must load: {banners:?}");
+    assert!(store.bundle_of(bundle_id).is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R3 positive control: an EV-free chart bundle loads successfully, and its lookup result
+/// carries `ev_source_sb = None` (trivially true here since none was ever present -- see
+/// `chart_lookup_clears_ev_even_when_constructed_directly` below for the case where EV data
+/// *is* present in the underlying map and must still be cleared).
+#[test]
+fn chart_bundle_without_ev_loads_with_none() {
+    let bundle_id = "chart_ok";
+    let nodes_text = baseline_nodes_json_text(bundle_id);
+    let hash = sha256_hex(nodes_text.as_bytes());
+    let manifest_text = minimal_manifest_json(bundle_id, "ChartTranscription", "[0.5,1.0]", &hash);
+
+    let manifest: core_preflop::BundleInfo = serde_json::from_str(&manifest_text).unwrap();
+    let envelope = core_preflop::checked_envelope(&manifest, nodes_text.as_bytes()).expect("EV-free chart bundle must validate");
+    let map = core_preflop::build_node_map(&manifest, &envelope).unwrap();
+    let chart = core_preflop::ChartTranscription { info: manifest, nodes: map };
+    let key = core_preflop::PreflopNodeKey { depth_bb: 100, rake_profile: "5% cap 0.5bb".into(), straddle: false, history: vec![] };
+    let node = chart.lookup(&key).expect("EV-free chart bundle must load");
+    assert_eq!(node.ev_source_sb, None);
+}
+
+/// R3: bypasses `load_bundle`/`checked_envelope` entirely, proving `ChartTranscription::
+/// lookup`'s EV-clearing is a property of the adapter itself, not just something load-time
+/// validation happens to guarantee.
+#[test]
+fn chart_lookup_clears_ev_even_when_constructed_directly() {
+    let info: core_preflop::BundleInfo = serde_json::from_slice(MANIFEST_JSON).unwrap();
+    let envelope = core_preflop::checked_envelope(&info, NODES_JSON).unwrap();
+    let map = core_preflop::build_node_map(&info, &envelope).unwrap();
+    let key = core_preflop::PreflopNodeKey { depth_bb: 100, rake_profile: "5% cap 0.5bb".into(), straddle: false, history: vec![] };
+    // Sanity: this map really does carry a live EV before being wrapped as a chart adapter.
+    assert!(map[&core_preflop::node_key(&key)].ev_source_sb.is_some());
+
+    let chart = core_preflop::ChartTranscription { info, nodes: map };
+    let node = chart.lookup(&key).unwrap();
+    assert_eq!(node.ev_source_sb, None, "ChartTranscription::lookup must clear EV regardless of what is stored");
+}
+
+/// R6 regression: a malformed node late in a multi-node bundle must be identified by its own
+/// history, not the first node's (which stays valid and empty here).
+#[test]
+fn node_validation_error_names_the_offending_nodes_own_history() {
+    let mut e = base_envelope(); // node 0: empty history, actor UTG, valid.
+    let mut second = e.nodes[0].clone();
+    second.history = vec![("UTG".into(), "raise".into(), 2500)];
+    second.actor = "HJ".into();
+    e.nodes.push(second);
+    e.nodes[1].weights[0][3] = 0.0; // corrupt only the second node: an undeclared zero class.
+
+    let err = validate(&e).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("raise") && msg.contains("2500"), "message must name the second node's own history: {msg}");
+    assert!(!msg.contains("node 0"), "message must identify the second (index 1) node, not the first: {msg}");
+}
+
+// --- R1: filesystem containment must be link-safe, not merely lexical ---
+
+/// Creates a Windows directory junction at `link` -> `target` via `mklink /J` (unlike a true
+/// symbolic link, this needs no elevated privilege). Returns `false` and prints an explicit
+/// reason if creation is denied in this environment, so a caller can skip the link-dependent
+/// assertions explicitly -- never silently pass.
+fn try_make_junction(link: &Path, target: &Path) -> bool {
+    let out = std::process::Command::new("cmd.exe").args(["/C", "mklink", "/J", &link.display().to_string(), &target.display().to_string()]).output();
+    match out {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            eprintln!(
+                "skipping junction-dependent assertions: mklink /J denied (exit {:?}): {}{}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("skipping junction-dependent assertions: could not run mklink: {e}");
+            false
+        }
+    }
+}
+
+/// Creates a true Windows file symlink (needs `SeCreateSymbolicLinkPrivilege`, e.g.
+/// Developer Mode or an elevated process -- unlike a junction, there is no unprivileged
+/// equivalent for a single file). Returns `false` and prints an explicit reason if denied.
+fn try_make_file_symlink(link: &Path, target: &Path) -> bool {
+    match std::os::windows::fs::symlink_file(target, link) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("skipping file-symlink-dependent assertions: symlink_file denied: {e}");
+            false
+        }
+    }
+}
+
+#[test]
+fn open_rejects_external_directory_link_without_touching_its_target() {
+    let pid = std::process::id();
+    let root = std::env::temp_dir().join(format!("core_preflop_p3t2_r1_link_{pid}"));
+    let external = std::env::temp_dir().join(format!("core_preflop_p3t2_r1_external_{pid}"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&external);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&external).unwrap();
+
+    // A fully valid bundle, planted OUTSIDE the store's directory.
+    std::fs::write(external.join("manifest.json"), MANIFEST_JSON).unwrap();
+    std::fs::write(external.join("nodes.json"), NODES_JSON).unwrap();
+
+    let link = root.join("evil");
+    if !try_make_junction(&link, &external) {
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&external);
+        return;
+    }
+
+    let (store, banners) = core_preflop::PreflopStore::open(&root);
+    assert!(store.bundle_of(&good_bundle_id()).is_none(), "a bundle reached through a directory link must never load: {banners:?}");
+    assert!(!banners.is_empty(), "the link entry must be rejected with a banner");
+    // External content must remain completely untouched: still present at its own path,
+    // still byte-identical, never renamed or read-and-rewritten.
+    assert_eq!(std::fs::read(external.join("nodes.json")).unwrap(), NODES_JSON);
+    assert_eq!(std::fs::read(external.join("manifest.json")).unwrap(), MANIFEST_JSON);
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&external);
+}
+
+#[test]
+fn open_rejects_bundle_whose_input_file_is_a_symlink() {
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("core_preflop_p3t2_r1_filelink_{pid}"));
+    let external = std::env::temp_dir().join(format!("core_preflop_p3t2_r1_filelink_ext_{pid}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&external);
+    std::fs::create_dir_all(dir.join("sneaky")).unwrap();
+    std::fs::create_dir_all(&external).unwrap();
+
+    // A real manifest.json inside a genuine child directory, but nodes.json is a symlink to
+    // external content.
+    std::fs::write(dir.join("sneaky").join("manifest.json"), MANIFEST_JSON).unwrap();
+    std::fs::write(external.join("nodes.json"), NODES_JSON).unwrap();
+    let link = dir.join("sneaky").join("nodes.json");
+
+    if !try_make_file_symlink(&link, &external.join("nodes.json")) {
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&external);
+        return;
+    }
+
+    let (store, banners) = core_preflop::PreflopStore::open(&dir);
+    assert!(store.bundle_of(&good_bundle_id()).is_none(), "a bundle read through a linked input file must never load: {banners:?}");
+    assert!(!banners.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&external);
+}
+
+#[test]
+fn quarantine_name_skips_a_name_already_occupied_by_a_plain_entry() {
+    let dir = std::env::temp_dir().join(format!("core_preflop_p3t2_r1_occupied_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A bad bundle that will need quarantining.
+    let text = nodes_json_text("bad", "[]", "BB", baseline_actions(), &baseline_weights(), None, "[]"); // R2 defect: wrong actor
+    let hash = sha256_hex(text.as_bytes());
+    let manifest_text = minimal_manifest_json("bad", "PokerDataJson", "[0.5,1.0]", &hash);
+    std::fs::create_dir_all(dir.join("bad")).unwrap();
+    std::fs::write(dir.join("bad").join("manifest.json"), manifest_text.as_bytes()).unwrap();
+    std::fs::write(dir.join("bad").join("nodes.json"), text.as_bytes()).unwrap();
+
+    // Pre-occupy the first quarantine name with an ordinary file.
+    std::fs::write(dir.join("bad.bad"), b"already here").unwrap();
+
+    let (_, banners) = core_preflop::PreflopStore::open(&dir);
+    assert_eq!(banners.len(), 1, "{banners:?}");
+    assert!(dir.join("bad.1.bad").exists(), "the smallest free name must be bad.1.bad, since bad.bad is occupied");
+    assert_eq!(std::fs::read(dir.join("bad.bad")).unwrap(), b"already here", "the pre-existing bad.bad entry must be untouched");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn quarantine_name_treats_a_dangling_junction_as_occupied() {
+    let dir = std::env::temp_dir().join(format!("core_preflop_p3t2_r1_dangling_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let text = nodes_json_text("bad", "[]", "BB", baseline_actions(), &baseline_weights(), None, "[]"); // R2 defect: wrong actor
+    let hash = sha256_hex(text.as_bytes());
+    let manifest_text = minimal_manifest_json("bad", "PokerDataJson", "[0.5,1.0]", &hash);
+    std::fs::create_dir_all(dir.join("bad")).unwrap();
+    std::fs::write(dir.join("bad").join("manifest.json"), manifest_text.as_bytes()).unwrap();
+    std::fs::write(dir.join("bad").join("nodes.json"), text.as_bytes()).unwrap();
+
+    // A dangling junction at the first quarantine name: `Path::exists` reports `false` for
+    // this (it tries to resolve the target and fails), which is exactly the bug R1 fixes.
+    let target = dir.join("dangling_target");
+    std::fs::create_dir_all(&target).unwrap();
+    let dangling = dir.join("bad.bad");
+    let have_junction = try_make_junction(&dangling, &target);
+    std::fs::remove_dir_all(&target).unwrap();
+    if !have_junction {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    assert!(!dangling.exists(), "sanity: Path::exists must report false for this dangling link");
+    assert!(std::fs::symlink_metadata(&dangling).is_ok(), "sanity: symlink_metadata must still see the link itself");
+
+    let (_, banners) = core_preflop::PreflopStore::open(&dir);
+    assert_eq!(banners.len(), 1, "{banners:?}");
+    assert!(dir.join("bad.1.bad").exists(), "bad.bad is occupied by a dangling link, so the free name must be bad.1.bad");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

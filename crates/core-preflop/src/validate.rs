@@ -91,38 +91,51 @@ fn check_node_evs(evs: Option<&Vec<Vec<Option<f64>>>>, actions_len: usize) -> Re
     Ok(())
 }
 
-/// Every non-numeric structural rule plus the numeric rules above, applied envelope-wide
-/// (class order/depth, and, per node: actor validity, non-empty menu, unique history,
-/// resolved sizes, unique action kinds, unique unreachable indices, then the numeric rules).
-fn check_envelope(class_order: &str, depth_bb: u16, nodes: &[WideNode]) -> Result<(), BundleError> {
+/// One node's structural rules (actor validity, non-empty menu, unique history, resolved
+/// sizes, unique action kinds, unique unreachable indices, then the numeric rules). Split out
+/// of `check_envelope` (R6) so every error it produces can be wrapped with `n`'s own history
+/// at a single boundary, rather than each `return Err(...)` needing to remember to attach it.
+fn check_node(n: &WideNode, positions: &[&str; 6], keys: &mut std::collections::BTreeSet<String>) -> Result<(), BundleError> {
     let bad = |s: &str| BundleError::Content(s.into());
+    if !positions.contains(&n.actor) || n.actions.is_empty() || !keys.insert(serde_json::to_string(n.history)?) {
+        return Err(bad("actor, empty menu, or duplicate history"));
+    }
+    // History tuples are `(position, step, amount)` with 0 meaning "no amount",
+    // which is why the history check maps 0 to None before calling `valid_step`.
+    if n.history.iter().any(|(p, s, v)| !positions.contains(&p.as_str()) || !valid_step(s, (*v != 0).then_some(*v)))
+        || n.actions.iter().any(|a| !valid_step(&a.step, a.to_bb_x1000))
+    {
+        return Err(bad("unresolved size or invalid token"));
+    }
+    let mut menu = std::collections::BTreeSet::new();
+    if n.actions.iter().any(|a| !menu.insert((a.step.clone(), a.to_bb_x1000))) {
+        return Err(bad("duplicate action kind and amount"));
+    }
+    let mut unreachable_seen = std::collections::BTreeSet::new();
+    if n.unreachable_classes.iter().any(|c| !unreachable_seen.insert(*c)) {
+        return Err(bad("duplicate unreachable class"));
+    }
+    check_node_weights(&n.weights, n.actions.len(), n.unreachable_classes)?;
+    check_node_evs(n.evs.as_ref(), n.actions.len())?;
+    Ok(())
+}
+
+/// Every non-numeric structural rule plus the numeric rules above, applied envelope-wide
+/// (class order/depth, and, per node: `check_node`). R6: any per-node failure is rewrapped
+/// with that node's own index and `history` (never another node's, and never fabricated for
+/// an envelope-wide failure like the class-order/depth check above, which names no node at
+/// all) so a quarantine banner can identify the offending node, not just the bundle.
+fn check_envelope(class_order: &str, depth_bb: u16, nodes: &[WideNode]) -> Result<(), BundleError> {
     if class_order != "A-2 row-major, section 4.1" || depth_bb == 0 {
-        return Err(bad("class order or depth"));
+        return Err(BundleError::Content("class order or depth".into()));
     }
     let positions = ["UTG", "HJ", "CO", "BTN", "SB", "BB"];
     let mut keys = std::collections::BTreeSet::new();
-    for n in nodes {
-        if !positions.contains(&n.actor) || n.actions.is_empty() || !keys.insert(serde_json::to_string(n.history)?) {
-            return Err(bad("actor, empty menu, or duplicate history"));
-        }
-        // History tuples are `(position, step, amount)` with 0 meaning "no amount",
-        // which is why the history check maps 0 to None before calling `valid_step`.
-        if n.history.iter().any(|(p, s, v)| {
-            !positions.contains(&p.as_str()) || !valid_step(s, (*v != 0).then_some(*v))
-        }) || n.actions.iter().any(|a| !valid_step(&a.step, a.to_bb_x1000))
-        {
-            return Err(bad("unresolved size or invalid token"));
-        }
-        let mut menu = std::collections::BTreeSet::new();
-        if n.actions.iter().any(|a| !menu.insert((a.step.clone(), a.to_bb_x1000))) {
-            return Err(bad("duplicate action kind and amount"));
-        }
-        let mut unreachable_seen = std::collections::BTreeSet::new();
-        if n.unreachable_classes.iter().any(|c| !unreachable_seen.insert(*c)) {
-            return Err(bad("duplicate unreachable class"));
-        }
-        check_node_weights(&n.weights, n.actions.len(), n.unreachable_classes)?;
-        check_node_evs(n.evs.as_ref(), n.actions.len())?;
+    for (index, n) in nodes.iter().enumerate() {
+        check_node(n, &positions, &mut keys).map_err(|e| match e {
+            BundleError::Content(reason) => BundleError::Content(format!("node {index} (history {:?}): {reason}", n.history)),
+            other => other,
+        })?;
     }
     Ok(())
 }
