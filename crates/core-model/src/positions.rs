@@ -20,7 +20,7 @@ pub fn validate_table(cfg: &HandConfig, button: Seat, dealt: &[Seat]) -> Result<
     if cfg.sb_chips == 0 || cfg.bb_chips < cfg.sb_chips { return Err(invalid("blinds must satisfy 0 < sb <= bb")); }
     if let Some(s) = cfg.straddle {
         if dealt.len() != 6 { return Err(RulesError::FormatUnsupported { detail: "straddle requires six dealt seats".into() }); }
-        if s.amount_chips < 2 * cfg.bb_chips { return Err(RulesError::FormatUnsupported { detail: "short straddle post".into() }); }
+        if u64::from(s.amount_chips) < 2 * u64::from(cfg.bb_chips) { return Err(RulesError::FormatUnsupported { detail: "short straddle post".into() }); }
     }
     Ok(ring(button, dealt))
 }

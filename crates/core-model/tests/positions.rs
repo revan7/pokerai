@@ -65,3 +65,24 @@ fn dealt_seats_3_to_6() {
     assert!(validate_table(&c, Seat(4), &three).is_err(), "button must be dealt");
     assert!(validate_table(&c, Seat(5), &seats(&[5, 0, 0])).is_err(), "duplicate seat");
 }
+
+#[test]
+fn straddle_validation_does_not_overflow() {
+    let six = seats(&[0, 1, 2, 3, 4, 5]);
+    // Mathematical minimum straddle for bb_chips = 2_147_483_648 is 4_294_967_296, which is
+    // outside u32::MAX (4_294_967_295). This must be rejected via `FormatUnsupported`, not by
+    // panicking (overflow checks on) or silently wrapping `2 * bb_chips` to a small/zero value
+    // that would make the short-straddle comparison falsely pass (overflow checks off).
+    let overflowing = cfg(1, 2_147_483_648, Some(2_147_483_648));
+    assert!(matches!(
+        validate_table(&overflowing, Seat(5), &six),
+        Err(RulesError::FormatUnsupported { detail }) if detail == "short straddle post"
+    ));
+
+    // Valid boundary: straddle exactly equals `2 * bb_chips`, with both operands large enough
+    // that the doubling itself would overflow u32 (2_147_483_647 * 2 = 4_294_967_294, which
+    // fits, but the naive `u32` multiplication path is exercised right at the edge of the
+    // representable range). Must be accepted, not rejected.
+    let boundary = cfg(1, 2_147_483_647, Some(4_294_967_294));
+    assert!(validate_table(&boundary, Seat(5), &six).is_ok());
+}
