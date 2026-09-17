@@ -1,0 +1,155 @@
+{
+  "suite": "turn_min",
+  "spots": [
+    {
+      "id": "srp100_dry",
+      "template_id": "turn_min_v1",
+      "root_street": "turn",
+      "board": [
+        "Kh",
+        "7d",
+        "2c",
+        "4d"
+      ],
+      "oop_range": "JJ-22,AJs-A2s,K2s+,Q2s+,J2s+,T2s+,92s+,84s+,74s+,63s+,53s+,43s,32s,AJo-A2o,K5o+,Q7o+,J8o+,T8o+,98o,97o,87o,76o",
+      "ip_range": "22+,A2s+,K2s+,Q2s+,J3s+,T6s+,96s+,86s+,75s+,65s,54s,43s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o",
+      "pot": 115,
+      "stack_oop": 945,
+      "stack_ip": 945,
+      "rake": {
+        "kind": "pot_rake",
+        "rate": 0.05,
+        "cap_mchips": 5000,
+        "no_flop_no_drop": false
+      },
+      "history": [],
+      "target_bp": 50,
+      "range_source": "r8_uniform"
+    },
+    {
+      "id": "srp100_wet",
+      "template_id": "turn_min_v1",
+      "root_street": "turn",
+      "board": [
+        "Jh",
+        "9h",
+        "6c",
+        "2d"
+      ],
+      "oop_range": "JJ-22,AJs-A2s,K2s+,Q2s+,J2s+,T2s+,92s+,84s+,74s+,63s+,53s+,43s,32s,AJo-A2o,K5o+,Q7o+,J8o+,T8o+,98o,97o,87o,76o",
+      "ip_range": "22+,A2s+,K2s+,Q2s+,J3s+,T6s+,96s+,86s+,75s+,65s,54s,43s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o",
+      "pot": 115,
+      "stack_oop": 945,
+      "stack_ip": 945,
+      "rake": {
+        "kind": "pot_rake",
+        "rate": 0.05,
+        "cap_mchips": 5000,
+        "no_flop_no_drop": false
+      },
+      "history": [],
+      "target_bp": 50,
+      "range_source": "r8_uniform"
+    },
+    {
+      "id": "srp100_paired",
+      "template_id": "turn_min_v1",
+      "root_street": "turn",
+      "board": [
+        "8s",
+        "8d",
+        "3c",
+        "Qh"
+      ],
+      "oop_range": "JJ-22,AJs-A2s,K2s+,Q2s+,J2s+,T2s+,92s+,84s+,74s+,63s+,53s+,43s,32s,AJo-A2o,K5o+,Q7o+,J8o+,T8o+,98o,97o,87o,76o",
+      "ip_range": "22+,A2s+,K2s+,Q2s+,J3s+,T6s+,96s+,86s+,75s+,65s,54s,43s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o",
+      "pot": 115,
+      "stack_oop": 945,
+      "stack_ip": 945,
+      "rake": {
+        "kind": "pot_rake",
+        "rate": 0.05,
+        "cap_mchips": 5000,
+        "no_flop_no_drop": false
+      },
+      "history": [],
+      "target_bp": 50,
+      "range_source": "r8_uniform"
+    },
+    {
+      "id": "srp200_dry",
+      "template_id": "turn_min_v1",
+      "root_street": "turn",
+      "board": [
+        "Kh",
+        "7d",
+        "2c",
+        "4d"
+      ],
+      "oop_range": "JJ-22,AJs-A2s,K2s+,Q2s+,J2s+,T2s+,92s+,84s+,74s+,63s+,53s+,43s,32s,AJo-A2o,K5o+,Q7o+,J8o+,T8o+,98o,97o,87o,76o",
+      "ip_range": "22+,A2s+,K2s+,Q2s+,J3s+,T6s+,96s+,86s+,75s+,65s,54s,43s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o",
+      "pot": 115,
+      "stack_oop": 1945,
+      "stack_ip": 1945,
+      "rake": {
+        "kind": "pot_rake",
+        "rate": 0.05,
+        "cap_mchips": 5000,
+        "no_flop_no_drop": false
+      },
+      "history": [],
+      "target_bp": 50,
+      "range_source": "r8_uniform"
+    },
+    {
+      "id": "srp200_wet",
+      "template_id": "turn_min_v1",
+      "root_street": "turn",
+      "board": [
+        "Jh",
+        "9h",
+        "6c",
+        "2d"
+      ],
+      "oop_range": "JJ-22,AJs-A2s,K2s+,Q2s+,J2s+,T2s+,92s+,84s+,74s+,63s+,53s+,43s,32s,AJo-A2o,K5o+,Q7o+,J8o+,T8o+,98o,97o,87o,76o",
+      "ip_range": "22+,A2s+,K2s+,Q2s+,J3s+,T6s+,96s+,86s+,75s+,65s,54s,43s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o",
+      "pot": 115,
+      "stack_oop": 1945,
+      "stack_ip": 1945,
+      "rake": {
+        "kind": "pot_rake",
+        "rate": 0.05,
+        "cap_mchips": 5000,
+        "no_flop_no_drop": false
+      },
+      "history": [],
+      "target_bp": 50,
+      "range_source": "r8_uniform"
+    },
+    {
+      "id": "srp200_paired",
+      "template_id": "turn_min_v1",
+      "root_street": "turn",
+      "board": [
+        "8s",
+        "8d",
+        "3c",
+        "Qh"
+      ],
+      "oop_range": "JJ-22,AJs-A2s,K2s+,Q2s+,J2s+,T2s+,92s+,84s+,74s+,63s+,53s+,43s,32s,AJo-A2o,K5o+,Q7o+,J8o+,T8o+,98o,97o,87o,76o",
+      "ip_range": "22+,A2s+,K2s+,Q2s+,J3s+,T6s+,96s+,86s+,75s+,65s,54s,43s,A2o+,K7o+,Q8o+,J8o+,T8o+,98o",
+      "pot": 115,
+      "stack_oop": 1945,
+      "stack_ip": 1945,
+      "rake": {
+        "kind": "pot_rake",
+        "rate": 0.05,
+        "cap_mchips": 5000,
+        "no_flop_no_drop": false
+      },
+      "history": [],
+      "target_bp": 50,
+      "range_source": "r8_uniform"
+    }
+  ]
+}
