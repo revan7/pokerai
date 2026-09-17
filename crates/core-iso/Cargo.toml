@@ -1,0 +1,12 @@
+[package]
+name = "core-iso"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Board canonicalization under suit permutations with the stabilizer tie-break (spec section 2)"
+
+[dependencies]
+proto = { path = "../proto" }
+core-ranges = { path = "../core-ranges" }
+serde = { workspace = true }
