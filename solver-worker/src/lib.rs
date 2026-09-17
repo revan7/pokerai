@@ -1,4 +1,6 @@
 pub mod cards;
+pub mod memory;
+pub mod solve_loop;
 pub mod win;
 
 use proto::worker::{Ready, WorkerMessage, ADAPTER_VERSION, PROTO_VERSION};
