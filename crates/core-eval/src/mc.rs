@@ -5,6 +5,12 @@
 //! rejected when any two combos share a card, so an accepted tuple carries the product of its
 //! combos' weights over the disjoint tuples. The runout is a uniform partial shuffle of what is
 //! left of the deck. Sampling is seeded, so the same request and seed reproduce the same answer.
+//!
+//! Every phase of a run - the compatibility search as much as the sampling loop - is inside the
+//! caller's budget and answers the cancel flag (spec section 7, review T25-R1), and `InvalidRanges`
+//! is a statement about the ranges alone: an empty support, or a completed proof that no disjoint
+//! tuple exists. How long sampling takes to find a rare compatible tuple is a property of the
+//! sampler, never evidence about the input (review T25-R2).
 
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -14,12 +20,13 @@ use proto::{Card, EquityMethod};
 use crate::equity::{check_request, result, support, Deadline, EquityRequest, EquityResult, EquityStatus, Support, Tally};
 use crate::evaluator::{BinaryEvaluator, Evaluator};
 
-/// A colliding request with no disjoint assignment must not sample forever; after this many
-/// rejections without a single accepted tuple the request is `InvalidRanges`.
-const REJECTION_CAP: u64 = 10_000_000;
+/// Draw cap of `sample_joint_holes` alone, so a test binary asking for draws that its request can
+/// almost never produce returns a short vector instead of hanging. It carries no status meaning:
+/// `monte_carlo` has a budget and a cancel flag instead, and never reads a rejection count.
+const HELPER_DRAW_CAP: u64 = 10_000_000;
 
-/// Step cap of the compatibility search. A search that exceeds it is treated as compatible and
-/// falls through to `REJECTION_CAP`, so the bounded search never turns a solvable request into
+/// Step cap of the compatibility search. A search that exceeds it ends as `Compat::Unknown` — it
+/// proved nothing — and sampling decides, so the bounded search never turns a solvable request into
 /// `InvalidRanges` by giving up early.
 const DFS_STEP_CAP: u64 = 5_000_000;
 
@@ -89,26 +96,60 @@ impl Sampler {
     }
 }
 
-/// Bounded DFS: does any disjoint assignment exist? A search that exceeds the step cap counts as
-/// compatible, so sampling (and its own rejection cap) decides instead of this approximation.
-fn compatible(supports: &[Support], used: &mut [bool; 52], player: usize, steps: &mut u64) -> bool {
-    if player == supports.len() { return true; }
+/// Outcome of the bounded compatibility search. Only `Proven` is a statement about the ranges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Compat {
+    /// A pairwise-disjoint assignment was exhibited: some tuple can be sampled.
+    Witness,
+    /// The search was exhaustive and found none: no disjoint tuple exists. `InvalidRanges`.
+    Proven,
+    /// The step cap or a stop request ended the search before it could decide either way.
+    Unknown,
+}
+
+/// Bounded DFS for a disjoint assignment, polling the deadline on every candidate it visits.
+///
+/// The search can visit up to `DFS_STEP_CAP` candidates, which is milliseconds of work on a request
+/// whose whole budget may be half a second, so it is not a phase a caller can be made to wait out:
+/// `tick_work` is called for every candidate (the same counter the rejection loop uses, because
+/// neither produces a rank evaluation) and a stop ends the search as `Unknown` with the status
+/// recorded in `stop` (review T25-R1). An `Unknown` from any child ends the whole search, since both
+/// causes — the shared step counter and the clock — are global rather than local to one branch.
+fn compatible(
+    supports: &[Support],
+    used: &mut [bool; 52],
+    player: usize,
+    steps: &mut u64,
+    deadline: &mut Deadline<'_>,
+    stop: &mut Option<EquityStatus>,
+) -> Compat {
+    if player == supports.len() { return Compat::Witness; }
     for (_, cards, _) in &supports[player] {
         *steps += 1;
-        if *steps > DFS_STEP_CAP { return true; }
+        if *steps > DFS_STEP_CAP { return Compat::Unknown; }
+        if let Some(s) = deadline.tick_work() { *stop = Some(s); return Compat::Unknown; }
         let (a, b) = (cards[0].0 as usize, cards[1].0 as usize);
         if used[a] || used[b] { continue; }
         used[a] = true; used[b] = true;
-        let ok = compatible(supports, used, player + 1, steps);
+        let sub = compatible(supports, used, player + 1, steps, deadline, stop);
         used[a] = false; used[b] = false;
-        if ok { return true; }
+        match sub {
+            Compat::Witness => return Compat::Witness,
+            Compat::Unknown => return Compat::Unknown,
+            // This candidate leads nowhere, but the branch was searched exhaustively: try the next.
+            Compat::Proven => {}
+        }
     }
-    false
+    Compat::Proven
 }
 
-/// Test support: `count` accepted joint draws for the request's players. Bounded by the same
-/// 10,000,000-rejection cap as `monte_carlo`, so a request with no disjoint assignment returns the
-/// partial vector instead of spinning forever in the test binary.
+/// Test support: `count` accepted joint draws for the request's players.
+///
+/// Bounded by `HELPER_DRAW_CAP` rejections, so a request whose compatible tuples are unreachable by
+/// sampling returns a short vector instead of hanging a test binary. That bound belongs to this
+/// helper alone and says nothing about the request: it is not `monte_carlo`'s stopping rule, and it
+/// is never a reason to call a range invalid (review T25-R2). A caller that needs exactly `count`
+/// draws asserts on the returned length.
 ///
 /// # Panics
 /// Panics on a structurally invalid request; see `check_request`.
@@ -126,7 +167,7 @@ pub fn sample_joint_holes(req: &EquityRequest, seed: u64, count: usize) -> Vec<V
             Some(_) => out.push(holes.clone()),
             None => {
                 rejections += 1;
-                if rejections > REJECTION_CAP { break; }
+                if rejections > HELPER_DRAW_CAP { break; }
             }
         }
     }
@@ -137,8 +178,10 @@ pub fn sample_joint_holes(req: &EquityRequest, seed: u64, count: usize) -> Vec<V
 ///
 /// Status (spec section 7): `Ready` when `max_samples` is reached or the budget stops the loop with
 /// at least one completed sample, `Cancelled` when the flag stops it (with shares when any sample
-/// completed), `BudgetExceeded` only when no sample completed at all, and `InvalidRanges` when the
-/// supports admit no disjoint assignment.
+/// completed), `BudgetExceeded` only when no sample completed at all, and `InvalidRanges` only when
+/// a support is empty or the compatibility search completed a proof that no disjoint tuple exists.
+/// A request whose compatible tuples are too rare to sample is not invalid: it samples until the
+/// budget or the flag stops it and reports that (review T25-R2).
 ///
 /// # Panics
 /// Panics on a structurally invalid request; see `check_request`.
@@ -151,10 +194,22 @@ pub fn monte_carlo(req: &EquityRequest, seed: u64, max_samples: u32, budget: Dur
     if let Some(status) = deadline.check() { return result(status, None, vec![], 0, deadline.elapsed()); }
     let supports: Vec<Support> = req.players.iter().map(|p| support(&p.range, &req.board)).collect();
     let board_used = req.board_used();
-    if supports.iter().any(|s| s.is_empty()) { return result(EquityStatus::InvalidRanges, None, vec![], 0, deadline.elapsed()); }
+    // Both preflight terminals report a stop in preference to `InvalidRanges`, as the exact path
+    // does: a caller that has stopped waiting is told so, and is never told its ranges are the
+    // problem on the strength of a search that did not finish.
+    if supports.iter().any(|s| s.is_empty()) {
+        let status = deadline.check().unwrap_or(EquityStatus::InvalidRanges);
+        return result(status, None, vec![], 0, deadline.elapsed());
+    }
     let mut probe = board_used;
     let mut steps = 0u64;
-    if !compatible(&supports, &mut probe, 0, &mut steps) { return result(EquityStatus::InvalidRanges, None, vec![], 0, deadline.elapsed()); }
+    let mut probe_stop: Option<EquityStatus> = None;
+    let compat = compatible(&supports, &mut probe, 0, &mut steps, &mut deadline, &mut probe_stop);
+    if let Some(status) = probe_stop { return result(status, None, vec![], 0, deadline.elapsed()); }
+    if compat == Compat::Proven {
+        let status = deadline.check().unwrap_or(EquityStatus::InvalidRanges);
+        return result(status, None, vec![], 0, deadline.elapsed());
+    }
     let sampler = Sampler::new(supports);
     let mut rng = Xoshiro256::seed(seed);
     let mut tally = Tally::new(req, &pots);
@@ -166,16 +221,13 @@ pub fn monte_carlo(req: &EquityRequest, seed: u64, max_samples: u32, budget: Dur
     let mut deck: Vec<Card> = Vec::with_capacity(deck_base.len());
     let mut board_cards = req.board.clone();
     let mut samples = 0u64;
-    let mut rejections = 0u64;
     let mut stop: Option<EquityStatus> = None;
     while samples < max_samples as u64 {
         let Some(used) = sampler.draw_into(&mut rng, &board_used, &mut holes) else {
-            rejections += 1;
-            if samples == 0 && rejections > REJECTION_CAP {
-                return result(EquityStatus::InvalidRanges, None, vec![], 0, deadline.elapsed());
-            }
-            // A request whose players always collide completes no sample and so evaluates no rank:
-            // this is the only poll that can observe the budget or the cancel flag on that path.
+            // A rejected draw completes no sample and so evaluates no rank: this is the only poll
+            // that can observe the budget or the cancel flag on that path. How many rejections it
+            // takes to find a rare compatible tuple is not counted and cannot end the run: only the
+            // budget, the flag or `max_samples` does (review T25-R2).
             if let Some(s) = deadline.tick_work() { stop = Some(s); break; }
             continue;
         };

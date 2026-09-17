@@ -552,3 +552,179 @@ fn colliding_supports_report_invalid_ranges_promptly() {
         assert!(took < Duration::from_millis(100), "case {i}: took {took:?}");
     }
 }
+
+// Fix round 1 (review T25-R1, T25-R2): the compatibility search is part of the request's time
+// budget, and a rejection count is never evidence about the ranges.
+
+/// The T25-R1 review fixture: six seats on a five-card board whose supports admit no disjoint
+/// assignment, and whose proof costs 3,967,092 candidate visits (36 + 36^2 + 36^3 + 36^3 * 28 +
+/// two single-combo levels), just under the 5,000,000-step cap - so the compatibility search runs
+/// the proof to completion, about 6 ms, instead of falling through to sampling. Seats 0-3 hold
+/// every pair inside four disjoint card-id blocks; seats 4 and 5 both hold only the combo (40, 41).
+fn incompatible_six_player_mc(seed: u64) -> EquityRequest {
+    let last = Range1326::from_fn(|i| if i == combo_index(Card(40), Card(41)) { 1.0 } else { 0.0 });
+    EquityRequest::single_pot(
+        vec![Card(44), Card(45), Card(46), Card(47), Card(48)],
+        vec![
+            PlayerRange { seat: Seat(0), range: block_range(0, 9) },
+            PlayerRange { seat: Seat(1), range: block_range(9, 18) },
+            PlayerRange { seat: Seat(2), range: block_range(18, 27) },
+            PlayerRange { seat: Seat(3), range: block_range(27, 35) },
+            PlayerRange { seat: Seat(4), range: last.clone() },
+            PlayerRange { seat: Seat(5), range: last },
+        ],
+        EquityMode::MonteCarlo { seed, max_samples: 100_000 },
+    )
+}
+
+/// Spawns a thread that raises `cancel` `after` a spin-measured delay, and returns once that thread
+/// is running. Windows' sleep resolution (15.6 ms by default) is coarser than the searches these
+/// tests cancel, so the delay is spun, and the handshake keeps thread-start latency out of it: the
+/// caller enters `equity` within microseconds of the setter starting its own clock.
+fn cancel_after(cancel: &Arc<AtomicBool>, after: Duration) -> std::thread::JoinHandle<()> {
+    let ready = Arc::new(AtomicBool::new(false));
+    let (flag, go) = (cancel.clone(), ready.clone());
+    let handle = std::thread::spawn(move || {
+        go.store(true, Ordering::Relaxed);
+        let start = Instant::now();
+        while start.elapsed() < after { std::hint::spin_loop(); }
+        flag.store(true, Ordering::Relaxed);
+    });
+    while !ready.load(Ordering::Relaxed) { std::hint::spin_loop(); }
+    handle
+}
+
+/// T25-R1: the compatibility search runs inside the request's budget like every other phase. This
+/// proof takes about 6 ms, so a 1 ms budget must stop it mid-proof and report `BudgetExceeded` -
+/// never `InvalidRanges`, which a caller reads as a statement about its ranges, not about the clock.
+#[test]
+fn mc_compatibility_search_observes_the_budget() {
+    let req = incompatible_six_player_mc(1);
+    let start = Instant::now();
+    let res = equity(&req, Duration::from_millis(1), &no_cancel());
+    let took = start.elapsed();
+    assert_eq!(res.status, EquityStatus::BudgetExceeded, "stopped after {took:?}");
+    assert_eq!(res.samples, 0, "no tuple is sampled during the compatibility search");
+    assert!(res.shares.is_empty());
+    assert_eq!(res.method, None);
+    assert!(took < Duration::from_millis(50), "spec 13.1 overrun limit: stopped after {took:?}");
+}
+
+/// T25-R1: the same search must observe a cancellation raised while it is running, which only a
+/// poll inside the traversal can catch.
+#[test]
+fn mc_compatibility_search_observes_cancellation() {
+    let req = incompatible_six_player_mc(1);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let setter = cancel_after(&cancel, Duration::from_millis(1));
+    let start = Instant::now();
+    let res = equity(&req, Duration::from_secs(5), &cancel);
+    let took = start.elapsed();
+    setter.join().unwrap();
+    assert_eq!(res.status, EquityStatus::Cancelled, "stopped after {took:?}");
+    assert_eq!(res.samples, 0);
+    assert!(res.shares.is_empty());
+    assert_eq!(res.method, None);
+    assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 1 ms flag");
+}
+
+/// T25-R2: rejections are a property of the sampler, never evidence about the ranges.
+///
+/// `AcAd` (weight 1) collides with the villain's only combo, but `KcKd` (weight 1e-12) does not, so
+/// a disjoint tuple exists and exact enumeration answers it. A sampler needs about 10^12 draws to
+/// find it, so this request is exactly the case where a rejection count must not be mistaken for a
+/// proof: the run may only end on the budget or the cancel flag, reporting `BudgetExceeded` with no
+/// shares. The contrast below is a genuinely impossible pair, which the compatibility proof still
+/// reports as `InvalidRanges`.
+#[test]
+fn rejection_exhaustion_is_never_invalid_ranges() {
+    let board = cards("2c7d9hJs4s");
+    let rare = Range1326::from_fn(|i| if i == combo("AcAd") { 1.0 } else if i == combo("KcKd") { 1e-12 } else { 0.0 });
+    let players = || vec![PlayerRange { seat: Seat(0), range: rare.clone() }, fixed(1, "AcAh")];
+
+    let exact = equity(&EquityRequest::single_pot(board.clone(), players(), EquityMode::Exact), Duration::from_secs(10), &no_cancel());
+    assert_eq!(exact.status, EquityStatus::Ready, "KcKd against AcAh is a disjoint tuple");
+    assert_eq!(share(&exact, 0), 0.0, "K K J 9 7 never beats A A J 9 7");
+    assert_eq!(share(&exact, 1), 1.0);
+
+    // The rejection cap used to be reached in about 60 ms, so this budget is long enough for the
+    // old behaviour to surface and short enough to keep the test cheap.
+    let budget = Duration::from_millis(300);
+    let mc = EquityRequest::single_pot(board.clone(), players(), EquityMode::MonteCarlo { seed: 1, max_samples: 1 });
+    let start = Instant::now();
+    let res = equity(&mc, budget, &no_cancel());
+    let took = start.elapsed();
+    assert_ne!(res.status, EquityStatus::InvalidRanges, "a compatible tuple exists; rejections prove nothing");
+    assert_eq!(res.status, EquityStatus::BudgetExceeded, "stopped after {took:?}");
+    assert_eq!(res.samples, 0);
+    assert!(res.shares.is_empty());
+    assert_eq!(res.method, None);
+    assert!(took >= budget, "the loop must sample until the budget, not stop at a rejection count: {took:?}");
+    assert!(took < budget + Duration::from_millis(100), "overran its budget: {took:?}");
+
+    // Contrast: no disjoint tuple at all, which the completed proof does report.
+    let impossible = EquityRequest::single_pot(board, vec![fixed(0, "AcAd"), fixed(1, "AcAd")], EquityMode::MonteCarlo { seed: 1, max_samples: 1 });
+    let start = Instant::now();
+    let res = equity(&impossible, Duration::from_secs(5), &no_cancel());
+    assert_eq!(res.status, EquityStatus::InvalidRanges);
+    assert_eq!(res.samples, 0);
+    assert!(start.elapsed() < Duration::from_millis(100), "a completed proof is prompt");
+}
+
+/// A Monte Carlo request that is already cancelled, or has no budget left, reports that before it
+/// builds a support or visits a single candidate (the exact path's rule, spec 13.1).
+#[test]
+fn mc_entry_stop_reports_before_any_work() {
+    let board = cards("Kh7d2c");
+    let req = || EquityRequest::single_pot(board.clone(), vec![player(0, "random", &board), player(1, "random", &board)], EquityMode::MonteCarlo { seed: 2, max_samples: 100_000 });
+    let res = equity(&req(), Duration::from_secs(10), &AtomicBool::new(true));
+    assert_eq!(res.status, EquityStatus::Cancelled);
+    assert_eq!(res.samples, 0);
+    assert!(res.shares.is_empty());
+    assert_eq!(res.method, None);
+    let res = equity(&req(), Duration::ZERO, &no_cancel());
+    assert_eq!(res.status, EquityStatus::BudgetExceeded);
+    assert_eq!(res.samples, 0);
+    assert!(res.shares.is_empty());
+    assert_eq!(res.method, None);
+}
+
+/// Partial results: a stop that arrives after some samples keeps the estimate. The budget stopping
+/// the loop is still `Ready` (the estimate is what was asked for, only shorter); the cancel flag is
+/// `Cancelled` but still carries the shares, because the caller may yet want them.
+#[test]
+fn mc_partial_runs_keep_their_shares() {
+    let board = cards("Kh7d2c");
+    let req = || EquityRequest::single_pot(board.clone(), vec![player(0, "random", &board), player(1, "random", &board)], EquityMode::MonteCarlo { seed: 8, max_samples: u32::MAX });
+
+    let budget = Duration::from_millis(50);
+    let start = Instant::now();
+    let res = equity(&req(), budget, &no_cancel());
+    let took = start.elapsed();
+    assert_eq!(res.status, EquityStatus::Ready, "a budget stop with samples in hand is still an answer");
+    assert!(res.samples > 0 && res.samples < u32::MAX as u64, "partial sample count {}", res.samples);
+    assert!(took < budget + Duration::from_millis(50), "stopped {took:?} after a {budget:?} budget");
+    let sum: f32 = res.shares.iter().map(|s| s.value).sum();
+    assert!((sum - 1.0).abs() < 1e-5, "shares sum to {sum}");
+    match res.method {
+        Some(EquityMethod::MonteCarlo { samples, std_err }) => {
+            assert_eq!(samples as u64, res.samples);
+            assert!(std_err > 0.0);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let setter = cancel_after(&cancel, Duration::from_millis(20));
+    let start = Instant::now();
+    let res = equity(&req(), Duration::from_secs(10), &cancel);
+    let took = start.elapsed();
+    setter.join().unwrap();
+    assert_eq!(res.status, EquityStatus::Cancelled);
+    assert!(res.samples > 0, "the samples taken before the flag are not thrown away");
+    assert!(!res.shares.is_empty());
+    let sum: f32 = res.shares.iter().map(|s| s.value).sum();
+    assert!((sum - 1.0).abs() < 1e-5, "shares sum to {sum}");
+    assert!(matches!(res.method, Some(EquityMethod::MonteCarlo { .. })));
+    assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 20 ms flag");
+}
