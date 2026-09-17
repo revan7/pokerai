@@ -20,3 +20,6 @@ __pycache__/
 
 # Benchmark temporary files
 docs/bench/*.tmp
+
+# SDD scratch workspace (ledger, briefs, reports, review packages)
+.superpowers/
