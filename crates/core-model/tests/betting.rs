@@ -150,3 +150,30 @@ fn short_big_blind_preserves_the_full_bring_in() {
 fn open_rejects_a_live_seat_missing_from_the_order() {
     let _ = Round::open(Street::Flop, vec![Seat(0)], [100, 100, 0, 0, 0, 0], [false, false, true, true, true, true], [false; 6], 2);
 }
+
+/// T1 (final review): a seat that posts twice keeps `committed[i] <= facing` -- the guard is the
+/// commitment, not the nominal amount (`Round::post`'s `.max(committed[i])`).
+///
+/// That `.max` term is the only branch in `Round` with no coverage, and what it protects is an
+/// always-on assert: `owed` asserts `facing >= committed[i]`, so a `facing` left behind a
+/// double-poster's commitment turns `legal()` into a process abort.
+#[test]
+fn a_double_post_raises_the_bring_in_to_the_commitment() {
+    let mut r = Round::open(
+        Street::Preflop,
+        vec![Seat(0), Seat(1)],
+        [100, 100, 0, 0, 0, 0],
+        [false, false, true, true, true, true],
+        [false; 6],
+        2,
+    );
+    r.post(Seat(0), 1);
+    r.post(Seat(0), 2);
+    assert_eq!((r.committed[0], r.facing), (3, 3), "facing follows the commitment, not the 2-chip nominal");
+    assert_eq!(
+        r.legal(),
+        vec![LegalAction::Check, LegalAction::Raise { min_to: 5, max_to: 100 }, LegalAction::AllIn { to: 100 }],
+        "seat 1 is not the double-poster and must still get a legal set, not an assert"
+    );
+    assert_eq!(chips_in_play(&r), 200, "two posts by one seat manufacture no chips");
+}

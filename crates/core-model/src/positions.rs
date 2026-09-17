@@ -29,7 +29,10 @@ pub fn validate_table(cfg: &HandConfig, button: Seat, dealt: &[Seat]) -> Result<
 pub fn positions(button: Seat, dealt: &[Seat]) -> Vec<(Seat, Position)> {
     let r = ring(button, dealt);
     let n = r.len();
-    debug_assert!((3..=6).contains(&n));
+    // Always-on, per the standing ruling: `positions` is `pub` and re-exported at the crate root,
+    // nothing forces `validate_table` to have run first, and the next line slices a three-name
+    // array from `6 - n` -- in release that was a raw slice panic naming nothing useful (review S7).
+    assert!((3..=6).contains(&n), "positions: {n} dealt seats; 3 to 6 are supported");
     let names = &[Position::Utg, Position::Hj, Position::Co][(6 - n)..];
     let mut out = vec![(r[0], Position::Sb), (r[1], Position::Bb)];
     for (k, seat) in r[2..n - 1].iter().enumerate() { out.push((*seat, names[k])); }

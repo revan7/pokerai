@@ -86,3 +86,26 @@ fn straddle_validation_does_not_overflow() {
     let boundary = cfg(1, 2_147_483_647, Some(4_294_967_294));
     assert!(validate_table(&boundary, Seat(5), &six).is_ok());
 }
+
+/// S7 (final review): `positions` guarded its 3-to-6 dealt-seat range with the last surviving
+/// `debug_assert!` in the plan-1 tree. Standing ruling (b): an infallible internal enforces its
+/// invariants with an always-on `assert!` naming the offending value. `positions` is `pub` and
+/// re-exported at the crate root, and nothing forces `validate_table` to have run first, so in
+/// release the next line sliced a 3-name array from index `6 - n` and panicked with a raw slice
+/// message that named nothing useful.
+#[test]
+#[should_panic(expected = "positions: 2 dealt seats; 3 to 6 are supported")]
+fn positions_names_the_unsupported_seat_count() {
+    let _ = positions(Seat(1), &seats(&[0, 1]));
+}
+
+/// S8 (final review): `straddle_posts` divides by the straddle amount. `validate_table` rejects a
+/// straddle below `2 * bb`, but `straddle_posts` is a free `pub` function with no such
+/// precondition, so a zero amount produced `[inf, inf, 1.0]` -- which then serialized as
+/// `[null, null, 1.0]` and could not be read back (the S1 failure mode, reached from inside
+/// `core-model`).
+#[test]
+#[should_panic(expected = "straddle_posts: the straddle amount is at least one chip")]
+fn straddle_posts_rejects_a_zero_straddle() {
+    let _ = straddle_posts(&cfg(1, 2, Some(0)));
+}
