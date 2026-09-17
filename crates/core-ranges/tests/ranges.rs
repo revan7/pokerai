@@ -38,6 +38,12 @@ fn range_roundtrip_pio_strings() {
     assert!(parse_range("AA:-0.1").is_err());
     assert!(parse_range("AA:nan").is_err());
     assert!(parse_range("A9s-K6s").is_err());
+    // R1 regression: text weights must be validated before narrowing to f32, not after
+    assert!(matches!(parse_range("AA:1.00000001"), Err(RangeError::Weight(_))), "rounds to 1.0f32 but is out of domain as written");
+    assert!(matches!(parse_range("AA:-1e-50"), Err(RangeError::Weight(_))), "rounds to -0.0f32 but is negative as written");
+    assert_eq!(mass(&parse_range("AA:0").unwrap()), 0.0, "success control at 0");
+    assert_eq!(mass(&parse_range("AA:0.5").unwrap()), 3.0, "success control at 0.5");
+    assert_eq!(mass(&parse_range("AA:1").unwrap()), 6.0, "success control at 1");
     // a class with mixed weights prints per combo and round-trips
     let mut mixed = parse_range("AKs").unwrap();
     mixed.set(combo_index("As".parse().unwrap(), "Ks".parse().unwrap()), 0.37);
@@ -65,4 +71,47 @@ fn class_expansion_multiplicity() {
     assert_eq!(class_name(class_index(8, 7, false)), "T9o");
     assert_eq!(mass(&parse_range("random").unwrap()), 1326.0);
     assert_eq!(mass(&expand_169(&[1.0; 169])), 1326.0);
+}
+
+// R2 regression: expand_169 must assert its precondition (finite, [0,1] weights) rather than
+// silently propagating invalid values into the constructed Range1326.
+
+#[test]
+#[should_panic(expected = "class 5")]
+fn expand_169_rejects_nan() {
+    let mut classes = [0f32; 169];
+    classes[5] = f32::NAN;
+    expand_169(&classes);
+}
+
+#[test]
+#[should_panic(expected = "class 5")]
+fn expand_169_rejects_positive_infinity() {
+    let mut classes = [0f32; 169];
+    classes[5] = f32::INFINITY;
+    expand_169(&classes);
+}
+
+#[test]
+#[should_panic(expected = "class 5")]
+fn expand_169_rejects_negative_infinity() {
+    let mut classes = [0f32; 169];
+    classes[5] = f32::NEG_INFINITY;
+    expand_169(&classes);
+}
+
+#[test]
+#[should_panic(expected = "class 5")]
+fn expand_169_rejects_negative_weight() {
+    let mut classes = [0f32; 169];
+    classes[5] = -0.1;
+    expand_169(&classes);
+}
+
+#[test]
+#[should_panic(expected = "class 5")]
+fn expand_169_rejects_weight_above_one() {
+    let mut classes = [0f32; 169];
+    classes[5] = 1.5;
+    expand_169(&classes);
 }

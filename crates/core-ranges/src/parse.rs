@@ -93,9 +93,20 @@ fn expand_body(body: &str) -> Result<Vec<ComboIndex>, RangeError> {
     Ok(classes.into_iter().flat_map(class_combos).collect())
 }
 
+/// Parses a weight token as `f64` and validates finiteness and `[0, 1]` on that wider value
+/// before narrowing to `f32` (never clamping), so out-of-domain text such as `"1.00000001"`
+/// or `"-1e-50"` cannot slip through by rounding into range during narrowing. The narrowed
+/// `f32` value is re-checked as a safety net.
 fn parse_weight(text: &str) -> Result<f32, RangeError> {
-    let w: f32 = text.trim().parse().map_err(|_| RangeError::Weight(format!("cannot parse weight {text:?}")))?;
-    if !w.is_finite() || !(0.0..=1.0).contains(&w) { return Err(RangeError::Weight(format!("weight {text} is outside [0, 1]"))); }
+    let text = text.trim();
+    let w64: f64 = text.parse().map_err(|_| RangeError::Weight(format!("cannot parse weight {text:?}")))?;
+    if !w64.is_finite() || !(0.0..=1.0).contains(&w64) {
+        return Err(RangeError::Weight(format!("weight {text} is outside [0, 1]")));
+    }
+    let w = w64 as f32;
+    if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+        return Err(RangeError::Weight(format!("weight {text} is outside [0, 1]")));
+    }
     Ok(w)
 }
 
@@ -131,6 +142,17 @@ pub fn range_to_string(r: &Range1326) -> String {
 }
 
 /// Every combo of a class receives the class value (pair 6, suited 4, offsuit 12 combos).
+///
+/// # Panics
+///
+/// Panics if any of the 169 class weights is not finite or lies outside `[0.0, 1.0]`, naming
+/// the offending class index in the message. This is an always-on precondition check (not
+/// debug-only, never a silent clamp): `expand_169` stays infallible for valid input, but callers
+/// must supply already-validated class weights, since `Range1326::from_fn` performs no
+/// validation of its own.
 pub fn expand_169(classes: &[f32; CLASSES]) -> Range1326 {
+    for (i, w) in classes.iter().enumerate() {
+        assert!(w.is_finite() && (0.0..=1.0).contains(w), "expand_169: class {i} weight {w} is not finite in [0, 1]");
+    }
     Range1326::from_fn(|i| classes[class_of(i) as usize])
 }
