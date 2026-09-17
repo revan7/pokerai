@@ -18,13 +18,15 @@
 //! owns the absolute deadline (`clock::Clock::now_ms`) and passes what remains of it, defaulting to
 //! [`EQUITY_BUDGET_MS`].
 
+use crate::clock::{Clock, SystemClock};
 use core_eval::{equity, exact_cost, EquityMode, EquityRequest, EquityStatus, PlayerRange};
 use core_ranges::hero_conditioned;
 use proto::{combo_index, Availability, Card, EquityEstimate, EquityMethod, EquitySummary, Range1326, Seat};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-/// Default per-estimate equity budget in milliseconds (spec section 7).
+/// The equity phase's whole budget in milliseconds: spec section 7 gives the phase 0.5 s after
+/// `Fast`, cancellable — not 0.5 s per estimate (review R1).
 pub const EQUITY_BUDGET_MS: u64 = 500;
 /// Spec section 7 / review S3: the engine chooses exact enumeration iff `exact_cost(&req) <= 2 * 10^7`.
 pub const EXACT_COST_LIMIT: u64 = 20_000_000;
@@ -45,6 +47,9 @@ const VILLAIN: Seat = Seat(1);
 pub(crate) enum NoEquity {
     /// Hero's cards are not entered, so there is no hero combo to run.
     NoHeroCombo,
+    /// The equity phase's one deadline passed before this estimate was started (review R1). It is
+    /// not `BudgetExceeded`: no work was done and no partial answer exists.
+    DeadlineExpired,
     /// Empty support, or a completed proof that the two ranges cannot meet at a showdown.
     InvalidRanges,
     /// The budget ran out before an answer (never confused with `InvalidRanges`).
@@ -60,6 +65,7 @@ impl NoEquity {
     pub(crate) fn reason(self) -> String {
         match self {
             NoEquity::NoHeroCombo => "hero's cards are not entered".to_string(),
+            NoEquity::DeadlineExpired => "equity deadline expired before this estimate".to_string(),
             NoEquity::InvalidRanges => "no compatible holdings".to_string(),
             NoEquity::BudgetExceeded => "equity budget exceeded".to_string(),
             NoEquity::Cancelled => "cancelled before an answer".to_string(),
@@ -145,19 +151,50 @@ pub fn pending_summary(opponents: &[Seat]) -> EquitySummary {
 /// Spec section 4.4's two populations for every opponent: hero's actual combo against each seat's
 /// hero-conditioned public range, and hero's public range against each public range.
 ///
-/// `budget` is per estimate, not for the whole summary; `per_pot_shares` is filled by the
-/// multiway path, not here.
+/// `budget` is **one deadline for the whole summary**, not a per-estimate allowance: spec section 7
+/// gives the equity phase 0.5 s and says "every phase receives only the remaining time" (review
+/// R1). Each estimate is handed what is left of it, a finished estimate is kept, and an estimate
+/// that never started because the deadline passed is reported `Unavailable` with that reason rather
+/// than run on a renewed budget. `per_pot_shares` is filled by the multiway path, not here.
 pub fn equity_summary(hero: Option<[Card; 2]>, hero_public: &Range1326, opponents: &[(Seat, Range1326)], board: &[Card], budget: Duration, cancel: &AtomicBool) -> EquitySummary {
+    equity_summary_with_clock(&SystemClock::new(), hero, hero_public, opponents, board, budget, cancel)
+}
+
+/// [`equity_summary`] against a caller-supplied clock: the engine's single time source, so the
+/// deadline is measurable in a test instead of raced against wall time (`clock.rs`, and nothing in
+/// the engine calls `Instant::now` itself).
+pub fn equity_summary_with_clock(clock: &dyn Clock, hero: Option<[Card; 2]>, hero_public: &Range1326, opponents: &[(Seat, Range1326)], board: &[Card], budget: Duration, cancel: &AtomicBool) -> EquitySummary {
+    // Absolute deadline, taken once. `as_millis` is `u128`, so the budget is validated in its wide
+    // form before narrowing (plan-1 standing ruling (a)) rather than clamped; the clock's own
+    // resolution is milliseconds.
+    let budget_ms = u64::try_from(budget.as_millis()).expect("equity: the summary budget in milliseconds must fit u64");
+    let deadline_ms = clock.now_ms().saturating_add(budget_ms);
+    let remaining = || {
+        let now = clock.now_ms();
+        if now >= deadline_ms { None } else { Some(Duration::from_millis(deadline_ms - now)) }
+    };
     let combo = opponents
         .iter()
         .map(|(s, r)| {
             let run = match hero {
-                Some(h) => hero_combo_run(h, r, board, budget, cancel),
                 None => Err(NoEquity::NoHeroCombo),
+                Some(h) => match remaining() {
+                    None => Err(NoEquity::DeadlineExpired),
+                    Some(left) => hero_combo_run(h, r, board, left, cancel),
+                },
             };
             (*s, estimate(run))
         })
         .collect();
-    let range = opponents.iter().map(|(s, r)| (*s, estimate(range_run(hero_public, r, board, budget, cancel)))).collect();
+    let range = opponents
+        .iter()
+        .map(|(s, r)| {
+            let run = match remaining() {
+                None => Err(NoEquity::DeadlineExpired),
+                Some(left) => range_run(hero_public, r, board, left, cancel),
+            };
+            (*s, estimate(run))
+        })
+        .collect();
     EquitySummary { hero_combo_vs_each: combo, hero_range_vs_each: range, per_pot_shares: vec![] }
 }

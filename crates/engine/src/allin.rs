@@ -51,7 +51,7 @@ pub struct AllInAnswer {
 fn unsupported(e: NoEquity) -> UnsupportedReason {
     match e {
         NoEquity::InvalidRanges | NoEquity::NoHeroCombo => UnsupportedReason::InvalidRanges,
-        NoEquity::BudgetExceeded => UnsupportedReason::DeadlineExceeded { stage: "facing-all-in hero-combo equity".to_string() },
+        NoEquity::BudgetExceeded | NoEquity::DeadlineExpired => UnsupportedReason::DeadlineExceeded { stage: "facing-all-in hero-combo equity".to_string() },
         NoEquity::Cancelled => UnsupportedReason::EngineError { message: "facing-all-in hero-combo equity cancelled".to_string(), retryable: true },
         NoEquity::Malformed(what) => UnsupportedReason::EngineError { message: format!("facing-all-in hero-combo equity: {what}"), retryable: false },
     }
