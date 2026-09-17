@@ -2,7 +2,7 @@ use super::*;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tauri::{
-    ipc::{CallbackFn, InvokeBody},
+    ipc::{CallbackFn, InvokeBody, InvokeResponseBody},
     test::{get_ipc_response, mock_builder, mock_context, noop_assets},
     webview::InvokeRequest,
 };
@@ -37,10 +37,25 @@ fn commands_delegate_and_tag_is_unsupported() {
     for command in ["finish_hand", "abandon_hand", "presolver_pause", "presolver_resume"] {
         assert_eq!(invoke(&w, command, json!({})).unwrap(), Value::Null);
     }
-    invoke(&w, "cancel", json!({"decision_id":9})).unwrap();
+    assert_eq!(invoke(&w, "cancel", json!({"decision_id":9})).unwrap(), Value::Null);
     let error = invoke(&w, "set_seat_tag", json!({"seat":2,"tag":"unknown"})).unwrap_err();
     assert!(error.to_string().contains("phase 1"));
-    assert!(!calls.lock().unwrap().iter().any(|c| c == "set_seat_tag"));
+    // Complete ordered dispatch list: `{}` for every no-argument operation, the
+    // decoded `decision_id` for `cancel`, and no `set_seat_tag` entry at all
+    // (the phase-1 stub never reaches the engine). This fails if any two
+    // operations are swapped, if `cancel`'s id is substituted, or if
+    // `set_seat_tag` ever dispatches.
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![
+            ("presolver_status".to_string(), json!({})),
+            ("finish_hand".to_string(), json!({})),
+            ("abandon_hand".to_string(), json!({})),
+            ("presolver_pause".to_string(), json!({})),
+            ("presolver_resume".to_string(), json!({})),
+            ("cancel".to_string(), json!({"decision_id":9})),
+        ]
+    );
 }
 
 // tests.rs additions: scripted values are transport fixtures, never a rules implementation.
@@ -80,8 +95,9 @@ impl service::EnginePort for ScriptPort {
             },
             Op::Undo => (json!({}), serde_json::to_value(&self.hand)?),
             Op::Recommend(channel) => {
+                let channel_id = channel.id();
                 for e in &self.events { channel.send(e.clone()).unwrap(); }
-                (json!({}), serde_json::to_value(sample_id())?)
+                (json!({"on_event_channel_id":channel_id}), serde_json::to_value(sample_id())?)
             },
             Op::Cancel(id) => (json!({"decision_id":id}), Value::Null),
             Op::PresolverStatus => (json!({}), json!({"paused":false})),
@@ -120,22 +136,65 @@ fn all_state_command_arguments_and_engine_errors_cross_ipc() {
     service.stop();
 }
 
+#[test]
+fn recommend_delivers_events_through_the_named_channel() {
+    let calls = Arc::new(Mutex::new(vec![]));
+    let event = proto::RecommendationEvent::NoDecision { identity: sample_id(), reason: "queued".into() };
+    let service = service::Service::spawn(Box::new(ScriptPort {
+        calls: calls.clone(),
+        hand: sample_hand(),
+        events: vec![event.clone()],
+    }));
+    let intercepted: Arc<Mutex<Vec<(u32, usize, Value)>>> = Arc::new(Mutex::new(vec![]));
+    let intercepted_clone = intercepted.clone();
+    let builder = mock_builder().channel_interceptor(move |_webview, callback_fn, index, body| {
+        let payload = match body {
+            InvokeResponseBody::Json(s) => serde_json::from_str(s).unwrap(),
+            InvokeResponseBody::Raw(_) => Value::Null,
+        };
+        intercepted_clone.lock().unwrap().push((callback_fn.0, index, payload));
+        true // consumed: MockRuntime has no real webview to eval a script into.
+    });
+    let app = configure(builder, service.clone()).build(mock_context(noop_assets())).unwrap();
+    let w = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+
+    let response = invoke(&w, "recommend", json!({"on_event":"__CHANNEL__:42"})).unwrap();
+    assert_eq!(response, serde_json::to_value(sample_id()).unwrap());
+    assert_eq!(*calls.lock().unwrap(), vec![("recommend".to_string(), json!({"on_event_channel_id":42}))]);
+
+    let events = intercepted.lock().unwrap();
+    assert_eq!(events.len(), 1, "exactly one scripted event should reach the channel");
+    assert_eq!(events[0].0, 42, "the event must reach the channel id supplied by on_event");
+    assert_eq!(events[0].2, serde_json::to_value(&event).unwrap());
+    drop(events);
+
+    let before = calls.lock().unwrap().len();
+    assert!(invoke(&w, "recommend", json!({})).is_err(), "a missing on_event must be rejected");
+    assert!(invoke(&w, "recommend", json!({"onEvent":"__CHANNEL__:42"})).is_err(), "camelCase onEvent must be rejected (rename_all = snake_case)");
+    assert!(invoke(&w, "recommend", json!({"on_event":"not-a-channel"})).is_err(), "a malformed channel value must be rejected");
+    assert_eq!(calls.lock().unwrap().len(), before, "rejected arguments must never reach engine dispatch");
+
+    service.stop();
+}
+
 struct RecordingPort {
-    calls: Arc<Mutex<Vec<String>>>,
+    calls: Arc<Mutex<Vec<(String, Value)>>>,
 }
 impl service::EnginePort for RecordingPort {
     fn dispatch(&mut self, op: service::Op) -> Result<Value, error::AppError> {
-        self.calls.lock().unwrap().push(op.name().into());
-        match op {
-            service::Op::PresolverStatus => Ok(json!({"paused":false,"done":4})),
-            service::Op::Cancel(_) | service::Op::Finish | service::Op::Abandon | service::Op::Pause | service::Op::Resume => {
-                Ok(Value::Null)
-            }
-            _ => Err(error::AppError::Engine { message: "script has no reply".into() }),
-        }
+        use service::Op;
+        let name = op.name().to_owned();
+        let (args, reply) = match op {
+            Op::Cancel(id) => (json!({"decision_id": id}), Ok(Value::Null)),
+            Op::PresolverStatus => (json!({}), Ok(json!({"paused":false,"done":4}))),
+            Op::Finish | Op::Abandon | Op::Pause | Op::Resume => (json!({}), Ok(Value::Null)),
+            _ => (json!({}), Err(error::AppError::Engine { message: "script has no reply".into() })),
+        };
+        self.calls.lock().unwrap().push((name, args));
+        reply
     }
     fn shutdown(&mut self) {
-        self.calls.lock().unwrap().push("shutdown".into());
+        self.calls.lock().unwrap().push(("shutdown".to_string(), json!({})));
     }
 }
 
@@ -149,7 +208,15 @@ fn service_dispatches_by_name_and_reports_engine_errors() {
     tauri::async_runtime::block_on(service.request::<()>(service::Op::Cancel(9))).unwrap();
     let error = tauri::async_runtime::block_on(service.request::<Value>(service::Op::Undo)).unwrap_err();
     assert!(matches!(error, error::AppError::Engine { .. }));
-    assert_eq!(*calls.lock().unwrap(), vec!["presolver_status", "finish_hand", "cancel", "undo"]);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![
+            ("presolver_status".to_string(), json!({})),
+            ("finish_hand".to_string(), json!({})),
+            ("cancel".to_string(), json!({"decision_id":9})),
+            ("undo".to_string(), json!({})),
+        ]
+    );
     service.stop();
 }
 
@@ -212,5 +279,5 @@ fn stop_is_idempotent_and_delegates_once() {
         std::thread::yield_now();
     }
     assert!(s.stopped());
-    assert_eq!(calls.lock().unwrap().iter().filter(|x| *x == "shutdown").count(), 1);
+    assert_eq!(calls.lock().unwrap().iter().filter(|(name, _)| name == "shutdown").count(), 1);
 }
