@@ -56,27 +56,37 @@ fn kind(w: &Walk) -> Kind {
 /// `TemplateSpec`'s fields are public and the registry establishes no invariant on a template a
 /// caller builds itself, so this is the boundary: a menu coefficient must be inside the domain
 /// `proto::MenuSize` enforces on both serde directions (positive and finite — a value outside it
-/// could not even be serialized into the `EffectiveTree` the worker receives), the two all-in
-/// thresholds must be finite and non-negative (upstream's own `ConfigError` rule, plus the
-/// finiteness upstream's `< 0.0` test misses for NaN), and the merge threshold stays pinned to 0.0
-/// because upstream's `merge_bet_actions` step is not mirrored here.
+/// could not even be serialized into the `EffectiveTree` the worker receives), a raise coefficient
+/// must in addition exceed 1.0, the two all-in thresholds must be finite and non-negative
+/// (upstream's own `ConfigError` rule, plus the finiteness upstream's `< 0.0` test misses for NaN),
+/// and the merge threshold stays pinned to 0.0 because upstream's `merge_bet_actions` step is not
+/// mirrored here.
 fn validate_template(t: &TemplateSpec) -> Result<(), UnsupportedReason> {
-    let sizes = |label: &'static str, v: &[MenuSize], street: Street| -> Result<(), UnsupportedReason> {
+    let sizes = |label: &'static str, v: &[MenuSize], street: Street, raise: bool| -> Result<(), UnsupportedReason> {
         for s in v {
             if let MenuSize::Pot(x) = s {
                 if !(x.is_finite() && *x > 0.0) {
                     return Err(unsupported(format!("template {} has an out-of-domain {label} menu size {x:e} on {street:?}: a menu size must be positive and finite", t.id)));
+                }
+                // A raise coefficient multiplies the facing wager, so `<= 1.0` names a raise-to
+                // that does not exceed it. Upstream refuses such a size at parse time
+                // (`third_party/postflop-solver/src/bet_size.rs:164`, "Multiplier must be greater
+                // than 1.0") and never builds that node, whereas this mirror would push the amount
+                // through the min-raise clamp and materialize a raise the worker's realized tree
+                // cannot contain — the `tree_mismatch` the spec forbids the engine to cause.
+                if raise && *x <= 1.0 {
+                    return Err(unsupported(format!("template {} has a {label} menu size {x:e} on {street:?}: a raise size must be greater than 1.0", t.id)));
                 }
             }
         }
         Ok(())
     };
     for (street, m) in &t.menus {
-        sizes("oop bet", &m.oop.bet, *street)?;
-        sizes("oop raise", &m.oop.raise, *street)?;
-        sizes("ip bet", &m.ip.bet, *street)?;
-        sizes("ip raise", &m.ip.raise, *street)?;
-        if let Some(donk) = &m.donk { sizes("donk", donk, *street)?; }
+        sizes("oop bet", &m.oop.bet, *street, false)?;
+        sizes("oop raise", &m.oop.raise, *street, true)?;
+        sizes("ip bet", &m.ip.bet, *street, false)?;
+        sizes("ip raise", &m.ip.raise, *street, true)?;
+        if let Some(donk) = &m.donk { sizes("donk", donk, *street, false)?; }
     }
     for (label, x) in [("add_allin_threshold", t.add_allin_threshold), ("force_allin_threshold", t.force_allin_threshold)] {
         if !(x.is_finite() && x >= 0.0) {
@@ -451,6 +461,35 @@ mod tests {
         assert_eq!(node(&m, &[]).actions, vec![Action::Check, bet(50)]);
         assert!(run(&local(vec![proto::MenuSize::Pot(4.694967296)])).is_ok());
         assert!(run(&local(vec![proto::MenuSize::AllIn])).is_ok());
+    }
+
+    /// The `local` template with a raise menu on both sides (it has none by default).
+    fn with_raises(raises: Vec<proto::MenuSize>) -> super::TemplateSpec {
+        let mut t = local(vec![proto::MenuSize::Pot(0.5)]);
+        let m = t.menus.get_mut(&Street::River).unwrap();
+        m.oop.raise = raises.clone();
+        m.ip.raise = raises;
+        t
+    }
+
+    /// A raise coefficient multiplies the facing wager, so `<= 1.0` names a raise-to that does not
+    /// exceed it. Upstream refuses such a size at parse time (`src/bet_size.rs:164`, "Multiplier
+    /// must be greater than 1.0") and never builds that node, while this mirror would push it
+    /// through the min-raise clamp and materialize a raise the worker's realized tree cannot
+    /// contain. Bet and donk coefficients keep the plain positive-finite rule.
+    #[test]
+    fn raise_sizes_must_exceed_the_facing_wager() {
+        let run = |t: &super::TemplateSpec| materialize(&MaterializeInput { template: t, starting_pot: 100, eff: 500, prefix: &[] });
+        for x in [0.5f32, 1.0, f32::MIN_POSITIVE] {
+            let e = run(&with_raises(vec![proto::MenuSize::Pot(x)]));
+            assert!(matches!(&e, Err(proto::UnsupportedReason::UnsupportedHistory { reason }) if reason.contains("raise") && reason.contains("greater than 1.0")), "{x:e} -> {e:?}");
+        }
+        // the next representable f32 above 1.0 is already a legal raise size
+        assert!(run(&with_raises(vec![proto::MenuSize::Pot(1.0000001)])).is_ok());
+        assert!(run(&with_raises(vec![proto::MenuSize::Pot(2.5)])).is_ok());
+        assert!(run(&with_raises(vec![proto::MenuSize::AllIn])).is_ok());
+        // the same coefficient stays legal as a bet size, where it is a pot fraction
+        assert!(run(&local(vec![proto::MenuSize::Pot(0.5)])).is_ok());
     }
 
     /// R3: §4.6 allows only fold and call against an all-in, and the pinned
