@@ -192,3 +192,37 @@ fn hash_scaled_asymmetric_vector_matches_frozen_digest() {
     let expected = hex32("c2d43116e02b952084a7ebccd3cf882bda59daec2daf3f54a98c0717aefbead8");
     assert_eq!(hash_scaled(&r), expected);
 }
+
+/// S5 (final review): `-0.0` passes the `[0, 1]` domain check (`-0.0 == 0.0`) and then survives
+/// into the bit-exact layers, where `hash_scaled` hashes `0x80000000` differently from
+/// `0x00000000`. A range and its own `range_to_string` round trip are then numerically identical
+/// yet produce **different cache keys**, and the same `-0.0` decides which of several equally valid
+/// suit permutations wins the section 2 tie-break.
+///
+/// The fix normalizes once, at this ingestion boundary (and at `proto`'s `Range1326` deserializer).
+/// `hash_scaled`, `apply_range` and `canonicalize` stay bit-exact as ruled by T20/T21 — an
+/// in-memory `-0.0` still hashes as `-0.0`, which is what `iso_tiebreak_negative_zero_regression`
+/// relies on.
+#[test]
+fn parsed_negative_zero_weight_hashes_as_positive_zero() {
+    let parsed = parse_range("AA:-0.0,KK").unwrap();
+    // Stored as `+0.0`, bit for bit -- not merely numerically equal to it.
+    assert_eq!(weight_of(&parsed, "AcAd").to_bits(), 0.0f32.to_bits(), "a parsed -0.0 must be stored as +0.0");
+    assert_eq!(weight_of(&parsed, "KcKd"), 1.0);
+    let plain = parse_range("KK").unwrap();
+    assert_eq!(hash_scaled(&parsed), hash_scaled(&plain), "a -0.0 weight must not change the range hash");
+    // The symptom the review measured: the text round trip drops the zero-weight combos, and the
+    // hash must be stable across it.
+    assert_eq!(range_to_string(&parsed), "KK");
+    assert_eq!(hash_scaled(&parse_range(&range_to_string(&parsed)).unwrap()), hash_scaled(&parsed), "hash stable across a text round trip");
+    // An in-memory `-0.0` is still preserved: only the text boundary normalizes. This is T21's own
+    // shape -- `-0.0` at combo 19 with a positive weight elsewhere, so `hash_scaled` divides by a
+    // non-zero maximum and actually hashes the `-0.0` bit pattern.
+    let mut in_memory = Range1326::zero();
+    in_memory.set(19, -0.0);
+    in_memory.set(1034, 1.0);
+    assert_eq!(in_memory.get(19).to_bits(), (-0.0f32).to_bits(), "`set` is not an ingestion boundary and must not normalize");
+    let mut control = Range1326::zero();
+    control.set(1034, 1.0);
+    assert_ne!(hash_scaled(&in_memory), hash_scaled(&control), "hash_scaled stays bit-exact, as T20/T21 ruled");
+}
