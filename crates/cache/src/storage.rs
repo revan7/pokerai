@@ -84,6 +84,18 @@
 //!
 //! R4 (the storage-level corruption-case matrix) and R5 (test temp-directory hygiene) are test
 //! changes only; see `crates/cache/tests/storage.rs`. R6 is a report correction only.
+//!
+//! ## Fix round 2 (review `task-5-review-round-2.md`, N1)
+//!
+//! Round 1's `read_cell_with_hook` was a `pub fn`, which itself widened the production API for a
+//! test-only seam (N1, Minor). It is now `read_cell_core` (the shared, always-compiled, private
+//! implementation both `read_cell` and the test seam call) plus a `#[cfg(test)]`, non-public
+//! `read_cell_with_hook` that only exists during `cargo test` and is only reachable from this
+//! module's own `#[cfg(test)] mod tests` below -- never from `crates/cache/tests/storage.rs`
+//! (a separate crate, which can only see this crate's real `pub` items). The R3 interleaving
+//! regression that needs the hook moved into that unit-test module with it, with every one of
+//! its assertions unchanged; `crates/cache/tests/storage.rs` now uses only the five sanctioned
+//! public interfaces.
 
 use crate::entry::CacheEntry;
 use crate::CacheError;
@@ -245,20 +257,22 @@ pub fn decode(bytes: &[u8]) -> Result<Cell, CacheError> {
     Ok(Cell { entries })
 }
 
-/// Reads and decodes the cell stored at `path`. Equivalent to `read_cell_with_hook(path, || {})`;
-/// see that function for the deletion-race guard (review R3).
+/// Reads and decodes the cell stored at `path`. Equivalent to `read_cell_core(path, || {})`; see
+/// that function for the deletion-race guard (review R3).
 pub fn read_cell(path: &Path) -> Option<Cell> {
-    read_cell_with_hook(path, || {})
+    read_cell_core(path, || {})
 }
 
 /// `read_cell`'s real implementation, with one added seam: `between_read_and_delete` runs after
-/// a decode failure but before this function decides whether to unlink anything. Production code
-/// only ever reaches this through `read_cell` (a no-op hook); the hook exists so
-/// `crates/cache/tests/storage.rs` can deterministically reproduce the exact interleaving review
-/// R3 describes (a valid replacement published in the window between this read and its cleanup)
-/// without relying on real thread scheduling/timing. Not one of this task's five sanctioned
-/// interfaces (`Cell`, `encode`, `decode`, `entry_path`, `read_cell`) -- `read_cell` itself is
-/// unchanged for any caller that does not know this function exists.
+/// a decode failure but before this function decides whether to unlink anything. `read_cell`
+/// (production, always compiled) calls this with a no-op hook; the only other caller is the
+/// `#[cfg(test)]`-only `read_cell_with_hook` wrapper just below, used solely by this module's own
+/// unit test to deterministically reproduce the exact interleaving review R3 describes (a valid
+/// replacement published in the window between a read and its cleanup) without relying on real
+/// thread scheduling/timing. Deliberately private (fix round 2, review N1: a `pub` hook-taking
+/// function would itself widen the production API for a test-only seam) -- neither this function
+/// nor `read_cell_with_hook` is one of this task's five sanctioned interfaces (`Cell`, `encode`,
+/// `decode`, `entry_path`, `read_cell`), and `read_cell` itself is unchanged for every caller.
 ///
 /// Any failure -- I/O, an oversized file, a bad header, a checksum mismatch, or a
 /// `decode`/`validate_entry` rejection -- is a cache miss (`None`). The file is deleted only if a
@@ -268,7 +282,7 @@ pub fn read_cell(path: &Path) -> Option<Cell> {
 /// best-effort proxy, not an exact identity check, and for the residual race it does not close).
 /// A mismatch -- like a deletion failure, e.g. `path` naming a directory -- is silently treated
 /// as "leave it alone": the lookup is still a miss, but nothing is removed.
-pub fn read_cell_with_hook(path: &Path, between_read_and_delete: impl FnOnce()) -> Option<Cell> {
+fn read_cell_core(path: &Path, between_read_and_delete: impl FnOnce()) -> Option<Cell> {
     let opened = std::fs::File::open(path).ok()?;
     let identity = {
         let m = opened.metadata().ok()?;
@@ -293,5 +307,233 @@ pub fn read_cell_with_hook(path: &Path, between_read_and_delete: impl FnOnce()) 
             }
             None
         }
+    }
+}
+
+/// Test-only seam (fix round 2, review N1): exposes `read_cell_core`'s hook parameter, but only
+/// under `#[cfg(test)]` and never `pub` -- it does not exist at all in a normal build, and is not
+/// reachable from `crates/cache/tests/storage.rs` (a separate crate, which can only see this
+/// crate's actual `pub` items) even during `cargo test`. Used only by this module's own
+/// `#[cfg(test)] mod tests` below.
+#[cfg(test)]
+fn read_cell_with_hook(path: &Path, between_read_and_delete: impl FnOnce()) -> Option<Cell> {
+    read_cell_core(path, between_read_and_delete)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ported from `crates/cache/tests/support/mod.rs::entry()` (fix round 2, review N1): that
+    /// helper is written for the integration-test crate, where `cache::` refers to this crate as
+    /// an external dependency; here, inside `cache` itself, the equivalent paths are `crate::`.
+    /// A full, valid `CacheEntry` is what `read_cell_does_not_delete_a_replacement_published_between_read_and_cleanup`
+    /// needs to prove its "replacement remains readable" assertion -- there is no smaller fixture
+    /// that would still exercise a real `encode`/`read_cell` round trip.
+    fn fixture_entry() -> crate::entry::CacheEntry {
+        use crate::entry::{CacheEntry, SourceInputs};
+        use crate::key::{KeyFields, Model, RakeKey, Rational};
+        use proto::{Action, EffectiveTree, MaterializedNode, MenuSize, PlayerMenus, SideMenu, Street};
+
+        let original = vec![proto::Card(46), proto::Card(21), proto::Card(0)];
+        let r = core_ranges::parse_range("AA").unwrap();
+        let (_, perm) = core_iso::canonicalize(&original, &[&r, &r]);
+        let mut board = original.iter().map(|c| core_iso::apply(&perm, *c)).collect::<Vec<_>>();
+        board.sort_by_key(|c| c.0);
+        let r = core_iso::apply_range(&perm, &r);
+        let hash = core_ranges::hash_scaled(&r);
+
+        let mut materialized = Vec::new();
+        for n in 0..6 {
+            let street = [Street::Flop, Street::Turn, Street::River][n / 2];
+            let actor = if n % 2 == 0 { "oop" } else { "ip" };
+            let other = if n % 2 == 0 { "ip" } else { "oop" };
+            materialized.push(MaterializedNode {
+                path: vec![0; n],
+                street,
+                actor: actor.into(),
+                actions: vec![Action::Check, Action::AllIn { to: 500 }],
+                terminal_pots: vec![if n == 5 { Some(100) } else { None }, None],
+            });
+            let mut facing = vec![0; n];
+            facing.push(1);
+            materialized.push(MaterializedNode {
+                path: facing,
+                street,
+                actor: other.into(),
+                actions: vec![Action::Fold, Action::Call],
+                terminal_pots: vec![Some(100), Some(1100)],
+            });
+        }
+        materialized.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let side = SideMenu { bet: vec![MenuSize::AllIn], raise: vec![MenuSize::AllIn] };
+        let menus = [Street::Flop, Street::Turn, Street::River]
+            .into_iter()
+            .map(|street| {
+                (
+                    street,
+                    PlayerMenus { oop: side.clone(), ip: side.clone(), donk: if street == Street::Flop { None } else { Some(vec![]) } },
+                )
+            })
+            .collect();
+        let tree = EffectiveTree {
+            rules_version: 3,
+            template_id: "check_jam_test_v1".into(),
+            root_street: Street::Flop,
+            menus,
+            add_allin_threshold: 0.0,
+            force_allin_threshold: 0.0,
+            merging_threshold: 0.0,
+            wager_cap: 1,
+            inserted: vec![],
+            materialized,
+        };
+
+        let nodes = tree
+            .materialized
+            .iter()
+            .filter(|n| n.street == Street::Flop)
+            .enumerate()
+            .map(|(k, n)| {
+                let mut probs = vec![vec![0.0; 2]; 1326];
+                let mut ev_chips = vec![vec![0.0; 2]; 1326];
+                let mut available = vec![false; 1326];
+                for i in 0..1326 {
+                    available[i] = r.0[i] > 0.0;
+                    probs[i] = if available[i] { vec![0.5, 0.5] } else { vec![0.0, 0.0] };
+                    ev_chips[i] = if available[i] { vec![0.0, 10.0] } else { vec![0.0, 0.0] };
+                }
+                if matches!(n.actions[0], Action::Fold) {
+                    for row in &mut ev_chips {
+                        row[0] = 0.0;
+                    }
+                }
+                for (i, row) in ev_chips.iter_mut().enumerate() {
+                    if available[i] {
+                        row[1] += k as f32;
+                    }
+                }
+                proto::worker::NodeStrategy {
+                    path: crate::entry::chip_path(&tree.materialized, &n.path).unwrap(),
+                    actor: n.actor.clone(),
+                    actions: n.actions.clone(),
+                    probs,
+                    ev_chips,
+                    available,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let solution = proto::worker::StreetSolution {
+            covered_paths: nodes.iter().map(|n| n.path.clone()).collect(),
+            nodes,
+            requested: 0,
+            exploitability_chips: 0.4,
+            iterations: 100,
+            memory_bytes: 1024,
+            mode: "f32".into(),
+            locks_applied: 0,
+            export: "street".into(),
+        };
+        let nodes = crate::entry::normalize(&solution, &tree, 100).unwrap();
+
+        let fractions = tree
+            .materialized
+            .iter()
+            .map(|n| {
+                n.actions
+                    .iter()
+                    .map(|a| match a {
+                        Action::Bet { to } | Action::Raise { to } | Action::AllIn { to } => Some(Rational::new(*to as u64, 100).unwrap()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+
+        CacheEntry {
+            key: KeyFields {
+                schema_version: 3,
+                solver_commit: proto::worker::SOLVER_COMMIT.into(),
+                adapter_version: 1,
+                rules_version: 3,
+                canonical_board: board,
+                root_street: Street::Flop,
+                spr_bucket: 81,
+                tree_signature: "check_jam_test_v1".into(),
+                rake: RakeKey::new(0.05, Rational::new(5000, 100_000).unwrap(), 1).unwrap(),
+                range_hash_oop: hash,
+                range_hash_ip: hash,
+                model: Model::Baseline,
+            },
+            source: SourceInputs {
+                pot: 100,
+                stack_oop: 500,
+                stack_ip: 500,
+                spr: Rational::new(5, 1).unwrap(),
+                bb_chips: 2,
+                quantum_over_p: Rational::new(1, 100).unwrap(),
+                cap_mchips: 5000,
+                ranges: [r.clone(), r],
+            },
+            tree,
+            fractions,
+            covered_paths: nodes.iter().map(|n| n.path.clone()).collect(),
+            nodes,
+            exploitability_over_P: 0.004,
+            target_bp: 50,
+            iterations: 100,
+            elapsed_ms: 10,
+            memory_bytes: 1024,
+            mode: "f32".into(),
+            locks_applied: 0,
+            export: "street".into(),
+            reasons: vec![],
+            created: 1,
+            last_hit: 1,
+        }
+    }
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static UNIQUE: AtomicU64 = AtomicU64::new(0);
+        let id = UNIQUE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("pokerai-cache-src-{label}-{}-{id}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("unique_temp_dir must get a fresh, exclusively-created directory at {dir:?}: {e}"));
+        dir
+    }
+
+    /// The controlled-interleaving regression review R3 asked for: a valid replacement is
+    /// published at `path` in the exact window between `read_cell`'s read (of the original
+    /// corrupt bytes) and its cleanup decision, using the test-only `read_cell_with_hook` seam
+    /// (this module's doc explains why a real thread race would be nondeterministic here). The
+    /// replacement must survive -- not be deleted -- because its `(len, last_write_time)` no
+    /// longer agrees with what was captured from the *original* file's opened handle.
+    #[test]
+    fn read_cell_does_not_delete_a_replacement_published_between_read_and_cleanup() {
+        let dir = unique_temp_dir("race");
+        let path = dir.join("cell.bin");
+        std::fs::write(&path, b"not a cache header").unwrap();
+
+        let e = fixture_entry();
+        let replacement = encode(&Cell { entries: vec![e.clone()] }).unwrap();
+
+        let got = read_cell_with_hook(&path, || {
+            // Simulates a cache-writer's atomic publish landing in the window between this
+            // read's decode failure and its cleanup step (review R3). A real writer would use a
+            // temp-file-plus-rename publish (Task 6's job); an in-place overwrite is enough here
+            // to change this path's (len, last_write_time) identity, which is all the guard
+            // checks.
+            std::fs::write(&path, &replacement).unwrap();
+        });
+        assert!(got.is_none(), "the original corrupt bytes must still be reported as a miss");
+        assert!(path.exists(), "the concurrently published replacement must survive cleanup");
+        assert_eq!(std::fs::read(&path).unwrap(), replacement, "cleanup must not have touched the replacement's bytes");
+
+        let reread = read_cell(&path).expect("the surviving replacement must still be a hit");
+        assert_eq!(reread.entries[0].key, e.key);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
