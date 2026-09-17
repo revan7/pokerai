@@ -800,7 +800,11 @@ fn monte_carlo_rejects_a_zero_sample_cap() {
 ///
 /// Exhaustive-gated (spec 13.1): this is a throughput contract, not a correctness one, and it is
 /// two orders of magnitude more work than any other test in the file.
-#[cfg(feature = "exhaustive")]
+///
+/// Release-only as well: the section 7 ceiling is a **release-profile** budget, so measuring it in
+/// a debug build asserts a number the spec never promised (this fixture reaches only 14,151,680 of
+/// its 36,796,320 evaluations in 500 ms at `opt-level = 1`, and finishes in 0.34 s in release).
+#[cfg(all(feature = "exhaustive", not(debug_assertions)))]
 #[test]
 fn exact_enumeration_at_the_selection_ceiling_finishes_inside_the_budget() {
     let board = cards("QsJd7h3c");
