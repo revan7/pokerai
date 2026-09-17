@@ -638,6 +638,23 @@ fn chart_lookup_clears_ev_even_when_constructed_directly() {
     assert_eq!(node.ev_source_sb, None, "ChartTranscription::lookup must clear EV regardless of what is stored");
 }
 
+/// N1 (P3.T2 re-review, minor): `checked_envelope` now enforces the exact `[0.5, 1.0]`
+/// source-blind contract itself, not only `load_bundle`'s earlier wide-`f64` pre-check
+/// (`check_exact_source_blinds`, private to `store.rs`) -- a `pub` caller who builds a
+/// `BundleInfo` directly and calls `checked_envelope` without ever going through
+/// `load_bundle` must still be rejected. `[0.6, 1.2]` is a "near miss": a valid (positive,
+/// finite, ordered) blind pair under the general domain check in `numeric.rs`, so nothing
+/// upstream of `checked_envelope` itself would ever catch it on this direct-call path.
+#[test]
+fn checked_envelope_alone_rejects_a_source_blinds_near_miss_pair() {
+    let bundle_id = good_bundle_id();
+    let hash = sha256_hex(NODES_JSON);
+    let manifest_text = minimal_manifest_json(&bundle_id, "PokerDataJson", "[0.5,1.0]", &hash);
+    let mut info: core_preflop::BundleInfo = serde_json::from_str(&manifest_text).unwrap();
+    info.source_blinds = [0.6, 1.2];
+    assert!(core_preflop::checked_envelope(&info, NODES_JSON).is_err());
+}
+
 /// R6 regression: a malformed node late in a multi-node bundle must be identified by its own
 /// history, not the first node's (which stays valid and empty here).
 #[test]

@@ -1,0 +1,614 @@
+"""Tests for `chart_ingest` (P3.T3): the deterministic chart ingestion and validation tool.
+
+Covers `class_names`/`build`/`validate` as pure functions, `manifest_for_chart`'s exact
+`BundleInfo` field parity with the Rust struct (Task 1), the CLI's four subcommands
+(`fetch`/`build`/`validate`/`verify`), and every structural/numeric rule `validate` enforces
+-- each exercised by an explicit malformed-row case so the rule fails without the check, per
+the standing ruling that a test must fail when its guarded artifact/behavior is missing.
+
+`fetch` is tested against a monkeypatched `chart_ingest.urlopen`, never a real network call
+(this task ships the tool only; Task 4 performs the actual acquisition).
+"""
+from __future__ import annotations
+
+import copy
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+import chart_ingest
+from chart_ingest import (
+    BUNDLE_INFO_FIELDS,
+    bb_to_x1000,
+    build,
+    class_names,
+    extract_links,
+    find_anchor,
+    manifest_for_chart,
+    validate,
+)
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+# --- exact brief scenario (Step 1) ---
+
+
+def test_class_order_and_sibling_sum():
+    assert class_names()[:3] == ["AA", "AKs", "AQs"]
+    assert class_names()[13:15] == ["AKo", "KK"]
+    t = {
+        "bundle_id": "test",
+        "depth_bb": 100,
+        "rake_profile": "undocumented",
+        "straddle": False,
+        "nodes": [
+            {
+                "history": [],
+                "actor": "UTG",
+                "page": 2,
+                "title": "UTG RFI",
+                "actions": [{"step": "fold"}, {"step": "raise", "to_bb_x1000": 2500}],
+                "legend": {"F": [1, 0], "R": [0, 1], "M": [0.5, 0.5]},
+                "rows": [["F"] * 13 for _ in range(13)],
+            }
+        ],
+    }
+    t["nodes"][0]["rows"][0][0] = "M"
+    e = build(t)
+    assert e["nodes"][0]["weights"][0][0] == 0.5
+    assert "evs" not in e["nodes"][0]
+    validate(e)
+    e["nodes"][0]["weights"][0][0] = 0.1
+    with pytest.raises(ValueError, match="sum"):
+        validate(e)
+
+
+# --- class_names ---
+
+
+def test_class_names_has_169_unique_entries():
+    names = class_names()
+    assert len(names) == 169
+    assert len(set(names)) == 169
+
+
+def test_class_names_last_entry_is_the_lowest_pair():
+    assert class_names()[168] == "22"
+
+
+# --- build: grid/legend structural errors ---
+
+
+def _transcription_node(**overrides):
+    node = {
+        "history": [],
+        "actor": "UTG",
+        "page": 2,
+        "title": "UTG RFI",
+        "actions": [{"step": "fold"}, {"step": "raise", "to_bb_x1000": 2500}],
+        "legend": {"F": [1, 0], "R": [0, 1]},
+        "rows": [["F"] * 13 for _ in range(13)],
+    }
+    node.update(overrides)
+    return node
+
+
+def _transcription(**node_overrides):
+    return {
+        "bundle_id": "test",
+        "depth_bb": 100,
+        "rake_profile": "undocumented",
+        "straddle": False,
+        "license_note": "test fixture",
+        "nodes": [_transcription_node(**node_overrides)],
+    }
+
+
+def test_build_rejects_wrong_grid_shape():
+    t = _transcription(rows=[["F"] * 13 for _ in range(12)])
+    with pytest.raises(ValueError, match="grid shape"):
+        build(t)
+
+
+def test_build_rejects_ragged_row():
+    rows = [["F"] * 13 for _ in range(13)]
+    rows[0] = ["F"] * 12
+    t = _transcription(rows=rows)
+    with pytest.raises(ValueError, match="grid shape"):
+        build(t)
+
+
+def test_build_rejects_legend_action_count_mismatch():
+    t = _transcription(legend={"F": [1, 0, 0], "R": [0, 1, 0]})
+    with pytest.raises(ValueError, match="legend action count"):
+        build(t)
+
+
+def test_build_rejects_missing_legend_code():
+    rows = [["F"] * 13 for _ in range(13)]
+    rows[3][7] = "Z"  # not in legend
+    t = _transcription(rows=rows)
+    with pytest.raises(ValueError, match="legend"):
+        build(t)
+
+
+def test_build_transposes_action_major_and_never_emits_evs():
+    t = _transcription()
+    e = build(t)
+    node = e["nodes"][0]
+    assert len(node["weights"]) == 2
+    assert all(len(row) == 169 for row in node["weights"])
+    assert "evs" not in node
+    assert node["unreachable_classes"] == []
+
+
+def test_build_preserves_explicit_unreachable_classes():
+    rows = [["F"] * 13 for _ in range(13)]
+    rows[12][12] = "Z"  # class 168 ("22"): the legend code below gives it zero weight everywhere
+    t = _transcription(rows=rows, unreachable_classes=[168], legend={"F": [1, 0], "R": [0, 1], "Z": [0, 0]})
+    e = build(t)
+    assert e["nodes"][0]["unreachable_classes"] == [168]
+    assert e["nodes"][0]["weights"][0][168] == 0
+    assert e["nodes"][0]["weights"][1][168] == 0
+
+
+def test_build_rejects_unreachable_class_with_nonzero_weight():
+    rows = [["F"] * 13 for _ in range(13)]
+    rows[12][12] = "R"  # class 168 ("22") given full weight on the raise action instead
+    t = _transcription(rows=rows, unreachable_classes=[168])
+    # class 168 (index 168 = row 12, col 12) sums to 0 on the fold action and 1 on raise --
+    # declared unreachable but not exactly zero, so `build`'s trailing `validate` must reject it.
+    with pytest.raises(ValueError, match="unreachable sum"):
+        build(t)
+
+
+# --- BundleInfo field parity (Task 1) ---
+
+
+def _rust_bundle_info_fields() -> list[str]:
+    src = (ROOT / "crates" / "core-preflop" / "src" / "envelope.rs").read_text(encoding="utf-8")
+    match = re.search(r"pub struct BundleInfo \{(.*?)\n\}", src, re.DOTALL)
+    assert match, "BundleInfo struct not found in envelope.rs"
+    return re.findall(r"pub (\w+):", match.group(1))
+
+
+def test_bundle_info_fields_has_fifteen_entries():
+    assert len(BUNDLE_INFO_FIELDS) == 15
+
+
+def test_bundle_info_fields_matches_rust_struct():
+    assert sorted(BUNDLE_INFO_FIELDS) == sorted(_rust_bundle_info_fields())
+
+
+def test_manifest_for_chart_keys_match_bundle_info_fields():
+    t = _transcription()
+    e = build(t)
+    manifest = manifest_for_chart(e, t)
+    assert sorted(manifest) == sorted(BUNDLE_INFO_FIELDS)
+
+
+def test_manifest_for_chart_forces_source_and_ev_reference():
+    t = _transcription()
+    e = build(t)
+    manifest = manifest_for_chart(e, t)
+    assert manifest["source"] == "ChartTranscription"
+    assert manifest["ev_reference"] == "unverified"
+    assert manifest["version"] == 2
+    assert manifest["game"] == "nl"
+    assert manifest["ev_unit"] == "source_sb"
+    assert manifest["depths"] == [e["depth_bb"]]
+    assert manifest["source_blinds"] == [0.5, 1.0]
+
+
+def test_manifest_for_chart_accepts_undocumented_rake_profile_with_null_rake():
+    t = _transcription()
+    t["rake_profile"] = "undocumented"
+    e = build(t)
+    manifest = manifest_for_chart(e, t)
+    assert manifest["rake"] is None
+    assert manifest["rake_profile"] == "undocumented"
+
+
+def test_manifest_for_chart_rejects_null_rake_with_documented_profile():
+    t = _transcription()
+    t["rake_profile"] = "5% cap 0.5bb"
+    e = build(t)
+    with pytest.raises(ValueError, match="undocumented"):
+        manifest_for_chart(e, t)
+
+
+def test_manifest_for_chart_sha256_matches_encoded_envelope():
+    import hashlib
+
+    t = _transcription()
+    e = build(t)
+    manifest = manifest_for_chart(e, t)
+    raw = (json.dumps(e, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    assert manifest["sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_manifest_for_chart_default_accuracy_is_unverified():
+    t = _transcription()
+    e = build(t)
+    manifest = manifest_for_chart(e, t)
+    assert manifest["accuracy"] == "unverified"
+
+
+def test_manifest_for_chart_respects_explicit_accuracy():
+    t = _transcription()
+    t["accuracy"] = "verified-by-hand"
+    e = build(t)
+    manifest = manifest_for_chart(e, t)
+    assert manifest["accuracy"] == "verified-by-hand"
+
+
+# --- validate: exhaustive malformed-row parametrization ---
+
+
+def _valid_envelope() -> dict:
+    weights = [[0.0] * 169, [0.0] * 169]
+    for c in range(169):
+        weights[0][c] = 1.0
+    return {
+        "bundle_id": "test",
+        "depth_bb": 100,
+        "rake_profile": "undocumented",
+        "straddle": False,
+        "class_order": "A-2 row-major, section 4.1",
+        "nodes": [
+            {
+                "history": [],
+                "actor": "UTG",
+                "actions": [{"step": "fold"}, {"step": "raise", "to_bb_x1000": 2500}],
+                "weights": weights,
+                "unreachable_classes": [],
+            }
+        ],
+    }
+
+
+def test_valid_envelope_passes():
+    validate(_valid_envelope())
+
+
+def _mut_bad_actor(e):
+    e["nodes"][0]["actor"] = "ZZ"
+    return e
+
+
+def _mut_bad_history_position(e):
+    e["nodes"][0]["history"] = [["ZZ", "fold", 0]]
+    return e
+
+
+def _mut_raise_missing_amount_in_history(e):
+    e["nodes"][0]["history"] = [["UTG", "raise", 0]]
+    return e
+
+
+def _mut_action_raise_missing_amount(e):
+    e["nodes"][0]["actions"] = [{"step": "fold"}, {"step": "raise"}]
+    return e
+
+
+def _mut_action_fold_with_amount(e):
+    e["nodes"][0]["actions"] = [{"step": "fold", "to_bb_x1000": 100}, {"step": "raise", "to_bb_x1000": 2500}]
+    return e
+
+
+def _mut_action_unknown_step(e):
+    e["nodes"][0]["actions"] = [{"step": "bogus"}, {"step": "raise", "to_bb_x1000": 2500}]
+    return e
+
+
+def _mut_duplicate_action_kind(e):
+    e["nodes"][0]["actions"] = [{"step": "fold"}, {"step": "fold"}]
+    return e
+
+
+def _mut_duplicate_unreachable_class(e):
+    e["nodes"][0]["unreachable_classes"] = [5, 5]
+    return e
+
+
+def _mut_unreachable_class_out_of_range(e):
+    e["nodes"][0]["unreachable_classes"] = [169]
+    return e
+
+
+def _mut_duplicate_node_history(e):
+    e["nodes"].append(copy.deepcopy(e["nodes"][0]))
+    return e
+
+
+def _mut_empty_menu(e):
+    e["nodes"][0]["actions"] = []
+    e["nodes"][0]["weights"] = []
+    return e
+
+
+def _mut_actions_weights_shape_mismatch(e):
+    e["nodes"][0]["weights"] = [e["nodes"][0]["weights"][0]]
+    return e
+
+
+def _mut_row_not_169_wide(e):
+    e["nodes"][0]["weights"][0] = e["nodes"][0]["weights"][0][:-1]
+    return e
+
+
+def _mut_probability_out_of_bounds(e):
+    e["nodes"][0]["weights"][0][0] = 1.5
+    return e
+
+
+def _mut_sibling_sum_wrong(e):
+    e["nodes"][0]["weights"][0][0] = 0.1
+    return e
+
+
+def _mut_unreachable_sum_nonzero(e):
+    e["nodes"][0]["unreachable_classes"] = [0]
+    return e
+
+
+def _mut_evs_forbidden(e):
+    e["nodes"][0]["evs"] = [[None] * 169, [None] * 169]
+    return e
+
+
+def _mut_class_order_wrong(e):
+    e["class_order"] = "some other order"
+    return e
+
+
+def _mut_depth_bb_zero(e):
+    e["depth_bb"] = 0
+    return e
+
+
+MALFORMED_CASES = [
+    (_mut_bad_actor, "actor"),
+    (_mut_bad_history_position, "history"),
+    (_mut_raise_missing_amount_in_history, "history"),
+    (_mut_action_raise_missing_amount, "action"),
+    (_mut_action_fold_with_amount, "action"),
+    (_mut_action_unknown_step, "action"),
+    (_mut_duplicate_action_kind, "duplicate action"),
+    (_mut_duplicate_unreachable_class, "duplicate unreachable"),
+    (_mut_unreachable_class_out_of_range, "range"),
+    (_mut_duplicate_node_history, "duplicate node"),
+    (_mut_empty_menu, "empty menu"),
+    (_mut_actions_weights_shape_mismatch, "shape"),
+    (_mut_row_not_169_wide, "169"),
+    (_mut_probability_out_of_bounds, "bound"),
+    (_mut_sibling_sum_wrong, "sum"),
+    (_mut_unreachable_sum_nonzero, "unreachable sum"),
+    (_mut_evs_forbidden, "EV"),
+    (_mut_class_order_wrong, "class order"),
+    (_mut_depth_bb_zero, "depth"),
+]
+
+
+@pytest.mark.parametrize("mutate,match", MALFORMED_CASES, ids=[m.__name__ for m, _ in MALFORMED_CASES])
+def test_validate_rejects_malformed_rows(mutate, match):
+    envelope = mutate(copy.deepcopy(_valid_envelope()))
+    with pytest.raises(ValueError, match=match):
+        validate(envelope)
+
+
+# --- CLI: build / validate / verify round trip ---
+
+
+def test_cli_build_writes_envelope_and_manifest(tmp_path):
+    t = _transcription()
+    transcription_path = tmp_path / "transcription.json"
+    transcription_path.write_text(json.dumps(t), encoding="utf-8")
+    output_path = tmp_path / "out.json"
+    manifest_path = tmp_path / "out.manifest.json"
+
+    rc = chart_ingest.main(["build", str(transcription_path), str(output_path), str(manifest_path)])
+    assert rc == 0
+    envelope = json.loads(output_path.read_text(encoding="utf-8"))
+    assert envelope == build(t)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest == manifest_for_chart(build(t), t)
+    # LF-only, deterministic, trailing newline (matches gen_preflop_fixtures.py's write_json).
+    assert output_path.read_bytes().endswith(b"\n")
+    assert b"\r\n" not in output_path.read_bytes()
+
+
+def test_cli_validate_success_prints_report(tmp_path, capsys):
+    envelope_path = tmp_path / "envelope.json"
+    envelope_path.write_text(json.dumps(_valid_envelope()), encoding="utf-8")
+    rc = chart_ingest.main(["validate", str(envelope_path)])
+    assert rc == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 2  # one node report line + one aggregate line
+    node_report = json.loads(lines[0])
+    assert len(node_report["sums"]) == 169
+    aggregate = json.loads(lines[1])
+    assert aggregate["aggregate_min"] == pytest.approx(1.0)
+    assert aggregate["aggregate_max"] == pytest.approx(1.0)
+
+
+def test_cli_validate_failure_exits_nonzero(tmp_path, capsys):
+    bad = _mut_sibling_sum_wrong(_valid_envelope())
+    envelope_path = tmp_path / "envelope.json"
+    envelope_path.write_text(json.dumps(bad), encoding="utf-8")
+    rc = chart_ingest.main(["validate", str(envelope_path)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "sum" in err
+
+
+def test_cli_verify_succeeds_on_untouched_build(tmp_path, capsys):
+    t = _transcription()
+    transcription_path = tmp_path / "transcription.json"
+    t["inventory"] = [{"title": "UTG RFI", "status": "covered", "history": [], "page": 2, "reason": "2.5bb"}]
+    transcription_path.write_text(json.dumps(t), encoding="utf-8")
+    output_path = tmp_path / "out.json"
+    manifest_path = tmp_path / "out.manifest.json"
+    assert chart_ingest.main(["build", str(transcription_path), str(output_path), str(manifest_path)]) == 0
+
+    rc = chart_ingest.main(["verify", str(transcription_path), str(output_path), str(manifest_path)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "verified 1 nodes, 169 classes" in out
+
+
+def test_cli_verify_detects_corrupted_output_bytes(tmp_path, capsys):
+    t = _transcription()
+    transcription_path = tmp_path / "transcription.json"
+    t["inventory"] = [{"title": "UTG RFI", "status": "covered", "history": [], "page": 2, "reason": "2.5bb"}]
+    transcription_path.write_text(json.dumps(t), encoding="utf-8")
+    output_path = tmp_path / "out.json"
+    manifest_path = tmp_path / "out.manifest.json"
+    chart_ingest.main(["build", str(transcription_path), str(output_path), str(manifest_path)])
+
+    envelope = json.loads(output_path.read_text(encoding="utf-8"))
+    envelope["nodes"][0]["weights"][0][0] = 0.4  # class 0 = AA
+    envelope["nodes"][0]["weights"][1][0] = 0.6  # keep the sibling sum valid so only bytes differ
+    output_path.write_text(json.dumps(envelope, indent=2) + "\n", encoding="utf-8")
+
+    rc = chart_ingest.main(["verify", str(transcription_path), str(output_path), str(manifest_path)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "node 0" in err
+    assert "AA" in err
+
+
+def test_cli_verify_detects_inventory_envelope_key_mismatch(tmp_path, capsys):
+    t = _transcription()
+    transcription_path = tmp_path / "transcription.json"
+    t["inventory"] = []  # the built node is never listed as covered
+    transcription_path.write_text(json.dumps(t), encoding="utf-8")
+    output_path = tmp_path / "out.json"
+    manifest_path = tmp_path / "out.manifest.json"
+    chart_ingest.main(["build", str(transcription_path), str(output_path), str(manifest_path)])
+
+    rc = chart_ingest.main(["verify", str(transcription_path), str(output_path), str(manifest_path)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "mismatch" in err
+
+
+# --- fetch: monkeypatched urlopen, no real network access ---
+
+
+class _FakeResponse:
+    def __init__(self, data: bytes, url: str):
+        self._data = data
+        self.url = url
+
+    def read(self, n: int = -1) -> bytes:
+        return self._data if n < 0 else self._data[:n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_fetch_writes_bytes_and_reports_final_url(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(chart_ingest, "urlopen", lambda req, timeout=30: _FakeResponse(b"hello world", "https://example.com/final"))
+    output = tmp_path / "out.txt"
+    chart_ingest.fetch("https://example.com/start", output)
+    assert output.read_bytes() == b"hello world"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["url"] == "https://example.com/final"
+    assert payload["bytes"] == len(b"hello world")
+    import hashlib
+
+    assert payload["sha256"] == hashlib.sha256(b"hello world").hexdigest()
+
+
+def test_fetch_rejects_html_returned_as_pdf(tmp_path, monkeypatch):
+    monkeypatch.setattr(chart_ingest, "urlopen", lambda req, timeout=30: _FakeResponse(b"<html>not found</html>", "https://example.com/final.pdf"))
+    output = tmp_path / "out.pdf"
+    with pytest.raises(ValueError, match="non-PDF"):
+        chart_ingest.fetch("https://example.com/start", output)
+    assert not output.exists()
+
+
+def test_fetch_accepts_pdf_magic_bytes(tmp_path, monkeypatch):
+    monkeypatch.setattr(chart_ingest, "urlopen", lambda req, timeout=30: _FakeResponse(b"%PDF-1.4 minimal", "https://example.com/final.pdf"))
+    output = tmp_path / "out.pdf"
+    chart_ingest.fetch("https://example.com/start", output)
+    assert output.read_bytes() == b"%PDF-1.4 minimal"
+
+
+def test_fetch_rejects_oversized_download(tmp_path, monkeypatch):
+    monkeypatch.setattr(chart_ingest, "MAX_BUNDLE_BYTES", 10)
+    monkeypatch.setattr(chart_ingest, "urlopen", lambda req, timeout=30: _FakeResponse(b"x" * 20, "https://example.com/final"))
+    output = tmp_path / "out.bin"
+    with pytest.raises(ValueError, match="64 MiB"):
+        chart_ingest.fetch("https://example.com/start", output)
+    assert not output.exists()
+
+
+# --- bounded_read / load_json ---
+
+
+def test_bounded_read_rejects_oversized_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(chart_ingest, "MAX_BUNDLE_BYTES", 10)
+    path = tmp_path / "big.json"
+    path.write_bytes(b"x" * 20)
+    with pytest.raises(ValueError, match="64 MiB"):
+        chart_ingest.bounded_read(path)
+
+
+def test_load_json_round_trips_a_small_file(tmp_path):
+    path = tmp_path / "small.json"
+    path.write_text(json.dumps({"a": 1}), encoding="utf-8")
+    assert chart_ingest.load_json(path) == {"a": 1}
+
+
+# --- extract_links / find_anchor (html.parser) ---
+
+
+SAMPLE_HTML = """
+<html><body>
+<a href="/page-a">Some other link</a>
+<a href="/downloads/gto">6 max 200bb 500z GTO Ranges</a>
+</body></html>
+"""
+
+
+def test_extract_links_returns_text_and_href_pairs():
+    links = extract_links(SAMPLE_HTML)
+    assert ("Some other link", "/page-a") in links
+    assert ("6 max 200bb 500z GTO Ranges", "/downloads/gto") in links
+
+
+def test_find_anchor_returns_href_for_matching_text():
+    assert find_anchor(SAMPLE_HTML, "6 max 200bb 500z GTO Ranges") == "/downloads/gto"
+
+
+def test_find_anchor_returns_none_when_absent():
+    assert find_anchor(SAMPLE_HTML, "nonexistent link text") is None
+
+
+# --- bb_to_x1000 (decimal-exact bb -> to_bb_x1000 conversion) ---
+
+
+def test_bb_to_x1000_exact_decimal_conversion():
+    assert bb_to_x1000("8.75") == 8750
+    assert bb_to_x1000(22) == 22000
+    assert bb_to_x1000("0.1") == 100
+
+
+def test_bb_to_x1000_rejects_non_positive():
+    with pytest.raises(ValueError):
+        bb_to_x1000(0)
+    with pytest.raises(ValueError):
+        bb_to_x1000(-2.5)
+
+
+def test_bb_to_x1000_rejects_invalid_decimal():
+    with pytest.raises(ValueError):
+        bb_to_x1000("1/3")

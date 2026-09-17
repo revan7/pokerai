@@ -35,12 +35,24 @@ pub fn bounded_read(path: &Path) -> Result<Vec<u8>, BundleError> {
 /// Hashes `raw` (the node file's exact bytes) against `info.sha256`, decodes and structurally
 /// validates it (`decode`, which runs every rule in `validate.rs`), and cross-checks the
 /// envelope against its manifest: matching `bundle_id`/`depth_bb`/`rake_profile`/`straddle`,
-/// and the fixed source contract (`game = "nl"`, `version = 2`, `ev_unit = "source_sb"`). A
-/// hash match alone never passes without content validation, and a content match alone never
-/// passes without the hash matching first. `source_blinds` is checked exactly, at its
-/// original wide `f64` precision, by `check_exact_source_blinds` before `BundleInfo` is even
-/// produced (R4) -- `info.source_blinds` here is already narrowed and is not re-checked
-/// against `[0.5, 1.0]`, so this function is not itself a substitute for that earlier call.
+/// and the fixed source contract (`game = "nl"`, `version = 2`, `ev_unit = "source_sb"`,
+/// `source_blinds == [0.5, 1.0]`). A hash match alone never passes without content
+/// validation, and a content match alone never passes without the hash matching first.
+///
+/// N1 (P3.T2 re-review, minor): the exact `[0.5, 1.0]` source-blind check now also runs here,
+/// on `info.source_blinds` (already narrowed to `f32` -- both `0.5` and `1.0` are exactly
+/// representable, so this catches any narrowed value that is not precisely that pair) --
+/// not only in `check_exact_source_blinds` below, which `load_bundle` runs first, on the
+/// manifest's original wide `f64` bytes, before `BundleInfo` is even produced (R4). That
+/// earlier wide check is what actually prevents a near-miss `f64` value (e.g.
+/// `[0.500000001, 1.000000001]`) from rounding into the accepted pair on narrowing; this
+/// function's own check is what prevents a `pub` caller who constructs a `BundleInfo`
+/// directly and calls `checked_envelope` without ever going through `load_bundle`/
+/// `check_exact_source_blinds` at all from skipping the source-blind contract entirely. Since
+/// `load_bundle` always calls `check_exact_source_blinds` first and that call already forces
+/// the wide value to be exactly `[0.5, 1.0]` before `info` is produced, this added check can
+/// never fire on that path -- `load_bundle`'s behaviour is unchanged.
+///
 /// R3: a `ChartTranscription`-labelled envelope carrying any EV data is rejected here, at
 /// load time -- `ChartTranscription::lookup` additionally clears `ev_source_sb` on every
 /// result as a second, independent guarantee, but that lookup-time behavior is not a
@@ -58,6 +70,7 @@ pub fn checked_envelope(info: &BundleInfo, raw: &[u8]) -> Result<Envelope, Bundl
         || info.game != "nl"
         || info.version != 2
         || info.ev_unit != "source_sb"
+        || info.source_blinds != [0.5, 1.0]
     {
         return Err(BundleError::Content("manifest/envelope mismatch".into()));
     }
