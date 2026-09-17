@@ -1,4 +1,5 @@
 use serde::de::{self, Visitor};
+use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -16,7 +17,14 @@ pub enum MenuSize { Pot(f32), AllIn }
 
 impl Serialize for MenuSize {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        match self { MenuSize::Pot(x) => s.serialize_f32(*x), MenuSize::AllIn => s.serialize_str("a") }
+        match self {
+            // A constructed `Pot` can be built outside `Deserialize` (the type is public), so the
+            // same positive-finite domain is re-checked here: emitting an invalid value as JSON
+            // `null` (serde's behavior for a non-finite f32) would silently corrupt the wire form.
+            MenuSize::Pot(x) if x.is_finite() && *x > 0.0 => s.serialize_f32(*x),
+            MenuSize::Pot(x) => Err(S::Error::custom(format!("a menu size must be positive and finite, got {x:e}"))),
+            MenuSize::AllIn => s.serialize_str("a"),
+        }
     }
 }
 
@@ -26,7 +34,18 @@ impl<'de> Visitor<'de> for MenuSizeVisitor {
     type Value = MenuSize;
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("a positive menu size or \"a\"") }
     fn visit_f64<E: de::Error>(self, v: f64) -> Result<MenuSize, E> {
-        if v.is_finite() && v > 0.0 { Ok(MenuSize::Pot(v as f32)) } else { Err(E::custom("a menu size must be positive and finite")) }
+        if !(v.is_finite() && v > 0.0) {
+            return Err(E::custom("a menu size must be positive and finite"));
+        }
+        // The wire value is f64 but the stored value is f32 (spec 4.6): a magnitude that overflows
+        // f32 to infinity, or underflows to zero, must be rejected rather than silently narrowed.
+        // A positive f64 that narrows to a positive f32 subnormal is preserved as-is.
+        let narrowed = v as f32;
+        if narrowed.is_finite() && narrowed > 0.0 {
+            Ok(MenuSize::Pot(narrowed))
+        } else {
+            Err(E::custom("a menu size must be positive and finite after narrowing to f32"))
+        }
     }
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<MenuSize, E> { self.visit_f64(v as f64) }
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<MenuSize, E> { self.visit_f64(v as f64) }
@@ -80,18 +99,26 @@ pub struct EffectiveTree {
 }
 
 /// Resolves a wire chip path into the ordinal path of a materialized decision node (spec section 2).
+///
+/// A path resolves only if, for every edge including the last: the action exists in the current
+/// node's menu, the action's index is a representable ordinal (`u8`), its `terminal_pots` marker
+/// exists and is `None` (a continuation, never a terminal child), and a materialized node exists
+/// at the resulting ordinal path.
 pub fn resolve_chip_path(materialized: &[MaterializedNode], path: &[Action]) -> Option<OrdinalPath> {
     let index: HashMap<&[u8], &MaterializedNode> = materialized.iter().map(|n| (n.path.as_slice(), n)).collect();
     let mut node = *index.get(&[][..])?;
     let mut ordinal: OrdinalPath = Vec::with_capacity(path.len());
-    for (k, action) in path.iter().enumerate() {
+    for action in path {
         let i = node.actions.iter().position(|a| a == action)?;
-        ordinal.push(i as u8);
-        if k + 1 == path.len() { break; }
+        // Reject before narrowing: an index that does not fit in u8 must never wrap onto another
+        // action's ordinal (e.g. 256 -> 0), which could alias an unrelated existing node.
+        let idx = u8::try_from(i).ok()?;
+        // The marker must exist and name a continuation on every edge, including the final one:
+        // a terminal edge (Some(pot)) never names a decision node, no matter what else is materialized.
         if node.terminal_pots.get(i)?.is_some() { return None; }
+        ordinal.push(idx);
         node = *index.get(ordinal.as_slice())?;
     }
-    if !index.contains_key(ordinal.as_slice()) { return None; }
     Some(ordinal)
 }
 
@@ -134,5 +161,123 @@ mod tests {
         assert_eq!(jam_only.oop.bet, vec![MenuSize::AllIn]);
         assert_eq!(jam_only.donk, None, "absent on the root street");
         assert!(serde_json::from_str::<PlayerMenus>(r#"{"oop":{"bet":[0.0],"raise":[]},"ip":{"bet":[],"raise":[]}}"#).is_err(), "a pot fraction must be positive");
+    }
+
+    /// R1: the wire form must reject an f64 that overflows or underflows f32, and `Serialize`
+    /// must refuse to emit an invalid constructed `Pot` value instead of silently writing `null`.
+    #[test]
+    fn menu_size_domain_is_validated_both_directions() {
+        assert!(serde_json::from_str::<MenuSize>("1e39").is_err(), "f64->f32 overflow to infinity must be rejected");
+        assert!(serde_json::from_str::<MenuSize>("1e-50").is_err(), "f64->f32 underflow to zero must be rejected");
+
+        // valid numeric and "a" values still round trip
+        assert_eq!(serde_json::from_str::<MenuSize>("2.5").unwrap(), MenuSize::Pot(2.5));
+        assert_eq!(serde_json::from_str::<MenuSize>(r#""a""#).unwrap(), MenuSize::AllIn);
+        assert_eq!(serde_json::to_string(&MenuSize::Pot(2.5)).unwrap(), "2.5");
+        assert_eq!(serde_json::to_string(&MenuSize::AllIn).unwrap(), r#""a""#);
+
+        // a positive representable subnormal f32 must survive, not collapse to zero
+        let subnormal: MenuSize = serde_json::from_str("1e-40").unwrap();
+        match subnormal {
+            MenuSize::Pot(x) => {
+                assert!(x > 0.0 && x.is_finite(), "subnormal must remain positive and finite, got {x:e}");
+                assert!(x < 1.18e-38, "expected a subnormal magnitude, got {x:e}");
+                assert!(serde_json::to_string(&MenuSize::Pot(x)).is_ok(), "a valid subnormal must still serialize");
+            }
+            MenuSize::AllIn => panic!("expected Pot for a numeric input"),
+        }
+
+        // invalid constructed values must be rejected on serialize, not emitted as `null`
+        assert!(serde_json::to_string(&MenuSize::Pot(0.0)).is_err(), "zero must be rejected on serialize");
+        assert!(serde_json::to_string(&MenuSize::Pot(-1.0)).is_err(), "negative must be rejected on serialize");
+        assert!(serde_json::to_string(&MenuSize::Pot(f32::NAN)).is_err(), "NaN must be rejected on serialize");
+        assert!(serde_json::to_string(&MenuSize::Pot(f32::INFINITY)).is_err(), "infinity must be rejected on serialize");
+        assert!(serde_json::to_string(&MenuSize::Pot(f32::NEG_INFINITY)).is_err(), "negative infinity must be rejected on serialize");
+    }
+
+    /// R2: `resolve_chip_path` must not narrow an action index that does not fit in `u8`,
+    /// and must not let that overflow alias an existing node at a wrapped-around ordinal.
+    #[test]
+    fn resolve_chip_path_rejects_unrepresentable_ordinal_and_accepts_255() {
+        let root = MaterializedNode {
+            path: vec![],
+            street: Street::River,
+            actor: "oop".to_string(),
+            actions: (0u32..257).map(|to| Action::Bet { to }).collect(),
+            terminal_pots: vec![None; 257],
+        };
+        // an existing node at ordinal [0] that a `256 as u8 -> 0` wraparound could wrongly alias
+        let alias_target = MaterializedNode {
+            path: vec![0],
+            street: Street::River,
+            actor: "ip".to_string(),
+            actions: vec![Action::Check],
+            terminal_pots: vec![None],
+        };
+        // the node actually addressed by ordinal 255 (the positive control)
+        let at_255 = MaterializedNode {
+            path: vec![255],
+            street: Street::River,
+            actor: "ip".to_string(),
+            actions: vec![Action::Check],
+            terminal_pots: vec![None],
+        };
+        let materialized = vec![root, alias_target, at_255];
+
+        assert_eq!(
+            resolve_chip_path(&materialized, &[Action::Bet { to: 256 }]),
+            None,
+            "index 256 is unrepresentable as u8 and must not alias node [0]"
+        );
+        assert_eq!(
+            resolve_chip_path(&materialized, &[Action::Bet { to: 255 }]),
+            Some(vec![255]),
+            "index 255 is representable and must resolve normally"
+        );
+    }
+
+    /// R3: every edge, including the last, must have a `None` (continuation) marker before its
+    /// child is accepted; a terminal final edge or a missing final marker must not resolve.
+    #[test]
+    fn resolve_chip_path_rejects_terminal_final_edge_and_missing_marker() {
+        let root_terminal = MaterializedNode {
+            path: vec![],
+            street: Street::River,
+            actor: "oop".to_string(),
+            actions: vec![Action::Check],
+            terminal_pots: vec![Some(100)], // Check is terminal at the root
+        };
+        // a stray materialized child at [0], even though the edge into it is terminal
+        let stray_child = MaterializedNode {
+            path: vec![0],
+            street: Street::River,
+            actor: "ip".to_string(),
+            actions: vec![Action::Check],
+            terminal_pots: vec![None],
+        };
+        let materialized = vec![root_terminal, stray_child];
+        assert_eq!(
+            resolve_chip_path(&materialized, &[Action::Check]),
+            None,
+            "a terminal final edge must not resolve to a stray materialized child"
+        );
+
+        // missing final marker: the node's terminal_pots vector is shorter than its actions vector
+        let root_missing_marker = MaterializedNode {
+            path: vec![],
+            street: Street::River,
+            actor: "oop".to_string(),
+            actions: vec![Action::Check],
+            terminal_pots: vec![],
+        };
+        let materialized_missing = vec![root_missing_marker];
+        assert_eq!(
+            resolve_chip_path(&materialized_missing, &[Action::Check]),
+            None,
+            "a missing terminal marker on the final edge must not resolve"
+        );
+
+        // controls kept: valid final continuation (`[Check, AllIn]` -> `Some([0, 1])`) and the
+        // empty root path (`[]` -> `Some(vec![])`) are asserted in `wire_tree_parses_and_paths_resolve`.
     }
 }
