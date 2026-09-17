@@ -1002,15 +1002,35 @@ def test_bb_to_x1000_rejects_invalid_decimal():
 # --- sources.manifest.json availability (P3.T4): which chart depths this build actually has ---
 
 
-ROOT = Path(__file__).resolve().parents[2]
-
-
 def load_availability():
     return json.loads((ROOT / "fixtures/charts/sources.manifest.json").read_text(encoding="utf-8"))
 
 
 def available_depths():
     return {d["depth_bb"]: d for d in load_availability()["depths"] if d["status"] == "available"}
+
+
+def assert_committed_bytes_match(path, expected_bytes, expected_sha256):
+    """The one integrity check every manifest-tracked committed artifact (a depth's PDF, or a
+    provenance HTML) is verified against: `path` must be a regular file, its actual byte count
+    must equal `expected_bytes` exactly, and `hashlib.sha256` over its actual bytes must equal
+    `expected_sha256` exactly. Raises `AssertionError` (never returns a bool, never skips) on
+    a missing file, a wrong length, or a content change that keeps the same length -- the
+    review's explicit requirement that a listed source whose actual bytes differ from its
+    manifest entry fails this test, rather than the previous `len(sha256) == 64 and bytes > 0`
+    check, which read no file at all and could not detect drift, truncation or replacement.
+    """
+    import hashlib
+
+    assert path.is_file(), f"{path} is missing or not a regular file"
+    raw = path.read_bytes()
+    assert len(raw) == expected_bytes, (
+        f"{path}: manifest says {expected_bytes} bytes, on-disk file has {len(raw)}"
+    )
+    actual_sha256 = hashlib.sha256(raw).hexdigest()
+    assert actual_sha256 == expected_sha256, (
+        f"{path}: manifest sha256 {expected_sha256} does not match on-disk sha256 {actual_sha256}"
+    )
 
 
 def test_sources_manifest_shape():
@@ -1020,9 +1040,105 @@ def test_sources_manifest_shape():
     for d in m["depths"]:
         assert d["status"] in ("available", "unsupported")
         if d["status"] == "available":
-            assert (ROOT / d["source_file"]).exists()
             assert len(d["sha256"]) == 64 and d["bytes"] > 0
         else:
             assert d["source_file"] is None and d["sha256"] is None
             assert d["note"].startswith(f"depth {d['depth_bb']} unsupported")
     assert available_depths(), "no chart depth acquired; the release has no range source"
+
+
+def test_sources_manifest_depth_files_match_their_recorded_bytes_and_hash():
+    """The actual integrity gate (R2): every `"available"` depth's committed `source_file`
+    must have exactly the recorded byte count and SHA-256, read from disk, not merely a
+    64-character hex string and a positive declared size."""
+    m = load_availability()
+    checked = 0
+    for d in m["depths"]:
+        if d["status"] != "available":
+            continue
+        assert_committed_bytes_match(ROOT / d["source_file"], d["bytes"], d["sha256"])
+        checked += 1
+    assert checked >= 1
+
+
+def test_sources_manifest_provenance_artifacts_present_and_integrity_checked():
+    """R3: the redacted `rangeconverter_200.html` provenance HTML is not a chart source (it is
+    not any depth's `source_file`), but it must still be integrity-pinned in the manifest, with
+    its committed (post-redaction) bytes/hash kept separate from its original fetched
+    bytes/hash so the redaction itself stays auditable."""
+    m = load_availability()
+    artifacts = m["provenance_artifacts"]
+    assert artifacts, "no provenance_artifacts entry; the redacted article HTML is unpinned"
+    required_fields = {
+        "artifact_id",
+        "path",
+        "fetched_url",
+        "fetched_utc",
+        "fetched_bytes",
+        "fetched_sha256",
+        "committed_bytes",
+        "committed_sha256",
+        "redaction_note",
+    }
+    for artifact in artifacts:
+        assert required_fields <= set(artifact.keys())
+        assert len(artifact["fetched_sha256"]) == 64
+        assert len(artifact["committed_sha256"]) == 64
+        assert_committed_bytes_match(
+            ROOT / artifact["path"], artifact["committed_bytes"], artifact["committed_sha256"]
+        )
+
+
+def test_rangeconverter_article_provenance_record_matches_the_acquisition_report():
+    """Pins the one provenance artifact's exact recorded values (not just its shape) against
+    what P3.T4's acquisition actually reported: the `fetch` at Step 3a returned 16584 bytes,
+    and the two token redactions dropped it to 16432 committed bytes -- a real difference, not
+    a placeholder pair of equal numbers."""
+    m = load_availability()
+    article = next(
+        a for a in m["provenance_artifacts"] if a["artifact_id"] == "rangeconverter_200_article"
+    )
+    assert article["fetched_bytes"] == 16584
+    assert article["fetched_sha256"] == (
+        "33b9007cf6318b347a5ade89d6e2ba099b126dc86207a45dbd24f9afeda3a76d"
+    )
+    assert article["committed_bytes"] == 16432
+    assert article["committed_sha256"] == (
+        "f9cba1810f1486b320934f15a07be59ab62d28d860f39fa04586d667b7506c7c"
+    )
+    assert article["fetched_bytes"] != article["committed_bytes"]
+    assert article["fetched_sha256"] != article["committed_sha256"]
+
+
+def test_assert_committed_bytes_match_fails_on_missing_file(tmp_path):
+    with pytest.raises(AssertionError, match="missing"):
+        assert_committed_bytes_match(tmp_path / "does_not_exist.bin", 4, "0" * 64)
+
+
+def test_assert_committed_bytes_match_fails_on_length_mismatch(tmp_path):
+    import hashlib
+
+    path = tmp_path / "recorded.bin"
+    path.write_bytes(b"1234")
+    wrong_length = 5
+    real_sha256 = hashlib.sha256(b"1234").hexdigest()
+    with pytest.raises(AssertionError, match="bytes"):
+        assert_committed_bytes_match(path, wrong_length, real_sha256)
+
+
+def test_assert_committed_bytes_match_fails_on_hash_mismatch_same_length(tmp_path):
+    import hashlib
+
+    path = tmp_path / "tampered.bin"
+    path.write_bytes(b"1234")  # same length as the "recorded" content below, different bytes
+    recorded_sha256 = hashlib.sha256(b"5678").hexdigest()
+    with pytest.raises(AssertionError, match="sha256"):
+        assert_committed_bytes_match(path, 4, recorded_sha256)
+
+
+def test_assert_committed_bytes_match_passes_on_a_genuine_match(tmp_path):
+    import hashlib
+
+    path = tmp_path / "good.bin"
+    path.write_bytes(b"exact-bytes")
+    assert_committed_bytes_match(path, len(b"exact-bytes"), hashlib.sha256(b"exact-bytes").hexdigest())

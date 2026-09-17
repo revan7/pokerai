@@ -23,5 +23,20 @@
       "acquired_utc": "2026-09-17T19:48:50Z",
       "note": ""
     }
+  ],
+  "provenance_artifacts": [
+    {
+      "artifact_id": "rangeconverter_200_article",
+      "path": "fixtures/charts/sources/rangeconverter_200.html",
+      "depth_bb": 200,
+      "role": "provenance record for the depth-200 acquisition path (Step 3a); not a chart source itself and not read by core_preflop -- carries the download-anchor link this build's rangeconverter_200.pdf was reached through",
+      "fetched_url": "https://rangeconverter.com/articles/poker-charts-6-max-200bb-no-limit-texas-holdem",
+      "fetched_utc": "2026-09-17T19:46:50Z",
+      "fetched_bytes": 16584,
+      "fetched_sha256": "33b9007cf6318b347a5ade89d6e2ba099b126dc86207a45dbd24f9afeda3a76d",
+      "committed_bytes": 16432,
+      "committed_sha256": "f9cba1810f1486b320934f15a07be59ab62d28d860f39fa04586d667b7506c7c",
+      "redaction_note": "Two per-session values were replaced with the literal '[stripped]' before commit: the <meta name=\"csrf-token\"> content attribute, and the hidden <input name=\"authenticity_token\"> value. This is the only difference between fetched_* and committed_*; no other session, account or cookie value was found on the page."
+    }
   ]
 }
