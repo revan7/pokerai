@@ -368,3 +368,23 @@ fn assumption_and_event_floats_are_validated_both_directions() {
     assert!(text.contains(r#""exploitability_pct":null"#), "None is still the one nullable value: {text}");
     assert_eq!(serde_json::from_str::<RecommendationEvent>(&text).unwrap(), none_progress);
 }
+
+/// Cross-plan D7: `tools/gen_worker_fixtures.py` (plan 2, P2.T6) is the single definition of the
+/// two-combo river ranges; Python cannot import `river_two_combo_ranges()` above, so this test is
+/// the owed cross-check that `fixtures/worker/river_two_combo.jsonl`'s solve line agrees with it
+/// combo by combo. Per the standing ruling that a test must fail (never skip) when a required
+/// committed artifact is absent, a missing fixture panics with a message naming the regenerator.
+#[test]
+fn river_two_combo_fixture_agrees_with_the_rust_definition_combo_by_combo() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/worker/river_two_combo.jsonl");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e} (run tools/gen_worker_fixtures.py)", path.display()));
+    let first_line = text.lines().next().expect("river_two_combo.jsonl must have at least one line");
+    let msg: EngineMessage = serde_json::from_str(first_line).expect("first line must parse as an EngineMessage");
+    let EngineMessage::Solve(req) = msg else { panic!("first line of river_two_combo.jsonl must be a solve request") };
+    let (oop, ip) = river_two_combo_ranges();
+    for i in 0..COMBOS as u16 {
+        assert_eq!(req.oop_range.get(i), oop.get(i), "oop_range combo {i} disagrees with river_two_combo_ranges()");
+        assert_eq!(req.ip_range.get(i), ip.get(i), "ip_range combo {i} disagrees with river_two_combo_ranges()");
+    }
+}
