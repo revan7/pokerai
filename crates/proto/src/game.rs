@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use crate::hand::Seat;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct UtgStraddle { pub amount_chips: u32 }
 
 /// Rake rule (spec 2). `rate` is the same physical quantity as the worker wire's `rake_rate` and
@@ -10,9 +11,11 @@ pub struct UtgStraddle { pub amount_chips: u32 }
 /// would silently produce a non-finite or sign-flipped payoff.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum Rake {
     PotRake {
         #[serde(with = "crate::numeric::rake_rate")]
+        #[cfg_attr(feature = "typescript", ts(as = "f32"))]
         rate: f32,
         cap_mchips: u32,
         no_flop_no_drop: bool,
@@ -22,16 +25,20 @@ pub enum Rake {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum SeatTag { Unknown, Nit, Tag, LoosePassive, CallingStation, Lag, Maniac }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum QuickFact { NeverFoldsRiver, RarelyBluffs, LimpsALot, Over3bets, FoldsToPressure }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SeatConfig { pub seat: Seat, pub tag: Option<SeatTag>, pub facts: Vec<QuickFact> }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SolverPrefs { pub threads: u8, pub target_bp: u16, pub flop_budget_s: u8 }
 
 impl Default for SolverPrefs {
@@ -39,6 +46,7 @@ impl Default for SolverPrefs {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct GameConfig {
     pub config_revision: u32,
     pub chip_label: String,
@@ -51,6 +59,7 @@ pub struct GameConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct HandConfig {
     pub config_revision: u32,
     pub sb_chips: u32,

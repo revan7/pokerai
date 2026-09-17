@@ -58,13 +58,31 @@ impl<'de> Deserialize<'de> for MenuSize {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<MenuSize, D::Error> { d.deserialize_any(MenuSizeVisitor) }
 }
 
+/// `MenuSize`'s untagged mixed-payload wire form (`0.33` / `"a"`) cannot be derived by ts-rs;
+/// this hand-written impl supplies the same union the hand-written `Serialize`/`Deserialize`
+/// impls above produce. `output_path` only needs to be `Some(_)` so `Registry::visit` does not
+/// skip this type -- `bindings.rs` never reads the path itself. `decl` is overridden directly
+/// (ts-rs 12.0.1's default `decl` panics rather than composing `name`/`inline`); `WithoutGenerics`
+/// and `OptionInnerType` are the non-generic, non-`Option` defaults per the `TS` trait's own docs.
+#[cfg(feature = "typescript")]
+impl ts_rs::TS for MenuSize {
+    type WithoutGenerics = MenuSize;
+    type OptionInnerType = Self;
+    fn name(_cfg: &ts_rs::Config) -> String { "MenuSize".into() }
+    fn inline(_cfg: &ts_rs::Config) -> String { r#"number | "a""#.into() }
+    fn decl(_cfg: &ts_rs::Config) -> String { r#"type MenuSize = number | "a";"#.into() }
+    fn output_path() -> Option<std::path::PathBuf> { Some(std::path::PathBuf::from("bindings/MenuSize.ts")) }
+}
+
 /// One player's menu on one street.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SideMenu { pub bet: Vec<MenuSize>, pub raise: Vec<MenuSize> }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct PlayerMenus {
     pub oop: SideMenu,
     pub ip: SideMenu,
@@ -75,6 +93,7 @@ pub struct PlayerMenus {
 /// One action node of the betting skeleton (spec section 2).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct MaterializedNode {
     pub path: OrdinalPath,
     pub street: Street,
@@ -85,6 +104,7 @@ pub struct MaterializedNode {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct EffectiveTree {
     pub rules_version: u16,
     pub template_id: String,
@@ -94,10 +114,13 @@ pub struct EffectiveTree {
     // non-negative finite magnitude, validated wide before narrowing and again on serialize
     // (review S1), so a `null` or an `inf` can never reach the materializer.
     #[serde(with = "crate::numeric::non_negative")]
+    #[cfg_attr(feature = "typescript", ts(as = "f32"))]
     pub add_allin_threshold: f32,
     #[serde(with = "crate::numeric::non_negative")]
+    #[cfg_attr(feature = "typescript", ts(as = "f32"))]
     pub force_allin_threshold: f32,
     #[serde(with = "crate::numeric::non_negative")]
+    #[cfg_attr(feature = "typescript", ts(as = "f32"))]
     pub merging_threshold: f32,
     pub wager_cap: u8,
     pub inserted: Vec<(ChipPath, String, Action)>,

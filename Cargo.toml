@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "solver-worker"]
+members = ["crates/*", "solver-worker", "apps/pokerai-ui/src-tauri"]
 exclude = ["third_party/postflop-solver"]
 
 [workspace.package]

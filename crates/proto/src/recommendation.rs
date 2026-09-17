@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use crate::hand::{Action, LegalAction, Seat, Street};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct DecisionIdentity { pub hand_id: u64, pub hand_revision: u32, pub decision_id: u64, pub config_revision: u32, pub model_revision: u32 }
 
 // Every `f32` and `Option<f32>` in this module crosses the Tauri IPC boundary to the UI, so each
@@ -13,19 +14,20 @@ pub struct DecisionIdentity { pub hand_id: u64, pub hand_revision: u32, pub deci
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum ApproxReason {
     BetTranslation {
         street: Street,
         seat: Seat,
-        #[serde(with = "crate::numeric::finite")] observed_pct: f32,
-        #[serde(with = "crate::numeric::mapped_sizes")] mapped: Vec<(f32, f32)>,
-        #[serde(with = "crate::numeric::probability")] deviation: f32,
+        #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] observed_pct: f32,
+        #[serde(with = "crate::numeric::mapped_sizes")] #[cfg_attr(feature = "typescript", ts(as = "Vec<(f32, f32)>"))] mapped: Vec<(f32, f32)>,
+        #[serde(with = "crate::numeric::probability")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] deviation: f32,
         prominent: bool,
     },
-    DepthBucket { seat: Seat, #[serde(with = "crate::numeric::finite")] actual_bb: f32, used_bb: u16, prominent: bool },
-    AsymmetricStacks { #[serde(with = "crate::numeric::finite_vec")] stacks_bb: Vec<f32>, prominent: bool },
+    DepthBucket { seat: Seat, #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] actual_bb: f32, used_bb: u16, prominent: bool },
+    AsymmetricStacks { #[serde(with = "crate::numeric::finite_vec")] #[cfg_attr(feature = "typescript", ts(as = "Vec<f32>"))] stacks_bb: Vec<f32>, prominent: bool },
     RakeProfileMapped { actual: String, used: String },
-    StraddleMapped { #[serde(with = "crate::numeric::finite_array3")] posts: [f32; 3] },
+    StraddleMapped { #[serde(with = "crate::numeric::finite_array3")] #[cfg_attr(feature = "typescript", ts(as = "[f32; 3]"))] posts: [f32; 3] },
     ShortHandedMapped { dealt: u8 },
     DeadlineBestSoFar { reached_bp: u16, target_bp: u16 },
     ChartRounded,
@@ -33,13 +35,14 @@ pub enum ApproxReason {
     UnconditionedPriorStreet { street: Street, seat: Seat, cause: String },
     UnconditionedCurrentStreet,
     MultiwayStreetRoot { folded_this_street: u8, dead_this_street: u32 },
-    SprBucketed { #[serde(with = "crate::numeric::finite")] actual: f32, #[serde(with = "crate::numeric::finite")] used: f32 },
-    MenuRounded { #[serde(with = "crate::numeric::finite")] max_delta_pct: f32 },
-    BranchResidual { seat: Seat, #[serde(with = "crate::numeric::finite")] residual_mass_pct: f32, cause: String },
+    SprBucketed { #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] actual: f32, #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] used: f32 },
+    MenuRounded { #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] max_delta_pct: f32 },
+    BranchResidual { seat: Seat, #[serde(with = "crate::numeric::finite")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] residual_mass_pct: f32, cause: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum UnsupportedReason {
     MultiwayEv { pot_eligible: u8 },
     MissingPreflopNode { key: String },
@@ -54,6 +57,7 @@ pub enum UnsupportedReason {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum Coverage {
     Exact,
     Approximate { reasons: Vec<ApproxReason> },
@@ -62,17 +66,21 @@ pub enum Coverage {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum Unavailable {
     NotInMenu, NoEvReference, HeroOutOfSupport, MovedProbability { from: Action }, ChartNoEv, NotEvaluated, Pending,
-    BranchSupportIncomplete { #[serde(with = "crate::numeric::probability")] covered_posterior: f32 },
+    BranchSupportIncomplete { #[serde(with = "crate::numeric::probability")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] covered_posterior: f32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct ActionAdvice {
     pub action: Action,
     #[serde(default, with = "crate::numeric::probability_opt")]
+    #[cfg_attr(feature = "typescript", ts(as = "Option<f32>"))]
     pub frequency: Option<f32>,
     #[serde(default, with = "crate::numeric::finite_opt")]
+    #[cfg_attr(feature = "typescript", ts(as = "Option<f32>"))]
     pub ev_bb: Option<f32>,
     pub unavailable: Option<Unavailable>,
     pub headline: bool,
@@ -80,31 +88,39 @@ pub struct ActionAdvice {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum Availability { Ready, Pending, Unavailable { reason: String } }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
-pub enum EquityMethod { Exact, MonteCarlo { samples: u32, #[serde(with = "crate::numeric::probability")] std_err: f32 } }
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub enum EquityMethod { Exact, MonteCarlo { samples: u32, #[serde(with = "crate::numeric::probability")] #[cfg_attr(feature = "typescript", ts(as = "f32"))] std_err: f32 } }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct EquityEstimate {
     #[serde(default, with = "crate::numeric::probability_opt")]
+    #[cfg_attr(feature = "typescript", ts(as = "Option<f32>"))]
     pub value: Option<f32>,
     pub availability: Availability,
     pub method: Option<EquityMethod>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct PotShares { pub pot_index: u8, pub population: String, pub shares: Vec<(Seat, EquityEstimate)> }
 
 pub const POT_SHARES_POPULATION: &str = "hero combo fixed; opponents jointly sampled, disjoint, from hero-conditioned public ranges";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct EquitySummary { pub hero_combo_vs_each: Vec<(Seat, EquityEstimate)>, pub hero_range_vs_each: Vec<(Seat, EquityEstimate)>, pub per_pot_shares: Vec<PotShares> }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct Assumptions {
     #[serde(with = "crate::numeric::mass_triples")]
+    #[cfg_attr(feature = "typescript", ts(as = "Vec<(Seat, String, f32)>"))]
     pub ranges_used: Vec<(Seat, String, f32)>,
     pub tree_signature: String, pub template_id: String,
     pub source: String, pub source_accuracy: String, pub source_granularity: String,
@@ -113,9 +129,11 @@ pub struct Assumptions {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct ExperimentalHu {
     pub opponent: Seat, pub hero_role: String, pub pot: u32, pub stack: u32, pub template_id: String,
     #[serde(with = "crate::numeric::mass_pair")]
+    #[cfg_attr(feature = "typescript", ts(as = "[(Seat, String, f32); 2]"))]
     pub ranges_used: [(Seat, String, f32); 2],
     pub actions: Vec<ActionAdvice>, pub reached_bp: Option<u16>, pub elapsed_ms: u32, pub note: String,
 }
@@ -123,38 +141,46 @@ pub struct ExperimentalHu {
 pub const EXPERIMENTAL_NOTE: &str = "experimental, not solved: synthetic root, empty history, unconditioned ranges";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct ExploitAdvice {
     #[serde(with = "crate::numeric::probability")]
+    #[cfg_attr(feature = "typescript", ts(as = "f32"))]
     pub alpha: f32,
     pub model_revision: u32, pub model_summary: String, pub gto_action: Action, pub exploit_action: Action,
     #[serde(default, with = "crate::numeric::finite_opt")]
+    #[cfg_attr(feature = "typescript", ts(as = "Option<f32>"))]
     pub ev_delta_bb: Option<f32>,
     pub locked_nodes: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum Phase { Fast, Provisional, Final }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct Recommendation {
     pub identity: DecisionIdentity, pub phase: Phase, pub coverage: Coverage, pub legal: Vec<LegalAction>,
     pub actions: Vec<ActionAdvice>,
     #[serde(with = "crate::numeric::probability")]
+    #[cfg_attr(feature = "typescript", ts(as = "f32"))]
     pub unresolved_mass: f32,
     #[serde(default, with = "crate::numeric::action_weights_opt")]
+    #[cfg_attr(feature = "typescript", ts(as = "Option<Vec<(Action, f32)>>"))]
     pub range_mix: Option<Vec<(Action, f32)>>,
     pub equity: EquitySummary, pub assumptions: Assumptions, pub experimental: Option<ExperimentalHu>, pub exploit: Option<ExploitAdvice>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum RecommendationEvent {
     Fast(Recommendation),
     Equity { identity: DecisionIdentity, equity: EquitySummary },
     Progress {
         identity: DecisionIdentity, stage: String, iterations: u32,
-        #[serde(default, with = "crate::numeric::non_negative_opt")] exploitability_pct: Option<f32>,
+        #[serde(default, with = "crate::numeric::non_negative_opt")] #[cfg_attr(feature = "typescript", ts(as = "Option<f32>"))] exploitability_pct: Option<f32>,
         elapsed_ms: u32,
     },
     Provisional(Recommendation),

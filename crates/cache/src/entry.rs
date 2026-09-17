@@ -13,7 +13,7 @@
 use crate::CacheError;
 
 // --- Numeric wire validation for cached matrices (standing ruling (a): validate wide, never
-// clamp; fix round 1 R1) ---
+// clamp; fix round 1 R1, width fixed in fix round 2 N1) ---
 //
 // `CachedNode::probs`/`ev_over_P` are `Vec<Vec<f32>>` in memory (spec: EV is signed finite f32
 // chips), matching `proto::worker::NodeStrategy`. Deriving plain `Deserialize` for those fields
@@ -23,19 +23,31 @@ use crate::CacheError;
 //
 // `proto::worker` already solves this for the worker wire (spec 4.5) with private
 // `narrow_checked`/`widen_checked`/`deserialize_matrix` helpers; they are not exported, so
-// (per this fix's instruction) equivalent private helpers are defined here rather than
-// weakening proto's visibility. Unlike proto::worker's codec, which only ever serializes to
-// JSON-lines and can safely write narrow `f32` while reading wide `f64` (JSON is
-// self-describing), `CachedNode` is also the type a bincode-encoded on-disk cache entry
-// carries (spec 10.4). Bincode is *not* self-describing -- the deserializer reads exactly as
-// many bytes as the field type it is asked for -- so if this codec wrote narrow `f32` (4
-// bytes) but read wide `f64` (8 bytes), a bincode round trip of the very data this codec
-// wrote would desync and fail to decode. Reading and writing `f64` on *both* sides keeps
-// bincode's width symmetric while still performing the wide-before-narrow admission check
-// against a value that may have arrived with more precision than f32 (the demonstrated JSON
-// attack); the field type itself stays `Vec<Vec<f32>>`, so nothing about the in-memory or
-// spec-mandated representation changes, and the wire cost is the same 8 bytes/value bincode
-// would already spend on a raw `f64` field.
+// (per R1's instruction) equivalent private helpers are defined here rather than weakening
+// proto's visibility.
+//
+// The wire *width* is format-dependent, decided by `Serializer`/`Deserializer::is_human_readable()`
+// (every serde format implements this; bincode 1.3.3 -- the pinned cache storage format, spec
+// 10.4 -- returns `false` from both its `Serializer` and `Deserializer`, `serde_json` inherits
+// serde's default `true`):
+// - Human-readable (JSON): read/write `f64`, exactly as before. JSON is text, so a value can
+//   arrive with more precision than `f32` -- this is the actual attack surface R1 demonstrated
+//   (`[1.00000001, -1e-50]` narrows to the in-domain `[1.0, -0.0]`) -- so the wide value is
+//   checked before narrowing on read, and an in-memory value is widened and re-checked before
+//   it reaches the wire on write.
+// - Non-human-readable (bincode): read/write `f32` directly, matching the field's own width.
+//   Bincode is not self-describing (the deserializer reads exactly as many bytes as the type
+//   it is asked for), so serialize and deserialize must already agree on width; there is also
+//   nothing to widen *from* -- the wire value already is an `f32`, so no narrowing step can
+//   lose precision it didn't already have. The finiteness/domain check still applies to the
+//   f32 value actually read (fix round 2 N1's own requirement: bincode cannot carry a wider
+//   value than what was validated in memory before serialization, but it can still carry a
+//   *corrupted* one, e.g. a hand-crafted NaN bit pattern, which must still be rejected).
+//
+// Fix round 1 chose f64 on both sides specifically to keep bincode's width symmetric, which
+// doubles the persisted size of every cached matrix against plan 4's storage budget (task-2
+// fix round 2 finding N1) -- unnecessarily, since `is_human_readable()` already gives a format
+// a way to declare its own width without needing bincode's unsupported `deserialize_any`.
 
 fn narrow_checked(raw: f64, domain: fn(f64) -> bool, what: &str) -> Result<f32, String> {
     if !raw.is_finite() || !domain(raw) {
@@ -55,6 +67,15 @@ fn widen_checked(v: f32, domain: fn(f64) -> bool, what: &str) -> Result<f64, Str
     Ok(v as f64)
 }
 
+/// Checks a value already at its native (non-widened) width -- the bincode path, where there is
+/// no wider source representation to check before narrowing.
+fn native_checked(v: f32, domain: fn(f64) -> bool, what: &str) -> Result<f32, String> {
+    if !v.is_finite() || !domain(v as f64) {
+        return Err(format!("{what} {v} is outside its valid domain"));
+    }
+    Ok(v)
+}
+
 fn domain_unit_interval(x: f64) -> bool {
     (0.0..=1.0).contains(&x)
 }
@@ -63,23 +84,42 @@ fn domain_finite(_: f64) -> bool {
 }
 
 fn deserialize_matrix<'de, D: serde::Deserializer<'de>>(d: D, domain: fn(f64) -> bool, what: &str) -> Result<Vec<Vec<f32>>, D::Error> {
-    let raw: Vec<Vec<f64>> = serde::Deserialize::deserialize(d)?;
-    raw.into_iter()
-        .map(|row| row.into_iter().map(|x| narrow_checked(x, domain, what).map_err(serde::de::Error::custom)).collect())
-        .collect()
+    if d.is_human_readable() {
+        let raw: Vec<Vec<f64>> = serde::Deserialize::deserialize(d)?;
+        raw.into_iter()
+            .map(|row| row.into_iter().map(|x| narrow_checked(x, domain, what).map_err(serde::de::Error::custom)).collect())
+            .collect()
+    } else {
+        let raw: Vec<Vec<f32>> = serde::Deserialize::deserialize(d)?;
+        raw.into_iter()
+            .map(|row| row.into_iter().map(|x| native_checked(x, domain, what).map_err(serde::de::Error::custom)).collect())
+            .collect()
+    }
 }
 
 fn serialize_matrix<S: serde::Serializer>(v: &[Vec<f32>], s: S, domain: fn(f64) -> bool, what: &str) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeSeq;
-    let mut outer = s.serialize_seq(Some(v.len()))?;
-    for row in v {
-        let mut checked_row = Vec::with_capacity(row.len());
-        for x in row {
-            checked_row.push(widen_checked(*x, domain, what).map_err(serde::ser::Error::custom)?);
+    if s.is_human_readable() {
+        let mut outer = s.serialize_seq(Some(v.len()))?;
+        for row in v {
+            let mut checked_row = Vec::with_capacity(row.len());
+            for x in row {
+                checked_row.push(widen_checked(*x, domain, what).map_err(serde::ser::Error::custom)?);
+            }
+            outer.serialize_element(&checked_row)?;
         }
-        outer.serialize_element(&checked_row)?;
+        outer.end()
+    } else {
+        let mut outer = s.serialize_seq(Some(v.len()))?;
+        for row in v {
+            let mut checked_row = Vec::with_capacity(row.len());
+            for x in row {
+                checked_row.push(native_checked(*x, domain, what).map_err(serde::ser::Error::custom)?);
+            }
+            outer.serialize_element(&checked_row)?;
+        }
+        outer.end()
     }
-    outer.end()
 }
 
 fn deserialize_prob_matrix<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<f32>>, D::Error> {

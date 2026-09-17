@@ -78,10 +78,12 @@ pub const ADAPTER_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct SolveRequest {
     pub id: String, pub spot: String, pub board: Vec<Card>, pub oop_range: Range1326, pub ip_range: Range1326,
     pub pot: u32, pub stack_oop: u32, pub stack_ip: u32,
     #[serde(with = "crate::numeric::rake_rate")]
+    #[cfg_attr(feature = "typescript", ts(as = "f32"))]
     pub rake_rate: f32,
     pub rake_cap_mchips: u32,
     pub tree: EffectiveTree, pub history: Vec<Action>, pub target_bp: u16, pub deadline_ms: u32,
@@ -90,6 +92,7 @@ pub struct SolveRequest {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct NodeLock {
     pub path: Vec<Action>, pub actor: String,
     #[serde(deserialize_with = "deserialize_prob_matrix", serialize_with = "serialize_prob_matrix")]
@@ -98,6 +101,7 @@ pub struct NodeLock {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum EngineMessage {
     Solve(SolveRequest),
     Lock { id: String, spot: String, locks: Vec<NodeLock> },
@@ -108,6 +112,7 @@ pub enum EngineMessage {
 /// The `ready` payload (spec 4.5). Named `Ready` because plans 2 and 5 consume it under that name.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct Ready {
     pub proto_version: u16, pub solver_commit: String, pub adapter_version: u16, pub threads: u8,
     pub build_features: Vec<String>, pub cpu_features: Vec<String>, pub capabilities: Vec<String>,
@@ -115,18 +120,22 @@ pub struct Ready {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum AckStatus { Accepted, Staged, Rejected, AlreadyFinished, UnknownTarget }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum Stage { Building, Solving, Extracting }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum ResultStatus { Ok, BestSoFar, Cancelled, Error }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerError {
     pub code: String, pub message: String, pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +144,7 @@ pub struct WorkerError {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct NodeStrategy {
     pub path: Vec<Action>, pub actor: String, pub actions: Vec<Action>,
     #[serde(deserialize_with = "deserialize_prob_matrix", serialize_with = "serialize_prob_matrix")]
@@ -146,6 +156,7 @@ pub struct NodeStrategy {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct StreetSolution {
     pub nodes: Vec<NodeStrategy>, pub requested: u32,
     #[serde(deserialize_with = "deserialize_finite_f32", serialize_with = "serialize_finite_f32")]
@@ -156,6 +167,7 @@ pub struct StreetSolution {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum WorkerMessage {
     Ready(Ready),
     Ack {
