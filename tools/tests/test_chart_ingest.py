@@ -997,3 +997,32 @@ def test_bb_to_x1000_rejects_non_positive():
 def test_bb_to_x1000_rejects_invalid_decimal():
     with pytest.raises(ValueError):
         bb_to_x1000("1/3")
+
+
+# --- sources.manifest.json availability (P3.T4): which chart depths this build actually has ---
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load_availability():
+    return json.loads((ROOT / "fixtures/charts/sources.manifest.json").read_text(encoding="utf-8"))
+
+
+def available_depths():
+    return {d["depth_bb"]: d for d in load_availability()["depths"] if d["status"] == "available"}
+
+
+def test_sources_manifest_shape():
+    m = load_availability()
+    assert m["schema_version"] == 1
+    assert [d["depth_bb"] for d in m["depths"]] == [100, 200]
+    for d in m["depths"]:
+        assert d["status"] in ("available", "unsupported")
+        if d["status"] == "available":
+            assert (ROOT / d["source_file"]).exists()
+            assert len(d["sha256"]) == 64 and d["bytes"] > 0
+        else:
+            assert d["source_file"] is None and d["sha256"] is None
+            assert d["note"].startswith(f"depth {d['depth_bb']} unsupported")
+    assert available_depths(), "no chart depth acquired; the release has no range source"
