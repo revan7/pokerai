@@ -581,6 +581,52 @@ def test_validate_rejects_malformed_rows(mutate, match):
         validate(envelope)
 
 
+# --- N1 (P3.T3 fix round 2, minor): boundary-value ACCEPTANCE regressions. Fix round 1 added
+# rejection tests for out-of-domain and immediately-out-of-range values (e.g. depth_bb 0 and
+# 65536, to_bb_x1000 4294967296); it never separately confirmed that the domain's own inclusive
+# endpoints (depth_bb 1 and 65535, to_bb_x1000 1 and u32::MAX, weight 0.0 and 1.0) actually
+# validate successfully, as opposed to merely being adjacent to a rejected value. ---
+
+
+@pytest.mark.parametrize("depth_bb", [1, 65535], ids=["min", "max"])
+def test_validate_accepts_depth_bb_boundary_values(depth_bb):
+    envelope = copy.deepcopy(_valid_envelope())
+    envelope["depth_bb"] = depth_bb
+    validate(envelope)  # must not raise
+
+
+@pytest.mark.parametrize("amount", [1, 4294967295], ids=["min", "u32_max"])
+def test_validate_accepts_raise_amount_boundary_values(amount):
+    """`to_bb_x1000` boundary values where the token rule allows an amount at all (`raise`)."""
+    envelope = copy.deepcopy(_valid_envelope())
+    envelope["nodes"][0]["actions"][1]["to_bb_x1000"] = amount
+    validate(envelope)  # must not raise
+
+
+def test_validate_accepts_weight_boundary_values_zero_and_one():
+    envelope = copy.deepcopy(_valid_envelope())
+    # The closed interval `[0, 1]`'s two inclusive endpoints, explicit and asserted here rather
+    # than only implicitly present (as every other passing test's default weights already are).
+    envelope["nodes"][0]["weights"][0][0] = 1.0
+    envelope["nodes"][0]["weights"][1][0] = 0.0
+    validate(envelope)  # must not raise
+
+
+def test_build_accepts_weight_boundary_values_through_a_transcription_grid():
+    """The same two boundary values, reached through `build`'s legend lookup (a transcription
+    grid cell), not only by constructing an already-built envelope dict directly."""
+    legend = {"F": [1.0, 0.0], "R": [0.0, 1.0]}
+    t = _transcription(legend=legend)
+    e = build(t)  # must not raise
+    assert e["nodes"][0]["weights"][0][0] == 1.0
+    assert e["nodes"][0]["weights"][1][0] == 0.0
+
+
+# The immediately-out-of-range rejections (depth 0/65536, amount 4294967296) are already
+# covered by MALFORMED_CASES above (`_mut_depth_bb_zero`, `_mut_depth_bb_too_large`,
+# `_mut_raise_amount_overflow_u32`) -- not duplicated here.
+
+
 # --- R4 (P3.T3 fix round 1): class-specific validation errors carry both index and name ---
 
 
