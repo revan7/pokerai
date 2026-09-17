@@ -128,7 +128,11 @@ def river_two_combo_lines():
 
 
 def lock_river_lines():
-    """IP's river node locked to bet QQ 100% and 54o 20% (ev_convention_non_root_payoffs); OOP holds AA and 66."""
+    """IP's river node locked to bet QQ 100% and 54o 20% (ev_convention_non_root_payoffs); OOP holds
+    QQ and 66 (spec 13.2, ~line 734: OOP QQ and 66, not AA -- required so the locked call EVs are
+    opposite-signed: OOP's QQ is blocked to the same three non-board queens IP's locked QQ portion
+    uses, so it wins the whole compatible range for +200; OOP's 66 is unblocked and faces IP's full
+    locked range, losing the QQ portion for -50)."""
     rows = [[0.0, 0.0] for _ in range(1326)]
     for i, w in enumerate(block(parse_range("QQ"), RIVER_BOARD)):
         if w > 0:
@@ -137,7 +141,7 @@ def lock_river_lines():
         if w > 0:
             rows[i] = [0.8, 0.2]
     yield json.dumps({"type": "lock", "id": "47", "spot": SPOT_LOCK, "locks": [{"path": [action("check")], "actor": "ip", "probs": rows}]}, separators=(",", ":"))
-    yield solve_line("51", SPOT_LOCK, RIVER_BOARD, parse_range("AA,66"), parse_range("QQ,54o:0.25"), 100, 100, RIVER_ORACLE_TREE, [action("check")], 10, 1500, 200)
+    yield solve_line("51", SPOT_LOCK, RIVER_BOARD, parse_range("QQ,66"), parse_range("QQ,54o:0.25"), 100, 100, RIVER_ORACLE_TREE, [action("check")], 10, 1500, 200)
     yield json.dumps({"type": "shutdown", "id": "52"}, separators=(",", ":"))
 
 
