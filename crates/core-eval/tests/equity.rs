@@ -75,15 +75,18 @@ fn equity_budget_respected() {
     assert_eq!(res.status, EquityStatus::BudgetExceeded);
     assert!(took < budget + Duration::from_millis(50), "stopped {took:?} after a {budget:?} budget");
     assert!(res.shares.is_empty());
+    // The flag is raised through `cancel_after`, not a raw `std::thread::sleep`: this enumeration
+    // is hundreds of milliseconds of work, so a 1 ms spun delay is unambiguously *inside* it on
+    // either build profile, whereas a 30 ms `sleep` lands within a Windows timer tick (15.6 ms) of
+    // its own overrun bound and made this assertion fail intermittently in release.
     let cancel = Arc::new(AtomicBool::new(false));
-    let flag = cancel.clone();
-    let setter = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(30)); flag.store(true, Ordering::Relaxed); });
+    let setter = cancel_after(&cancel, Duration::from_millis(1));
     let start = Instant::now();
     let res = equity(&req, Duration::from_secs(10), &cancel);
     let took = start.elapsed();
     setter.join().unwrap();
     assert_eq!(res.status, EquityStatus::Cancelled);
-    assert!(took < Duration::from_millis(80), "cancelled {took:?} after a 30 ms flag");
+    assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 1 ms flag");
 }
 
 /// Hand-checkable exact case: AcAd against KcKd on the turn Qs Jd 7h 3c.
@@ -246,20 +249,27 @@ fn assignment_search_observes_the_budget_with_no_evaluations() {
 
 /// R1: the same search must observe a cancellation raised while it is running, which only a poll
 /// inside the assignment traversal can catch.
+///
+/// The flag is raised through `cancel_after`, whose delay is spun, and after 1 ms rather than 20.
+/// A raw `std::thread::sleep(20 ms)` was a genuine race: this search is 9,150,625 candidate visits,
+/// about 18 ms in a release build, so the sleep and the search were the same order of magnitude and
+/// the search often finished first — reporting `InvalidRanges`, which is the correct answer for a
+/// completed proof and a wrong one for this test's intent. 1 ms is a hundred `tick_work` polls into
+/// the traversal (one every 4,096 candidates, about 8 us) and a twentieth of the shortest run, so
+/// the poll under test is the only thing that can end it, on either profile.
 #[test]
 fn assignment_search_observes_cancellation_with_no_evaluations() {
     let req = colliding_six_player();
     let cancel = Arc::new(AtomicBool::new(false));
-    let flag = cancel.clone();
-    let setter = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(20)); flag.store(true, Ordering::Relaxed); });
+    let setter = cancel_after(&cancel, Duration::from_millis(1));
     let start = Instant::now();
     let res = equity(&req, Duration::from_secs(10), &cancel);
     let took = start.elapsed();
     setter.join().unwrap();
-    assert_eq!(res.status, EquityStatus::Cancelled);
+    assert_eq!(res.status, EquityStatus::Cancelled, "stopped after {took:?}");
     assert!(res.shares.is_empty());
     assert_eq!(res.samples, 0);
-    assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 20 ms flag");
+    assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 1 ms flag");
 }
 
 /// R2: non-uniform joint weights, hand-derived, with one partially colliding pair.
@@ -719,19 +729,23 @@ fn mc_partial_runs_keep_their_shares() {
         other => panic!("{other:?}"),
     }
 
+    // 1 ms, not 20: `max_samples` is `u32::MAX`, so the run cannot end on its own and the only
+    // question is whether a sample completes before the flag -- one takes microseconds. Spinning
+    // for 20 ms burned a core for the whole delay and left the 200 ms bound below within reach of
+    // scheduling noise when the rest of this binary runs in parallel.
     let cancel = Arc::new(AtomicBool::new(false));
-    let setter = cancel_after(&cancel, Duration::from_millis(20));
+    let setter = cancel_after(&cancel, Duration::from_millis(1));
     let start = Instant::now();
     let res = equity(&req(), Duration::from_secs(10), &cancel);
     let took = start.elapsed();
     setter.join().unwrap();
-    assert_eq!(res.status, EquityStatus::Cancelled);
+    assert_eq!(res.status, EquityStatus::Cancelled, "stopped after {took:?}");
     assert!(res.samples > 0, "the samples taken before the flag are not thrown away");
     assert!(!res.shares.is_empty());
     let sum: f32 = res.shares.iter().map(|s| s.value).sum();
     assert!((sum - 1.0).abs() < 1e-5, "shares sum to {sum}");
     assert!(matches!(res.method, Some(EquityMethod::MonteCarlo { .. })));
-    assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 20 ms flag");
+    assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 1 ms flag");
 }
 
 /// S9 (final review): the spec keeps EV in `f32` chips, but `terminal_payoff` must not do the
