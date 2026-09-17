@@ -1,0 +1,9 @@
+[project]
+name = "pokerai-tools"
+version = "0.1.0"
+description = "Dev-only oracles and fixture generators for the PokerAI assistant (never a runtime dependency)"
+requires-python = ">=3.12"
+dependencies = ["pokerkit==0.7.5", "phevaluator==0.6.0", "pytest>=9.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
