@@ -281,3 +281,54 @@ fn stop_is_idempotent_and_delegates_once() {
     assert!(s.stopped());
     assert_eq!(calls.lock().unwrap().iter().filter(|(name, _)| name == "shutdown").count(), 1);
 }
+
+// P5.T6 review round 1, R2: command drift between this crate's registration and the
+// TypeScript `Backend` surface previously had no automated guard. Both sides now pin
+// the identical fourteen-name inventory: this test reads `lib.rs`'s own
+// `generate_handler!` source text (never Tauri's runtime handler table, which is not
+// introspectable) and compares it against the committed list below; the
+// TypeScript-side half lives in `apps/pokerai-ui/src/test/backend.test.ts`'s
+// `COMMAND_NAMES` (checked there against `keyof Backend` at compile time). A rename,
+// addition, or removal of a registered command on the Rust side that is not mirrored
+// in the committed list here fails this test; a drift purely on the TypeScript side
+// fails that file's own checks instead — so a mismatch between the two crates always
+// fails at least one side's suite.
+#[test]
+fn registered_commands_match_the_committed_command_inventory() {
+    const COMMAND_NAMES: [&str; 14] = [
+        "set_game_config",
+        "begin_hand",
+        "set_hero_cards",
+        "apply_action",
+        "set_board",
+        "undo",
+        "recommend",
+        "cancel",
+        "finish_hand",
+        "abandon_hand",
+        "set_seat_tag",
+        "presolver_status",
+        "presolver_pause",
+        "presolver_resume",
+    ];
+    let source = include_str!("lib.rs");
+    let mut registered: Vec<&str> = Vec::new();
+    let mut rest = source;
+    while let Some(idx) = rest.find("commands::") {
+        rest = &rest[idx + "commands::".len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        registered.push(&rest[..end]);
+        rest = &rest[end..];
+    }
+    assert!(!registered.is_empty(), "no `commands::` references found in lib.rs; the parser is broken");
+    registered.sort_unstable();
+    let mut committed = COMMAND_NAMES.to_vec();
+    committed.sort_unstable();
+    assert_eq!(
+        registered, committed,
+        "invoke_handler registration in lib.rs drifted from the committed command \
+         inventory shared with apps/pokerai-ui/src/test/backend.test.ts's COMMAND_NAMES"
+    );
+}
