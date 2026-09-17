@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "depths": [
+    {
+      "depth_bb": 100,
+      "bundle_id": "pokercoaching_100",
+      "status": "available",
+      "source_file": "fixtures/charts/sources/pokercoaching_100.pdf",
+      "final_url": "https://poker-coaching.s3.amazonaws.com/tools/preflop-charts/online-6max-gto-charts.pdf",
+      "sha256": "f5686c6dd672c782249752c60cd4ff5850378271e2139abc2b15e690149d091b",
+      "bytes": 2055584,
+      "acquired_utc": "2026-09-17T19:44:42Z",
+      "note": ""
+    },
+    {
+      "depth_bb": 200,
+      "bundle_id": "rangeconverter_200",
+      "status": "available",
+      "source_file": "fixtures/charts/sources/rangeconverter_200.pdf",
+      "final_url": "https://rangeconverter.com/downloads/6-max-200bb-Poker-Charts-No-Limit-Texas-Holdem-Cash",
+      "sha256": "f0797be2a9894c520af90e70c17e2b7dee208215eab58b6ae953e8cc81bf70e2",
+      "bytes": 5169125,
+      "acquired_utc": "2026-09-17T19:48:50Z",
+      "note": ""
+    }
+  ]
+}
