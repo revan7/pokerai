@@ -58,15 +58,17 @@ pub(crate) fn widen_checked(v: f32, domain: Domain, what: &str) -> Result<f32, S
     Ok(v)
 }
 
-/// Checks a value already at its native (non-widened) width -- the bincode path, where the wire
-/// value already is an `f32` (there is no wider source representation to validate before
-/// narrowing, and no narrowing step at all: see `crates/cache/src/entry.rs`'s identical helper
-/// and rationale, the established precedent this module now follows for every codec below).
+/// Checks a value already at its native (non-widened) width -- the bincode read path, where the
+/// wire value already is an `f32` (there is no wider source representation to validate before
+/// narrowing, and no narrowing step at all). Review R2 (fix round 1): this is exactly
+/// `widen_checked`'s check (finiteness and `domain` on an `f32`), so it delegates rather than
+/// duplicating the body; the two keep distinct names because each documents which *direction* --
+/// write (`widen_checked`, called from `serialize`) or read (`native_checked`, called from
+/// `deserialize`) -- the caller is on, matching the read/write split every codec below makes
+/// explicit. `narrow_checked` stays a genuinely separate helper: it is the only one of the three
+/// that starts from a wider `f64` and narrows.
 pub(crate) fn native_checked(v: f32, domain: Domain, what: &str) -> Result<f32, String> {
-    if !v.is_finite() || !domain(v as f64) {
-        return Err(format!("{what} {v} is outside its valid domain"));
-    }
-    Ok(v)
+    widen_checked(v, domain, what)
 }
 
 /// Generates the `#[serde(with = "...")]` module for a required `f32` field of one domain.
