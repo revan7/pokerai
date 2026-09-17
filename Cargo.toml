@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["third_party/postflop-solver"]
 
 [workspace.package]
 version = "0.1.0"
