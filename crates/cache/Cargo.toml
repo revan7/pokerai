@@ -1,0 +1,23 @@
+[package]
+name = "cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Canonical cache keys, on-disk street-solution store and background pre-solver queue (spec section 10.4-10.5)"
+
+[features]
+# Plan 5 enables this to generate the `PresolverStatus` TypeScript binding (cross-plan Or7).
+typescript = ["dep:ts-rs"]
+
+[dependencies]
+proto = { path = "../proto" }
+core-iso = { path = "../core-iso" }
+core-ranges = { path = "../core-ranges" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+ts-rs = { workspace = true, optional = true }
+bincode = "=1.3.3"
+zstd = "=0.13.3"
