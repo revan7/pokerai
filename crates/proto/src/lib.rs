@@ -8,6 +8,8 @@ pub mod range;
 pub use range::*;
 pub use game::*;
 pub use hand::*;
+pub mod tree;
+pub use tree::*;
 
 /// Wire protocol version reported in `ready` (spec section 4.5).
 pub const PROTO_VERSION: u16 = 3;
