@@ -1,6 +1,6 @@
 mod support;
 
-use cache::entry::{validate_entry, CacheEntry};
+use cache::entry::{validate_entry, CacheEntry, CachedNode};
 use cache::CacheError;
 use cache::key::{Model, RakeKey, Rational};
 use proto::{Action, MaterializedNode, Street};
@@ -77,11 +77,19 @@ fn simple_tree_and_solution() -> (proto::EffectiveTree, proto::worker::StreetSol
     };
 
     let (probs0, ev0, avail0) = support::rows(2);
-    let (probs1, mut ev1, avail1) = support::rows(2);
+    // R3 (fix round 1): the child must be populated at a *different* combo, with *different*
+    // probabilities and a *different* non-fold EV than the root -- support::rows alone would
+    // give both nodes the identical single-combo payload (AhAd, [0.5,0.5], [0.0,10.0]), which
+    // cannot distinguish a correct per-node normalize from a regression that aliases every
+    // node's payload to the root's.
+    let child_combo = 0usize; // 2c2d (combo_index 0): distinct from the root's AhAd (1274).
+    let mut probs1 = vec![vec![0.0; 2]; 1326];
+    let mut ev1 = vec![vec![0.0; 2]; 1326];
+    let mut avail1 = vec![false; 1326];
+    avail1[child_combo] = true;
+    probs1[child_combo] = vec![0.3, 0.7];
     // Action 0 at the `ip` node is Fold: spec section 2 requires EV(fold) == 0 exactly.
-    for row in &mut ev1 {
-        row[0] = 0.0;
-    }
+    ev1[child_combo] = vec![0.0, 25.0];
     let nodes = vec![
         proto::worker::NodeStrategy {
             path: vec![],
@@ -119,16 +127,34 @@ fn normalize_converts_chip_path_to_ordinal_and_scales_ev_by_pot() {
     let (tree, sol) = simple_tree_and_solution();
     let out = cache::entry::normalize(&sol, &tree, 100).unwrap();
     assert_eq!(out.len(), 2);
+
+    // Root (`oop`, ordinal path []): populated at AhAd (combo 1274) by support::rows.
     assert_eq!(out[0].path, Vec::<u8>::new(), "root chip path [] must resolve to ordinal path []");
     assert_eq!(out[0].actor, "oop");
+    assert_eq!(out[0].probs[1274], vec![0.5, 0.5]);
+    // support::rows populates AhAd with ev [0.0, 10.0] chips; normalize must divide by the
+    // pot (100) to store the pot-relative fraction.
+    assert_eq!(out[0].ev_over_P[1274], vec![0.0, 0.1]);
+    assert!(out[0].available[1274]);
+    assert_eq!(out[0].probs[0], vec![0.0, 0.0], "root's unpopulated 2c2d combo must be a zero row");
+    assert_eq!(out[0].ev_over_P[0], vec![0.0, 0.0]);
+    assert!(!out[0].available[0]);
+    assert!(out[0].available.iter().enumerate().all(|(i, a)| *a == (i == 1274)));
+
+    // Child (`ip`, ordinal path [1]): populated at 2c2d (combo 0) -- deliberately a *different*
+    // combo with *different* values from the root (R3, fix round 1), so this test cannot pass
+    // if normalize aliases the child's payload to the root's.
     assert_eq!(out[1].path, vec![1u8], "Bet{{to:50}} at the root must resolve to ordinal [1]");
     assert_eq!(out[1].actor, "ip");
-    // support::rows populates exactly the AhAd combo (index 1274) with ev [0.0, 10.0] chips;
-    // normalize must divide by the pot (100) to store the pot-relative fraction.
-    assert_eq!(out[0].ev_over_P[1274], vec![0.0, 0.1]);
-    assert_eq!(out[0].probs[1274], vec![0.5, 0.5]);
-    assert!(out[0].available[1274]);
-    assert!(out[0].available.iter().enumerate().all(|(i, a)| *a == (i == 1274)));
+    assert_eq!(out[1].probs[0], vec![0.3, 0.7]);
+    // The child's EV was set to [0.0, 25.0] chips; normalize must divide by the pot (100),
+    // producing a pot-normalized fraction distinct from the root's.
+    assert_eq!(out[1].ev_over_P[0], vec![0.0, 0.25]);
+    assert!(out[1].available[0]);
+    assert_eq!(out[1].probs[1274], vec![0.0, 0.0], "child's unpopulated AhAd combo must be a zero row");
+    assert_eq!(out[1].ev_over_P[1274], vec![0.0, 0.0]);
+    assert!(!out[1].available[1274]);
+    assert!(out[1].available.iter().enumerate().all(|(i, a)| *a == (i == 0)));
 }
 
 #[test]
@@ -406,6 +432,93 @@ fn validate_entry_rejects_reconstructed_solution_failing_validate_solution() {
     // `StreetSolution` must fail `proto::worker::validate_solution`.
     let e = mutate(|e| {
         e.nodes[0].probs[1274] = vec![0.1, 0.1];
+    });
+    assert!(validate_entry(&e).is_err());
+}
+
+// --- R1 (fix round 1): CachedNode's probs/ev_over_P matrices admit wide values -----------------
+
+/// A JSON probability row that narrows to the in-domain `[1.0, -0.0]` but whose wide (f64)
+/// values are out of domain -- the exact row the Codex review's probe demonstrated decoding
+/// successfully (and then passing `validate_entry`) before the R1 fix.
+#[test]
+fn cached_node_probs_reject_invalid_wide_values_before_narrowing() {
+    let json = r#"{"path":[],"actor":"oop","probs":[[1.00000001,-1e-50]],"ev_over_P":[[0.0,0.0]],"available":[true]}"#;
+    assert!(serde_json::from_str::<CachedNode>(json).is_err());
+}
+
+#[test]
+fn cached_node_ev_over_p_rejects_non_finite_values_on_decode() {
+    for bad in ["1e999", "-1e999", "1e39", "-1e39"] {
+        let json = format!(r#"{{"path":[],"actor":"oop","probs":[[0.5,0.5]],"ev_over_P":[[{bad},0.0]],"available":[true]}}"#);
+        assert!(serde_json::from_str::<CachedNode>(&json).is_err(), "ev_over_P {bad} must be rejected");
+    }
+}
+
+#[test]
+fn cached_node_serialize_rejects_non_finite_or_out_of_domain_in_memory_values() {
+    let nan_ev = CachedNode {
+        path: vec![],
+        actor: "oop".into(),
+        probs: vec![vec![0.5, 0.5]],
+        ev_over_P: vec![vec![f32::NAN, 0.0]],
+        available: vec![true],
+    };
+    assert!(serde_json::to_string(&nan_ev).is_err(), "NaN ev_over_P must not silently serialize");
+
+    let out_of_domain_prob = CachedNode {
+        path: vec![],
+        actor: "oop".into(),
+        probs: vec![vec![1.5, -0.1]],
+        ev_over_P: vec![vec![0.0, 0.0]],
+        available: vec![true],
+    };
+    assert!(serde_json::to_string(&out_of_domain_prob).is_err(), "out-of-[0,1] probs must not silently serialize");
+}
+
+/// The Codex review's exact reproduction (R1 evidence): a full, otherwise-valid `CacheEntry`
+/// JSON with one populated probability row corrupted to `[1.00000001, -1e-50]` must fail to
+/// decode at all -- not decode successfully (narrowing to `[1.0, -0.0]`) and then separately
+/// pass or fail `validate_entry`.
+#[test]
+fn cache_entry_json_decode_rejects_invalid_wide_probabilities_row() {
+    let text = serde_json::to_string(&support::entry()).unwrap();
+    assert!(text.contains("[0.5,0.5]"), "fixture must contain a populated probability row to corrupt");
+    let corrupted = text.replacen("[0.5,0.5]", "[1.00000001,-1e-50]", 1);
+    assert!(serde_json::from_str::<CacheEntry>(&corrupted).is_err());
+}
+
+/// A valid entry -- matrices included -- round-trips through JSON unchanged and stays valid.
+#[test]
+fn cache_entry_with_valid_matrices_round_trips_through_json() {
+    let e = support::entry();
+    let text = serde_json::to_string(&e).unwrap();
+    let back: CacheEntry = serde_json::from_str(&text).unwrap();
+    assert!(validate_entry(&back).is_ok());
+    assert_eq!(back.nodes.len(), e.nodes.len());
+    for (a, b) in e.nodes.iter().zip(back.nodes.iter()) {
+        assert_eq!(a.path, b.path);
+        assert_eq!(a.actor, b.actor);
+        assert_eq!(a.probs, b.probs);
+        assert_eq!(a.ev_over_P, b.ev_over_P);
+        assert_eq!(a.available, b.available);
+    }
+}
+
+// --- R2 (fix round 1): canonical range identity is bit-exact ---------------------------------
+
+/// Reproduces the Codex review's exact probe. With canonical board `[Card(0), Card(20),
+/// Card(44)]` (2c, 7c, Kc -- three same-suit cards, giving the board a nontrivial stabilizer)
+/// and OOP range index 41 set to `-0.0`, `canonicalize`'s tie-break selects the non-identity
+/// `SuitPerm([0, 3, 1, 2])`. The permuted range is numerically equal to the stored range
+/// (ordinary float `==` treats `+0.0 == -0.0`) but has a different `hash_scaled` digest, so
+/// `validate_entry` must reject it, not accept it.
+#[test]
+fn validate_entry_rejects_asymmetric_stabilizer_signed_zero_regression() {
+    let e = mutate(|e| {
+        e.key.canonical_board = vec![proto::Card(0), proto::Card(20), proto::Card(44)];
+        e.source.ranges[0].0[41] = -0.0f32;
+        e.key.range_hash_oop = core_ranges::hash_scaled(&e.source.ranges[0]);
     });
     assert!(validate_entry(&e).is_err());
 }
