@@ -17,3 +17,4 @@ pub mod entry;
 pub mod key;
 pub mod label;
 pub mod lookup;
+pub mod storage;
