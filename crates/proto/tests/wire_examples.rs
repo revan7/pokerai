@@ -84,3 +84,87 @@ fn structurally_invalid_lines_are_rejected() {
     assert!(matches!(parsed, EngineMessage::Lock { .. }), "shape errors of lock matrices are validate_locks' job, not serde's");
     assert!(serde_json::from_str::<WorkerMessage>(r#"{"type":"progress","id":"1","stage":"solving","iterations":1,"exploitability_chips":1e999,"elapsed_ms":1,"memory_bytes":1}"#).is_err(), "non-finite numbers are rejected");
 }
+
+/// T7-R1: every f32 wire field must be validated in its wide f64 form before narrowing (a
+/// value that merely rounds into a domain on narrowing, e.g. a probability `1.00000001`, or
+/// that overflows to infinity on narrowing, e.g. `1e39`, must be rejected), and again on
+/// serialize (a non-finite in-memory value must error, never silently become JSON `null`).
+#[test]
+fn wire_floats_are_validated_before_narrowing_and_on_serialize() {
+    // Probabilities (NodeLock.probs / NodeStrategy.probs share the same [0,1] domain codec):
+    // reject anything that would only round into range on narrowing, and overflow, accept the
+    // closed endpoints and an ordinary in-domain value.
+    let node_lock = |probs: &str| format!(r#"{{"path":[],"actor":"oop","probs":[[{probs}]]}}"#);
+    for bad in ["1.00000001", "-1e-50", "1e39", "-1e39"] {
+        assert!(serde_json::from_str::<NodeLock>(&node_lock(bad)).is_err(), "probability {bad} must be rejected");
+    }
+    for ok in ["0.0", "1.0", "0.5"] {
+        assert!(serde_json::from_str::<NodeLock>(&node_lock(ok)).is_ok(), "probability {ok} must be accepted");
+    }
+    let bad_lock = NodeLock { path: vec![], actor: "oop".into(), probs: vec![vec![1.5]] };
+    assert!(serde_json::to_string(&bad_lock).is_err(), "an out-of-domain in-memory probability must not serialize");
+
+    // ev_chips: finite only, no [0,1] bound, but overflow-on-narrow must still be rejected.
+    let node_strategy = |ev: &str| format!(r#"{{"path":[],"actor":"oop","actions":[],"probs":[],"ev_chips":[[{ev}]],"available":[]}}"#);
+    assert!(serde_json::from_str::<NodeStrategy>(&node_strategy("1e39")).is_err(), "ev_chips overflow-on-narrow must be rejected");
+    assert!(serde_json::from_str::<NodeStrategy>(&node_strategy("-123.5")).is_ok());
+
+    // StreetSolution.exploitability_chips: scalar, finite only, always present.
+    let street = |v: &str| format!(r#"{{"nodes":[],"requested":0,"exploitability_chips":{v},"iterations":0,"memory_bytes":0,"mode":"f32","locks_applied":0,"export":"street","covered_paths":[]}}"#);
+    assert!(serde_json::from_str::<StreetSolution>(&street("1e39")).is_err());
+    assert!(serde_json::from_str::<StreetSolution>(&street("12.5")).is_ok());
+    let bad_street = StreetSolution { nodes: vec![], requested: 0, exploitability_chips: f32::NAN, iterations: 0, memory_bytes: 0, mode: "f32".into(), locks_applied: 0, export: "street".into(), covered_paths: vec![] };
+    assert!(serde_json::to_string(&bad_street).is_err(), "NaN exploitability_chips must not serialize");
+
+    // rake_rate: half-open [0,1); build one valid SolveRequest, then vary rake_rate by text
+    // substitution (deserialize direction) and by direct field mutation (serialize direction).
+    let (oop, ip) = river_two_combo_ranges();
+    let tree: EffectiveTree = serde_json::from_str(r#"{"rules_version":3,"template_id":"river_oracle_v1","root_street":"river","menus":{"river":{"oop":{"bet":[],"raise":[]},"ip":{"bet":[1.0],"raise":[]}}},"add_allin_threshold":0.0,"force_allin_threshold":0.0,"merging_threshold":0.0,"wager_cap":1,"inserted":[],"materialized":[{"path":[],"street":"river","actor":"oop","actions":[{"kind":"check"}],"terminal_pots":[null]}]}"#).unwrap();
+    let board: Vec<Card> = ["Qs", "Jd", "7h", "3c", "2d"].iter().map(|s| s.parse().unwrap()).collect();
+    let base = SolveRequest { id: "1".into(), spot: "x".into(), board, oop_range: oop, ip_range: ip, pot: 100, stack_oop: 100, stack_ip: 100, rake_rate: 0.0, rake_cap_mchips: 0, tree, history: vec![], target_bp: 10, deadline_ms: 1500, extraction_margin_ms: 200, memory_limit_bytes: 1, background: false };
+    let line = serde_json::to_string(&EngineMessage::Solve(base.clone())).unwrap();
+    assert!(line.contains(r#""rake_rate":0.0"#), "{line}");
+    for bad in ["1.0", "1.5", "-0.1", "1e39"] {
+        let replaced = line.replacen(r#""rake_rate":0.0"#, &format!(r#""rake_rate":{bad}"#), 1);
+        assert!(serde_json::from_str::<EngineMessage>(&replaced).is_err(), "rake_rate {bad} must be rejected");
+    }
+    let ok_line = line.replacen(r#""rake_rate":0.0"#, r#""rake_rate":0.999"#, 1);
+    assert!(serde_json::from_str::<EngineMessage>(&ok_line).is_ok());
+    let mut nan_request = base;
+    nan_request.rake_rate = f32::NAN;
+    assert!(serde_json::to_string(&EngineMessage::Solve(nan_request)).is_err(), "NaN rake_rate must not serialize");
+
+    // Progress.exploitability_chips: reject overflow-on-narrow, accept explicit null and a
+    // finite measurement.
+    let progress = |v: &str| format!(r#"{{"type":"progress","id":"1","stage":"solving","iterations":1,"exploitability_chips":{v},"elapsed_ms":1,"memory_bytes":1}}"#);
+    assert!(serde_json::from_str::<WorkerMessage>(&progress("1e39")).is_err());
+    assert!(serde_json::from_str::<WorkerMessage>(&progress("-1e39")).is_err());
+    assert!(serde_json::from_str::<WorkerMessage>(&progress("null")).is_ok());
+    assert!(serde_json::from_str::<WorkerMessage>(&progress("0.5")).is_ok());
+
+    // Serialize-side rejection: an in-memory NaN/Infinity must error, never become `null`
+    // (serde_json's default rendering of a non-finite float, indistinguishable from `None`).
+    let nan_progress = WorkerMessage::Progress { id: "1".into(), stage: Stage::Solving, iterations: 1, exploitability_chips: Some(f32::NAN), elapsed_ms: 1, memory_bytes: 1 };
+    assert!(serde_json::to_string(&nan_progress).is_err(), "NaN must not silently serialize as null");
+    let inf_progress = WorkerMessage::Progress { id: "1".into(), stage: Stage::Solving, iterations: 1, exploitability_chips: Some(f32::INFINITY), elapsed_ms: 1, memory_bytes: 1 };
+    assert!(serde_json::to_string(&inf_progress).is_err(), "infinity must not silently serialize as null");
+}
+
+/// T7-R2: `Progress.exploitability_chips` is required (always present) but nullable (spec 4.5:
+/// `null` until measured). A plain `Option<f32>` would accept a missing key as `None`; the key
+/// must be required, while its value may legitimately be `null`.
+#[test]
+fn progress_measurement_is_required_but_nullable() {
+    let missing = r#"{"type":"progress","id":"1","stage":"solving","iterations":1,"elapsed_ms":1,"memory_bytes":1}"#;
+    assert!(serde_json::from_str::<WorkerMessage>(missing).is_err(), "an omitted exploitability_chips key must be rejected");
+
+    let explicit_null = r#"{"type":"progress","id":"1","stage":"solving","iterations":1,"exploitability_chips":null,"elapsed_ms":1,"memory_bytes":1}"#;
+    let m: WorkerMessage = serde_json::from_str(explicit_null).unwrap();
+    assert!(matches!(m, WorkerMessage::Progress { exploitability_chips: None, .. }));
+    assert_eq!(serde_json::to_string(&m).unwrap(), explicit_null);
+
+    let measured = r#"{"type":"progress","id":"1","stage":"solving","iterations":1,"exploitability_chips":0.5,"elapsed_ms":1,"memory_bytes":1}"#;
+    let m: WorkerMessage = serde_json::from_str(measured).unwrap();
+    assert!(matches!(m, WorkerMessage::Progress { exploitability_chips: Some(v), .. } if v == 0.5));
+    assert_eq!(serde_json::to_string(&m).unwrap(), measured);
+}

@@ -1,9 +1,129 @@
 //! Worker protocol (spec 4.5): UTF-8 JSON Lines, `type`-tagged, lowercase tags, unknown fields rejected.
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeError;
+use serde::ser::{Error as SerError, SerializeSeq};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::cards::Card;
 use crate::hand::Action;
 use crate::range::Range1326;
 use crate::tree::EffectiveTree;
+
+// --- Numeric wire validation (spec 4.5, standing ruling: validate wide, never clamp) ---
+//
+// Every f32 field on the wire is read as f64 and checked against its domain *before*
+// narrowing to f32, and the narrowed value is checked again (narrowing itself can overflow
+// a finite, in-domain f64 to a non-finite f32). The same domain is enforced on serialize, so
+// an invalid in-memory value (however constructed) can never reach the wire -- in particular
+// it can never surface as JSON `null`, which is serde_json's silent rendering of a non-finite
+// float and would be indistinguishable from a legitimate absent value.
+
+/// No bound beyond finiteness (already checked by the caller): EV chips and exploitability.
+fn domain_finite(_: f64) -> bool { true }
+/// Probabilities (spec 4.1/4.5): closed unit interval.
+fn domain_unit_interval(x: f64) -> bool { (0.0..=1.0).contains(&x) }
+/// `rake_rate` (spec 2): a fraction, never a full rake (half-open at 1).
+fn domain_rake_rate(x: f64) -> bool { (0.0..1.0).contains(&x) }
+
+/// Reads a wire number as `f64`, checks it is finite and inside `domain`, and only then
+/// narrows to `f32`, re-checking the narrowed value against the same domain. This ordering
+/// is load-bearing: an f64 merely close to (but outside) the domain must never be admitted by
+/// rounding into it during narrowing (e.g. a probability `1.00000001` must not become `1.0`,
+/// `-1e-50` must not become `-0.0`), and a finite, in-domain f64 that overflows f32 on
+/// narrowing (e.g. `1e39`) must be rejected rather than silently becoming `inf`.
+fn narrow_checked(raw: f64, domain: fn(f64) -> bool, what: &str) -> Result<f32, String> {
+    if !raw.is_finite() || !domain(raw) {
+        return Err(format!("{what} {raw} is outside its valid domain"));
+    }
+    let narrowed = raw as f32;
+    if !narrowed.is_finite() || !domain(narrowed as f64) {
+        return Err(format!("{what} {raw} narrows to {narrowed:e}, outside its valid domain"));
+    }
+    Ok(narrowed)
+}
+
+/// The serialize-side counterpart of `narrow_checked`: rejects an in-memory value that is
+/// non-finite or out of domain instead of letting it reach the wire.
+fn widen_checked(v: f32, domain: fn(f64) -> bool, what: &str) -> Result<f32, String> {
+    if !v.is_finite() || !domain(v as f64) {
+        return Err(format!("{what} {v} is outside its valid domain"));
+    }
+    Ok(v)
+}
+
+fn deserialize_rake_rate<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    let raw = f64::deserialize(d)?;
+    narrow_checked(raw, domain_rake_rate, "rake_rate").map_err(DeError::custom)
+}
+fn serialize_rake_rate<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    let checked = widen_checked(*v, domain_rake_rate, "rake_rate").map_err(SerError::custom)?;
+    s.serialize_f32(checked)
+}
+
+/// Scalar, finite-only float (no domain bound beyond finiteness): used for
+/// `StreetSolution::exploitability_chips`, which is always present and never null.
+fn deserialize_finite_f32<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    let raw = f64::deserialize(d)?;
+    narrow_checked(raw, domain_finite, "exploitability_chips").map_err(DeError::custom)
+}
+fn serialize_finite_f32<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+    let checked = widen_checked(*v, domain_finite, "exploitability_chips").map_err(SerError::custom)?;
+    s.serialize_f32(checked)
+}
+
+/// Required-but-nullable scalar float: used for `WorkerMessage::Progress::exploitability_chips`
+/// (spec 4.5: always present on the wire, `null` until measured). Unlike a plain `Option<f32>`
+/// field, this does not default a missing key to `None` -- the key itself is required, and only
+/// its value may legitimately be `null`.
+fn deserialize_required_nullable_f32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    let raw = Option::<f64>::deserialize(d)?;
+    match raw {
+        None => Ok(None),
+        Some(x) => narrow_checked(x, domain_finite, "exploitability_chips").map(Some).map_err(DeError::custom),
+    }
+}
+fn serialize_required_nullable_f32<S: Serializer>(v: &Option<f32>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        None => s.serialize_none(),
+        Some(x) => {
+            let checked = widen_checked(*x, domain_finite, "exploitability_chips").map_err(SerError::custom)?;
+            s.serialize_some(&checked)
+        }
+    }
+}
+
+/// Validates every element of a `Vec<Vec<f32>>` wire matrix against `domain` before narrowing
+/// (see `narrow_checked`). Shared by `NodeLock::probs`, `NodeStrategy::probs` (unit interval)
+/// and `NodeStrategy::ev_chips` (finite only). Matrix shape/row-length/path validation stays
+/// Task 8's job (spec/brief); this only guards the numeric domain of each element.
+fn deserialize_matrix<'de, D: Deserializer<'de>>(d: D, domain: fn(f64) -> bool, what: &str) -> Result<Vec<Vec<f32>>, D::Error> {
+    let raw: Vec<Vec<f64>> = Deserialize::deserialize(d)?;
+    raw.into_iter()
+        .map(|row| row.into_iter().map(|x| narrow_checked(x, domain, what).map_err(DeError::custom)).collect())
+        .collect()
+}
+fn serialize_matrix<S: Serializer>(v: &[Vec<f32>], s: S, domain: fn(f64) -> bool, what: &str) -> Result<S::Ok, S::Error> {
+    let mut outer = s.serialize_seq(Some(v.len()))?;
+    for row in v {
+        let mut checked_row = Vec::with_capacity(row.len());
+        for x in row {
+            checked_row.push(widen_checked(*x, domain, what).map_err(SerError::custom)?);
+        }
+        outer.serialize_element(&checked_row)?;
+    }
+    outer.end()
+}
+
+fn deserialize_prob_matrix<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<f32>>, D::Error> {
+    deserialize_matrix(d, domain_unit_interval, "probability")
+}
+fn serialize_prob_matrix<S: Serializer>(v: &Vec<Vec<f32>>, s: S) -> Result<S::Ok, S::Error> {
+    serialize_matrix(v, s, domain_unit_interval, "probability")
+}
+fn deserialize_finite_matrix<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<f32>>, D::Error> {
+    deserialize_matrix(d, domain_finite, "ev_chips")
+}
+fn serialize_finite_matrix<S: Serializer>(v: &Vec<Vec<f32>>, s: S) -> Result<S::Ok, S::Error> {
+    serialize_matrix(v, s, domain_finite, "ev_chips")
+}
 
 pub const REQUEST_LINE_MAX: usize = 1 << 20;
 pub const RESULT_LINE_MAX: usize = 16 << 20;
@@ -22,14 +142,21 @@ pub const ADAPTER_VERSION: u16 = 1;
 #[serde(deny_unknown_fields)]
 pub struct SolveRequest {
     pub id: String, pub spot: String, pub board: Vec<Card>, pub oop_range: Range1326, pub ip_range: Range1326,
-    pub pot: u32, pub stack_oop: u32, pub stack_ip: u32, pub rake_rate: f32, pub rake_cap_mchips: u32,
+    pub pot: u32, pub stack_oop: u32, pub stack_ip: u32,
+    #[serde(deserialize_with = "deserialize_rake_rate", serialize_with = "serialize_rake_rate")]
+    pub rake_rate: f32,
+    pub rake_cap_mchips: u32,
     pub tree: EffectiveTree, pub history: Vec<Action>, pub target_bp: u16, pub deadline_ms: u32,
     pub extraction_margin_ms: u32, pub memory_limit_bytes: u64, pub background: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NodeLock { pub path: Vec<Action>, pub actor: String, pub probs: Vec<Vec<f32>> }
+pub struct NodeLock {
+    pub path: Vec<Action>, pub actor: String,
+    #[serde(deserialize_with = "deserialize_prob_matrix", serialize_with = "serialize_prob_matrix")]
+    pub probs: Vec<Vec<f32>>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
@@ -72,13 +199,20 @@ pub struct WorkerError {
 #[serde(deny_unknown_fields)]
 pub struct NodeStrategy {
     pub path: Vec<Action>, pub actor: String, pub actions: Vec<Action>,
-    pub probs: Vec<Vec<f32>>, pub ev_chips: Vec<Vec<f32>>, pub available: Vec<bool>,
+    #[serde(deserialize_with = "deserialize_prob_matrix", serialize_with = "serialize_prob_matrix")]
+    pub probs: Vec<Vec<f32>>,
+    #[serde(deserialize_with = "deserialize_finite_matrix", serialize_with = "serialize_finite_matrix")]
+    pub ev_chips: Vec<Vec<f32>>,
+    pub available: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreetSolution {
-    pub nodes: Vec<NodeStrategy>, pub requested: u32, pub exploitability_chips: f32, pub iterations: u32,
+    pub nodes: Vec<NodeStrategy>, pub requested: u32,
+    #[serde(deserialize_with = "deserialize_finite_f32", serialize_with = "serialize_finite_f32")]
+    pub exploitability_chips: f32,
+    pub iterations: u32,
     pub memory_bytes: u64, pub mode: String, pub locks_applied: u16, pub export: String, pub covered_paths: Vec<Vec<Action>>,
 }
 
@@ -91,7 +225,12 @@ pub enum WorkerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")] reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")] replaced: Option<bool>,
     },
-    Progress { id: String, stage: Stage, iterations: u32, exploitability_chips: Option<f32>, elapsed_ms: u32, memory_bytes: u64 },
+    Progress {
+        id: String, stage: Stage, iterations: u32,
+        #[serde(deserialize_with = "deserialize_required_nullable_f32", serialize_with = "serialize_required_nullable_f32")]
+        exploitability_chips: Option<f32>,
+        elapsed_ms: u32, memory_bytes: u64,
+    },
     Result {
         id: String, status: ResultStatus, elapsed_ms: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")] solution: Option<StreetSolution>,
