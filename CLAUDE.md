@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-PokerAI is a Windows 11 desktop assistant for 6-max NLHE cash, played live and entered by hand at the table: a Rust workspace with a Tauri 2 UI, a heads-up CFR postflop solver pinned as a vendored fork and run in a separate worker process, plus a preflop strategy store. The project is documentation-only right now — spec revision 8 and implementation plans 1-5 at revision 3 (114 tasks; order in docs/superpowers/plans/EXECUTION-ORDER.md); execution started 2026-09-17 on branch phase-c. An orchestrator (Claude, "Fable") owns the outline and delegates every atomic task to subagents (Claude Sonnet/Opus/Haiku, OpenAI Codex CLI), with an independent review gate on each.
+PokerAI is a Windows 11 desktop assistant for 6-max NLHE cash, played live and entered by hand at the table: a Rust workspace with a Tauri 2 UI, a heads-up CFR postflop solver pinned as a vendored fork and run in a separate worker process, plus a preflop strategy store. Spec revision 8; plan 1 at revision 4 (execution errata) and plans 2-5 at revision 3 (114 tasks; order in docs/superpowers/plans/EXECUTION-ORDER.md). Execution started 2026-09-17 on branch phase-c: plan 1 (workspace, `proto`, `core-model`, `core-ranges`, `core-iso`, `core-eval`, Python oracles, fixtures) is fully implemented and review-clean; plans 2-4 are in progress. An orchestrator (Claude, "Fable") owns the outline and delegates every atomic task to subagents (Claude Sonnet/Opus/Haiku, OpenAI Codex CLI), with an independent review gate on each.
 
 ## 2. Repository map
 
@@ -29,7 +29,7 @@ Current tree:
 | `AGENTS.md` | Codex CLI's instructions. |
 | `CLAUDE.md` | This file. |
 
-Future code layout (spec §3.2, not yet created):
+Code layout (spec §3.2; plan 1's crates, `tools/`, `fixtures/`, `third_party/`, `solver-worker/` and `crates/cache` exist; the rest lands per plan):
 
 ```
 Cargo.toml                      workspace manifest; .cargo/config.toml sets -C target-feature=+avx2
