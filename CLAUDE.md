@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-PokerAI is a Windows 11 desktop assistant for 6-max NLHE cash, played live and entered by hand at the table: a Rust workspace with a Tauri 2 UI, a heads-up CFR postflop solver pinned as a vendored fork and run in a separate worker process, plus a preflop strategy store. The project is documentation-only right now — spec revision 6 and implementation plans 1-5 are reviewed and revised (114 tasks); no crate exists yet. An orchestrator (Claude, "Fable") owns the outline and delegates every atomic task to subagents (Claude Sonnet/Opus/Haiku, OpenAI Codex CLI), with an independent review gate on each.
+PokerAI is a Windows 11 desktop assistant for 6-max NLHE cash, played live and entered by hand at the table: a Rust workspace with a Tauri 2 UI, a heads-up CFR postflop solver pinned as a vendored fork and run in a separate worker process, plus a preflop strategy store. The project is documentation-only right now — spec revision 8 and implementation plans 1-5 at revision 3 (114 tasks; order in docs/superpowers/plans/EXECUTION-ORDER.md); execution started 2026-09-17 on branch phase-c. An orchestrator (Claude, "Fable") owns the outline and delegates every atomic task to subagents (Claude Sonnet/Opus/Haiku, OpenAI Codex CLI), with an independent review gate on each.
 
 ## 2. Repository map
 
@@ -11,7 +11,7 @@ Current tree:
 | Path | Contents |
 |---|---|
 | `docs/design/2026-09-10-design-outline.md` | Orchestrator decisions. Highest authority. |
-| `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md` | The contract spec, revision 6, 807 lines. |
+| `docs/superpowers/specs/2026-09-10-pokerai-assistant-design.md` | The contract spec, revision 8, 809 lines. |
 | `docs/superpowers/plans/2026-09-10-plan-1-foundation.md` | Plan 1: workspace + `proto`, `core-model`, `core-ranges`, `core-iso`, `core-eval`, Python oracles. |
 | `docs/superpowers/plans/2026-09-10-plan-2-worker-engine.md` | Plan 2: `solver-worker`, `engine`. |
 | `docs/superpowers/plans/2026-09-10-plan-3-preflop-replay.md` | Plan 3: `core-preflop`, `core-replay`. |
