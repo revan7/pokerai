@@ -5,5 +5,8 @@ description = "Dev-only oracles and fixture generators for the PokerAI assistant
 requires-python = ">=3.12"
 dependencies = ["pokerkit==0.7.5", "phevaluator==0.6.0", "pytest>=9.0"]
 
+[tool.setuptools]
+py-modules = ["gen_fixtures", "gen_eval_oracle"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
