@@ -396,7 +396,9 @@ fn load_contained_bundle(canonical_dir: &Path, child: &Path) -> Result<Box<dyn P
 /// The independent-bundle store (spec section 8.1's `PreflopStore`): every bundle validated on
 /// its own bytes, a failing bundle quarantined without affecting any other.
 pub struct PreflopStore {
-    bundles: Vec<Box<dyn PreflopSource>>,
+    /// Crate-visible so `crate::lookup::query` can rank the candidates directly (spec section 8.3);
+    /// outside the crate the slice is reached through [`PreflopStore::bundles`].
+    pub(crate) bundles: Vec<Box<dyn PreflopSource>>,
 }
 
 impl PreflopStore {
