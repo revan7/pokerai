@@ -1,0 +1,15 @@
+[package]
+name = "core-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Hand lifecycle, positions, legal actions, settlement and street roots (spec sections 2, 4.3, 10.2)"
+
+[dependencies]
+proto = { path = "../proto" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
