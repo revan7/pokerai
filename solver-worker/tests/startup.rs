@@ -12,6 +12,11 @@ fn ready_reports_features() {
     assert_eq!(ready["threads"], 4);
     assert_eq!(ready["solver_commit"], "9d1509fe5077d019825f833eed04b16d342dfda1");
     assert!(ready["build_features"].as_array().unwrap().iter().any(|f| f == "avx2"));
+    // T7-R1: cpu_features must reflect the real running CPU, not just what the binary was built
+    // with (build_features already covers that). This machine genuinely has AVX2, so it must be
+    // a member of the reported set -- unlike build_features, this is not required to always
+    // contain "avx2" on every machine, only to be a truthful subset of what the host really has.
+    assert!(ready["cpu_features"].as_array().unwrap().iter().any(|f| f == "avx2"));
     for cap in ["solve", "lock", "cancel", "street_export", "i16"] {
         assert!(ready["capabilities"].as_array().unwrap().iter().any(|c| c == cap), "missing capability {cap}");
     }
