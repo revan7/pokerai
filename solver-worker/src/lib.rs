@@ -1,6 +1,10 @@
 pub mod cards;
+pub mod history;
 pub mod memory;
 pub mod solve_loop;
+#[cfg(test)]
+pub mod testutil;
+pub mod tree_build;
 pub mod win;
 
 use proto::worker::{Ready, WorkerMessage, ADAPTER_VERSION, PROTO_VERSION};
