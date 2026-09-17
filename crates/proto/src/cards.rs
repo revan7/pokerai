@@ -27,8 +27,17 @@ pub enum CardParseError {
 }
 
 impl Card {
+    /// Builds a card from a rank index (0..13, 2..A) and suit index (0..4, c/d/h/s).
+    ///
+    /// # Panics
+    /// Panics (in every build profile, not just debug) if `rank >= 13` or `suit >= 4`.
+    /// Callers ingesting untrusted numeric input must validate first, or use
+    /// `Card::checked`/`Card::parse`, which return a `Result` instead of panicking.
     pub fn new(rank: u8, suit: u8) -> Card {
-        debug_assert!(rank < 13 && suit < 4);
+        assert!(
+            rank < 13 && suit < 4,
+            "Card::new: rank {rank} or suit {suit} out of range"
+        );
         Card(rank * 4 + suit)
     }
     pub fn rank(self) -> u8 { self.0 / 4 }
@@ -72,15 +81,24 @@ impl<'de> Deserialize<'de> for Card {
 }
 
 /// `idx = hi*(hi-1)/2 + lo` for card ids `lo < hi` (spec 4.1).
+///
+/// # Panics
+/// Panics (in every build profile) if `a == b`; a combo needs two distinct cards.
 pub fn combo_index(a: Card, b: Card) -> ComboIndex {
-    debug_assert!(a != b);
+    assert!(a != b, "combo_index: cards {a:?} and {b:?} must be distinct");
     let (lo, hi) = if a.0 < b.0 { (a.0 as u16, b.0 as u16) } else { (b.0 as u16, a.0 as u16) };
     hi * (hi - 1) / 2 + lo
 }
 
 /// Inverse of `combo_index`: returns `[lo, hi]`.
+///
+/// # Panics
+/// Panics (in every build profile) if `i >= COMBOS`.
 pub fn combo_cards(i: ComboIndex) -> [Card; 2] {
-    debug_assert!((i as usize) < COMBOS);
+    assert!(
+        (i as usize) < COMBOS,
+        "combo_cards: index {i} out of range 0..{COMBOS}"
+    );
     let mut hi: u16 = 1;
     while (hi + 1) * hi / 2 <= i { hi += 1; }
     let lo = i - hi * (hi - 1) / 2;
@@ -157,5 +175,26 @@ mod tests {
             assert_eq!(class_combos(c).len(), expected);
             assert!(class_combos(c).iter().all(|k| class_of(*k) == c));
         }
+    }
+
+    // R1 fix: these three guards must hold in release builds too (debug_assert! alone
+    // is compiled out under `cargo test --release`). Each probe reproduces the exact
+    // invalid input from the review finding.
+    #[test]
+    #[should_panic(expected = "Card::new: rank 0 or suit 4 out of range")]
+    fn card_new_rejects_out_of_range_suit_in_release() {
+        Card::new(0, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "combo_index: cards Card(1) and Card(1) must be distinct")]
+    fn combo_index_rejects_duplicate_cards_in_release() {
+        combo_index(Card(1), Card(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "combo_cards: index 1326 out of range 0..1326")]
+    fn combo_cards_rejects_out_of_range_index_in_release() {
+        combo_cards(1326);
     }
 }
