@@ -21,5 +21,8 @@ ts-rs = "=12.0.1"
 [profile.dev]
 opt-level = 1
 
+[profile.dev.package.holdem-hand-evaluator]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
