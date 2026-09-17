@@ -4,6 +4,7 @@ pub mod mc;
 
 pub use equity::*;
 pub use evaluator::{BinaryEvaluator, Evaluator, PartialHand};
+pub use mc::{sample_joint_holes, Xoshiro256};
 use proto::Card;
 
 pub fn rank(cards: &[Card]) -> u16 { BinaryEvaluator.rank(cards) }

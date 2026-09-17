@@ -382,3 +382,173 @@ fn terminal_payoff_applies_the_cap_and_skips_a_time_charge() {
     let dropped = Rake::PotRake { rate: 0.05, cap_mchips: 5000, no_flop_no_drop: true };
     assert_eq!(terminal_payoff(1.0, 60, &dropped), terminal_payoff(1.0, 60, &raked));
 }
+
+/// Spec 13.1 `equity_mc_within_standard_error`: the Monte Carlo estimate of 20 spots lands inside
+/// four of its own reported standard errors of the exact answer, and the reported standard error
+/// is exactly the binomial `sqrt(v * (1 - v) / samples)`.
+#[test]
+fn equity_mc_within_standard_error() {
+    // Spec 13.1 requires 20 spots. The board changes every four spots while the hero cycles with
+    // period 5 and the villain with period 4, so the 20 (hero, board, villain) triples are distinct
+    // and no hero shares a card with its board (7h7s, not 7h7d, keeps Kd7d2c clean).
+    let heroes = ["AsKs", "7h7s", "QdJd", "9c8c", "AhQh"];
+    let villains = ["QQ+,AKs", "22+,A2s+,KTs+", "JJ-77,AQo,KJs", "random"];
+    let boards = ["Jh9h6c", "Kd7d2c", "8s8d3c", "AcQs5h", "Ts6s2d"];
+    let mut checked = 0;
+    for k in 0..20 {
+        let name = boards[(k / 4) % 5];
+        let board = cards(name);
+        let hero = heroes[k % 5];
+        let villain = villains[k % 4];
+        assert!(!board.iter().any(|c| cards(hero).contains(c)), "spot {k}: {hero} must not share a card with {name}");
+        let players = || vec![player(0, hero, &board), player(1, villain, &board)];
+        let exact = equity(&EquityRequest::single_pot(board.clone(), players(), EquityMode::Exact), Duration::from_secs(30), &no_cancel());
+        assert_eq!(exact.status, EquityStatus::Ready, "spot {k}");
+        let mc_mode = EquityMode::MonteCarlo { seed: 7 + k as u64, max_samples: 100_000 };
+        let mc = equity(&EquityRequest::single_pot(board.clone(), players(), mc_mode), Duration::from_secs(30), &no_cancel());
+        assert_eq!(mc.status, EquityStatus::Ready, "spot {k}");
+        assert_eq!(mc.samples, 100_000);
+        let (e, m) = (share(&exact, 0), mc.shares.iter().find(|s| s.seat == Seat(0)).unwrap());
+        let bound = ((m.value as f64) * (1.0 - m.value as f64) / 100_000.0).sqrt() as f32;
+        assert!((m.std_err - bound).abs() < 1e-9, "spot {k}: reported std_err {} vs binomial bound {bound}", m.std_err);
+        assert!((m.value - e).abs() <= 4.0 * m.std_err, "spot {k} ({hero} vs {villain} on {name}): mc {} exact {e} std_err {}", m.value, m.std_err);
+        match mc.method { Some(EquityMethod::MonteCarlo { samples: 100_000, std_err }) => assert!(std_err >= m.std_err), other => panic!("{other:?}") }
+        checked += 1;
+    }
+    assert_eq!(checked, 20, "spec 13.1 measures 20 spots");
+}
+
+/// Spec 13.1 `equity_joint_disjoint_sampling`: a sampled tuple is pairwise disjoint and disjoint
+/// from the board, ranges that admit no disjoint tuple are `InvalidRanges` on both paths, and each
+/// pot's shares sum to 1 under both modes.
+#[test]
+fn equity_joint_disjoint_sampling() {
+    let board = cards("Kh7d2c");
+    let req = EquityRequest::single_pot(board.clone(), vec![player(0, "AKs,AQs,KQs", &board), player(1, "AKs,AQs,KQs", &board), player(2, "AKs,AQs,KQs,AA", &board)], EquityMode::MonteCarlo { seed: 1, max_samples: 1000 });
+    let draws = sample_joint_holes(&req, 1, 20_000);
+    assert_eq!(draws.len(), 20_000);
+    for holes in &draws {
+        let mut all: Vec<Card> = holes.iter().flatten().copied().collect();
+        all.extend(board.iter().copied());
+        let n = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), n, "samples never share a card");
+    }
+    let mut conflicting = EquityRequest::single_pot(board.clone(), vec![player(0, "AsKs", &board), player(1, "AsKs", &board)], EquityMode::Exact);
+    assert_eq!(equity(&conflicting, Duration::from_secs(1), &no_cancel()).status, EquityStatus::InvalidRanges);
+    conflicting.mode = EquityMode::MonteCarlo { seed: 1, max_samples: 1000 };
+    assert_eq!(equity(&conflicting, Duration::from_secs(1), &no_cancel()).status, EquityStatus::InvalidRanges);
+    let hero_blocks = EquityRequest::single_pot(board.clone(), vec![player(0, "AsKs", &board), player(1, "AsQd,AsJd,KsTc", &board)], EquityMode::MonteCarlo { seed: 1, max_samples: 1000 });
+    assert_eq!(equity(&hero_blocks, Duration::from_secs(1), &no_cancel()).status, EquityStatus::InvalidRanges);
+    // per-pot shares sum to 1 per pot: main pot with three players, side pot between seats 1 and 2
+    let river = cards("Kh7d2c9s4h");
+    let mut multi = EquityRequest::single_pot(river.clone(), vec![player(0, "QQ+,AK", &river), player(1, "22+,A2s+", &river), player(2, "random", &river)], EquityMode::Exact);
+    multi.pots = vec![PotEligibility { pot_index: 0, eligible: vec![Seat(0), Seat(1), Seat(2)] }, PotEligibility { pot_index: 1, eligible: vec![Seat(1), Seat(2)] }];
+    for mode in [EquityMode::Exact, EquityMode::MonteCarlo { seed: 3, max_samples: 50_000 }] {
+        multi.mode = mode;
+        let res = equity(&multi, Duration::from_secs(60), &no_cancel());
+        assert_eq!(res.status, EquityStatus::Ready, "{mode:?}");
+        for pot in 0..2u8 {
+            let sum: f32 = res.shares.iter().filter(|s| s.pot_index == pot).map(|s| s.value).sum();
+            assert!((sum - 1.0).abs() < 1e-5, "{mode:?} pot {pot} sums to {sum}");
+            assert_eq!(res.shares.iter().filter(|s| s.pot_index == pot).count(), if pot == 0 { 3 } else { 2 });
+        }
+    }
+}
+
+/// One seed defines the whole run: the same seed reproduces every share bit for bit, a different
+/// seed walks a different draw sequence. Determinism is what makes a Monte Carlo recommendation
+/// reproducible from the hand history alone (spec section 7).
+#[test]
+fn equity_mc_is_deterministic_per_seed() {
+    let board = cards("Kh7d2c");
+    let players = || vec![player(0, "AhKd", &board), player(1, "QQ+,AKs,76s", &board)];
+    let run = |seed: u64| {
+        let req = EquityRequest::single_pot(board.clone(), players(), EquityMode::MonteCarlo { seed, max_samples: 20_000 });
+        equity(&req, Duration::from_secs(30), &no_cancel())
+    };
+    let a = run(11);
+    let b = run(11);
+    assert_eq!(a.status, EquityStatus::Ready);
+    assert_eq!(a.samples, 20_000);
+    assert_eq!(a.shares, b.shares, "the same seed reproduces every share exactly");
+    assert_eq!(a.method, b.method);
+    assert_eq!(a.samples, b.samples);
+    let c = run(12);
+    assert_eq!(c.status, EquityStatus::Ready);
+    assert_ne!(a.shares, c.shares, "a different seed walks a different sample path");
+    // The draw sequence itself is what the shares inherit.
+    let req = EquityRequest::single_pot(board.clone(), players(), EquityMode::MonteCarlo { seed: 11, max_samples: 20_000 });
+    assert_eq!(sample_joint_holes(&req, 11, 200), sample_joint_holes(&req, 11, 200));
+    assert_ne!(sample_joint_holes(&req, 11, 200), sample_joint_holes(&req, 12, 200));
+}
+
+/// Convergence: on a case small enough to enumerate, the estimate lands within four of its own
+/// reported standard errors of the exact answer, on both seats.
+#[test]
+fn equity_mc_converges_to_the_exact_answer() {
+    let board = cards("QsJd7h3c");
+    let players = || vec![player(0, "AcAd", &board), player(1, "KK,QQ,JJ,AKs,T9s", &board)];
+    let exact = equity(&EquityRequest::single_pot(board.clone(), players(), EquityMode::Exact), Duration::from_secs(30), &no_cancel());
+    assert_eq!(exact.status, EquityStatus::Ready);
+    assert_eq!(exact.method, Some(EquityMethod::Exact));
+    let mc_req = EquityRequest::single_pot(board.clone(), players(), EquityMode::MonteCarlo { seed: 99, max_samples: 100_000 });
+    let mc = equity(&mc_req, Duration::from_secs(30), &no_cancel());
+    assert_eq!(mc.status, EquityStatus::Ready);
+    assert_eq!(mc.samples, 100_000);
+    for seat in 0..2u8 {
+        let e = share(&exact, seat);
+        let m = mc.shares.iter().find(|s| s.seat == Seat(seat)).unwrap();
+        assert!(m.std_err > 0.0 && m.std_err < 0.01, "seat {seat}: std_err {}", m.std_err);
+        assert!((m.value - e).abs() <= 4.0 * m.std_err, "seat {seat}: mc {} exact {e} std_err {}", m.value, m.std_err);
+    }
+    // The exact path reports no standard error at all; only the sampled one does.
+    for s in &exact.shares { assert_eq!(s.std_err, 0.0); }
+}
+
+/// The joint draw is proportional to each combo's weight: 1.0 against 0.25 is a 4:1 population.
+/// The villain here shares no card with either hero combo, so no draw is ever rejected and the
+/// accepted marginal is the weight law itself.
+#[test]
+fn joint_draw_follows_the_combo_weights() {
+    let board = cards("5h6s8c");
+    let weighted = PlayerRange { seat: Seat(0), range: parse_range("AsAd:1.0,KhKd:0.25").unwrap() };
+    let req = EquityRequest::single_pot(board, vec![weighted, fixed(1, "3c3d")], EquityMode::MonteCarlo { seed: 5, max_samples: 1000 });
+    let draws = sample_joint_holes(&req, 5, 20_000);
+    assert_eq!(draws.len(), 20_000);
+    let kh: Card = "Kh".parse().unwrap();
+    let three: Card = "3c".parse().unwrap();
+    let kings = draws.iter().filter(|h| h[0].contains(&kh)).count();
+    assert!(draws.iter().all(|h| h[1].contains(&three)), "the villain holds its only combo every time");
+    // p = 0.25 / 1.25 = 0.2, so 20 000 draws give 4 000 +- 56.6 (one sigma); this is a five-sigma
+    // window, and the seed is fixed, so the bound is deterministic.
+    assert!((3700..=4300).contains(&kings), "KhKd drawn {kings} times in 20 000; expected ~4 000 (4:1)");
+}
+
+/// A request whose supports admit no disjoint assignment is rejected by the bounded compatibility
+/// search, not by sampling until the 10 000 000-rejection cap: it returns `InvalidRanges` promptly
+/// and reports no shares.
+#[test]
+fn colliding_supports_report_invalid_ranges_promptly() {
+    let board = cards("2c7d9h");
+    let cases: Vec<Vec<PlayerRange>> = vec![
+        // every combo of both players holds As
+        vec![player(0, "AsKs,AsQs", &board), player(1, "AsKs,AsQs", &board)],
+        // a three-way chain of single combos that pairwise share a card
+        vec![fixed(0, "AsAd"), fixed(1, "AsAc"), fixed(2, "AhAd")],
+        // three players cannot hold three disjoint pairs of aces out of four aces
+        vec![player(0, "AA", &board), player(1, "AA", &board), player(2, "AA", &board)],
+    ];
+    for (i, players) in cases.into_iter().enumerate() {
+        let req = EquityRequest::single_pot(board.clone(), players, EquityMode::MonteCarlo { seed: 1, max_samples: 100_000 });
+        let start = Instant::now();
+        let res = equity(&req, Duration::from_secs(5), &no_cancel());
+        let took = start.elapsed();
+        assert_eq!(res.status, EquityStatus::InvalidRanges, "case {i}");
+        assert!(res.shares.is_empty(), "case {i}");
+        assert_eq!(res.samples, 0, "case {i}");
+        assert_eq!(res.method, None, "case {i}");
+        assert!(took < Duration::from_millis(100), "case {i}: took {took:?}");
+    }
+}
