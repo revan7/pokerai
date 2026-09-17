@@ -6,17 +6,41 @@
 //! `EngineCore` (Task 22) owns a `DecisionLog` as its fourth constructor argument, so this module
 //! is built first and its public shape does not change afterwards (cross-plan section 4).
 //!
-//! Every field on `DecisionRecord`/`InputRecord` is either a plain integer/bool/String with no
-//! numeric domain of its own, or a nested `proto` type (`DecisionIdentity`, `Street`, `Coverage`,
+//! Most fields on `DecisionRecord`/`InputRecord` are plain integer/bool/`String`s with no numeric
+//! domain of their own, or a nested `proto` type (`DecisionIdentity`, `Street`, `Coverage`,
 //! `ApproxReason`, `HandConfig`, `Seat`, `Card`, `TakenAction`) that already carries its own
 //! invariant-checked `Serialize`/`Deserialize` (finite-float domains, card validity, and so on).
-//! Neither record adds a numeric or cross-field invariant beyond what those nested types already
-//! enforce, so both use a bare derive here, matching every other container type in `proto` (e.g.
-//! `Recommendation`, `Assumptions`) that wraps invariant-bearing fields without re-deriving their
-//! checks at the container level.
+//! Two invariants belong to these records themselves, though, and review round 1 (R1/R2) found
+//! both unchecked in a first bare-derive pass:
+//!
+//! - `InputRecord::version`: only version 1 exists. The field keeps its bare `u16` type but
+//!   carries a `#[serde(with = "input_record_version")]` codec -- the same "check on both serde
+//!   directions" shape `proto::numeric` uses for its checked `f32` fields, just for an exact
+//!   integer domain (`== 1`) rather than a float range.
+//! - `DecisionRecord::{presolver_scenario, tier}`: one unit (spec section 5 step 10; tiers 1/2/3
+//!   of spec section 10.5) -- both present or both absent, and `tier` in `{1, 2, 3}` when
+//!   present. No single field's codec can express a two-field pairing, so `DecisionRecord` -- and
+//!   only it, among the types here -- has a hand-written `Serialize`/`Deserialize` that checks the
+//!   pair before delegating every field to a bare-derived wire mirror, `DecisionRecordWire`: the
+//!   same "derive normally, add a validating wrapper for what the derive cannot express"
+//!   structure `proto::Action`/`proto::ApproxReason` already use, minus their bincode-tag concern
+//!   (this module only ever writes JSON, so there is no `is_human_readable` branch to make).
+//!
+//! Every other field, on both records, still has no domain of its own beyond what its type
+//! already enforces, so it keeps a bare derive; `InputRecord` as a whole is still bare-derived,
+//! with only its one invariant-bearing field carrying a codec, exactly like `proto::Assumptions`
+//! or `proto::ExperimentalHu`.
+//!
+//! Neither the `u16` version check nor the `u8` tier-domain check needs the wide-`f64`-then-
+//! narrow dance `proto::numeric` uses for floats: an integer's `Deserialize` is already exact (a
+//! negative or oversized wire value is rejected outright, never silently rounded or truncated
+//! into range the way `f64 -> f32` narrowing can round a near-boundary value inward), so the
+//! domain check here only has to run after that already-exact deserialize.
 
 use proto::{ApproxReason, Card, Coverage, DecisionIdentity, HandConfig, HandState, Seat, Street, TakenAction};
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeError;
+use serde::ser::Error as SerError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -27,11 +51,36 @@ pub const KEEP_FILES: usize = 10;
 /// Current `InputRecord` version. Bumped whenever the record's shape changes.
 pub const INPUT_RECORD_VERSION: u16 = 1;
 
+/// Only version 1 of `InputRecord` exists today. A wire value other than 1 -- including one that
+/// does not even fit a `u16` -- is rejected outright rather than accepted under the version-1
+/// layout; the same check runs on serialize, so an in-memory record built with an unsupported
+/// version (the field is `pub`, so `from_state` is not the only way to construct one) can never
+/// reach disk either.
+mod input_record_version {
+    use super::{DeError, Deserialize, Deserializer, SerError, Serializer, INPUT_RECORD_VERSION as SUPPORTED};
+
+    pub fn serialize<S: Serializer>(v: &u16, s: S) -> Result<S::Ok, S::Error> {
+        if *v != SUPPORTED {
+            return Err(SerError::custom(format!("InputRecord.version {v} is not the supported version {SUPPORTED}")));
+        }
+        s.serialize_u16(*v)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
+        let v = u16::deserialize(d)?;
+        if v != SUPPORTED {
+            return Err(DeError::custom(format!("InputRecord.version {v} is not the supported version {SUPPORTED}")));
+        }
+        Ok(v)
+    }
+}
+
 /// Versioned input record (spec section 5 step 10: "versioned input record"). Hero's cards are
 /// recorded here, and only here -- never derived into any other part of the record -- per the
 /// standing rule that hero's actual cards never enter a public range, solve input or cache key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputRecord {
+    #[serde(with = "input_record_version")]
     pub version: u16,
     pub config: HandConfig,
     pub button: Seat,
@@ -65,7 +114,12 @@ impl InputRecord {
 /// result with the pre-solver scenario class and tier when the decision matches one (both `None`
 /// otherwise), reached exploitability of a best-so-far, deadline violations, and the versioned
 /// input record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Serialize`/`Deserialize` are hand-written (see the module doc comment): `presolver_scenario`
+/// and `tier` must be validated as a pair, which no per-field codec can express, so this delegates
+/// every field to the bare-derived `DecisionRecordWire` mirror below and checks the pair itself
+/// before returning `Ok`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecisionRecord {
     pub identity: DecisionIdentity,
     pub street: Street,
@@ -80,6 +134,101 @@ pub struct DecisionRecord {
     pub final_violation: bool,
     pub template_id: String,
     pub input: InputRecord,
+}
+
+/// Identical field-for-field shape to `DecisionRecord`, kept private and bare-derived purely so
+/// the hand-written impls above can reuse serde's normal struct machinery for every field except
+/// the one pairing check it cannot express (see the module doc comment).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct DecisionRecordWire {
+    identity: DecisionIdentity,
+    street: Street,
+    coverage: Coverage,
+    reasons: Vec<ApproxReason>,
+    elapsed_ms: u32,
+    cache: String,
+    presolver_scenario: Option<String>,
+    tier: Option<u8>,
+    reached_bp: Option<u16>,
+    street_violation: bool,
+    final_violation: bool,
+    template_id: String,
+    input: InputRecord,
+}
+
+impl From<DecisionRecord> for DecisionRecordWire {
+    fn from(r: DecisionRecord) -> Self {
+        DecisionRecordWire {
+            identity: r.identity,
+            street: r.street,
+            coverage: r.coverage,
+            reasons: r.reasons,
+            elapsed_ms: r.elapsed_ms,
+            cache: r.cache,
+            presolver_scenario: r.presolver_scenario,
+            tier: r.tier,
+            reached_bp: r.reached_bp,
+            street_violation: r.street_violation,
+            final_violation: r.final_violation,
+            template_id: r.template_id,
+            input: r.input,
+        }
+    }
+}
+
+impl From<DecisionRecordWire> for DecisionRecord {
+    fn from(w: DecisionRecordWire) -> Self {
+        DecisionRecord {
+            identity: w.identity,
+            street: w.street,
+            coverage: w.coverage,
+            reasons: w.reasons,
+            elapsed_ms: w.elapsed_ms,
+            cache: w.cache,
+            presolver_scenario: w.presolver_scenario,
+            tier: w.tier,
+            reached_bp: w.reached_bp,
+            street_violation: w.street_violation,
+            final_violation: w.final_violation,
+            template_id: w.template_id,
+            input: w.input,
+        }
+    }
+}
+
+/// The tiers spec section 10.5 defines for the pre-solver queue (tier 1, tier 2, tier 3).
+const VALID_TIERS: [u8; 3] = [1, 2, 3];
+
+/// `presolver_scenario` and `tier` are one unit: both present when the decision matches a
+/// pre-solver scenario and tier, both absent otherwise (spec section 5 step 10), and when present
+/// `tier` is one of `VALID_TIERS`. Shared by `DecisionRecord`'s `Serialize` and `Deserialize` so
+/// the same rule runs, worded the same way, on both directions.
+fn check_presolver_metadata(scenario: &Option<String>, tier: Option<u8>) -> Result<(), String> {
+    match (scenario, tier) {
+        (None, None) => Ok(()),
+        (Some(_), Some(t)) if VALID_TIERS.contains(&t) => Ok(()),
+        (Some(_), Some(t)) => {
+            Err(format!("tier {t} is outside the tiers spec section 10.5 defines {VALID_TIERS:?}"))
+        }
+        (scenario, tier) => Err(format!(
+            "presolver_scenario and tier must both be present or both be absent, got scenario={scenario:?} tier={tier:?}"
+        )),
+    }
+}
+
+impl Serialize for DecisionRecord {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        check_presolver_metadata(&self.presolver_scenario, self.tier).map_err(SerError::custom)?;
+        DecisionRecordWire::from(self.clone()).serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for DecisionRecord {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let wire = DecisionRecordWire::deserialize(d)?;
+        check_presolver_metadata(&wire.presolver_scenario, wire.tier).map_err(DeError::custom)?;
+        Ok(wire.into())
+    }
 }
 
 /// Appends `DecisionRecord`s as newline-delimited JSON (LF only), rotating `decisions.jsonl` at
@@ -118,8 +267,19 @@ impl DecisionLog {
     /// whatever already occupies the last slot, then leaves slot 0 (`decisions.jsonl`) free for
     /// `append` to recreate. Never rewrites the content of an existing line -- only whole files
     /// move.
+    ///
+    /// The dropped slot's removal ignores only `ErrorKind::NotFound` (the common case: nothing
+    /// occupies that slot yet) and propagates every other error -- in particular a sharing
+    /// violation from another handle that permits read/write but denies delete. Swallowing that
+    /// unconditionally (as a first pass did) would let `rotate` report success while the
+    /// oversized file it was supposed to remove is still sitting there, so the caller's `append`
+    /// would go on to write past the rotation threshold indefinitely.
     fn rotate(&self) -> std::io::Result<()> {
-        let _ = std::fs::remove_file(self.path(self.keep - 1));
+        match std::fs::remove_file(self.path(self.keep - 1)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         for k in (1..self.keep).rev() {
             let from = self.path(k - 1);
             if from.exists() {
@@ -216,5 +376,166 @@ mod tests {
         let text = serde_json::to_string(&input).unwrap();
         let back: InputRecord = serde_json::from_str(&text).unwrap();
         assert_eq!(back, input);
+    }
+
+    /// A per-test temp directory (test name + pid); every test using this removes it both before
+    /// (a previous run may have crashed mid-test) and after it runs.
+    fn unique_temp_dir(test_name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("pokerai_log_{test_name}_{}", std::process::id()))
+    }
+
+    fn valid_input_record() -> InputRecord {
+        InputRecord {
+            version: 1,
+            config: hand_config(),
+            button: proto::Seat(0),
+            hero: proto::Seat(2),
+            dealt: vec![],
+            stacks_start: vec![],
+            hero_cards: None,
+            actions: vec![],
+            board: vec![],
+            range_hashes: vec!["x".repeat(64)],
+        }
+    }
+
+    /// R1 (review round 1): only version 1 exists; every other representable value -- including
+    /// negative and oversized wire numbers that do not even fit a `u16` -- must be rejected on
+    /// both serialize and deserialize, never converted or clamped into 1.
+    #[test]
+    fn input_record_version_is_validated_on_both_serde_directions() {
+        let mut bad = valid_input_record();
+        bad.version = 0;
+        assert!(serde_json::to_string(&bad).is_err(), "version 0 must be rejected on serialize");
+        bad.version = 2;
+        assert!(serde_json::to_string(&bad).is_err(), "version 2 must be rejected on serialize");
+
+        let good = valid_input_record();
+        let text = serde_json::to_string(&good).unwrap();
+        assert_eq!(serde_json::from_str::<InputRecord>(&text).unwrap(), good);
+
+        let mut value = serde_json::to_value(&good).unwrap();
+        for bad_version in [serde_json::json!(0), serde_json::json!(2), serde_json::json!(-1), serde_json::json!(70_000)] {
+            value["version"] = bad_version.clone();
+            assert!(
+                serde_json::from_value::<InputRecord>(value.clone()).is_err(),
+                "version {bad_version} must be rejected on deserialize"
+            );
+        }
+    }
+
+    /// R2 (review round 1): `presolver_scenario`/`tier` are one unit (spec section 5 step 10,
+    /// section 10.5's tiers 1/2/3) -- both present or both absent, and `tier` in `{1, 2, 3}` when
+    /// present -- on both serialize and deserialize.
+    #[test]
+    fn decision_record_presolver_metadata_is_validated_on_both_serde_directions() {
+        let both_absent = rec(1);
+        let text = serde_json::to_string(&both_absent).unwrap();
+        assert_eq!(serde_json::from_str::<DecisionRecord>(&text).unwrap(), both_absent);
+
+        let mut both_present = rec(2);
+        both_present.presolver_scenario = Some("srp_btn_open_bb_call".into());
+        both_present.tier = Some(1);
+        let text = serde_json::to_string(&both_present).unwrap();
+        assert_eq!(serde_json::from_str::<DecisionRecord>(&text).unwrap(), both_present);
+
+        let mut scenario_only = rec(3);
+        scenario_only.presolver_scenario = Some("srp_btn_open_bb_call".into());
+        assert!(serde_json::to_string(&scenario_only).is_err(), "scenario without a tier must be rejected");
+
+        let mut tier_only = rec(4);
+        tier_only.tier = Some(1);
+        assert!(serde_json::to_string(&tier_only).is_err(), "tier without a scenario must be rejected");
+
+        for bad_tier in [0u8, 4, 255] {
+            let mut invalid_tier = rec(5);
+            invalid_tier.presolver_scenario = Some("srp_btn_open_bb_call".into());
+            invalid_tier.tier = Some(bad_tier);
+            assert!(serde_json::to_string(&invalid_tier).is_err(), "tier {bad_tier} must be rejected");
+        }
+
+        let base = serde_json::to_value(&both_present).unwrap();
+
+        let mut missing_tier = base.clone();
+        missing_tier["tier"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<DecisionRecord>(missing_tier).is_err(),
+            "scenario without a tier must be rejected on deserialize"
+        );
+
+        let mut missing_scenario = base.clone();
+        missing_scenario["presolver_scenario"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<DecisionRecord>(missing_scenario).is_err(),
+            "tier without a scenario must be rejected on deserialize"
+        );
+
+        for bad_tier in [serde_json::json!(0), serde_json::json!(4), serde_json::json!(255), serde_json::json!(-1)] {
+            let mut invalid = base.clone();
+            invalid["tier"] = bad_tier.clone();
+            assert!(
+                serde_json::from_value::<DecisionRecord>(invalid).is_err(),
+                "wire tier {bad_tier} must be rejected on deserialize"
+            );
+        }
+    }
+
+    /// R3 (review round 1): with `keep = 1` the sole rotation step deletes `decisions.jsonl`
+    /// itself (the rename loop is empty); this is the intended, successful case.
+    #[test]
+    fn keep_one_rotation_replaces_the_single_file() {
+        let dir = unique_temp_dir("keep_one_rotation_replaces_the_single_file");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut log = DecisionLog::with_limits(&dir, 1, 1);
+        log.append(&rec(1));
+        log.append(&rec(2));
+        let names: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["decisions.jsonl".to_string()], "keep=1 must never leave a decisions.1.jsonl behind");
+        let text = std::fs::read_to_string(dir.join("decisions.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 1, "keep=1 must retain only the newest record");
+        let back: DecisionRecord = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(back.identity.decision_id, 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// R3 (review round 1): if the rotation deletion fails for a reason other than "already
+    /// gone" (e.g. another handle denies delete-sharing while still permitting read/write), that
+    /// error must propagate through the append error path -- and no write must follow it. This
+    /// holds a second handle to `decisions.jsonl` open with `FILE_SHARE_READ | FILE_SHARE_WRITE`
+    /// but not `FILE_SHARE_DELETE`, so `remove_file` hits a real Windows sharing violation while
+    /// the file would otherwise still be perfectly appendable.
+    #[cfg(windows)]
+    #[test]
+    fn failed_rotation_deletion_is_propagated_and_blocks_append() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = unique_temp_dir("failed_rotation_deletion_is_propagated_and_blocks_append");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("decisions.jsonl");
+        std::fs::write(&target, b"seed\n").unwrap();
+
+        // Win32 `CreateFile` share-mode bits, used as raw literals so this test needs no extra
+        // dependency: `FILE_SHARE_READ` = 0x1, `FILE_SHARE_WRITE` = 0x2. `FILE_SHARE_DELETE`
+        // (0x4) is deliberately withheld, so a concurrent delete of this path fails with a
+        // sharing violation while read/write access from another handle keeps working --
+        // reproducing R3's "another handle allows read/write sharing but not delete sharing".
+        const FILE_SHARE_READ_WRITE_NO_DELETE: u32 = 0x1 | 0x2;
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ_WRITE_NO_DELETE)
+            .open(&target)
+            .expect("hold the live file open without delete sharing");
+
+        let mut log = DecisionLog::with_limits(&dir, 1, 1); // rotate_bytes=1: "seed\n" already qualifies
+        log.append(&rec(99));
+
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(after, "seed\n", "a failed rotation (deletion denied) must not be followed by an append");
+
+        drop(held);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
