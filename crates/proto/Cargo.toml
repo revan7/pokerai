@@ -6,9 +6,21 @@ license.workspace = true
 rust-version.workspace = true
 description = "Shared serde types of the PokerAI assistant (spec section 4)"
 
+[features]
+typescript = ["dep:ts-rs"]
+
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dependencies.ts-rs]
+workspace = true
+optional = true
+features = ["serde-compat"]
+
+[[example]]
+name = "export_ts"
+required-features = ["typescript"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

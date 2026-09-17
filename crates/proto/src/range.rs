@@ -6,7 +6,8 @@ use crate::cards::{ComboIndex, COMBOS};
 
 /// Weights in `[0, 1]` indexed by combo index (spec 4.1).
 #[derive(Clone, PartialEq)]
-pub struct Range1326(pub [f32; COMBOS]);
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct Range1326(#[cfg_attr(feature = "typescript", ts(type = "Array<number>"))] pub [f32; COMBOS]);
 
 impl Range1326 {
     pub fn zero() -> Range1326 { Range1326([0.0; COMBOS]) }

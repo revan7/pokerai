@@ -4,7 +4,8 @@ use std::str::FromStr;
 
 /// id = rank_index*4 + suit_index; ranks 2..A = 0..12; suits c,d,h,s = 0..3 (spec 4.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Card(pub u8);
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct Card(#[cfg_attr(feature = "typescript", ts(type = "string"))] pub u8);
 
 pub const RANK_CHARS: &[u8; 13] = b"23456789TJQKA";
 pub const SUIT_CHARS: &[u8; 4] = b"cdhs";
@@ -13,6 +14,7 @@ pub const CLASSES: usize = 169;
 pub type ComboIndex = u16;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub enum CardParseError {
     #[error("card text {0:?} must be exactly two characters")]
     Length(String),
