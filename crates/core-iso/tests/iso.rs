@@ -1,5 +1,7 @@
 use core_iso::*;
 use proto::*;
+use serde::de::value::{Error as DeError, MapDeserializer, SeqDeserializer};
+use serde::Deserialize;
 use std::collections::HashMap;
 
 fn cards(text: &str) -> Vec<Card> { text.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap().parse().unwrap()).collect() }
@@ -85,4 +87,145 @@ fn iso_stabilizer_tiebreak() {
     let (_, q) = canonicalize(&cards("AsKd2c"), &[&r1, &r2]);
     assert_eq!(p, q, "a rainbow flop has a trivial stabilizer: the ranges cannot change the permutation");
     assert_eq!(canonicalize(&cards("AsAh2c"), &[]).1, canonicalize(&cards("AsAh2c"), &[]).1, "deterministic");
+}
+
+/// `to_bits()` of every weight, so `-0.0` and `+0.0` compare unequal (spec section 2's tie-break
+/// compares serialized `f32` bit patterns, and `Range1326`'s own `PartialEq` does not).
+fn bits(r: &Range1326) -> Vec<u32> { r.0.iter().map(|w| w.to_bits()).collect() }
+
+// R1 (fix round 1): apply_range must move every weight bit-for-bit, including -0.0.
+
+#[test]
+fn iso_apply_range_is_bit_exact() {
+    let mut r = Range1326::zero();
+    r.set(19, -0.0);
+    r.set(1034, 1.0);
+    assert_eq!(
+        bits(&apply_range(&SuitPerm::IDENTITY, &r)),
+        bits(&r),
+        "identity must preserve bits exactly, including negative zero"
+    );
+    for p in ALL_PERMS {
+        let p = SuitPerm(p);
+        let round = apply_range(&inverse(&p), &apply_range(&p, &r));
+        assert_eq!(bits(&round), bits(&r), "{p:?}: inverse round-trip must be bit-exact");
+    }
+}
+
+#[test]
+fn iso_tiebreak_negative_zero_regression() {
+    // Reproduces the review finding exactly: board AsAh2c, range zero except r[19] = -0.0 and
+    // r[1034] = 1.0. Permutation [0,3,1,2] and [0,3,2,1] both produce the same canonical board;
+    // [0,3,2,1] is the bit-minimal serialization because it carries -0.0 (0x80000000) at its
+    // slot rather than silently normalizing it to +0.0 (0x00000000).
+    let mut r = Range1326::zero();
+    r.set(19, -0.0);
+    r.set(1034, 1.0);
+    let (_, p) = canonicalize(&cards("AsAh2c"), &[&r]);
+    assert_eq!(
+        p,
+        SuitPerm([0, 3, 2, 1]),
+        "the bit-minimal permutation must win the tie-break, not the one that happens to zero out -0.0"
+    );
+}
+
+// R2 (fix round 1): SuitPerm must validate the bijection invariant at deserialization and at
+// every public operation boundary that consumes a caller-supplied permutation.
+
+#[test]
+fn iso_suit_perm_deserialize_round_trips_all_valid_permutations() {
+    for p in ALL_PERMS {
+        let de = SeqDeserializer::<_, DeError>::new(p.into_iter());
+        let back: SuitPerm = SuitPerm::deserialize(de).unwrap();
+        assert_eq!(back, SuitPerm(p));
+    }
+}
+
+#[test]
+fn iso_suit_perm_deserialize_rejects_duplicate_image() {
+    let de = SeqDeserializer::<_, DeError>::new([0u8, 0, 2, 3].into_iter());
+    assert!(SuitPerm::deserialize(de).is_err(), "duplicate image (not a bijection) must be rejected");
+}
+
+#[test]
+fn iso_suit_perm_deserialize_rejects_out_of_range_image() {
+    let de = SeqDeserializer::<_, DeError>::new([0u8, 1, 2, 4].into_iter());
+    assert!(SuitPerm::deserialize(de).is_err(), "image 4 is outside 0..4 and must be rejected");
+}
+
+#[test]
+#[should_panic(expected = "repeats an earlier suit's image")]
+fn iso_inverse_panics_on_duplicate_image_perm() {
+    inverse(&SuitPerm([0, 0, 2, 3]));
+}
+
+#[test]
+#[should_panic(expected = "outside 0..4")]
+fn iso_inverse_panics_on_out_of_range_image_perm() {
+    inverse(&SuitPerm([0, 1, 2, 4]));
+}
+
+#[test]
+#[should_panic(expected = "repeats an earlier suit's image")]
+fn iso_apply_range_panics_on_duplicate_image_perm() {
+    apply_range(&SuitPerm([0, 0, 2, 3]), &Range1326::zero());
+}
+
+// R3 (fix round 1): CanonicalBoard must validate length, card domain, uniqueness, and
+// canonical-ness at deserialization; canonicalize/orbit_size_of must validate their board input.
+
+#[test]
+#[should_panic(expected = "duplicate card")]
+fn iso_canonicalize_rejects_duplicate_cards() {
+    canonicalize(&[Card(0), Card(0), Card(1)], &[]);
+}
+
+#[test]
+#[should_panic(expected = "outside 0..52")]
+fn iso_canonicalize_rejects_out_of_range_card_id() {
+    canonicalize(&[Card(0), Card(1), Card(99)], &[]);
+}
+
+#[test]
+#[should_panic(expected = "duplicate card")]
+fn iso_orbit_size_of_rejects_duplicate_cards() {
+    orbit_size_of(&[Card(0), Card(0), Card(1)]);
+}
+
+#[test]
+fn iso_canonical_board_deserialize_rejects_empty_payload() {
+    let pairs: Vec<(&str, Vec<&str>)> = vec![("cards", vec![])];
+    let de = MapDeserializer::<_, DeError>::new(pairs.into_iter());
+    assert!(CanonicalBoard::deserialize(de).is_err(), "0 cards is outside 3..=5");
+}
+
+#[test]
+fn iso_canonical_board_deserialize_rejects_duplicate_cards() {
+    let pairs: Vec<(&str, Vec<&str>)> = vec![("cards", vec!["As", "As", "2c"])];
+    let de = MapDeserializer::<_, DeError>::new(pairs.into_iter());
+    assert!(CanonicalBoard::deserialize(de).is_err(), "a repeated card must be rejected");
+}
+
+#[test]
+fn iso_canonical_board_deserialize_rejects_noncanonical_payload() {
+    // AsKd2c raw (dealt order 51, 45, 0) is a valid, duplicate-free 3-card board, but it is not
+    // itself the canonical representative (the flop must be sorted ascending, and this rainbow
+    // flop's minimal permutation relabels suits too).
+    let pairs: Vec<(&str, Vec<&str>)> = vec![("cards", vec!["As", "Kd", "2c"])];
+    let de = MapDeserializer::<_, DeError>::new(pairs.into_iter());
+    assert!(
+        CanonicalBoard::deserialize(de).is_err(),
+        "a valid but non-canonical card sequence must be rejected, not silently re-canonicalized"
+    );
+}
+
+#[test]
+fn iso_canonical_board_deserialize_round_trips_canonical_payload() {
+    let (canonical, _) = canonicalize(&cards("AsKd2c"), &[]);
+    let codes: Vec<String> = canonical.cards().iter().map(|c| c.to_string()).collect();
+    let code_refs: Vec<&str> = codes.iter().map(String::as_str).collect();
+    let pairs: Vec<(&str, Vec<&str>)> = vec![("cards", code_refs)];
+    let de = MapDeserializer::<_, DeError>::new(pairs.into_iter());
+    let back: CanonicalBoard = CanonicalBoard::deserialize(de).unwrap();
+    assert_eq!(back, canonical, "an already-canonical payload must round-trip");
 }
