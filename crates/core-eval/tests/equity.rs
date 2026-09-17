@@ -81,14 +81,17 @@ fn equity_budget_respected() {
     // is hundreds of milliseconds of work, so a 1 ms spun delay is unambiguously *inside* it on
     // either build profile, whereas a 30 ms `sleep` lands within a Windows timer tick (15.6 ms) of
     // its own overrun bound and made this assertion fail intermittently in release.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let setter = cancel_after(&cancel, Duration::from_millis(1));
-    let start = Instant::now();
-    let res = equity(&req, Duration::from_secs(10), &cancel);
-    let took = start.elapsed();
-    setter.join().unwrap();
-    assert_eq!(res.status, EquityStatus::Cancelled);
-    assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 1 ms flag");
+    assert_within_bound_eventually("equity_budget_respected cancel path", Duration::from_millis(200), || {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = cancel_after(&cancel, Duration::from_millis(1));
+        let start = Instant::now();
+        let res = equity(&req, Duration::from_secs(10), &cancel);
+        let took = start.elapsed();
+        setter.join().unwrap();
+        (took, res)
+    }, |res| {
+        assert_eq!(res.status, EquityStatus::Cancelled);
+    });
 }
 
 /// Hand-checkable exact case: AcAd against KcKd on the turn Qs Jd 7h 3c.
@@ -264,16 +267,19 @@ fn assignment_search_observes_the_budget_with_no_evaluations() {
 #[test]
 fn assignment_search_observes_cancellation_with_no_evaluations() {
     let req = colliding_six_player();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let setter = cancel_after(&cancel, Duration::from_millis(1));
-    let start = Instant::now();
-    let res = equity(&req, Duration::from_secs(10), &cancel);
-    let took = start.elapsed();
-    setter.join().unwrap();
-    assert_eq!(res.status, EquityStatus::Cancelled, "stopped after {took:?}");
-    assert!(res.shares.is_empty());
-    assert_eq!(res.samples, 0);
-    assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 1 ms flag");
+    assert_within_bound_eventually("assignment_search_observes_cancellation_with_no_evaluations", Duration::from_millis(200), || {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = cancel_after(&cancel, Duration::from_millis(1));
+        let start = Instant::now();
+        let res = equity(&req, Duration::from_secs(10), &cancel);
+        let took = start.elapsed();
+        setter.join().unwrap();
+        (took, res)
+    }, |res| {
+        assert_eq!(res.status, EquityStatus::Cancelled);
+        assert!(res.shares.is_empty());
+        assert_eq!(res.samples, 0, "no runout completes in this request, cancelled early or late");
+    });
 }
 
 /// R2: non-uniform joint weights, hand-derived, with one partially colliding pair.
@@ -615,35 +621,48 @@ fn cancel_after(cancel: &Arc<AtomicBool>, after: Duration) -> std::thread::JoinH
     handle
 }
 
-/// Orchestrator ruling (post-close follow-up, plan 1, timing follow-up 3): every wall-clock
-/// *overrun* assertion in this file runs its request, checks every non-timing assertion on that
-/// run's result, and stops as soon as one run's elapsed time meets the spec 13.1 bound, retrying
-/// up to ten times otherwise. Under extreme machine load even three fixed runs (the previous
-/// scheme, `min_elapsed_of_3`) can all be descheduled past a 50 ms bound -- observed on
-/// `mc_partial_runs_keep_their_shares` under seven parallel cargo builds (~40 compiler processes)
-/// -- so the bound is now asserted on the first attempt that meets it, not on the minimum (or
-/// mean) of a fixed sample. A scheduling stall lengthens at most a few consecutive attempts; it
-/// cannot hit ten consecutive overruns of the same bound. A systematic overrun -- the actual
-/// defect the bound guards against -- lengthens every attempt and still fails all ten. Every
-/// non-timing assertion (status, sample counts, share sums, std_err) is still checked on *every*
-/// attempt, not only the one that meets the bound, so a correctness regression cannot hide behind
-/// a slow first attempt. `label` identifies the call site in the all-ten-overran panic message.
+/// Orchestrator ruling (post-close follow-up, plan 1, timing follow-up 4): the retry idea behind
+/// `assert_within_bound_eventually` generalizes to *any* scheduling-dependent condition, not only a
+/// wall-clock overrun. `mc_partial_runs_keep_their_shares`'s cancel-flag block asserted
+/// `res.samples > 0` -- "the samples taken before the flag are not thrown away" -- which is exactly
+/// as race-dependent as an elapsed-time bound: under heavy build load the main thread can be
+/// descheduled before completing even its first sample, the 1 ms flag wins, and `samples == 0` with
+/// status `Cancelled` is a legitimate outcome of the scheduler, not a defect.
+///
+/// `eventually` is the general shape. `run` produces one fresh attempt; `accept` asserts every hard
+/// invariant with a plain `assert!`/`assert_eq!` (these panic immediately, on any attempt, and are
+/// never retried away) and returns `Err(reason)` only for a condition that depends on the scheduler
+/// -- an elapsed time against a bound, or a sample/evaluation count that depends on how far a
+/// preempted thread got before a flag was raised. A caller whose attempt races a helper thread
+/// (`cancel_after`) creates and joins a fresh flag and thread inside `run` on every attempt, so no
+/// two attempts ever share one. A scheduling stall lengthens at most a few consecutive attempts, not
+/// all ten; a genuine regression rejects every attempt and still panics, listing every reason.
+fn eventually<R>(label: &str, mut run: impl FnMut() -> R, mut accept: impl FnMut(&R) -> Result<(), String>) -> R {
+    let mut reasons = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let result = run();
+        match accept(&result) {
+            Ok(()) => return result,
+            Err(reason) => reasons.push(reason),
+        }
+    }
+    panic!("{label}: all 10 attempts were rejected: {reasons:?}");
+}
+
+/// Thin wrapper over `eventually` for the common case: the only scheduling-dependent condition is a
+/// wall-clock *overrun* against the spec 13.1 bound, and every other assertion on the result is a
+/// hard invariant. `check` runs on every attempt, not only the one that meets the bound, so a
+/// correctness regression cannot hide behind a slow first attempt.
 fn assert_within_bound_eventually(
     label: &str,
     bound: Duration,
-    mut run: impl FnMut() -> (Duration, EquityResult),
+    run: impl FnMut() -> (Duration, EquityResult),
     mut check: impl FnMut(&EquityResult),
 ) -> (Duration, EquityResult) {
-    let mut elapsed = Vec::with_capacity(10);
-    for _ in 0..10 {
-        let (took, res) = run();
-        check(&res);
-        elapsed.push(took);
-        if took < bound {
-            return (took, res);
-        }
-    }
-    panic!("{label}: all 10 attempts overran the {bound:?} bound: {elapsed:?}");
+    eventually(label, run, |(took, res)| {
+        check(res);
+        if *took < bound { Ok(()) } else { Err(format!("{took:?} overran the {bound:?} bound")) }
+    })
 }
 
 /// T25-R1: the compatibility search runs inside the request's budget like every other phase. This
@@ -669,17 +688,20 @@ fn mc_compatibility_search_observes_the_budget() {
 #[test]
 fn mc_compatibility_search_observes_cancellation() {
     let req = incompatible_six_player_mc(1);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let setter = cancel_after(&cancel, Duration::from_millis(1));
-    let start = Instant::now();
-    let res = equity(&req, Duration::from_secs(5), &cancel);
-    let took = start.elapsed();
-    setter.join().unwrap();
-    assert_eq!(res.status, EquityStatus::Cancelled, "stopped after {took:?}");
-    assert_eq!(res.samples, 0);
-    assert!(res.shares.is_empty());
-    assert_eq!(res.method, None);
-    assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 1 ms flag");
+    assert_within_bound_eventually("mc_compatibility_search_observes_cancellation", Duration::from_millis(200), || {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = cancel_after(&cancel, Duration::from_millis(1));
+        let start = Instant::now();
+        let res = equity(&req, Duration::from_secs(5), &cancel);
+        let took = start.elapsed();
+        setter.join().unwrap();
+        (took, res)
+    }, |res| {
+        assert_eq!(res.status, EquityStatus::Cancelled);
+        assert_eq!(res.samples, 0, "no tuple is sampled during the compatibility search");
+        assert!(res.shares.is_empty());
+        assert_eq!(res.method, None);
+    });
 }
 
 /// T25-R2: rejections are a property of the sampler, never evidence about the ranges.
@@ -779,19 +801,34 @@ fn mc_partial_runs_keep_their_shares() {
     // question is whether a sample completes before the flag -- one takes microseconds. Spinning
     // for 20 ms burned a core for the whole delay and left the 200 ms bound below within reach of
     // scheduling noise when the rest of this binary runs in parallel.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let setter = cancel_after(&cancel, Duration::from_millis(1));
-    let start = Instant::now();
-    let res = equity(&req(), Duration::from_secs(10), &cancel);
-    let took = start.elapsed();
-    setter.join().unwrap();
-    assert_eq!(res.status, EquityStatus::Cancelled, "stopped after {took:?}");
-    assert!(res.samples > 0, "the samples taken before the flag are not thrown away");
-    assert!(!res.shares.is_empty());
-    let sum: f32 = res.shares.iter().map(|s| s.value).sum();
-    assert!((sum - 1.0).abs() < 1e-5, "shares sum to {sum}");
-    assert!(matches!(res.method, Some(EquityMethod::MonteCarlo { .. })));
-    assert!(took < Duration::from_millis(200), "cancelled {took:?} after a 1 ms flag");
+    //
+    // Whether a sample completes before the 1 ms flag is itself scheduling-dependent (timing
+    // follow-up 4): under heavy load the main thread can be descheduled before its first sample
+    // finishes, so `samples == 0` with status `Cancelled` is a legitimate scheduler outcome, not a
+    // defect. `eventually` retries that rejection exactly like the elapsed-time bound, while status,
+    // the share sum and the method shape stay hard invariants on every attempt.
+    eventually("mc_partial_runs_keep_their_shares cancel path", || {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = cancel_after(&cancel, Duration::from_millis(1));
+        let start = Instant::now();
+        let res = equity(&req(), Duration::from_secs(10), &cancel);
+        let took = start.elapsed();
+        setter.join().unwrap();
+        (took, res)
+    }, |(took, res)| {
+        assert_eq!(res.status, EquityStatus::Cancelled, "stopped after {took:?}");
+        if res.samples == 0 {
+            return Err(format!("0 samples completed before the flag, after {took:?}"));
+        }
+        assert!(!res.shares.is_empty());
+        let sum: f32 = res.shares.iter().map(|s| s.value).sum();
+        assert!((sum - 1.0).abs() < 1e-5, "shares sum to {sum}");
+        assert!(matches!(res.method, Some(EquityMethod::MonteCarlo { .. })));
+        if *took >= Duration::from_millis(200) {
+            return Err(format!("cancelled {took:?} after a 1 ms flag, wanted < 200ms"));
+        }
+        Ok(())
+    });
 }
 
 /// S9 (final review): the spec keeps EV in `f32` chips, but `terminal_payoff` must not do the
