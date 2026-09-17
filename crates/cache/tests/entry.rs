@@ -659,3 +659,49 @@ fn cache_entry_round_trips_through_bincode_with_the_support_fixture() {
     // runs against a freshly built entry -- not just look equal field by field.
     assert!(validate_entry(&back).is_ok(), "a bincode round trip must not produce an entry that fails validate_entry");
 }
+
+/// Review R1 (fix round 1, Task: P4.T2): the binary (non-human-readable) branch of
+/// `Range1326`'s decoder must be a lossless persistence codec for an already-validated
+/// in-memory value -- it must preserve signed-zero bits exactly, not run the signed-zero
+/// normalization that belongs only to the human-readable ingestion boundary (S5's "one
+/// ingestion boundary" ruling; `hash_scaled`/`apply_range`/`canonicalize` stay bit-exact per
+/// T20/T21). `Serialize` never normalizes -0.0 on write (it only checks finiteness/domain), so
+/// a decoder that normalizes on the binary read desyncs a valid entry's stored range hash from
+/// its own decoded bits -- exactly the reviewer's reproduction: every previously-zero weight in
+/// both ranges is set to `-0.0` (still domain-valid, `-0.0 == 0.0`), the stored hashes are
+/// recomputed over those bits so the *unmodified* entry validates, and only the *binary*
+/// round-trip must still validate afterward.
+#[test]
+fn cache_entry_bincode_preserves_signed_zero_range_bits_after_binary_round_trip() {
+    let mut e = support::entry();
+    for range in &mut e.source.ranges {
+        for w in range.0.iter_mut() {
+            if *w == 0.0 {
+                *w = -0.0;
+            }
+        }
+    }
+    e.key.range_hash_oop = core_ranges::hash_scaled(&e.source.ranges[0]);
+    e.key.range_hash_ip = core_ranges::hash_scaled(&e.source.ranges[1]);
+    assert!(validate_entry(&e).is_ok(), "the modified-but-internally-consistent -0.0 entry must validate before any round trip");
+
+    // Control: at least one signed zero actually exists in each range, or this test would not
+    // be exercising the regression at all.
+    for range in &e.source.ranges {
+        assert!(range.0.iter().any(|w| w.is_sign_negative() && *w == 0.0), "fixture must contain a genuine -0.0 to be a meaningful regression");
+    }
+
+    let bytes = bincode::serialize(&e).expect("a -0.0-laden CacheEntry must still serialize through bincode");
+    let back: CacheEntry = bincode::deserialize(&bytes).expect("a bincode-encoded CacheEntry must deserialize back");
+
+    // Bit-exact: every weight's sign bit, not just its numeric value, must survive the binary
+    // round trip (ordinary float `==` treats `+0.0` and `-0.0` as equal and would not catch this).
+    for (range, back_range) in e.source.ranges.iter().zip(back.source.ranges.iter()) {
+        assert!(range.0.iter().zip(back_range.0.iter()).all(|(a, b)| a.to_bits() == b.to_bits()), "binary round trip must preserve every weight's bit pattern exactly, including sign");
+    }
+    // Stored hash agreement: the hash written into the key must still match a fresh hash of the
+    // decoded range -- this is what `InvalidTagEncoding`-adjacent identity corruption would break.
+    assert_eq!(core_ranges::hash_scaled(&back.source.ranges[0]), back.key.range_hash_oop, "decoded oop range must still hash to the stored key");
+    assert_eq!(core_ranges::hash_scaled(&back.source.ranges[1]), back.key.range_hash_ip, "decoded ip range must still hash to the stored key");
+    assert!(validate_entry(&back).is_ok(), "a valid -0.0-laden entry must still validate after a lossless binary round trip");
+}

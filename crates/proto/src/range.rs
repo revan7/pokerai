@@ -61,36 +61,46 @@ impl<'de> Visitor<'de> for RangeVisitor {
         for (i, slot) in out.iter_mut().enumerate() {
             // Human-readable (JSON): read as f64 first and validate the *wide* value: narrowing
             // to f32 before checking would let e.g. 1.00000001 round to 1.0 and -1e-50 round to
-            // -0.0, silently admitting out-of-domain input. Non-self-describing (bincode, the
-            // pinned cache storage format, spec 10.4): `Serialize` below already writes a native
-            // f32 on every format, so there is no wider source value to check and no narrowing
-            // step that could lose precision it did not already have -- read the f32 actually on
-            // the wire directly (still finiteness/domain checked, to reject a corrupted bit
-            // pattern), matching the identical split already established for `CachedNode`'s
-            // matrices in `crates/cache/src/entry.rs` and for every codec in `crate::numeric`.
-            let raw: f64 = if self.human_readable {
-                seq.next_element()?.ok_or_else(|| de::Error::invalid_length(i, &self))?
+            // -0.0, silently admitting out-of-domain input; then normalize `-0.0` to `+0.0` at
+            // this, the one *ingestion* boundary (S5, T20/T21 -- text or another process's JSON
+            // is untrusted input, not yet known to be bit-exact).
+            //
+            // Non-self-describing (bincode, the pinned cache storage format, spec 10.4): this is
+            // not an ingestion boundary -- `Serialize` below never normalizes `-0.0` (it only
+            // checks finiteness/domain), so a value already round-tripped once through this
+            // decoder, or built in memory and validated, may legitimately carry `-0.0` bits (the
+            // fixed-stabilizer regression this decoder must not reintroduce, review R1, fix
+            // round 1: normalizing here desynced a valid entry's stored range hash, computed
+            // over its `-0.0` bits, from the freshly-normalized `+0.0` bits this branch used to
+            // produce, rejecting a previously-valid persisted entry on every binary read).
+            // Bincode is a lossless persistence codec for an already-validated in-memory value:
+            // read the native `f32` on the wire directly (still finiteness/domain checked, to
+            // reject a corrupted bit pattern) and preserve its sign bit exactly, matching the
+            // identical split already established for `CachedNode`'s matrices in
+            // `crates/cache/src/entry.rs` and for every codec in `crate::numeric`.
+            if self.human_readable {
+                let raw: f64 = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(i, &self))?;
+                if !raw.is_finite() || !(0.0..=1.0).contains(&raw) {
+                    return Err(de::Error::custom(format!("weight {raw} at combo {i} is outside [0, 1]")));
+                }
+                // `+ 0.0` maps `-0.0` to `+0.0` and is the identity on every other in-domain
+                // value. `-0.0` passes the `[0, 1]` domain check above (`-0.0 == 0.0`) and would
+                // otherwise survive into the bit-exact layers, where `hash_scaled` hashes
+                // `0x80000000` differently from `0x00000000`: a range and its own
+                // `range_to_string` round trip are numerically identical yet produce different
+                // cache keys (review S5).
+                let w = (raw as f32) + 0.0;
+                if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+                    return Err(de::Error::custom(format!("weight {w} at combo {i} is outside [0, 1]")));
+                }
+                *slot = w;
             } else {
                 let native: f32 = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(i, &self))?;
-                native as f64
-            };
-            if !raw.is_finite() || !(0.0..=1.0).contains(&raw) {
-                return Err(de::Error::custom(format!("weight {raw} at combo {i} is outside [0, 1]")));
+                if !native.is_finite() || !(0.0..=1.0).contains(&(native as f64)) {
+                    return Err(de::Error::custom(format!("weight {native} at combo {i} is outside [0, 1]")));
+                }
+                *slot = native;
             }
-            // `+ 0.0` maps `-0.0` to `+0.0` and is the identity on every other in-domain value.
-            // `-0.0` passes the `[0, 1]` domain check above (`-0.0 == 0.0`) and would otherwise
-            // survive into the bit-exact layers, where `hash_scaled` hashes `0x80000000`
-            // differently from `0x00000000`: a range and its own `range_to_string` round trip are
-            // numerically identical yet produce different cache keys (review S5). Normalizing here,
-            // at the one ingestion boundary -- every `Deserialize` call, not only JSON's -- leaves
-            // `hash_scaled`, `apply_range` and `canonicalize` bit-exact as ruled by T20/T21 --
-            // including `iso_tiebreak_negative_zero_regression`, which builds its `-0.0` in memory
-            // and never crosses this boundary.
-            let w = (raw as f32) + 0.0;
-            if !w.is_finite() || !(0.0..=1.0).contains(&w) {
-                return Err(de::Error::custom(format!("weight {w} at combo {i} is outside [0, 1]")));
-            }
-            *slot = w;
         }
         if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
             return Err(de::Error::custom("range has more than 1326 entries"));
