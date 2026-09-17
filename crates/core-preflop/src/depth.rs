@@ -37,22 +37,26 @@ pub fn depth_for(actor: u32, others: &[u32], unit: u32) -> f64 {
     actor.min(others.iter().copied().max().unwrap_or(actor)) as f64 / unit as f64
 }
 
-/// Nearest acquired depth, ties deeper. The upper filter implements section 8.3's "above 200 clamps
-/// to 200" only while 200 is itself an acquired depth: with 200 present, the nearest-under-200
-/// choice for any actual above 200 is 200 exactly. That holds for the chart set and for the eight
-/// PokerData depths; a future bundle set whose deepest acquired depth is below 200 must clamp
-/// explicitly instead of relying on this filter.
+/// Nearest acquired depth, ties deeper. The `d <= 200` filter implements section 8.3's "above 200
+/// clamps to 200" only while 200 is itself an acquired depth: with 200 present, the
+/// nearest-under-200 choice for any actual above 200 is 200 exactly. That holds for the chart set
+/// and for the eight PokerData depths; a future bundle set whose deepest acquired depth is below
+/// 200 must clamp explicitly instead of relying on this filter.
 ///
-/// The lower bound of the filter is the one deviation from the brief's `d <= 200`: a declared
-/// acquired depth of zero is not a depth, and admitting it would divide by zero in
-/// [`prominent_depth`] and [`asymmetric`]. `validate` rejects a zero `depth_bb` in an envelope, but
-/// nothing validates a manifest's `depths` list, so a zero there is skipped here and the bundle
-/// simply offers no acquired depth (`MissingPreflopNode`) rather than panicking mid-query.
+/// # Panics
+/// Panics (in every build profile, per the standing ruling) if any declared depth is zero, naming
+/// its index. A zero is a malformed declaration, and a bundle carrying one never reaches here:
+/// `store::check_depths` rejects it at admission, so the store quarantines the bundle with a banner
+/// (P3.T8 fix round 1, R2). This assertion is the same invariant for an in-memory `BundleInfo` that
+/// no admission path produced -- it is never a silent repair of the list.
 pub fn bucket(actual: f64, available: &[u16]) -> Option<u16> {
+    if let Some(i) = available.iter().position(|&d| d == 0) {
+        panic!("bucket: acquired depth {i} is 0; every declared depth is at least 1 bb");
+    }
     available
         .iter()
         .copied()
-        .filter(|&d| (1..=200).contains(&d))
+        .filter(|&d| d <= 200)
         .min_by(|a, b| (actual - *a as f64).abs().total_cmp(&(actual - *b as f64).abs()).then_with(|| b.cmp(a)))
 }
 
