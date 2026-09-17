@@ -165,6 +165,37 @@ def test_build_rejects_unreachable_class_with_nonzero_weight():
         build(t)
 
 
+def test_build_maps_asymmetric_grid_cells_to_the_correct_classes():
+    """R3 (P3.T3 fix round 1): the brief's own example mutates only the symmetric diagonal
+    cell [0][0] ("AA"), which cannot distinguish correct row-major traversal from a transpose,
+    nor a correct action-row order from a swapped one (both would still pass a diagonal-only,
+    symmetric-value probe). This uses three distinguishable, nontrivial cells: [0][1] ("AKs")
+    and [1][0] ("AKo") each carry a different two-action split, and an unrelated off-diagonal
+    cell [2][5] ("Q9s") carries a third. See the P3.T3 fix-round-1 report for the executed
+    demonstration that swapping row/column traversal, and separately swapping the action-row
+    order, each makes this exact test fail.
+    """
+    rows = [["F"] * 13 for _ in range(13)]
+    rows[0][1] = "X"
+    rows[1][0] = "Y"
+    rows[2][5] = "Z"
+    legend = {"F": [1, 0], "X": [0.7, 0.3], "Y": [0.2, 0.8], "Z": [0.4, 0.6]}
+    t = _transcription(rows=rows, legend=legend)
+    e = build(t)
+    weights = e["nodes"][0]["weights"]
+    names = class_names()
+    assert names[1] == "AKs"
+    assert names[13] == "AKo"
+    assert names[31] == "Q9s"
+    assert (weights[0][1], weights[1][1]) == (0.7, 0.3), "AKs must carry [0][1]'s own values"
+    assert (weights[0][13], weights[1][13]) == (0.2, 0.8), "AKo must carry [1][0]'s own values, not AKs's"
+    assert (weights[0][31], weights[1][31]) == (0.4, 0.6), "Q9s must carry [2][5]'s own values"
+    for c in range(169):
+        if c in (1, 13, 31):
+            continue
+        assert weights[0][c] == 1.0 and weights[1][c] == 0.0, f"class {c} ({names[c]}) must stay at the default 'F' cell"
+
+
 # --- BundleInfo field parity (Task 1) ---
 
 
@@ -243,6 +274,57 @@ def test_manifest_for_chart_respects_explicit_accuracy():
     e = build(t)
     manifest = manifest_for_chart(e, t)
     assert manifest["accuracy"] == "verified-by-hand"
+
+
+# --- R1 (P3.T3 fix round 1): manifest/rake field types, mirroring RakeProfile/BundleInfo ---
+
+
+def test_manifest_for_chart_accepts_a_well_typed_rake_object():
+    t = _transcription()
+    t["rake_profile"] = "5% cap 0.5bb"
+    t["rake"] = {"rate": 0.05, "cap_bb": 0.5, "no_flop_no_drop": True}
+    e = build(t)
+    manifest = manifest_for_chart(e, t)
+    assert manifest["rake"] == {"rate": 0.05, "cap_bb": 0.5, "no_flop_no_drop": True}
+
+
+@pytest.mark.parametrize(
+    "rake",
+    [
+        {},  # missing all three required fields
+        {"rate": 0.05, "cap_bb": 0.5},  # missing no_flop_no_drop
+        {"rate": 1.0, "cap_bb": 0.5, "no_flop_no_drop": True},  # rate domain is half-open at 1
+        {"rate": -0.01, "cap_bb": 0.5, "no_flop_no_drop": True},  # rate must be >= 0
+        {"rate": "0.05", "cap_bb": 0.5, "no_flop_no_drop": True},  # rate must be a number, not a string
+        {"rate": 0.05, "cap_bb": -1.0, "no_flop_no_drop": True},  # cap_bb must be >= 0
+        {"rate": 0.05, "cap_bb": 0.5, "no_flop_no_drop": 1},  # no_flop_no_drop must be a bool, not an int
+        {"rate": True, "cap_bb": 0.5, "no_flop_no_drop": True},  # rate must be a number, not a bool
+    ],
+    ids=["empty", "missing_field", "rate_domain_high", "rate_domain_low", "rate_string", "cap_negative", "nfnd_int", "rate_bool"],
+)
+def test_manifest_for_chart_rejects_malformed_rake_object(rake):
+    t = _transcription()
+    t["rake_profile"] = "5% cap 0.5bb"
+    t["rake"] = rake
+    e = build(t)
+    with pytest.raises(ValueError, match="rake"):
+        manifest_for_chart(e, t)
+
+
+def test_manifest_for_chart_rejects_non_string_license_note():
+    t = _transcription()
+    t["license_note"] = 12345
+    e = build(t)
+    with pytest.raises(ValueError, match="license_note"):
+        manifest_for_chart(e, t)
+
+
+def test_manifest_for_chart_rejects_non_string_accuracy():
+    t = _transcription()
+    t["accuracy"] = 1
+    e = build(t)
+    with pytest.raises(ValueError, match="accuracy"):
+        manifest_for_chart(e, t)
 
 
 # --- validate: exhaustive malformed-row parametrization ---
@@ -370,6 +452,89 @@ def _mut_depth_bb_zero(e):
     return e
 
 
+# --- R1 (P3.T3 fix round 1): exact JSON scalar type/domain rules mirroring the Rust schema ---
+
+
+def _mut_depth_bb_negative(e):
+    e["depth_bb"] = -1
+    return e
+
+
+def _mut_depth_bb_too_large(e):
+    e["depth_bb"] = 65536
+    return e
+
+
+def _mut_depth_bb_float(e):
+    e["depth_bb"] = 100.0  # a Rust u16 field must never accept a JSON float, even a whole one
+    return e
+
+
+def _mut_straddle_string(e):
+    e["straddle"] = "false"  # a JSON string, not the Rust bool the field actually is
+    return e
+
+
+def _mut_straddle_int(e):
+    e["straddle"] = 0  # bool is never a number -- Python's `0 == False` must not paper over this
+    return e
+
+
+def _mut_bundle_id_wrong_type(e):
+    e["bundle_id"] = 123
+    return e
+
+
+def _mut_raise_amount_float(e):
+    e["nodes"][0]["actions"][1]["to_bb_x1000"] = 2500.5
+    return e
+
+
+def _mut_raise_amount_overflow_u32(e):
+    e["nodes"][0]["actions"][1]["to_bb_x1000"] = 4294967296  # u32::MAX + 1
+    return e
+
+
+def _mut_raise_amount_bool(e):
+    e["nodes"][0]["actions"][1]["to_bb_x1000"] = True
+    return e
+
+
+def _mut_action_unknown_field(e):
+    e["nodes"][0]["actions"][0]["note"] = "not a field Rust's EnvelopeAction has"
+    return e
+
+
+def _mut_action_label_wrong_type(e):
+    e["nodes"][0]["actions"][0]["label"] = 123
+    return e
+
+
+def _mut_history_amount_float(e):
+    e["nodes"][0]["history"] = [["UTG", "raise", 2500.0]]
+    return e
+
+
+def _mut_history_amount_negative(e):
+    e["nodes"][0]["history"] = [["UTG", "raise", -5]]
+    return e
+
+
+def _mut_unreachable_class_float(e):
+    e["nodes"][0]["unreachable_classes"] = [5.0]
+    return e
+
+
+def _mut_unreachable_class_bool(e):
+    e["nodes"][0]["unreachable_classes"] = [True]
+    return e
+
+
+def _mut_weight_boolean(e):
+    e["nodes"][0]["weights"][0][0] = True  # numerically 1 (a valid-looking probability), but not a JSON number
+    return e
+
+
 MALFORMED_CASES = [
     (_mut_bad_actor, "actor"),
     (_mut_bad_history_position, "history"),
@@ -390,6 +555,22 @@ MALFORMED_CASES = [
     (_mut_evs_forbidden, "EV"),
     (_mut_class_order_wrong, "class order"),
     (_mut_depth_bb_zero, "depth"),
+    (_mut_depth_bb_negative, "depth"),
+    (_mut_depth_bb_too_large, "depth"),
+    (_mut_depth_bb_float, "depth"),
+    (_mut_straddle_string, "straddle"),
+    (_mut_straddle_int, "straddle"),
+    (_mut_bundle_id_wrong_type, "bundle_id"),
+    (_mut_raise_amount_float, "action"),
+    (_mut_raise_amount_overflow_u32, "action"),
+    (_mut_raise_amount_bool, "action"),
+    (_mut_action_unknown_field, "unknown"),
+    (_mut_action_label_wrong_type, "label"),
+    (_mut_history_amount_float, "history"),
+    (_mut_history_amount_negative, "history"),
+    (_mut_unreachable_class_float, "integer"),
+    (_mut_unreachable_class_bool, "integer"),
+    (_mut_weight_boolean, "bound"),
 ]
 
 
@@ -397,6 +578,27 @@ MALFORMED_CASES = [
 def test_validate_rejects_malformed_rows(mutate, match):
     envelope = mutate(copy.deepcopy(_valid_envelope()))
     with pytest.raises(ValueError, match=match):
+        validate(envelope)
+
+
+# --- R4 (P3.T3 fix round 1): class-specific validation errors carry both index and name ---
+
+
+def test_validate_sibling_sum_error_names_both_class_index_and_hand_name():
+    envelope = _mut_sibling_sum_wrong(copy.deepcopy(_valid_envelope()))
+    with pytest.raises(ValueError, match=r"class 0 sum .*\bAA\b"):
+        validate(envelope)
+
+
+def test_validate_unreachable_sum_error_names_both_class_index_and_hand_name():
+    envelope = _mut_unreachable_sum_nonzero(copy.deepcopy(_valid_envelope()))
+    with pytest.raises(ValueError, match=r"unreachable sum at class 0.*\bAA\b"):
+        validate(envelope)
+
+
+def test_validate_probability_bound_error_names_both_class_index_and_hand_name():
+    envelope = _mut_probability_out_of_bounds(copy.deepcopy(_valid_envelope()))
+    with pytest.raises(ValueError, match=r"probability bound at class 0.*\bAA\b"):
         validate(envelope)
 
 
@@ -494,6 +696,143 @@ def test_cli_verify_detects_inventory_envelope_key_mismatch(tmp_path, capsys):
     assert rc == 1
     err = capsys.readouterr().err
     assert "mismatch" in err
+
+
+# --- R2 (P3.T3 fix round 1): every inventory row is validated, including absent ones ---
+
+
+def _built_transcription_and_paths(tmp_path, inventory):
+    t = _transcription()
+    t["inventory"] = inventory
+    transcription_path = tmp_path / "transcription.json"
+    transcription_path.write_text(json.dumps(t), encoding="utf-8")
+    output_path = tmp_path / "out.json"
+    manifest_path = tmp_path / "out.manifest.json"
+    assert chart_ingest.main(["build", str(transcription_path), str(output_path), str(manifest_path)]) == 0
+    return transcription_path, output_path, manifest_path
+
+
+def _covered_row(**overrides):
+    row = {"title": "UTG RFI", "status": "covered", "history": [], "page": 2, "reason": "2.5bb open"}
+    row.update(overrides)
+    return row
+
+
+def test_cli_verify_rejects_inventory_row_missing_required_fields(tmp_path, capsys):
+    paths = _built_transcription_and_paths(tmp_path, [{"status": "covered"}])
+    rc = chart_ingest.main(["verify", *[str(p) for p in paths]])
+    assert rc == 1
+    assert "title" in capsys.readouterr().err
+
+
+def test_cli_verify_rejects_invalid_inventory_status(tmp_path, capsys):
+    paths = _built_transcription_and_paths(tmp_path, [_covered_row(status="maybe")])
+    rc = chart_ingest.main(["verify", *[str(p) for p in paths]])
+    assert rc == 1
+    assert "status" in capsys.readouterr().err
+
+
+def test_cli_verify_rejects_inventory_row_with_bad_page_type(tmp_path, capsys):
+    paths = _built_transcription_and_paths(tmp_path, [_covered_row(page="two")])
+    rc = chart_ingest.main(["verify", *[str(p) for p in paths]])
+    assert rc == 1
+    assert "page" in capsys.readouterr().err
+
+
+def test_cli_verify_rejects_inventory_row_with_empty_reason(tmp_path, capsys):
+    paths = _built_transcription_and_paths(tmp_path, [_covered_row(reason="   ")])
+    rc = chart_ingest.main(["verify", *[str(p) for p in paths]])
+    assert rc == 1
+    assert "reason" in capsys.readouterr().err
+
+
+def test_cli_verify_rejects_inventory_row_with_malformed_history_position(tmp_path, capsys):
+    paths = _built_transcription_and_paths(tmp_path, [_covered_row(history=[["ZZ", "fold", 0]])])
+    rc = chart_ingest.main(["verify", *[str(p) for p in paths]])
+    assert rc == 1
+    assert "history" in capsys.readouterr().err
+
+
+def test_cli_verify_validates_absent_rows_too_not_only_covered_ones(tmp_path, capsys):
+    """The covered row matches the built node exactly (so the covered/envelope key check
+    alone would pass); the absent row's malformed history must still be caught."""
+    inventory = [_covered_row(), {"title": "CO cold call", "status": "absent", "history": [["ZZ", "fold", 0]], "page": None, "reason": "no grid shown"}]
+    paths = _built_transcription_and_paths(tmp_path, inventory)
+    rc = chart_ingest.main(["verify", *[str(p) for p in paths]])
+    assert rc == 1
+    assert "history" in capsys.readouterr().err
+
+
+def test_cli_verify_accepts_a_well_formed_absent_row(tmp_path, capsys):
+    inventory = [_covered_row(), {"title": "CO cold call", "status": "absent", "history": [["CO", "call", 0]], "page": None, "reason": "no grid shown for this line"}]
+    paths = _built_transcription_and_paths(tmp_path, inventory)
+    rc = chart_ingest.main(["verify", *[str(p) for p in paths]])
+    assert rc == 0, capsys.readouterr().err
+
+
+# --- R4 (P3.T3 fix round 1): verify diagnostics never leak a traceback on malformed input ---
+
+
+def test_cli_verify_reports_class_index_and_name_together(tmp_path, capsys):
+    t = _transcription()
+    transcription_path = tmp_path / "transcription.json"
+    t["inventory"] = [_covered_row()]
+    transcription_path.write_text(json.dumps(t), encoding="utf-8")
+    output_path = tmp_path / "out.json"
+    manifest_path = tmp_path / "out.manifest.json"
+    chart_ingest.main(["build", str(transcription_path), str(output_path), str(manifest_path)])
+
+    envelope = json.loads(output_path.read_text(encoding="utf-8"))
+    envelope["nodes"][0]["weights"][0][0] = 0.4
+    envelope["nodes"][0]["weights"][1][0] = 0.6
+    output_path.write_text(json.dumps(envelope, indent=2) + "\n", encoding="utf-8")
+
+    rc = chart_ingest.main(["verify", str(transcription_path), str(output_path), str(manifest_path)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "node 0" in err
+    assert "class 0" in err
+    assert "AA" in err
+
+
+def test_cli_verify_handles_a_malformed_stored_node_without_a_traceback(tmp_path, capsys):
+    t = _transcription()
+    transcription_path = tmp_path / "transcription.json"
+    t["inventory"] = [_covered_row()]
+    transcription_path.write_text(json.dumps(t), encoding="utf-8")
+    output_path = tmp_path / "out.json"
+    manifest_path = tmp_path / "out.manifest.json"
+    chart_ingest.main(["build", str(transcription_path), str(output_path), str(manifest_path)])
+
+    envelope = json.loads(output_path.read_text(encoding="utf-8"))
+    envelope["nodes"] = [None]  # structurally invalid stored output -- not just a value mismatch
+    output_path.write_text(json.dumps(envelope, indent=2) + "\n", encoding="utf-8")
+
+    rc = chart_ingest.main(["verify", str(transcription_path), str(output_path), str(manifest_path)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error:"), f"main() must report a clean typed error, not a traceback: {err!r}"
+    assert "Traceback" not in err
+
+
+def test_cli_verify_rejects_on_disk_manifest_with_straddle_as_integer_not_boolean(tmp_path, capsys):
+    """R1: dict equality alone would let a stored `straddle: 0` silently pass as `False`
+    (Python's `0 == False`); `verify` must type-check the on-disk manifest before comparing."""
+    t = _transcription()
+    transcription_path = tmp_path / "transcription.json"
+    t["inventory"] = [_covered_row()]
+    transcription_path.write_text(json.dumps(t), encoding="utf-8")
+    output_path = tmp_path / "out.json"
+    manifest_path = tmp_path / "out.manifest.json"
+    chart_ingest.main(["build", str(transcription_path), str(output_path), str(manifest_path)])
+
+    manifest_text = manifest_path.read_text(encoding="utf-8")
+    assert '"straddle": false' in manifest_text
+    manifest_path.write_text(manifest_text.replace('"straddle": false', '"straddle": 0'), encoding="utf-8")
+
+    rc = chart_ingest.main(["verify", str(transcription_path), str(output_path), str(manifest_path)])
+    assert rc == 1
+    assert "straddle" in capsys.readouterr().err
 
 
 # --- fetch: monkeypatched urlopen, no real network access ---
