@@ -1,8 +1,9 @@
 //! Bounded, checksummed binary storage for the on-disk street-solution cache (spec section 10.4):
 //! a `Cell` holds the one or two `CacheEntry` values kept per structural key, `encode`/`decode`
 //! convert a `Cell` to and from its on-disk bytes, `entry_path` derives the sharded file path for
-//! a key digest, and `read_cell` is the read side that turns any decode failure into a cache miss
-//! with best-effort deletion of the offending file (CLAUDE.md section 6: "Read/decode error:
+//! a key digest, `write_atomic` publishes bytes at such a path (temp file in the same directory,
+//! fsync, rename), and `read_cell` is the read side that turns any decode failure into a cache
+//! miss with best-effort deletion of the offending file (CLAUDE.md section 6: "Read/decode error:
 //! miss, best-effort delete").
 //!
 //! On-disk layout is a fixed 56-byte header followed by a zstd-compressed bincode payload:
@@ -80,10 +81,59 @@
 //!   a real residual window), and there is a second, smaller window between the fresh check and
 //!   the `remove_file` call itself. Making publication and cleanup mutually exclusive under one
 //!   lock closes both windows properly and is Task 6's job (it owns `write_atomic` and the
-//!   writer thread), not this read path's -- so no lock is introduced here.
+//!   writer thread), not this read path's -- so no lock is introduced here. **That lock now
+//!   exists**: see "The publication lock" below, which closes both of those windows; the
+//!   `(len, last_write_time)` proxy described here is kept only as a second guard against a
+//!   writer outside this process.
 //!
 //! R4 (the storage-level corruption-case matrix) and R5 (test temp-directory hygiene) are test
 //! changes only; see `crates/cache/tests/storage.rs`. R6 is a report correction only.
+//!
+//! ## The publication lock (task 6; R3's structural fix, owed by the orchestrator's ruling)
+//!
+//! R3's residual window described above is now closed. `write_atomic` (this task's publication
+//! primitive) and `read_cell`'s corrupt-file cleanup take the *same* lock, `PUBLICATION`, so a
+//! publication and a cleanup can never interleave:
+//!
+//! - Before it opens anything, `read_cell_core` registers a `ReadTicket` for the path it is about
+//!   to read (`ReadGuard::new`). The ticket is removed when the read finishes, by the guard's
+//!   `Drop` on every exit path -- including a panic and the early `File::open` failure.
+//! - `write_atomic` writes and fsyncs its temp file *outside* the lock, then takes the lock and,
+//!   under it, performs the `rename` that publishes the cell and marks every in-flight ticket for
+//!   that same path `superseded`.
+//! - `read_cell_core`, on a decode failure, takes the lock and -- under it -- decides and performs
+//!   the `remove_file`. A ticket marked `superseded` means a publication landed on this path at
+//!   some point after this read opened the file, so the bytes that failed to decode are no longer
+//!   what the path names, and nothing is unlinked.
+//!
+//! The two orderings are therefore the only two possible ones, and both are safe: a publication
+//! that commits before the cleanup's locked section marks the ticket (so the replacement is left
+//! alone), and one that commits after it finds the corrupt file already unlinked and publishes on
+//! top of nothing. Neither depends on the `(len, last_write_time)` proxy any more -- which matters
+//! on Windows specifically, where `last_write_time` is frequently identical across writes issued
+//! within the same system-clock tick, so a same-sized republish of a cell could genuinely collide
+//! with it. The proxy is *kept* as a second, narrower guard for a writer this process cannot see
+//! at all (a second app instance publishing into the same cache root, which holds no lock of
+//! ours): it is no longer the only thing standing between a fresh publication and `remove_file`.
+//! `read_cell`'s signature and observable behavior are unchanged -- an undisturbed corrupt file is
+//! still gone once the call returns (`read_cell_still_deletes_an_undisturbed_corrupt_file`,
+//! `cache_corrupt_entry_deleted`).
+//!
+//! Tickets are matched per path, by the path as given -- so a publication only ever silences the
+//! cleanup of the *same* cell, never an unrelated one, and unrelated cells (and unrelated tests
+//! running in parallel) never interfere. Both sides derive their path from `entry_path` against
+//! the one cache root the writer was opened with, so the two spellings agree; a caller that
+//! reached the same file through a differently spelled path would fall back to the identity proxy
+//! alone, which is exactly the pre-task-6 behavior rather than a new failure mode.
+//!
+//! Scope of the lock (plan 4's "No mutex spans file I/O"): it is held across exactly two single
+//! syscalls, the publishing `rename` and the cleanup `remove_file`, and never across an open,
+//! read, write, fsync, encode, decode or validation -- those are precisely the operations that
+//! rule is about, and making the two syscalls mutually exclusive is what the orchestrator's
+//! ruling on R3 requires. Deletions that are *not* a corrupt-read cleanup (`WriteCommand::Delete`,
+//! quota eviction, `quota::scan_index`'s garbage collection, `quota::sweep_temporaries`) all run
+//! on the single writer thread, which is also the only publisher, so they are already serialized
+//! against publication by being the same thread and take no lock.
 //!
 //! ## Fix round 2 (review `task-5-review-round-2.md`, N1)
 //!
@@ -257,8 +307,117 @@ pub fn decode(bytes: &[u8]) -> Result<Cell, CacheError> {
     Ok(Cell { entries })
 }
 
+// --- the publication lock (task 6; see the module doc) ------------------------------------------
+
+/// The in-flight `read_cell` calls that may still want to unlink the file they are reading. The
+/// mutex guarding them is the publication lock itself: `write_atomic` holds it across its
+/// `rename`, and a corrupt-read cleanup holds it across its decision and `remove_file`.
+static PUBLICATION: std::sync::Mutex<Vec<ReadTicket>> = std::sync::Mutex::new(Vec::new());
+
+struct ReadTicket {
+    id: u64,
+    path: PathBuf,
+    /// Set by `write_atomic` when it publishes over `path` while this read is still in flight.
+    superseded: bool,
+}
+
+/// Takes the publication lock, treating poisoning as recoverable: the guarded value is a plain
+/// list of in-flight reads with no invariant a panicking thread could leave half-updated, and
+/// refusing every publication and every cleanup for the rest of the process's life because some
+/// unrelated thread panicked would be strictly worse than carrying on.
+fn publication() -> std::sync::MutexGuard<'static, Vec<ReadTicket>> {
+    PUBLICATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One in-flight read's registration in `PUBLICATION`, removed on `Drop` (so every exit path of
+/// `read_cell_core`, including a panic, deregisters) or by `delete_unless_superseded`.
+struct ReadGuard {
+    id: u64,
+    registered: bool,
+}
+
+impl ReadGuard {
+    fn new(path: &Path) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        publication().push(ReadTicket { id, path: path.to_path_buf(), superseded: false });
+        ReadGuard { id, registered: true }
+    }
+
+    /// Unlinks `path` unless a publication landed on it since this guard was taken. Both the
+    /// decision and the `remove_file` run under the publication lock, which `write_atomic` also
+    /// holds across its `rename`, so a cleanup and a publication are mutually exclusive (module
+    /// doc). `identity` is task 5's `(len, last_write_time)` proxy, still required to agree as a
+    /// second guard against a writer outside this process; a missing ticket is treated as
+    /// superseded, i.e. as a reason not to delete.
+    fn delete_unless_superseded(mut self, path: &Path, identity: (u64, u64)) {
+        let mut tickets = publication();
+        let superseded = tickets.iter().find(|t| t.id == self.id).is_none_or(|t| t.superseded);
+        tickets.retain(|t| t.id != self.id);
+        self.registered = false;
+        if superseded {
+            return;
+        }
+        if let Ok(fresh) = std::fs::metadata(path) {
+            if (fresh.len(), fresh.last_write_time()) == identity {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        if self.registered {
+            publication().retain(|t| t.id != self.id);
+        }
+    }
+}
+
+/// Publishes `bytes` at `path` atomically: writes them to a temp file in the *same* directory
+/// (same volume, so the rename below is a true atomic replacement rather than a copy), fsyncs
+/// that file, and renames it over `path`. A crash at any point leaves either the previous cell or
+/// the new one, never a partially written file; a failure at any point removes the temp file and
+/// leaves `path` untouched. The `rename` runs under the publication lock, which also marks every
+/// in-flight `read_cell` on this path superseded, so a concurrent corrupt-read cleanup can never
+/// unlink what this call just published (module doc).
+///
+/// # Errors
+/// `CacheError::Invalid` if `path` has no parent directory. Propagates any I/O failure from
+/// creating the directory, creating/writing/fsyncing the temp file, or the rename -- including a
+/// full disk, a read-only cache root, and a `path` that names a directory.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().ok_or(CacheError::Invalid("cache write path has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+    // Unique per process *and* per call, so two publications of the same cell (or a crashed
+    // earlier run's leftovers, which `quota::sweep_temporaries` clears) never collide on one
+    // temp name; `create_new` below would refuse a collision rather than overwrite it.
+    let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let result = (|| -> Result<(), CacheError> {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        // The publication itself. Nothing above this line runs under the lock.
+        let mut tickets = publication();
+        std::fs::rename(&tmp, path)?;
+        for t in tickets.iter_mut().filter(|t| t.path == path) {
+            t.superseded = true;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
+}
+
 /// Reads and decodes the cell stored at `path`. Equivalent to `read_cell_core(path, || {})`; see
-/// that function for the deletion-race guard (review R3).
+/// that function for the deletion-race guard (review R3) and the module doc for the publication
+/// lock that closes it (task 6).
 pub fn read_cell(path: &Path) -> Option<Cell> {
     read_cell_core(path, || {})
 }
@@ -275,14 +434,18 @@ pub fn read_cell(path: &Path) -> Option<Cell> {
 /// `decode`, `entry_path`, `read_cell`), and `read_cell` itself is unchanged for every caller.
 ///
 /// Any failure -- I/O, an oversized file, a bad header, a checksum mismatch, or a
-/// `decode`/`validate_entry` rejection -- is a cache miss (`None`). The file is deleted only if a
-/// *fresh*, path-based metadata read taken immediately before removal still agrees, in both
-/// length and last-write time, with what was captured from the *opened handle's* own metadata
-/// before this function read anything (review R3; see the module doc for why this is a
-/// best-effort proxy, not an exact identity check, and for the residual race it does not close).
-/// A mismatch -- like a deletion failure, e.g. `path` naming a directory -- is silently treated
-/// as "leave it alone": the lookup is still a miss, but nothing is removed.
+/// `decode`/`validate_entry` rejection -- is a cache miss (`None`). The file is deleted only if
+/// no publication landed on `path` while this call was reading it (the publication lock and the
+/// `ReadGuard` registered below, task 6 -- see the module doc) *and* a fresh, path-based metadata
+/// read taken under that lock still agrees, in both length and last-write time, with what was
+/// captured from the *opened handle's* own metadata before this function read anything (review
+/// R3's cross-process proxy). Either check failing -- like a deletion failure, e.g. `path` naming
+/// a directory -- is silently treated as "leave it alone": the lookup is still a miss, but
+/// nothing is removed.
 fn read_cell_core(path: &Path, between_read_and_delete: impl FnOnce()) -> Option<Cell> {
+    // Registered *before* the file is opened, so any publication on `path` from this point on is
+    // visible to the cleanup decision below (task 6). Dropped on every exit path from here.
+    let guard = ReadGuard::new(path);
     let opened = std::fs::File::open(path).ok()?;
     let identity = {
         let m = opened.metadata().ok()?;
@@ -300,11 +463,7 @@ fn read_cell_core(path: &Path, between_read_and_delete: impl FnOnce()) -> Option
         Ok(cell) => Some(cell),
         Err(_) => {
             between_read_and_delete();
-            if let Ok(fresh) = std::fs::metadata(path) {
-                if (fresh.len(), fresh.last_write_time()) == identity {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
+            guard.delete_unless_superseded(path, identity);
             None
         }
     }
@@ -533,6 +692,66 @@ mod tests {
 
         let reread = read_cell(&path).expect("the surviving replacement must still be a hit");
         assert_eq!(reread.entries[0].key, e.key);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The structural regression task 6 owes review R3 (orchestrator ruling): a *real*
+    /// publication through `write_atomic`, landing in the exact window between a corrupt read and
+    /// its cleanup, is never unlinked -- even when the published file's `(len, last_write_time)`
+    /// is made to agree *exactly* with the corrupt file's, i.e. even in the one case task 5's
+    /// best-effort proxy cannot distinguish (and which is not exotic on Windows, where two writes
+    /// in the same system-clock tick share a last-write time). The interleaving is driven by the
+    /// crate-internal hook, never by timing, and the assertion inside the hook proves the proxy
+    /// really does agree -- so the only thing that can be keeping the replacement alive is the
+    /// publication lock and the ticket `write_atomic` marked under it.
+    #[test]
+    fn a_publication_racing_a_corrupt_read_survives_even_when_len_and_mtime_agree() {
+        let dir = unique_temp_dir("publish-race");
+        let path = dir.join("cell.bin");
+        let e = fixture_entry();
+        let replacement = encode(&Cell { entries: vec![e.clone()] }).unwrap();
+        // Corrupt bytes of exactly the replacement's length: zeros fail the magic check.
+        std::fs::write(&path, vec![0_u8; replacement.len()]).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let (len, modified) = (before.len(), before.modified().unwrap());
+
+        let got = read_cell_with_hook(&path, || {
+            write_atomic(&path, &replacement).unwrap();
+            let published = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            published.set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+            drop(published);
+            let fresh = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                (fresh.len(), fresh.modified().unwrap()),
+                (len, modified),
+                "the published replacement's identity must match the corrupt file's, or this test is not exercising the lock"
+            );
+        });
+
+        assert!(got.is_none(), "the corrupt bytes this call actually read are still a miss");
+        assert_eq!(std::fs::read(&path).unwrap(), replacement, "the published replacement must survive the cleanup");
+        let reread = read_cell(&path).expect("the surviving replacement must still be a hit");
+        assert_eq!(reread.entries[0].key, e.key);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other ordering: a cleanup that commits first unlinks only the corrupt bytes it read,
+    /// and a publication arriving afterwards still lands. Together with the test above this
+    /// covers both of the two orderings the publication lock allows.
+    #[test]
+    fn a_publication_after_a_cleanup_still_lands() {
+        let dir = unique_temp_dir("publish-after");
+        let path = dir.join("cell.bin");
+        std::fs::write(&path, b"not a cache header").unwrap();
+        assert!(read_cell(&path).is_none());
+        assert!(!path.exists(), "the corrupt file it read is unlinked");
+
+        let e = fixture_entry();
+        let bytes = encode(&Cell { entries: vec![e.clone()] }).unwrap();
+        write_atomic(&path, &bytes).unwrap();
+        assert_eq!(read_cell(&path).expect("the later publication must be a hit").entries[0].key, e.key);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

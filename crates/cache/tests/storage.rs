@@ -126,6 +126,63 @@ fn cache_corrupt_entry_deleted() {
     assert!(cache::storage::read_cell(dir.path()).is_none());
 }
 
+// --- task 6: atomic publication (`write_atomic`) -------------------------------------------------
+
+/// Brief step 1's replacement test, plus step 5's crash cases: a publication that never reached
+/// its `rename` leaves the previously published cell byte-for-byte intact and readable, and a
+/// publication that did rename is complete -- there is no state in which a reader can observe
+/// half of either version.
+#[test]
+fn cache_atomic_write_and_quota() {
+    let path = std::env::temp_dir().join(format!("pokerai-atomic-{}.bin", std::process::id()));
+    cache::storage::write_atomic(&path, b"old").unwrap();
+    cache::storage::write_atomic(&path, b"new").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    std::fs::remove_file(path).unwrap();
+
+    // Step 5, "inject failure before rename": a crashed writer's temp file is a sibling in the
+    // same directory, and the old cell is still the only thing at the published path.
+    let dir = TempDir::new("atomic-crash");
+    let e = support::entry();
+    let published = storage::entry_path(dir.path(), e.key.digest());
+    let old = storage::encode(&Cell { entries: vec![e.clone()] }).unwrap();
+    storage::write_atomic(&published, &old).unwrap();
+    assert_eq!(std::fs::read_dir(published.parent().unwrap()).unwrap().count(), 1, "a completed publication leaves only the cell itself");
+
+    let crashed = published.with_extension(format!("{}.4242.tmp", std::process::id()));
+    std::fs::write(&crashed, &old[..old.len() / 2]).unwrap();
+    assert_eq!(std::fs::read(&published).unwrap(), old, "a half-written temp sibling must not touch the published bytes");
+    let back = storage::read_cell(&published).expect("the old cell must still read back while a partial write sits beside it");
+    assert_eq!(back.entries[0].key, e.key);
+
+    // Step 5, "after rename": the replacement is whole, and its own temp file is gone.
+    let mut replacement_entry = support::entry();
+    replacement_entry.iterations = 4_321;
+    let new = storage::encode(&Cell { entries: vec![replacement_entry] }).unwrap();
+    assert_ne!(new, old, "the replacement must be distinguishable from the old cell");
+    storage::write_atomic(&published, &new).unwrap();
+    assert_eq!(std::fs::read(&published).unwrap(), new, "the replacement lands whole");
+    assert_eq!(storage::read_cell(&published).unwrap().entries[0].iterations, 4_321);
+    std::fs::remove_file(&crashed).unwrap();
+    assert_eq!(std::fs::read_dir(published.parent().unwrap()).unwrap().count(), 1, "write_atomic leaves no temp file of its own behind");
+}
+
+/// A publication that cannot complete reports the failure and cleans up after itself: the
+/// caller's recommendation path only ever sees an error, never a stray temp file and never a
+/// partially replaced cell.
+#[test]
+fn write_atomic_reports_a_failed_publication_and_removes_its_temp_file() {
+    let dir = TempDir::new("atomic-fail");
+    let blocked = dir.path().join("cell.bin");
+    std::fs::create_dir(&blocked).unwrap(); // rename cannot replace a directory
+    assert!(storage::write_atomic(&blocked, b"payload").is_err(), "publishing over a directory must fail");
+    assert!(blocked.is_dir(), "the failed publication must not have disturbed what was there");
+    let leftovers = std::fs::read_dir(dir.path()).unwrap().flatten().filter(|f| f.path().extension().and_then(|e| e.to_str()) == Some("tmp")).count();
+    assert_eq!(leftovers, 0, "a failed publication removes its own temp file");
+
+    assert!(storage::write_atomic(std::path::Path::new(""), b"payload").is_err(), "a path with no parent directory is rejected");
+}
+
 // --- encode: cell-level invariants ---------------------------------------------------------------
 
 /// review m4: entries that disagree on their own structural key have no business sharing a cell
