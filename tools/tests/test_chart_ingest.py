@@ -1545,3 +1545,145 @@ def test_pokercoaching_100_absent_rows_never_become_chart_nodes():
             f"absent row {r['title']!r} must never be promoted to a chart node "
             "(the Plan 4 fallback is the synthetic UnconditionedPriorStreet range, never a chart hit)"
         )
+
+
+# --- P3.T7 fix round 1, R2: machine-check the frozen checklist embedded in the document itself
+# ---
+#
+# The counts/prefix tests above (`test_frozen_coverage_counts_*`, `test_frozen_plan4_handoff_
+# prefixes_covered_*`) pin cardinalities and selected histories against the *fixtures*. They
+# never read `docs/data/chart-transcription.md`'s own frozen claims, so a documentation-only
+# edit to a history, a status, or a recorded hash could drift from the fixtures without any of
+# them noticing. The tests below parse the document's own machine-readable freeze blocks (added
+# in this fix round, in the "Frozen coverage and Plan 4 handoff (Task 7)" section's "Fix round 1"
+# subsection) and check them against the committed fixtures -- never against each other -- and
+# prove the comparison itself actually rejects a mismatch or a missing artifact, not merely that
+# nothing happens to disagree today.
+
+DOC_PATH = ROOT / "docs/data/chart-transcription.md"
+_FREEZE_BLOCK_RE = re.compile(r"#### Freeze: (\S+)\n```json\n(.*?)\n```", re.DOTALL)
+
+
+def _extract_freeze_blocks(markdown_text):
+    """Parses every `#### Freeze: <bundle_id>` heading immediately followed by a ```json fenced
+    block, returning `{bundle_id: parsed_dict}`. Raises if the document carries no freeze block
+    at all or a block is not valid JSON -- never returns an empty result silently."""
+    blocks = {}
+    for m in _FREEZE_BLOCK_RE.finditer(markdown_text):
+        bundle_id, raw = m.group(1), m.group(2)
+        blocks[bundle_id] = json.loads(raw)
+    assert blocks, "no `#### Freeze: <bundle_id>` / ```json block found in the document at all"
+    return blocks
+
+
+def _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription):
+    """The comparison itself, factored out so it can be exercised directly against synthetic
+    (corrupted) input by the tests below, not only against the real committed fixtures. Raises
+    `AssertionError` on any mismatch; never returns a bool and never skips."""
+    depth_entry = next(d for d in source_manifest["depths"] if d["bundle_id"] == frozen["bundle_id"])
+    assert depth_entry["depth_bb"] == frozen["depth_bb"], "depth-to-bundle mapping mismatch"
+    assert depth_entry["sha256"] == frozen["source_sha256"], "source PDF hash drift"
+    assert bundle_manifest["sha256"] == frozen["envelope_sha256"], "envelope hash drift"
+    assert bundle_manifest["bundle_id"] == frozen["bundle_id"], "bundle id mismatch"
+
+    actual_covered = sorted(json.dumps(n["history"]) for n in envelope["nodes"])
+    frozen_covered = sorted(json.dumps(h) for h in frozen["covered_histories"])
+    assert frozen_covered == actual_covered, "frozen covered-history list drifted from the committed envelope"
+
+    actual_absent = {json.dumps(r["history"]) for r in transcription["inventory"] if r["status"] == "absent"}
+    frozen_absent = {json.dumps(h) for h in frozen["absent_histories"]}
+    assert frozen_absent == actual_absent, "frozen absent-history list drifted from the transcription inventory"
+    assert not (frozen_absent & set(frozen_covered)), "a frozen absent history collides with a frozen covered history"
+
+
+def _load_real_freeze_inputs(bundle_id):
+    source_manifest = load_availability()
+    manifest_path = ROOT / f"fixtures/charts/{bundle_id}.manifest.json"
+    bundle_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    envelope, transcription = _bundle(bundle_id)
+    return source_manifest, bundle_manifest, envelope, transcription
+
+
+def test_frozen_checklist_blocks_present_for_both_bundles():
+    blocks = _extract_freeze_blocks(DOC_PATH.read_text(encoding="utf-8"))
+    assert set(blocks) == {"pokercoaching_100", "rangeconverter_200"}
+
+
+def test_frozen_checklist_matches_committed_bundles_and_manifests_100bb():
+    blocks = _extract_freeze_blocks(DOC_PATH.read_text(encoding="utf-8"))
+    frozen = blocks["pokercoaching_100"]
+    source_manifest, bundle_manifest, envelope, transcription = _load_real_freeze_inputs("pokercoaching_100")
+    _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription)
+
+
+def test_frozen_checklist_matches_committed_bundles_and_manifests_200bb():
+    blocks = _extract_freeze_blocks(DOC_PATH.read_text(encoding="utf-8"))
+    frozen = blocks["rangeconverter_200"]
+    source_manifest, bundle_manifest, envelope, transcription = _load_real_freeze_inputs("rangeconverter_200")
+    _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription)
+
+
+def _real_frozen_dict(bundle_id):
+    """Builds the exact frozen dict straight from the committed fixtures -- the same shape the
+    document's own freeze block records -- so the tests below can perturb one field in memory
+    and confirm `_check_frozen_checklist` rejects it, without ever touching the committed doc."""
+    source_manifest, bundle_manifest, envelope, transcription = _load_real_freeze_inputs(bundle_id)
+    depth_entry = next(d for d in source_manifest["depths"] if d["bundle_id"] == bundle_id)
+    frozen = {
+        "bundle_id": bundle_id,
+        "depth_bb": depth_entry["depth_bb"],
+        "source_sha256": depth_entry["sha256"],
+        "envelope_sha256": bundle_manifest["sha256"],
+        "covered_histories": [n["history"] for n in envelope["nodes"]],
+        "absent_histories": [r["history"] for r in transcription["inventory"] if r["status"] == "absent"],
+    }
+    return frozen, source_manifest, bundle_manifest, envelope, transcription
+
+
+def test_frozen_checklist_check_rejects_a_history_mismatch():
+    frozen, source_manifest, bundle_manifest, envelope, transcription = _real_frozen_dict("pokercoaching_100")
+    # Sanity: built straight from the fixtures, this must actually check out first.
+    _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription)
+    frozen["covered_histories"][0] = [["not", "a", "real_history_entry"]]
+    with pytest.raises(AssertionError):
+        _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription)
+
+
+def test_frozen_checklist_check_rejects_an_absent_history_mismatch():
+    frozen, source_manifest, bundle_manifest, envelope, transcription = _real_frozen_dict("rangeconverter_200")
+    _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription)
+    frozen["absent_histories"][0] = [["not", "a", "real_history_entry"]]
+    with pytest.raises(AssertionError):
+        _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription)
+
+
+def test_frozen_checklist_check_rejects_a_hash_mismatch():
+    frozen, source_manifest, bundle_manifest, envelope, transcription = _real_frozen_dict("pokercoaching_100")
+    _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription)
+    frozen["envelope_sha256"] = "0" * 64
+    with pytest.raises(AssertionError):
+        _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription)
+    frozen["envelope_sha256"] = bundle_manifest["sha256"]
+    frozen["source_sha256"] = "0" * 64
+    with pytest.raises(AssertionError):
+        _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription)
+
+
+def test_frozen_checklist_check_rejects_a_depth_mismatch():
+    frozen, source_manifest, bundle_manifest, envelope, transcription = _real_frozen_dict("rangeconverter_200")
+    _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription)
+    frozen["depth_bb"] = 999
+    with pytest.raises(AssertionError):
+        _check_frozen_checklist(frozen, source_manifest, bundle_manifest, envelope, transcription)
+
+
+def test_frozen_checklist_check_rejects_missing_required_artifact():
+    """A referenced manifest/envelope/transcription file that does not exist must fail hard,
+    never be silently skipped."""
+    with pytest.raises(FileNotFoundError):
+        _load_real_freeze_inputs("does_not_exist_bundle_id")
+
+
+def test_frozen_checklist_extraction_fails_hard_when_the_section_is_missing():
+    with pytest.raises(AssertionError):
+        _extract_freeze_blocks("# some unrelated document\n\nno freeze blocks here.\n")

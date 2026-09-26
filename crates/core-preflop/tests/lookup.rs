@@ -49,6 +49,12 @@ impl PreflopSource for EmptyBundle {
     fn lookup(&self, _key: &PreflopNodeKey) -> Option<PreflopNode> {
         None
     }
+    /// P3.T7 fix round 1, R1: `PreflopSource::nodes_have_no_ev` no longer has a default body,
+    /// so this test-only double states its own answer explicitly -- vacuously `true`, since it
+    /// never stores any node at all.
+    fn nodes_have_no_ev(&self) -> bool {
+        true
+    }
 }
 
 fn variant(bundle_id: &str, mutate: impl FnOnce(&mut BundleInfo)) -> Box<dyn PreflopSource> {
