@@ -300,13 +300,17 @@ test('unmapped_keys_are_no_ops',async()=>{
   const calls:string[]=[];
   const stub={key:(k:string)=>{calls.push(k);return Promise.resolve();}} as unknown as EntryController;
   const remove=attachKeys(window,stub);
-  for(const init of [{key:'Tab'},{key:'ArrowUp'},{key:'c',ctrlKey:true},{key:'f',altKey:true},{key:'Shift',shiftKey:true}]){
+  for(const init of [{key:'Tab'},{key:'ArrowUp'},{key:'c',ctrlKey:true},{key:'f',altKey:true},{key:'Shift',shiftKey:true},
+    {key:'Z',ctrlKey:true,shiftKey:true}]){ // I1: an extra modifier on the Ctrl+Z chord is unmapped, not Undo
     const event=new KeyboardEvent('keydown',{...init,cancelable:true});window.dispatchEvent(event);
     expect(event.defaultPrevented).toBe(false);
   }
   expect(calls).toHaveLength(0);
   const mapped=new KeyboardEvent('keydown',{key:'z',ctrlKey:true,cancelable:true});window.dispatchEvent(mapped);
   expect(mapped.defaultPrevented).toBe(true);expect(calls).toEqual(['Ctrl+Z']);
+  // Ordinary shifted letters for uppercase action/card entry keep working (no ctrlKey involved).
+  const shiftedLetter=new KeyboardEvent('keydown',{key:'F',shiftKey:true,cancelable:true});window.dispatchEvent(shiftedLetter);
+  expect(shiftedLetter.defaultPrevented).toBe(true);expect(calls).toEqual(['Ctrl+Z','F']);
   remove();entry.dispose();idle.entry.dispose();
 });
 
@@ -353,15 +357,40 @@ test('input_is_serialized_against_the_next_snapshot_and_capped_at_64_keys',async
   const checkable=hand({hand_revision:8});
   checkable.derived.legal=[{kind:'check'},{kind:'bet',min_to:10,max_to:990},{kind:'all_in',to:990}];
   fake.hands=[checkable,hand({hand_revision:9})];
-  const first=entry.key('f');const second=entry.key('c');
-  const fillers=Array.from({length:62},()=>entry.key('q'));
-  expect(entry.snapshot().error).toBeNull();
-  const dropped=entry.key('f'); // the 65th key while the first IPC call is still pending
+  const first=entry.key('f');
+  // I2: a burst of globally unmapped letters (never meaningful in any reachable mode) must never
+  // consume queue capacity or delay/displace a mapped key queued right after it.
+  const unmappedBurst=Array.from({length:70},()=>entry.key('g'));
+  const second=entry.key('c');
+  // 62 mapped filler keys (digits: they can become meaningful, e.g. typed against a later bet
+  // prompt) legitimately occupy the remaining queue capacity: first(1)+second(1)+fillers(62)=64.
+  const fillers=Array.from({length:62},()=>entry.key('0'));
+  expect(entry.snapshot().error).toBeNull(); // the 70-key unmapped burst never overflowed the queue
+  const dropped=entry.key('f'); // the 65th *mapped* key while the first IPC call is still pending
   expect(entry.snapshot().error).toMatch(/Input queue full/);
-  release();await Promise.all([first,second,...fillers,dropped]);
-  // `c` ran against the snapshot the fold returned (Check legal there), never the one it was typed on.
+  release();await Promise.all([first,...unmappedBurst,second,...fillers,dropped]);
+  // `c` ran against the snapshot the fold returned (Check legal there), never the one it was typed
+  // on; it was neither dropped nor reordered by the unmapped burst queued ahead of it.
   expect(fake.calls).toEqual([['apply_action',{action:{kind:'fold'}}],['apply_action',{action:{kind:'check'}}]]);
   expect(entry.snapshot().hand?.hand_revision).toBe(9);entry.dispose();
+});
+
+test('ctrl_z_is_gated_by_the_same_disabled_undo_predicate_as_the_button',async()=>{
+  // I3: Ctrl+Z must be a no-op whenever the on-screen Undo control would be disabled, including
+  // the `busy` condition (not just the no-hand/no-lastHand condition already covered elsewhere).
+  const {fake,entry}=controller();
+  let release=():void=>undefined;const held=new Promise<void>(resolve=>{release=resolve;});
+  const scripted=fake.apply_action.bind(fake);
+  fake.apply_action=async action=>{const result=scripted(action);await held;return result;};
+  fake.hands=[hand({hand_revision:5})];
+  const pending=entry.key('f'); // a genuinely pending mutation: the engine call is held open
+  await waitFor(()=>expect(entry.snapshot().busy).toBe(true));
+  render(<Entry state={entry.snapshot()} press={key=>entry.key(key)}/>);
+  expect(screen.getByRole('button',{name:'Undo'})).toBeDisabled();
+  const ctrlZ=entry.key('Ctrl+Z'); // pressed while busy, exactly when the Undo control is disabled
+  release();await Promise.all([pending,ctrlZ]);
+  expect(fake.calls).toEqual([['apply_action',{action:{kind:'fold'}}]]); // no undo was ever issued
+  expect(entry.snapshot().busy).toBe(false);entry.dispose();
 });
 
 test('every_mutation_invalidates_the_recommendation_identity_first',async()=>{

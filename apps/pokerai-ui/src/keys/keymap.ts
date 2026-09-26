@@ -25,3 +25,16 @@ export function wager(h:HandState,to:number):Action {
   const allin=h.derived.legal.find(a=>a.kind==='all_in'&&a.to===to);
   return allin?.kind==='all_in'?{kind:'allin',to}:{kind:range.kind,to};
 }
+// The frozen keyboard vocabulary (spec §5.1): action letters (F,C,A,B,H,T,E,X,N), card rank/suit
+// letters used by hero/board entry (ranks 2-9,T,J,Q,K,A; suits c,d,h,s), digits for wizard stacks
+// and bet amounts, space (recommend), and the named/control keys. A key outside this set can never
+// mean anything against any reachable snapshot -- not now, and not after further mutations change
+// the mode -- so it is excluded before queue admission (`EntryController.key`) and before the
+// native listener's `preventDefault` (`attachKeys`), rather than merely becoming a no-op once
+// already admitted and holding a queue slot (I2). Letters not in this union (g,i,l,m,o,p,r,u,v,w,y,z)
+// are never meaningful in any mode.
+const MAPPED_SINGLE_CHAR=/^[a-fhjknqstx0-9 ]$/i;
+const MAPPED_NAMED_KEYS=new Set(['Enter','Backspace','Escape','Ctrl+Z']);
+export function isMappedKey(key:string):boolean {
+  return MAPPED_SINGLE_CHAR.test(key)||MAPPED_NAMED_KEYS.has(key);
+}
