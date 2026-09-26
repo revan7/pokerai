@@ -40,8 +40,11 @@ fn chip_path_indexed(index: &MaterializedIndex<'_>, ordinal: &[u8]) -> Option<Ve
 /// One decision node (§10.3): navigate, `cache_normalized_weights`, `strategy`,
 /// `expected_values_detail(current_player())`, then transpose the library's action-major arrays over
 /// its compact hand list to combo-major `[1326][action]`. `available` = reach > 0 (the player's
-/// `weights`); combos outside the compact list (not in the range, or on the board) are absent and
-/// stay all-zero, as do combos with zero reach.
+/// `weights`) **and** compatible opponent support > 0 (its `normalized_weights`: own reach times the
+/// reach of the opponent hands that share no card with it). Where that support is zero the library
+/// writes a zero EV sentinel (`interpreter.rs`, `w_normalized == 0.0`), which is not a decision value,
+/// so such a combo is unavailable (review I1). Combos outside the compact list (not in the range, or
+/// on the board) are absent too; every unavailable combo stays all-zero.
 ///
 /// EV is the library's actor-owned value unchanged (`normalize_ev` is the identity, §10.3) except the
 /// fold column, which is emitted as exactly `+0.0` (§2: chips already in the pot are sunk;
@@ -69,7 +72,7 @@ fn extract_here(game: &mut PostFlopGame, node: &MaterializedNode, chip_path: &[A
         return Err(format!("menu {lib_actions:?} at {chip_path:?} differs from the skeleton's {:?}", node.actions));
     }
     game.cache_normalized_weights();
-    let m = combo_major(game.private_cards(player), game.weights(player), &game.strategy(), &game.expected_values_detail(player), &node.actions)
+    let m = combo_major(game.private_cards(player), game.weights(player), game.normalized_weights(player), &game.strategy(), &game.expected_values_detail(player), &node.actions)
         .map_err(|e| format!("{e} at {chip_path:?}"))?;
     Ok(NodeStrategy { path: chip_path.to_vec(), actor: node.actor.clone(), actions: node.actions.clone(), probs: m.probs, ev_chips: m.ev_chips, available: m.available })
 }
@@ -79,21 +82,25 @@ fn extract_here(game: &mut PostFlopGame, node: &MaterializedNode, chip_path: &[A
 struct Matrices { probs: Vec<Vec<f32>>, ev_chips: Vec<Vec<f32>>, available: Vec<bool> }
 
 /// The §10.3 matrix contract as a pure function of the library's arrays at one node: `hands` is the
-/// actor's compact hand list, `reach` its `weights`, and `strat` / `evs` the action-major
-/// `[action][hand]` arrays of `strategy()` and `expected_values_detail(actor)`. Library hand ->
-/// named combo -> `ComboIndex`; transposed to `[combo][action]`; zero-filled and unavailable
-/// wherever reach is zero or the combo is outside the list. The fold column is checked to be zero and
+/// actor's compact hand list, `reach` its `weights`, `support` its `normalized_weights` (own reach
+/// times compatible opponent reach), and `strat` / `evs` the action-major `[action][hand]` arrays of
+/// `strategy()` and `expected_values_detail(actor)`. Library hand -> named combo -> `ComboIndex`;
+/// transposed to `[combo][action]`; zero-filled and unavailable wherever reach or compatible support
+/// is not positive, or the combo is outside the list. The fold column is checked to be zero and
 /// emitted as `+0.0` (§2); nothing is clamped or overwritten.
-fn combo_major(hands: &[(LibCard, LibCard)], reach: &[f32], strat: &[f32], evs: &[f32], actions: &[Action]) -> Result<Matrices, String> {
+fn combo_major(hands: &[(LibCard, LibCard)], reach: &[f32], support: &[f32], strat: &[f32], evs: &[f32], actions: &[Action]) -> Result<Matrices, String> {
     let (n, na) = (hands.len(), actions.len());
-    if strat.len() != n * na || evs.len() != n * na || reach.len() != n {
-        return Err(format!("matrix shape: strategy {}, EV {}, reach {} for {n} hands x {na} actions", strat.len(), evs.len(), reach.len()));
+    if strat.len() != n * na || evs.len() != n * na || reach.len() != n || support.len() != n {
+        return Err(format!("matrix shape: strategy {}, EV {}, reach {}, support {} for {n} hands x {na} actions", strat.len(), evs.len(), reach.len(), support.len()));
     }
     let mut m = Matrices { probs: vec![vec![0.0f32; na]; COMBOS], ev_chips: vec![vec![0.0f32; na]; COMBOS], available: vec![false; COMBOS] };
     for (h, hand) in hands.iter().enumerate() {
-        let r = reach[h];
+        let (r, s) = (reach[h], support[h]);
         if !r.is_finite() { return Err(format!("non-finite reach {r} for library hand {hand:?}")); }
-        if r <= 0.0 { continue; }
+        if !s.is_finite() { return Err(format!("non-finite compatible support (normalized weight) {s} for library hand {hand:?}")); }
+        // Review I1: with no compatible opponent hand reaching this node the library's EV row is its
+        // zero sentinel, not a value; the combo is unavailable, not a real-looking 0 EV decision.
+        if r <= 0.0 || s <= 0.0 { continue; }
         let c = usize::from(lib_hand_to_combo(*hand));
         m.available[c] = true;
         for (a, action) in actions.iter().enumerate() {
@@ -114,8 +121,40 @@ fn combo_major(hands: &[(LibCard, LibCard)], reach: &[f32], strat: &[f32], evs: 
     Ok(m)
 }
 
+/// Copied into the solution as given: `exploitability_chips` must already be the reported value
+/// (see [`report_exploitability`]); the export neither measures nor normalizes it.
 #[derive(Debug, Clone, Copy)]
 pub struct SolutionMeta { pub exploitability_chips: f32, pub iterations: u32, pub memory_bytes: u64, pub mode: &'static str, pub locks_applied: u16 }
+
+/// Review ruling (c) of P2.T10: the deepest a measured exploitability may dip below zero and still
+/// count as floating-point noise (`compute_exploitability` averages two sums of differences). A fixed
+/// policy for this one computed diagnostic, never a proof that all roundoff at every chip scale fits.
+pub const EXPLOITABILITY_NOISE_FLOOR_CHIPS: f64 = 1e-6;
+
+/// A measured exploitability as the worker reports it, plus the diagnostic line (for stderr, §4.5)
+/// that keeps the raw measurement whenever the reported value differs from it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportedExploitability { pub chips: f32, pub log_line: Option<String> }
+
+/// Review ruling (c): the one place a raw `compute_exploitability` value becomes the reported
+/// `exploitability_chips`. A finite value in `[-1e-6, 0)` chips is noise and is reported as exactly
+/// `+0.0`, with the raw value in `log_line`; a zero (either sign) is `+0.0` and anything positive is
+/// unchanged, neither with a log line; a value below the floor, or a non-finite one, is an error. It
+/// is not an unconditional `max(0.0)` and never applies to ranges, probabilities or action EVs.
+///
+/// The job calls it once where the measurement feeds progress and result metadata, before emitting
+/// either, and writes `log_line` to stderr; `street_solution` copies the caller's metadata and does
+/// not call it, and `proto::worker::validate_solution` stays strict about negative values.
+pub fn report_exploitability(raw: f32) -> Result<ReportedExploitability, String> {
+    if !raw.is_finite() { return Err(format!("exploitability measurement {raw} is not finite")); }
+    if raw > 0.0 { return Ok(ReportedExploitability { chips: raw, log_line: None }); }
+    if raw == 0.0 { return Ok(ReportedExploitability { chips: 0.0, log_line: None }); }
+    if f64::from(raw) >= -EXPLOITABILITY_NOISE_FLOOR_CHIPS {
+        let line = format!("exploitability: raw measurement {raw:e} chips is within the [-1e-6, 0) noise floor; reported as 0");
+        return Ok(ReportedExploitability { chips: 0.0, log_line: Some(line) });
+    }
+    Err(format!("exploitability measurement {raw:e} chips is below the -1e-6 noise floor"))
+}
 
 /// The §4.5 export limits `street_solution` applies (`MAX_EXPORTED_NODES`, `RESULT_LINE_MAX`); a
 /// parameter only so the tests reach both truncation paths without a 100,000-node or 16 MiB export.
@@ -319,10 +358,10 @@ mod tests {
 
     /// The §10.3 matrix contract as a pure function over synthetic library arrays (the
     /// `combo_matrix_two_named` shape of §13.2), so that its guards are reachable: the action-major
-    /// `[action][hand]` input lands at `[combo][action]`; zero reach and every combo outside the hand
-    /// list are absent and all-zero; a `-0.0` fold value is emitted as `+0.0`; a non-zero fold value, a
-    /// non-finite EV or reach, a probability outside `[0, 1]` and a shape mismatch are errors, never a
-    /// clamp or an overwrite.
+    /// `[action][hand]` input lands at `[combo][action]`; zero reach, zero or negative compatible
+    /// support (review I1) and every combo outside the hand list are absent and all-zero; a `-0.0`
+    /// fold value is emitted as `+0.0`; a non-zero fold value, a non-finite EV, reach or support, a
+    /// probability outside `[0, 1]` and a shape mismatch are errors, never a clamp or an overwrite.
     #[test]
     fn combo_major_transposes_masks_and_guards() {
         use crate::cards::to_lib;
@@ -330,10 +369,11 @@ mod tests {
         let hands = [lib("Ks", "As"), lib("7d", "7h"), lib("2c", "3c")];
         let actions = [Action::Fold, Action::Call, Action::Raise { to: 300 }];
         let reach = [1.0f32, 0.5, 0.0];
+        let support = [3.0f32, 1.5, 0.0];
         //                fold (h0 h1 h2)    call              raise
         let strat = [0.1f32, 0.0, 0.3, 0.6, 1.0, 0.3, 0.3, 0.0, 0.4];
         let evs = [-0.0f32, 0.0, 0.0, 12.5, -40.0, 7.0, 30.0, -1.0, 2.0];
-        let m = combo_major(&hands, &reach, &strat, &evs, &actions).unwrap();
+        let m = combo_major(&hands, &reach, &support, &strat, &evs, &actions).unwrap();
         let (aks, sevens, deuces) = (combo("As", "Ks"), combo("7h", "7d"), combo("3c", "2c"));
         assert_eq!(m.probs[aks], vec![0.1, 0.6, 0.3]);
         assert_eq!(m.probs[sevens], vec![0.0, 1.0, 0.0]);
@@ -344,40 +384,103 @@ mod tests {
         for c in (0..1326).filter(|c| *c != aks && *c != sevens) {
             assert!(!m.available[c] && m.probs[c].iter().chain(&m.ev_chips[c]).all(|x| x.to_bits() == 0), "combo {c} (deuces {deuces}) is absent");
         }
-        let refuse = |reach: &[f32], strat: &[f32], evs: &[f32], needle: &str| {
-            let e = combo_major(&hands, reach, strat, evs, &actions).unwrap_err();
+
+        // review I1: reach without compatible opponent support is unavailable, whatever the
+        // library's arrays hold there (its EV row is the zero sentinel, its strategy arbitrary)
+        for unsupported in [0.0f32, -0.0, -1e-9] {
+            let m = combo_major(&hands, &reach, &[3.0, unsupported, 0.0], &strat, &evs, &actions).unwrap();
+            assert!(m.available[aks] && !m.available[sevens], "support {unsupported:e}");
+            assert!(m.probs[sevens].iter().chain(&m.ev_chips[sevens]).all(|x| x.to_bits() == 0), "support {unsupported:e}: rows stay +0.0");
+            assert_eq!(m.probs[aks], vec![0.1, 0.6, 0.3]);
+        }
+        // support is only read where reach is positive; zero reach stays unavailable whatever it says
+        let m = combo_major(&hands, &reach, &[3.0, 1.5, 2.0], &strat, &evs, &actions).unwrap();
+        assert!(!m.available[deuces]);
+
+        let refuse = |reach: &[f32], support: &[f32], strat: &[f32], evs: &[f32], needle: &str| {
+            let e = combo_major(&hands, reach, support, strat, evs, &actions).unwrap_err();
             assert!(e.contains(needle), "{needle:?} in {e}");
         };
         let mut fold = evs;
         fold[0] = 1.5;
-        refuse(&reach, &strat, &fold, "fold");
+        refuse(&reach, &support, &strat, &fold, "fold");
         let mut nan = evs;
         nan[3] = f32::NAN;
-        refuse(&reach, &strat, &nan, "non-finite EV");
+        refuse(&reach, &support, &strat, &nan, "non-finite EV");
         let mut over = strat;
         over[3] = 1.5;
-        refuse(&reach, &over, &evs, "outside [0, 1]");
+        refuse(&reach, &support, &over, &evs, "outside [0, 1]");
         let mut negative = strat;
         negative[6] = -0.25;
-        refuse(&reach, &negative, &evs, "outside [0, 1]");
-        refuse(&[1.0, f32::NAN, 0.0], &strat, &evs, "reach");
-        refuse(&reach, &strat[..8], &evs, "shape");
-        refuse(&reach[..2], &strat, &evs, "shape");
+        refuse(&reach, &support, &negative, &evs, "outside [0, 1]");
+        refuse(&[1.0, f32::NAN, 0.0], &support, &strat, &evs, "reach");
+        refuse(&reach, &[3.0, f32::NAN, 0.0], &strat, &evs, "support");
+        refuse(&reach, &[3.0, f32::INFINITY, 0.0], &strat, &evs, "support");
+        refuse(&reach, &[3.0, 1.5, f32::NAN], &strat, &evs, "support");
+        refuse(&reach, &support, &strat[..8], &evs, "shape");
+        refuse(&reach[..2], &support, &strat, &evs, "shape");
+        refuse(&reach, &support[..2], &strat, &evs, "shape");
     }
 
-    /// `available` is reach > 0 (§4.5), not range membership: with OOP's turn root locked to bet 66
-    /// with AsAh and check with 8s7s, OOP's node after bet/raise holds AsAh only and its node after
-    /// check/bet holds 8s7s only; the unreached combo's rows are all zero.
+    /// Review ruling (c) (fix round 1): a measured exploitability in `[-1e-6, 0)` chips is
+    /// floating-point noise, reported as exactly `+0.0` with the raw value kept in the log line;
+    /// below the floor, or non-finite, it is an error. Nothing else is touched: a zero or positive
+    /// value passes bit for bit (a `-0.0` becomes `+0.0`) with no log line. `validate_solution` stays
+    /// strict: it accepts the reported value and still rejects the raw negative.
+    #[test]
+    fn exploitability_noise_is_reported_as_zero_and_logged() {
+        let floor = -1e-6f32;
+        let below = f32::from_bits(floor.to_bits() + 1);            // the next f32 below the floor
+        assert!(below < floor && f64::from(below) < -1e-6);
+        for raw in [floor, -5e-7, -1e-12, -f32::MIN_POSITIVE] {
+            let r = report_exploitability(raw).unwrap();
+            assert_eq!(r.chips.to_bits(), 0.0f32.to_bits(), "{raw:e} is reported as +0.0");
+            let line = r.log_line.unwrap_or_else(|| panic!("{raw:e}: the raw value is logged"));
+            assert!(line.contains(&format!("{raw:e}")), "{raw:e} in {line}");
+        }
+        for (raw, reported) in [(0.0f32, 0.0f32), (-0.0, 0.0), (1e-7, 1e-7), (0.25, 0.25)] {
+            let r = report_exploitability(raw).unwrap();
+            assert_eq!((r.chips.to_bits(), r.log_line), (reported.to_bits(), None), "{raw:e}");
+        }
+        for (raw, needle) in [(below, "below"), (-0.01, "below"), (-5.0, "below"), (f32::NAN, "finite"), (f32::INFINITY, "finite"), (f32::NEG_INFINITY, "finite")] {
+            let e = report_exploitability(raw).unwrap_err();
+            assert!(e.contains(needle), "{raw:e}: {needle:?} in {e}");
+        }
+
+        let req = solve_request("river_two_combo", 0);
+        let (mut game, _) = solved(&req, 50, 0.0);
+        let mut m = meta();
+        m.exploitability_chips = report_exploitability(-5e-7).unwrap().chips;
+        let sol = street_solution(&mut game, &req, m, &no_cancel()).unwrap().unwrap();
+        assert_eq!(sol.exploitability_chips.to_bits(), 0.0f32.to_bits());
+        validate_solution(&sol, &req.tree.materialized).unwrap();
+        m.exploitability_chips = -5e-7;
+        let raw = street_solution(&mut game, &req, m, &no_cancel()).unwrap().unwrap();
+        assert!(validate_solution(&raw, &req.tree.materialized).unwrap_err().contains("non-negative"), "the wire gate stays strict");
+    }
+
+    /// `available` needs reach > 0 (§4.5), not range membership: with OOP's turn root locked to bet
+    /// 66 with AsAh and check with 8s7s, OOP's node after bet/raise holds AsAh only and its node after
+    /// check/bet holds 8s7s only; the unreached combo's rows are all zero. IP's two turn responses are
+    /// locked too (KsKh raises the bet and bets after the check; JsJh calls and checks back), so each
+    /// of those OOP nodes is reached by a compatible opponent hand: without IP's locks the solve never
+    /// raises, and AsAh there would rightly be unavailable for want of support (review I1).
     #[test]
     fn availability_follows_reach_not_range_membership() {
         let req = turn_request();
-        let (aces, eight_seven) = (combo("As", "Ah"), combo("8s", "7s"));
-        let mut probs = vec![vec![0.0f32; 3]; 1326];
-        probs[aces] = vec![0.0, 1.0, 0.0];
-        probs[eight_seven] = vec![1.0, 0.0, 0.0];
-        let lock = proto::worker::NodeLock { path: vec![], actor: "oop".into(), probs };
+        let (aces, eight_seven, kings, jacks) = (combo("As", "Ah"), combo("8s", "7s"), combo("Ks", "Kh"), combo("Js", "Jh"));
+        let lock = |path: Vec<Action>, actor: &str, rows: [(usize, Vec<f32>); 2]| {
+            let mut probs = vec![vec![0.0f32; 3]; 1326];
+            for (c, row) in rows { probs[c] = row; }
+            proto::worker::NodeLock { path, actor: actor.into(), probs }
+        };
+        let locks = [
+            lock(vec![], "oop", [(aces, vec![0.0, 1.0, 0.0]), (eight_seven, vec![1.0, 0.0, 0.0])]),
+            lock(vec![Action::Bet { to: 66 }], "ip", [(kings, vec![0.0, 0.0, 1.0]), (jacks, vec![0.0, 1.0, 0.0])]),
+            lock(vec![CHECK], "ip", [(kings, vec![0.0, 1.0, 0.0]), (jacks, vec![1.0, 0.0, 0.0])]),
+        ];
         let mut game = allocated(&req);
-        crate::locks::apply(&mut game, &lock, &req.tree.materialized).unwrap();
+        for l in &locks { crate::locks::apply(&mut game, l, &req.tree.materialized).unwrap(); }
         postflop_solver::solve(&mut game, 20, 0.0, false);
         let sol = street_solution(&mut game, &req, meta(), &no_cancel()).unwrap().unwrap();
         validate_solution(&sol, &req.tree.materialized).unwrap();
@@ -389,6 +492,41 @@ mod tests {
         assert!(after_bet.probs[eight_seven].iter().chain(&after_bet.ev_chips[eight_seven]).all(|x| *x == 0.0));
         let after_check = at(&[CHECK, Action::Bet { to: 66 }]);
         assert!(!after_check.available[aces] && after_check.available[eight_seven]);
+    }
+
+    /// Review I1 (fix round 1): availability needs compatible opponent support as well as own reach.
+    /// River Qs Jd 7h 3c 2d, OOP {AsAh, KsKh} against IP {AsAd, 5c4d}, IP's node after OOP's check
+    /// locked to jam AsAd and check 5c4d. At OOP's facing node AsAh still has reach 1 (OOP checks
+    /// everything at the root), but the only hand that jams (AsAd) shares its ace, so its normalized
+    /// weight is zero and the library's EV row there is its zero sentinel. AsAh is unavailable there
+    /// with all-zero rows, never an available row of real-looking 0 EVs; KsKh, which AsAd does reach,
+    /// stays available with fold exactly +0.0 and the §13.2 call value `equity * 300 - 100` = -100;
+    /// `validate_solution` accepts the export.
+    #[test]
+    fn a_combo_without_compatible_opponent_support_is_unavailable() {
+        use super::test_games::range_of;
+        let mut req = solve_request("lock_river", 1);
+        req.oop_range = range_of(&[("As", "Ah"), ("Ks", "Kh")]);
+        req.ip_range = range_of(&[("As", "Ad"), ("5c", "4d")]);
+        let (aces, kings, ace_diamond, five_four) = (combo("As", "Ah"), combo("Ks", "Kh"), combo("As", "Ad"), combo("5c", "4d"));
+        let mut probs = vec![vec![0.0f32; 2]; 1326];
+        probs[ace_diamond] = vec![0.0, 1.0];
+        probs[five_four] = vec![1.0, 0.0];
+        let lock = proto::worker::NodeLock { path: vec![CHECK], actor: "ip".into(), probs };
+        let mut game = allocated(&req);
+        crate::locks::apply(&mut game, &lock, &req.tree.materialized).unwrap();
+        postflop_solver::solve(&mut game, 100, 0.0, false);
+        let sol = street_solution(&mut game, &req, meta(), &no_cancel()).unwrap().unwrap();
+        validate_solution(&sol, &req.tree.materialized).unwrap();
+        assert_eq!(sol.covered_paths, vec![vec![], vec![CHECK], vec![CHECK, JAM]]);
+        let (root, ip, facing) = (&sol.nodes[0], &sol.nodes[1], &sol.nodes[2]);
+        assert!(root.available[aces] && root.available[kings], "both OOP hands meet 5c4d at the root");
+        assert!(ip.available[ace_diamond] && ip.available[five_four], "both IP hands meet KsKh after the check");
+        assert!(!facing.available[aces], "AsAh has reach but no compatible jamming hand: {:?} / {:?}", facing.probs[aces], facing.ev_chips[aces]);
+        assert!(facing.probs[aces].iter().chain(&facing.ev_chips[aces]).all(|x| x.to_bits() == 0), "unavailable rows are all +0.0");
+        assert!(facing.available[kings], "KsKh faces AsAd");
+        assert_eq!(facing.ev_chips[kings][0].to_bits(), 0.0f32.to_bits(), "fold EV is exactly +0.0");
+        assert!((facing.ev_chips[kings][1] + 100.0).abs() <= 1e-3, "KsKh call EV {} expected -100 (equity 0)", facing.ev_chips[kings][1]);
     }
 
     /// The §4.5 river wire example (`river_two_combo`, the §13.2 polarized-versus-bluffcatcher spot):
@@ -407,7 +545,8 @@ mod tests {
         assert_eq!(validate_solution(&sol, &req.tree.materialized).unwrap(), vec![vec![], vec![0], vec![0, 1]]);
         let actors: Vec<&str> = sol.nodes.iter().map(|n| n.actor.as_str()).collect();
         assert_eq!(actors, ["oop", "ip", "oop"]);
-        // available = reach > 0: nobody's reach changes on this line (OOP's root has one action)
+        // available = reach > 0 and compatible support > 0: nobody's reach changes on this line (OOP's
+        // root has one action) and every hand of each range meets a hand of the other it shares no card with
         for c in 0..1326 {
             assert_eq!(sol.nodes[0].available[c], req.oop_range.0[c] > 0.0, "root combo {c}");
             assert_eq!(sol.nodes[1].available[c], req.ip_range.0[c] > 0.0, "ip combo {c}");
