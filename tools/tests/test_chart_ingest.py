@@ -1309,3 +1309,141 @@ def test_chart_render_renders_a_committed_source_page_deterministically(tmp_path
 
     width, height = struct.unpack(">II", first[0].read_bytes()[16:24])
     assert (width, height) == (720, 405)
+
+
+# --- P3.T6: the committed RangeConverter 200bb ChartTranscription bundle ---
+
+
+@pytest.mark.skipif(200 not in available_depths(), reason="depth 200 unsupported")
+def test_rangeconverter_200_bundle():
+    e, t = _bundle("rangeconverter_200")
+    validate(e)
+    assert e["depth_bb"] == 200
+    assert all("evs" not in n for n in e["nodes"])
+    assert build(t) == e
+    assert {json.dumps(n["history"]) for n in e["nodes"]} == {
+        json.dumps(r["history"]) for r in t["inventory"] if r["status"] == "covered"}
+    assert any(r["status"] == "absent" for r in t["inventory"]), "the absent audit is part of the record"
+
+
+def test_unavailable_depth_ships_no_bundle():
+    for d in load_availability()["depths"]:
+        if d["status"] == "unsupported":
+            assert not (ROOT / f"fixtures/charts/{d['bundle_id']}.json").exists()
+            assert not (ROOT / f"fixtures/charts/{d['bundle_id']}.manifest.json").exists()
+
+
+@pytest.mark.skipif(200 not in available_depths(), reason="depth 200 unsupported")
+def test_rangeconverter_200_committed_bytes_and_manifest_hash_verify():
+    """The committed envelope/manifest pair is exactly what `build` writes from the committed
+    transcription, and the manifest's `sha256` is the hash of the committed envelope's bytes
+    read from disk. A missing file fails here; it is never skipped."""
+    import hashlib
+
+    base = ROOT / "fixtures/charts"
+    envelope_path = base / "rangeconverter_200.json"
+    manifest_path = base / "rangeconverter_200.manifest.json"
+    transcription_path = base / "transcription" / "rangeconverter_200.json"
+    for path in (envelope_path, manifest_path, transcription_path):
+        assert path.is_file(), f"{path} is missing"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["sha256"] == hashlib.sha256(envelope_path.read_bytes()).hexdigest()
+    assert manifest["source"] == "ChartTranscription"
+    assert manifest["ev_reference"] == "unverified"
+    assert manifest["depth_bb"] == 200 and manifest["depths"] == [200]
+    assert manifest["rake"] is None and manifest["rake_profile"] == "undocumented"
+    assert chart_ingest.verify(transcription_path, envelope_path, manifest_path) == (
+        "verified 35 nodes, 5915 classes")
+
+
+@pytest.mark.skipif(200 not in available_depths(), reason="depth 200 unsupported")
+def test_rangeconverter_200_every_node_actor_is_the_next_seat_to_act():
+    """Each node's declared actor is the seat whose turn it is after its explicitly folded
+    history (the rule `core_preflop::store::next_actor` enforces at load)."""
+    e, _ = _bundle("rangeconverter_200")
+    for n in e["nodes"]:
+        folded, idx = set(), 0
+        for pos, step, _amount in n["history"]:
+            while POSITIONS_ORDER[idx % 6] in folded:
+                idx += 1
+            assert POSITIONS_ORDER[idx % 6] == pos, f"out-of-turn {pos} in {n['history']}"
+            if step == "fold":
+                folded.add(pos)
+            idx += 1
+        while POSITIONS_ORDER[idx % 6] in folded:
+            idx += 1
+        assert n["actor"] == POSITIONS_ORDER[idx % 6], n["history"]
+
+
+@pytest.mark.skipif(200 not in available_depths(), reason="depth 200 unsupported")
+def test_rangeconverter_200_audit_matrix_counts():
+    """35 grids (5 RFI, 15 vs-RFI, 15 vs-3bet) are 35 distinct covered node keys; the blind-limp
+    lines and the absent-node audit are recorded as absent rows, never as nodes."""
+    e, t = _bundle("rangeconverter_200")
+    assert len(t["nodes"]) == len(e["nodes"]) == 35
+    raises = [sum(1 for _p, s, _a in n["history"] if s == "raise") for n in e["nodes"]]
+    assert (raises.count(0), raises.count(1), raises.count(2)) == (5, 15, 15)
+    assert sorted({r["page"] for r in t["inventory"] if r["status"] == "covered"}) == list(range(3, 14))
+    absent = [r for r in t["inventory"] if r["status"] == "absent"]
+    assert len(absent) >= 8
+    covered = {json.dumps(r["history"]) for r in t["inventory"] if r["status"] == "covered"}
+    assert not any(json.dumps(r["history"]) in covered for r in absent)
+
+
+@pytest.mark.skipif(200 not in available_depths(), reason="depth 200 unsupported")
+def test_rangeconverter_200_weights_follow_the_published_50_percent_rounding():
+    """Every weight is 0, 0.5 or 1 (page 2: 'rounded to the nearest 50%')."""
+    e, _ = _bundle("rangeconverter_200")
+    for n in e["nodes"]:
+        assert {w for row in n["weights"] for w in row} <= {0.0, 0.5, 1.0}, n["history"]
+
+
+@pytest.mark.skipif(200 not in available_depths(), reason="depth 200 unsupported")
+def test_rangeconverter_200_published_legends_are_complete():
+    """Each grid's legend panel, as transcribed, lists one percentage per menu action and the
+    percentages sum to 100 within the publisher's two-decimal display rounding. This checks
+    the legend reading independently of the cell grid (never a sum-to-one check on cells)."""
+    import math
+
+    _, t = _bundle("rangeconverter_200")
+    for n in t["nodes"]:
+        legend = n["published_legend"]
+        assert len(legend) == len(n["actions"]), n["title"]
+        assert abs(math.fsum(row["percent"] for row in legend) - 100.0) <= 0.025, n["title"]
+
+
+@pytest.mark.skipif(200 not in available_depths(), reason="depth 200 unsupported")
+def test_rangeconverter_200_every_history_raise_is_a_published_menu_size():
+    """Every raise in a node's history is on the menu of the published node for that decision
+    (the open from the RFI grid, the 3bet from the matching vs-RFI grid), so the vs-3bet keys
+    carry sizes resolved from this PDF only."""
+    e, _ = _bundle("rangeconverter_200")
+    checked = 0
+    for n in e["nodes"]:
+        for k, (pos, step, amount) in enumerate(n["history"]):
+            if step != "raise":
+                continue
+            parent = _node_by_history(e, n["history"][:k])
+            assert parent["actor"] == pos
+            assert {"step": "raise", "to_bb_x1000": amount} in parent["actions"], n["history"]
+            checked += 1
+    assert checked == 15 + 2 * 15
+
+
+@pytest.mark.skipif(200 not in available_depths(), reason="depth 200 unsupported")
+def test_rangeconverter_200_unreachable_classes_have_zero_opening_weight():
+    """A vs-3bet class is declared unreachable only where the grid shows no action colour and the
+    opener's own published raise weight for that class is exactly zero (brief Step 4)."""
+    e, _ = _bundle("rangeconverter_200")
+    checked = 0
+    for n in e["nodes"]:
+        if not n["unreachable_classes"]:
+            continue
+        k = max(i for i, (pos, _step, _amount) in enumerate(n["history"]) if pos == n["actor"])
+        pos, step, amount = n["history"][k]
+        parent = _node_by_history(e, n["history"][:k])
+        a = parent["actions"].index({"step": step, "to_bb_x1000": amount})
+        never = {c for c in range(169) if parent["weights"][a][c] == 0}
+        assert set(n["unreachable_classes"]) <= never, n["history"]
+        checked += 1
+    assert checked == 15

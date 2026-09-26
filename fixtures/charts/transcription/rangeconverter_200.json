@@ -1,0 +1,2349 @@
+{
+  "bundle_id": "rangeconverter_200",
+  "depth_bb": 200,
+  "rake_profile": "undocumented",
+  "straddle": false,
+  "license_note": "RangeConverter '6-Max 200BB Poker Charts - No Limit Texas Holdem Cash' (public PDF, '6 max 200bb 500z GTO Ranges'), transcribed cell by cell for private use; not redistributed. Frequencies are the published cells rounded to the nearest 50% (0, 0.5 or 1); no EVs.",
+  "accuracy": "unverified",
+  "rake": null,
+  "source": {
+    "file": "fixtures/charts/sources/rangeconverter_200.pdf",
+    "sha256": "f0797be2a9894c520af90e70c17e2b7dee208215eab58b6ae953e8cc81bf70e2",
+    "page_numbering": "physical PDF page order (1 intro, 2 'How to Use', 3 RFI, 4 MP vs RFI, 5 CO vs RFI, 6 BTN vs RFI, 7 SB vs RFI, 8 BB vs RFI, 9 UTG RFI vs 3bet, 10 MP RFI vs 3bet, 11 CO RFI vs 3bet, 12 BTN RFI vs 3bet, 13 SB RFI vs 3bet)",
+    "cell_orientation": "row r, column c of the 13x13 grid is class r*13+c (A-2 row-major): pairs on the diagonal, suited above, offsuit below, matching the hand label printed in every cell",
+    "position_names": "the publisher's MP is HJ; UTG, CO, BTN, SB and BB are unchanged"
+  },
+  "nodes": [
+    {
+      "title": "Raise First In (RFI) - 6 max 200bb Ranges: UTG RFI",
+      "page": 3,
+      "source_image": "page 3, the page's single embedded 2048x1313 image, grid top row, 1st from left, under the 'UTG RFI' label",
+      "history": [],
+      "actor": "UTG",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 2500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "RF": [0.5, 0.5],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '2.5bb'",
+        "RF": "cell split orange/blue = 50% '2.5bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 81.95},
+        {"label": "2.5bb", "percent": 18.05}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "RF", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "RF", "F", "F", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "RF", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "RF", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "R", "RF", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "RF", "RF", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF"]
+      ]
+    },
+    {
+      "title": "Raise First In (RFI) - 6 max 200bb Ranges: MP RFI",
+      "page": 3,
+      "source_image": "page 3, the page's single embedded 2048x1313 image, grid top row, 2nd from left, under the 'MP RFI' label",
+      "history": [
+        ["UTG", "fold", 0]
+      ],
+      "actor": "HJ",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 2500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "RF": [0.5, 0.5],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '2.5bb'",
+        "RF": "cell split orange/blue = 50% '2.5bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 77.49},
+        {"label": "2.5bb", "percent": 22.51}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "RF", "RF", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "RF", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "RF", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "RF", "RF", "R", "R", "R", "F", "F", "F", "F", "F", "F"],
+        ["RF", "F", "F", "F", "F", "R", "RF", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "RF", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "R", "RF", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "R", "RF", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "RF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF"]
+      ]
+    },
+    {
+      "title": "Raise First In (RFI) - 6 max 200bb Ranges: CO RFI",
+      "page": 3,
+      "source_image": "page 3, the page's single embedded 2048x1313 image, grid top row, 3rd from left, under the 'CO RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0]
+      ],
+      "actor": "CO",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 2500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "RF": [0.5, 0.5],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '2.5bb'",
+        "RF": "cell split orange/blue = 50% '2.5bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 69.85},
+        {"label": "2.5bb", "percent": 30.15}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "RF", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "RF", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F"],
+        ["R", "RF", "F", "F", "RF", "R", "R", "R", "F", "F", "F", "F", "F"],
+        ["R", "F", "F", "F", "F", "F", "R", "R", "RF", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "R", "R", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "R", "R", "F", "F", "F"],
+        ["RF", "F", "F", "F", "F", "F", "F", "F", "F", "R", "RF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R"]
+      ]
+    },
+    {
+      "title": "Raise First In (RFI) - 6 max 200bb Ranges: BTN RFI",
+      "page": 3,
+      "source_image": "page 3, the page's single embedded 2048x1313 image, grid top row, 4th from left, under the 'BTN RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0]
+      ],
+      "actor": "BTN",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 2500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "RF": [0.5, 0.5],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '2.5bb'",
+        "RF": "cell split orange/blue = 50% '2.5bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 53.37},
+        {"label": "2.5bb", "percent": 46.63}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "F", "F", "F"],
+        ["R", "R", "F", "F", "F", "F", "F", "R", "R", "R", "F", "F", "F"],
+        ["R", "F", "F", "F", "F", "F", "F", "F", "R", "R", "R", "F", "F"],
+        ["R", "F", "F", "F", "F", "F", "F", "F", "F", "R", "R", "R", "F"],
+        ["R", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F"],
+        ["RF", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R"]
+      ]
+    },
+    {
+      "title": "Raise First In (RFI) - 6 max 200bb Ranges: SB RFI",
+      "page": 3,
+      "source_image": "page 3, the page's single embedded 2048x1313 image, grid bottom row, 1st from left, under the 'SB RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 3000}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "RF": [0.5, 0.0, 0.5],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '3.0bb'",
+        "RC": "cell split orange/green = 50% '3.0bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%)",
+        "RF": "cell split orange/blue = 50% '3.0bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 53.65},
+        {"label": "Call", "percent": 7.19},
+        {"label": "3.0bb", "percent": 39.16}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "R", "RC", "R", "R", "R", "RC"],
+        ["R", "R", "R", "R", "R", "R", "RC", "RC", "R", "R", "R", "R", "R"],
+        ["R", "R", "R", "R", "R", "RC", "RC", "R", "R", "R", "R", "R", "R"],
+        ["R", "R", "R", "R", "R", "R", "RC", "R", "R", "R", "RC", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "CF", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "RC", "R", "R", "CF", "F", "F", "F"],
+        ["R", "R", "RC", "RF", "R", "RC", "R", "R", "R", "R", "F", "F", "F"],
+        ["R", "CF", "F", "F", "F", "F", "F", "R", "R", "R", "F", "F", "F"],
+        ["R", "F", "F", "F", "F", "F", "F", "F", "R", "R", "R", "F", "F"],
+        ["R", "F", "F", "F", "F", "F", "F", "F", "F", "R", "R", "RF", "F"],
+        ["RC", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F"],
+        ["CF", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R"]
+      ]
+    },
+    {
+      "title": "MP vs RFI - 6 max 200bb Ranges: MP vs UTG RFI",
+      "page": 4,
+      "source_image": "page 4, the page's single embedded 2048x1313 image, grid top row, 1st from left, under the 'MP vs UTG RFI' label",
+      "history": [
+        ["UTG", "raise", 2500]
+      ],
+      "actor": "HJ",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 8500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "RF": [0.5, 0.5],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '8.5bb'",
+        "RF": "cell split orange/blue = 50% '8.5bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 91.44},
+        {"label": "8.5bb", "percent": 8.56}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "R", "RF", "F", "F"],
+        ["R", "R", "R", "R", "RF", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["RF", "F", "R", "R", "RF", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "R", "RF", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "RF", "RF", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "RF", "RF", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF"]
+      ]
+    },
+    {
+      "title": "CO vs RFI - 6 max 200bb Ranges: CO vs UTG RFI",
+      "page": 5,
+      "source_image": "page 5, the page's single embedded 2048x1313 image, grid top row, 1st from left, under the 'CO vs UTG RFI' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0]
+      ],
+      "actor": "CO",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 8500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "RF": [0.5, 0.5],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '8.5bb'",
+        "RF": "cell split orange/blue = 50% '8.5bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 90.63},
+        {"label": "8.5bb", "percent": 9.37}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "R", "RF", "F", "F"],
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["RF", "F", "R", "R", "RF", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "R", "RF", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "RF", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "RF", "RF", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "RF", "RF", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF"]
+      ]
+    },
+    {
+      "title": "CO vs RFI - 6 max 200bb Ranges: CO vs MP RFI",
+      "page": 5,
+      "source_image": "page 5, the page's single embedded 2048x1313 image, grid top row, 2nd from left, under the 'CO vs MP RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500]
+      ],
+      "actor": "CO",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 8500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "RF": [0.5, 0.5],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '8.5bb'",
+        "RF": "cell split orange/blue = 50% '8.5bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 89.1},
+        {"label": "8.5bb", "percent": 10.9}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "RF", "F", "F", "F", "R", "R", "RF", "F"],
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "RF", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "RF", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "RF", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "RF", "RF", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "RF", "RF", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF"]
+      ]
+    },
+    {
+      "title": "BTN vs RFI - 6 max 200bb Ranges: BTN vs UTG RFI",
+      "page": 6,
+      "source_image": "page 6, the page's single embedded 2048x1313 image, grid top row, 1st from left, under the 'BTN vs UTG RFI' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0]
+      ],
+      "actor": "BTN",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 8500}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "RF": [0.5, 0.0, 0.5],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '8.5bb'",
+        "RC": "cell split orange/green = 50% '8.5bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%)",
+        "RF": "cell split orange/blue = 50% '8.5bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 87.0},
+        {"label": "Call", "percent": 4.37},
+        {"label": "8.5bb", "percent": 8.63}
+      ],
+      "rows": [
+        ["R", "R", "R", "RC", "RC", "RC", "RF", "RF", "F", "R", "RC", "RF", "F"],
+        ["RC", "R", "RC", "RC", "RC", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["RC", "RF", "R", "RC", "RC", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "RC", "RC", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "RC", "RC", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "RC", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "RC", "RF", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "RC", "RF", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "RC", "RF", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF"]
+      ]
+    },
+    {
+      "title": "BTN vs RFI - 6 max 200bb Ranges: BTN vs MP RFI",
+      "page": 6,
+      "source_image": "page 6, the page's single embedded 2048x1313 image, grid top row, 2nd from left, under the 'BTN vs MP RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0]
+      ],
+      "actor": "BTN",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 8500}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "RF": [0.5, 0.0, 0.5],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '8.5bb'",
+        "RC": "cell split orange/green = 50% '8.5bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%)",
+        "RF": "cell split orange/blue = 50% '8.5bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 85.81},
+        {"label": "Call", "percent": 2.85},
+        {"label": "8.5bb", "percent": 11.34}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "RC", "R", "R", "RF", "F", "R", "R", "RF", "F"],
+        ["R", "R", "R", "R", "RC", "RF", "F", "F", "F", "F", "F", "F", "F"],
+        ["RC", "RF", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["RF", "F", "F", "R", "R", "RF", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "RC", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "RF", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "RC", "RF", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "RC", "RF", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "RF", "RF", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF"]
+      ]
+    },
+    {
+      "title": "BTN vs RFI - 6 max 200bb Ranges: BTN vs CO RFI",
+      "page": 6,
+      "source_image": "page 6, the page's single embedded 2048x1313 image, grid top row, 3rd from left, under the 'BTN vs CO RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500]
+      ],
+      "actor": "BTN",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 8500}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RF": [0.5, 0.0, 0.5],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '8.5bb'",
+        "RF": "cell split orange/blue = 50% '8.5bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 83.64},
+        {"label": "Call", "percent": 1.18},
+        {"label": "8.5bb", "percent": 15.19}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "RF", "F", "R", "R", "R", "F"],
+        ["R", "R", "R", "R", "R", "R", "F", "F", "RF", "F", "F", "F", "F"],
+        ["R", "RF", "R", "R", "R", "RF", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "RF", "F", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["RF", "F", "F", "F", "R", "R", "RF", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "RF", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "RF", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "R", "R", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "R", "R", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "R", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RF"]
+      ]
+    },
+    {
+      "title": "SB vs RFI - 6 max 200bb Ranges: SB vs UTG RFI",
+      "page": 7,
+      "source_image": "page 7, the page's single embedded 2048x1313 image, grid top row, 1st from left, under the 'SB vs UTG RFI' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 10900}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "RF": [0.5, 0.5],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '10.9bb'",
+        "RF": "cell split orange/blue = 50% '10.9bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 93.99},
+        {"label": "10.9bb", "percent": 6.01}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "RF", "F", "F", "F", "F", "R", "RF", "F", "F"],
+        ["R", "R", "R", "RF", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "R", "RF", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "RF", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "RF", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "SB vs RFI - 6 max 200bb Ranges: SB vs MP RFI",
+      "page": 7,
+      "source_image": "page 7, the page's single embedded 2048x1313 image, grid top row, 2nd from left, under the 'SB vs MP RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 10900}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "RF": [0.5, 0.5],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '10.9bb'",
+        "RF": "cell split orange/blue = 50% '10.9bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 92.6},
+        {"label": "10.9bb", "percent": 7.4}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "R", "RF", "F", "F"],
+        ["R", "R", "R", "R", "RF", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "R", "R", "RF", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "R", "RF", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "RF", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "RF", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "SB vs RFI - 6 max 200bb Ranges: SB vs CO RFI",
+      "page": 7,
+      "source_image": "page 7, the page's single embedded 2048x1313 image, grid top row, 3rd from left, under the 'SB vs CO RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 10900}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "RF": [0.5, 0.5],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '10.9bb'",
+        "RF": "cell split orange/blue = 50% '10.9bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 90.63},
+        {"label": "10.9bb", "percent": 9.37}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "RF", "F", "F", "F", "R", "RF", "F", "F"],
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["RF", "F", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "RF", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "RF", "RF", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "RF", "RF", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "SB vs RFI - 6 max 200bb Ranges: SB vs BTN RFI",
+      "page": 7,
+      "source_image": "page 7, the page's single embedded 2048x1313 image, grid top row, 4th from left, under the 'SB vs BTN RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 10900}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "RF": [0.5, 0.5],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '10.9bb'",
+        "RF": "cell split orange/blue = 50% '10.9bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 86.44},
+        {"label": "10.9bb", "percent": 13.56}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "R", "F", "R", "R", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "RF", "F", "F", "F", "F", "F", "F", "F"],
+        ["RF", "F", "F", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "R", "RF", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "R", "RF", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "RF", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "BB vs RFI - 6 max 200bb Ranges: BB vs UTG RFI",
+      "page": 8,
+      "source_image": "page 8, the page's single embedded 2048x1313 image, grid top row, 1st from left, under the 'BB vs UTG RFI' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "actor": "BB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 11050}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '11.05bb'",
+        "RC": "cell split orange/green = 50% '11.05bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%)",
+        "C": "green cell = legend 'Call'",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 73.13},
+        {"label": "Call", "percent": 22.4},
+        {"label": "11.05bb", "percent": 4.47}
+      ],
+      "rows": [
+        ["R", "R", "RC", "RC", "RC", "C", "RC", "C", "C", "RC", "RC", "C", "C"],
+        ["C", "R", "RC", "RC", "RC", "C", "C", "C", "C", "C", "C", "CF", "CF"],
+        ["C", "C", "RC", "RC", "RC", "C", "C", "CF", "CF", "CF", "F", "F", "F"],
+        ["C", "C", "CF", "RC", "RC", "C", "C", "CF", "F", "F", "F", "F", "F"],
+        ["C", "F", "F", "CF", "C", "C", "C", "C", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "C", "C", "C", "C", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "C", "C", "C", "CF", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "C", "C", "C", "CF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "C", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C"]
+      ]
+    },
+    {
+      "title": "BB vs RFI - 6 max 200bb Ranges: BB vs MP RFI",
+      "page": 8,
+      "source_image": "page 8, the page's single embedded 2048x1313 image, grid top row, 2nd from left, under the 'BB vs MP RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "actor": "BB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 11050}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '11.05bb'",
+        "RC": "cell split orange/green = 50% '11.05bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%)",
+        "C": "green cell = legend 'Call'",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 69.76},
+        {"label": "Call", "percent": 24.47},
+        {"label": "11.05bb", "percent": 5.77}
+      ],
+      "rows": [
+        ["R", "R", "R", "RC", "RC", "RC", "C", "C", "C", "RC", "RC", "C", "C"],
+        ["C", "R", "RC", "RC", "RC", "C", "C", "C", "C", "C", "C", "C", "C"],
+        ["C", "C", "R", "R", "RC", "C", "C", "C", "C", "C", "CF", "F", "F"],
+        ["C", "C", "C", "RC", "RC", "C", "C", "C", "F", "F", "F", "F", "F"],
+        ["C", "C", "CF", "CF", "RC", "C", "C", "C", "F", "F", "F", "F", "F"],
+        ["CF", "F", "F", "F", "F", "C", "C", "C", "C", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "C", "C", "C", "C", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "C", "C", "C", "CF", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "C", "RC", "C", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C"]
+      ]
+    },
+    {
+      "title": "BB vs RFI - 6 max 200bb Ranges: BB vs CO RFI",
+      "page": 8,
+      "source_image": "page 8, the page's single embedded 2048x1313 image, grid top row, 3rd from left, under the 'BB vs CO RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "actor": "BB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 11050}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '11.05bb'",
+        "RC": "cell split orange/green = 50% '11.05bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%)",
+        "C": "green cell = legend 'Call'",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 64.3},
+        {"label": "Call", "percent": 27.71},
+        {"label": "11.05bb", "percent": 7.99}
+      ],
+      "rows": [
+        ["R", "R", "R", "RC", "RC", "RC", "RC", "C", "C", "RC", "RC", "RC", "C"],
+        ["RC", "R", "R", "R", "R", "C", "C", "C", "C", "C", "C", "C", "C"],
+        ["C", "C", "R", "R", "R", "RC", "C", "C", "C", "C", "C", "C", "C"],
+        ["C", "C", "C", "RC", "R", "RC", "C", "C", "C", "CF", "F", "F", "F"],
+        ["C", "C", "C", "C", "RC", "RC", "C", "C", "C", "F", "F", "F", "F"],
+        ["C", "CF", "F", "CF", "CF", "RC", "C", "C", "C", "F", "F", "F", "F"],
+        ["C", "F", "F", "F", "F", "F", "RC", "RC", "C", "C", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "RC", "RC", "C", "C", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "C", "RC", "C", "CF", "F"],
+        ["CF", "F", "F", "F", "F", "F", "F", "F", "F", "C", "RC", "C", "CF"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C"]
+      ]
+    },
+    {
+      "title": "BB vs RFI - 6 max 200bb Ranges: BB vs BTN RFI",
+      "page": 8,
+      "source_image": "page 8, the page's single embedded 2048x1313 image, grid top row, 4th from left, under the 'BB vs BTN RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500],
+        ["SB", "fold", 0]
+      ],
+      "actor": "BB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 11050}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '11.05bb'",
+        "RC": "cell split orange/green = 50% '11.05bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%)",
+        "C": "green cell = legend 'Call'",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 50.15},
+        {"label": "Call", "percent": 37.2},
+        {"label": "11.05bb", "percent": 12.64}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "RC", "C", "C", "RC", "RC", "R", "R", "RC", "C"],
+        ["R", "R", "R", "R", "R", "RC", "C", "RC", "RC", "C", "C", "C", "C"],
+        ["RC", "C", "R", "R", "R", "RC", "RC", "C", "C", "C", "C", "C", "C"],
+        ["C", "C", "C", "R", "R", "R", "RC", "RC", "C", "C", "C", "C", "C"],
+        ["C", "C", "C", "C", "RC", "R", "R", "RC", "C", "C", "C", "CF", "F"],
+        ["C", "C", "C", "C", "C", "RC", "R", "RC", "C", "C", "F", "F", "F"],
+        ["C", "C", "CF", "CF", "C", "C", "RC", "RC", "C", "C", "F", "F", "F"],
+        ["C", "CF", "F", "F", "F", "F", "CF", "RC", "RC", "C", "C", "F", "F"],
+        ["C", "F", "F", "F", "F", "F", "F", "CF", "RC", "RC", "C", "C", "F"],
+        ["C", "F", "F", "F", "F", "F", "F", "F", "F", "RC", "RC", "C", "C"],
+        ["C", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "C"],
+        ["CF", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C"]
+      ]
+    },
+    {
+      "title": "BB vs RFI - 6 max 200bb Ranges: BB vs SB RFI",
+      "page": 8,
+      "source_image": "page 8, the page's single embedded 2048x1313 image, grid bottom row, 1st from left, under the 'BB vs SB RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 3000]
+      ],
+      "actor": "BB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 10000}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "RF": [0.5, 0.0, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '10.0bb'",
+        "RC": "cell split orange/green = 50% '10.0bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%)",
+        "RF": "cell split orange/blue = 50% '10.0bb', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "C": "green cell = legend 'Call'",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%)",
+        "F": "blue cell = legend 'Fold'"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 42.19},
+        {"label": "Call", "percent": 39.91},
+        {"label": "10.0bb", "percent": 17.89}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "RC", "C", "C", "C", "C", "R", "R", "RC", "C"],
+        ["R", "R", "R", "R", "R", "C", "C", "C", "RC", "C", "C", "C", "C"],
+        ["RC", "C", "R", "R", "R", "C", "C", "C", "C", "C", "C", "C", "C"],
+        ["C", "C", "C", "R", "R", "RC", "C", "C", "C", "C", "C", "C", "C"],
+        ["C", "C", "C", "C", "R", "R", "RC", "C", "C", "C", "RC", "RC", "RC"],
+        ["C", "C", "RC", "C", "C", "RC", "RC", "RC", "C", "C", "CF", "F", "F"],
+        ["C", "C", "RC", "RC", "RC", "C", "RC", "RC", "C", "C", "C", "F", "F"],
+        ["C", "RC", "F", "F", "RF", "CF", "C", "RC", "RC", "C", "C", "C", "F"],
+        ["RC", "RC", "F", "F", "F", "F", "F", "C", "RC", "RC", "C", "C", "F"],
+        ["C", "RF", "F", "F", "F", "F", "F", "F", "CF", "RC", "RC", "C", "C"],
+        ["RC", "F", "F", "F", "F", "F", "F", "F", "F", "CF", "RC", "C", "C"],
+        ["RC", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C"],
+        ["RC", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C"]
+      ]
+    },
+    {
+      "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs MP 3bet",
+      "page": 9,
+      "source_image": "page 9, the page's single embedded 2048x1313 image, grid top row, 1st from left, under the 'UTG vs MP 3bet' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "raise", 8500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "actor": "UTG",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 23600}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        "g": [0.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '23.6bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '23.6bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "g": "grey cell with no readable action strip (no strip, or only a sub-pixel antialiased tint): no action data (unreachable: the opener's published raise weight for this class is 0)",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 58.08},
+        {"label": "Call", "percent": 23.23},
+        {"label": "23.6bb", "percent": 18.69}
+      ],
+      "rows": [
+        ["R", "R", "RC", "RC", "CF", "F", "F", "F", "F", "RC", "CF", "F", "F"],
+        ["RC", "R", "RC", "CF", "F", "F", "F", "F", ".", ".", ".", ".", "."],
+        ["F", "F", "RC", "CF", "CF", "F", ".", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "RC", "CF", "F", ".", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", ".", "RC", "F", "F", ".", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", "CF", "CF", "C", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", "CF", "RC", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", "CF", "RC", "g", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "CF", "RC", "g", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", "CF", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 45, 46, 47, 48, 49, 50, 51, 55, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs CO 3bet",
+      "page": 9,
+      "source_image": "page 9, the page's single embedded 2048x1313 image, grid top row, 2nd from left, under the 'UTG vs CO 3bet' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 8500],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "actor": "UTG",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 23600}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        "g": [0.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '23.6bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '23.6bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "g": "grey cell with no readable action strip (no strip, or only a sub-pixel antialiased tint): no action data (unreachable: the opener's published raise weight for this class is 0)",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 54.99},
+        {"label": "Call", "percent": 25.05},
+        {"label": "23.6bb", "percent": 19.96}
+      ],
+      "rows": [
+        ["R", "R", "RC", "RC", "RC", "F", "F", "F", "F", "RC", "CF", "F", "F"],
+        ["RC", "R", "RC", "C", "CF", "F", "F", "F", ".", ".", ".", ".", "."],
+        ["F", "F", "RC", "RC", "CF", "F", ".", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "RC", "CF", "F", ".", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", ".", "RC", "F", "F", ".", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", "CF", "CF", "C", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", "CF", "RC", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", "CF", "RC", "g", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "CF", "RC", "g", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 45, 46, 47, 48, 49, 50, 51, 55, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs BTN 3bet",
+      "page": 9,
+      "source_image": "page 9, the page's single embedded 2048x1313 image, grid top row, 3rd from left, under the 'UTG vs BTN 3bet' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 8500],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "actor": "UTG",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 23800}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        "g": [0.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '23.8bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '23.8bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "g": "grey cell with no readable action strip (no strip, or only a sub-pixel antialiased tint): no action data (unreachable: the opener's published raise weight for this class is 0)",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 48.52},
+        {"label": "Call", "percent": 32.11},
+        {"label": "23.8bb", "percent": 19.36}
+      ],
+      "rows": [
+        ["R", "R", "RC", "RC", "RC", "CF", "F", "F", "F", "RC", "RC", "F", "F"],
+        ["RC", "R", "RC", "C", "CF", "F", "F", "F", ".", ".", ".", ".", "."],
+        ["F", "F", "RC", "RC", "CF", "F", ".", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "RC", "CF", "F", ".", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", ".", "RC", "CF", "F", ".", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", "C", "CF", "C", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", "CF", "RC", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", "CF", "C", "C", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "C", "RC", "g", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 45, 46, 47, 48, 49, 50, 51, 55, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs SB 3bet",
+      "page": 9,
+      "source_image": "page 9, the page's single embedded 2048x1313 image, grid top row, 4th from left, under the 'UTG vs SB 3bet' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 10900],
+        ["BB", "fold", 0]
+      ],
+      "actor": "UTG",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 25050}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        "g": [0.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '25.05bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '25.05bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "g": "grey cell with no readable action strip (no strip, or only a sub-pixel antialiased tint): no action data (unreachable: the opener's published raise weight for this class is 0)",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 50.38},
+        {"label": "Call", "percent": 36.79},
+        {"label": "25.05bb", "percent": 12.82}
+      ],
+      "rows": [
+        ["R", "R", "C", "C", "RC", "F", "F", "F", "F", "RC", "RC", "CF", "F"],
+        ["C", "RC", "RC", "CF", "F", "F", "F", "F", ".", ".", ".", ".", "."],
+        ["F", "F", "C", "C", "CF", "F", ".", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "C", "CF", "F", ".", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", ".", "C", "CF", "C", ".", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", "CF", "C", "C", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", "CF", "RC", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", "CF", "C", "g", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "C", "C", "g", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 45, 46, 47, 48, 49, 50, 51, 55, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs BB 3bet",
+      "page": 9,
+      "source_image": "page 9, the page's single embedded 2048x1313 image, grid bottom row, 1st from left, under the 'UTG vs BB 3bet' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "raise", 11050]
+      ],
+      "actor": "UTG",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 25000}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        "g": [0.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '25.0bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '25.0bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "g": "grey cell with no readable action strip (no strip, or only a sub-pixel antialiased tint): no action data (unreachable: the opener's published raise weight for this class is 0)",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 49.08},
+        {"label": "Call", "percent": 41.8},
+        {"label": "25.0bb", "percent": 9.11}
+      ],
+      "rows": [
+        ["R", "RC", "C", "C", "C", "CF", "CF", "F", "F", "C", "RC", "CF", "F"],
+        ["C", "C", "C", "C", "CF", "F", "F", "F", ".", ".", ".", ".", "."],
+        ["F", "F", "C", "CF", "CF", "F", ".", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "C", "CF", "F", ".", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", ".", "C", "CF", "C", ".", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", "CF", "C", "C", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", "CF", "C", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", "CF", "C", "C", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "C", "C", "g", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 45, 46, 47, 48, 49, 50, 51, 55, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "MP RFI vs 3bet - 6 max 200bb Ranges: MP vs CO 3bet",
+      "page": 10,
+      "source_image": "page 10, the page's single embedded 2048x1313 image, grid top row, 1st from left, under the 'MP vs CO 3bet' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "raise", 8500],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "actor": "HJ",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 23800}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '23.8bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '23.8bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 56.69},
+        {"label": "Call", "percent": 24.55},
+        {"label": "23.8bb", "percent": 18.75}
+      ],
+      "rows": [
+        ["R", "R", "R", "RC", "RC", "F", "F", "F", "F", "RC", "CF", "F", "F"],
+        ["RC", "R", "RC", "RC", "C", "F", "F", "F", "F", "F", ".", ".", "."],
+        ["CF", "F", "R", "RC", "CF", "F", "F", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "RC", "RC", "F", "F", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "RC", "CF", "F", ".", ".", ".", ".", ".", "."],
+        ["F", ".", ".", ".", ".", "RC", "CF", "CF", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", "CF", "CF", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", "CF", "CF", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "CF", "RC", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", "CF", "CF", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [23, 24, 25, 33, 34, 35, 36, 37, 38, 46, 47, 48, 49, 50, 51, 59, 60, 61, 62, 63, 64, 66, 67, 68, 69, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "MP RFI vs 3bet - 6 max 200bb Ranges: MP vs BTN 3bet",
+      "page": 10,
+      "source_image": "page 10, the page's single embedded 2048x1313 image, grid top row, 2nd from left, under the 'MP vs BTN 3bet' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 8500],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "actor": "HJ",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 23600}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '23.6bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '23.6bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 51.82},
+        {"label": "Call", "percent": 28.42},
+        {"label": "23.6bb", "percent": 19.75}
+      ],
+      "rows": [
+        ["R", "R", "R", "RC", "RC", "CF", "CF", "F", "F", "RC", "CF", "F", "F"],
+        ["RC", "R", "RC", "RC", "RC", "F", "F", "F", "F", "F", ".", ".", "."],
+        ["CF", "F", "R", "RC", "RC", "F", "F", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "RC", "RC", "F", "F", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "RC", "CF", "F", ".", ".", ".", ".", ".", "."],
+        ["F", ".", ".", ".", ".", "RC", "CF", "CF", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", "C", "CF", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", "CF", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "CF", "RC", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [23, 24, 25, 33, 34, 35, 36, 37, 38, 46, 47, 48, 49, 50, 51, 59, 60, 61, 62, 63, 64, 66, 67, 68, 69, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "MP RFI vs 3bet - 6 max 200bb Ranges: MP vs SB 3bet",
+      "page": 10,
+      "source_image": "page 10, the page's single embedded 2048x1313 image, grid top row, 3rd from left, under the 'MP vs SB 3bet' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 10900],
+        ["BB", "fold", 0]
+      ],
+      "actor": "HJ",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 25050}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '25.05bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '25.05bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 50.37},
+        {"label": "Call", "percent": 37.09},
+        {"label": "25.05bb", "percent": 12.54}
+      ],
+      "rows": [
+        ["R", "R", "C", "C", "RC", "CF", "F", "F", "F", "C", "RC", "RC", "F"],
+        ["C", "RC", "C", "RC", "RC", "F", "F", "F", "F", "F", ".", ".", "."],
+        ["F", "F", "C", "C", "C", "F", "F", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "C", "C", "F", "F", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "C", "CF", "F", ".", ".", ".", ".", ".", "."],
+        ["F", ".", ".", ".", ".", "C", "C", "C", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", "C", "C", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", "CF", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "CF", "C", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [23, 24, 25, 33, 34, 35, 36, 37, 38, 46, 47, 48, 49, 50, 51, 59, 60, 61, 62, 63, 64, 66, 67, 68, 69, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "MP RFI vs 3bet - 6 max 200bb Ranges: MP vs BB 3bet",
+      "page": 10,
+      "source_image": "page 10, the page's single embedded 2048x1313 image, grid top row, 4th from left, under the 'MP vs BB 3bet' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "raise", 11050]
+      ],
+      "actor": "HJ",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 25000}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '25.0bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '25.0bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 49.76},
+        {"label": "Call", "percent": 41.08},
+        {"label": "25.0bb", "percent": 9.14}
+      ],
+      "rows": [
+        ["R", "RC", "C", "C", "C", "C", "CF", "CF", "CF", "C", "C", "RC", "F"],
+        ["C", "RC", "C", "C", "C", "F", "F", "F", "F", "F", ".", ".", "."],
+        ["F", "F", "C", "C", "C", "F", "F", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "C", "C", "F", "F", ".", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "C", "CF", "F", ".", ".", ".", ".", ".", "."],
+        ["F", ".", ".", ".", ".", "C", "C", "C", ".", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", "C", "C", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", "CF", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "CF", "C", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [23, 24, 25, 33, 34, 35, 36, 37, 38, 46, 47, 48, 49, 50, 51, 59, 60, 61, 62, 63, 64, 66, 67, 68, 69, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "CO RFI vs 3bet - 6 max 200bb Ranges: CO vs BTN 3bet",
+      "page": 11,
+      "source_image": "page 11, the page's single embedded 2048x1313 image, grid top row, 1st from left, under the 'CO vs BTN 3bet' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "raise", 8500],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "actor": "CO",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 23600}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '23.6bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '23.6bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 53.56},
+        {"label": "Call", "percent": 27.79},
+        {"label": "23.6bb", "percent": 18.65}
+      ],
+      "rows": [
+        ["R", "R", "R", "RC", "RC", "RC", "CF", "CF", "F", "RC", "C", "CF", "F"],
+        ["RC", "R", "R", "RC", "RC", "CF", "F", "F", "CF", "F", "F", "F", "."],
+        ["C", "CF", "R", "RC", "RC", "CF", "F", "F", "F", "F", ".", ".", "."],
+        ["F", "F", "F", "RC", "RC", "RC", "F", "F", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "RC", "RC", "CF", "F", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "F", "RC", "CF", "F", ".", ".", ".", ".", "."],
+        ["F", ".", ".", ".", ".", ".", "RC", "CF", "CF", ".", ".", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", "C", "CF", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "C", "CF", ".", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", ".", "CF", "CF", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [25, 36, 37, 38, 47, 48, 49, 50, 51, 60, 61, 62, 63, 64, 73, 74, 75, 76, 77, 79, 80, 81, 82, 83, 87, 88, 89, 90, 92, 93, 94, 95, 96, 97, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "CO RFI vs 3bet - 6 max 200bb Ranges: CO vs SB 3bet",
+      "page": 11,
+      "source_image": "page 11, the page's single embedded 2048x1313 image, grid top row, 2nd from left, under the 'CO vs SB 3bet' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 10900],
+        ["BB", "fold", 0]
+      ],
+      "actor": "CO",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 25050}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '25.05bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '25.05bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 50.54},
+        {"label": "Call", "percent": 37.83},
+        {"label": "25.05bb", "percent": 11.63}
+      ],
+      "rows": [
+        ["R", "R", "RC", "RC", "C", "RC", "RC", "CF", "F", "C", "C", "C", "F"],
+        ["C", "R", "C", "C", "C", "CF", "F", "F", "CF", "F", "F", "F", "."],
+        ["RC", "F", "RC", "C", "C", "F", "F", "F", "F", "F", ".", ".", "."],
+        ["F", "F", "F", "C", "C", "C", "F", "F", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "C", "C", "CF", "F", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "F", "C", "CF", "F", ".", ".", ".", ".", "."],
+        ["F", ".", ".", ".", ".", ".", "C", "C", "C", ".", ".", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", "C", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "C", "C", ".", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", ".", "CF", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [25, 36, 37, 38, 47, 48, 49, 50, 51, 60, 61, 62, 63, 64, 73, 74, 75, 76, 77, 79, 80, 81, 82, 83, 87, 88, 89, 90, 92, 93, 94, 95, 96, 97, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "CO RFI vs 3bet - 6 max 200bb Ranges: CO vs BB 3bet",
+      "page": 11,
+      "source_image": "page 11, the page's single embedded 2048x1313 image, grid top row, 3rd from left, under the 'CO vs BB 3bet' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "raise", 11050]
+      ],
+      "actor": "CO",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 25000}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '25.0bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '25.0bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 50.72},
+        {"label": "Call", "percent": 39.37},
+        {"label": "25.0bb", "percent": 9.91}
+      ],
+      "rows": [
+        ["R", "R", "C", "C", "C", "C", "C", "RC", "CF", "C", "C", "C", "F"],
+        ["C", "RC", "C", "C", "C", "CF", "F", "F", "F", "F", "F", "F", "."],
+        ["RC", "F", "C", "C", "C", "F", "F", "F", "F", "F", ".", ".", "."],
+        ["F", "F", "F", "C", "C", "CF", "F", "F", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "C", "C", "CF", "F", ".", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "F", "C", "CF", "F", ".", ".", ".", ".", "."],
+        ["F", ".", ".", ".", ".", ".", "C", "CF", "CF", ".", ".", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", "C", "C", ".", ".", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", "C", "C", ".", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", ".", "CF", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [25, 36, 37, 38, 47, 48, 49, 50, 51, 60, 61, 62, 63, 64, 73, 74, 75, 76, 77, 79, 80, 81, 82, 83, 87, 88, 89, 90, 92, 93, 94, 95, 96, 97, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 114, 115, 116, 118, 119, 120, 121, 122, 123, 124, 125, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "BTN RFI vs 3bet - 6 max 200bb Ranges: BTN vs SB 3bet",
+      "page": 12,
+      "source_image": "page 12, the page's single embedded 2048x1313 image, grid top row, 1st from left, under the 'BTN vs SB 3bet' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500],
+        ["SB", "raise", 10900],
+        ["BB", "fold", 0]
+      ],
+      "actor": "BTN",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 25050}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '25.05bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '25.05bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 52.29},
+        {"label": "Call", "percent": 37.83},
+        {"label": "25.05bb", "percent": 9.88}
+      ],
+      "rows": [
+        ["R", "R", "RC", "RC", "RC", "C", "RC", "C", "C", "RC", "C", "C", "C"],
+        ["RC", "R", "C", "RC", "C", "C", "C", "CF", "C", "CF", "F", "F", "F"],
+        ["C", "RC", "RC", "C", "C", "C", "F", "F", "F", "F", "F", "F", "F"],
+        ["RC", "CF", "F", "RC", "C", "C", "C", "F", "F", "F", "F", ".", "."],
+        ["F", "F", "F", "CF", "C", "C", "C", "CF", "F", "F", ".", ".", "."],
+        ["F", "F", "F", "F", "F", "C", "C", "C", "F", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "F", "F", "C", "C", "C", "F", ".", ".", "."],
+        ["F", "F", ".", ".", ".", ".", ".", "C", "C", "CF", "F", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", "C", "C", "CF", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", ".", "C", "C", "C", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [50, 51, 62, 63, 64, 74, 75, 76, 77, 88, 89, 90, 93, 94, 95, 96, 97, 102, 103, 105, 106, 107, 108, 109, 110, 111, 115, 116, 118, 119, 120, 121, 122, 123, 124, 125, 129, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "BTN RFI vs 3bet - 6 max 200bb Ranges: BTN vs BB 3bet",
+      "page": 12,
+      "source_image": "page 12, the page's single embedded 2048x1313 image, grid top row, 2nd from left, under the 'BTN vs BB 3bet' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500],
+        ["SB", "fold", 0],
+        ["BB", "raise", 11050]
+      ],
+      "actor": "BTN",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 25000}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '25.0bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '25.0bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 53.14},
+        {"label": "Call", "percent": 37.19},
+        {"label": "25.0bb", "percent": 9.66}
+      ],
+      "rows": [
+        ["R", "R", "RC", "RC", "C", "C", "C", "C", "C", "C", "C", "C", "C"],
+        ["RC", "R", "C", "C", "C", "C", "C", "C", "C", "CF", "F", "F", "F"],
+        ["C", "RC", "RC", "C", "C", "C", "CF", "F", "F", "F", "F", "F", "F"],
+        ["RC", "CF", "CF", "C", "C", "C", "RC", "F", "F", "F", "F", ".", "."],
+        ["F", "F", "F", "F", "C", "C", "C", "F", "F", "F", ".", ".", "."],
+        ["F", "F", "F", "F", "F", "C", "C", "C", "F", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "F", "F", "C", "C", "CF", "F", ".", ".", "."],
+        ["F", "F", ".", ".", ".", ".", ".", "C", "C", "CF", "F", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", "C", "C", "F", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", ".", "C", "C", "CF", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [50, 51, 62, 63, 64, 74, 75, 76, 77, 88, 89, 90, 93, 94, 95, 96, 97, 102, 103, 105, 106, 107, 108, 109, 110, 111, 115, 116, 118, 119, 120, 121, 122, 123, 124, 125, 129, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    },
+    {
+      "title": "SB RFI vs 3bet - 6 max 200bb Ranges: SB vs BB 3bet",
+      "page": 13,
+      "source_image": "page 13, the page's single embedded 2048x1313 image, grid top row, 1st from left, under the 'SB vs BB 3bet' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 3000],
+        ["BB", "raise", 10000]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 27050}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "RC": [0.0, 0.5, 0.5],
+        "C": [0.0, 1.0, 0.0],
+        "CF": [0.5, 0.5, 0.0],
+        "F": [1.0, 0.0, 0.0],
+        "g": [0.0, 0.0, 0.0],
+        ".": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "orange cell = legend '27.05bb'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "RC": "cell split orange/green = 50% '27.05bb', 50% 'Call' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "C": "green cell = legend 'Call'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "CF": "cell split green/blue = 50% 'Call', 50% 'Fold' (page-2 rule: rounded to the nearest 50%); in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "F": "blue cell = legend 'Fold'; in a vs-3bet grid the strip's height shows how much of the class the opener raised, and only its colour split is transcribed",
+        "g": "grey cell with no readable action strip (no strip, or only a sub-pixel antialiased tint): no action data (unreachable: the opener's published raise weight for this class is 0)",
+        ".": "navy cell, no strip: outside the opener's displayed range; no action data (unreachable: the opener's published raise weight for this class is 0)"
+      },
+      "published_legend": [
+        {"label": "Fold", "percent": 53.98},
+        {"label": "Call", "percent": 27.02},
+        {"label": "27.05bb", "percent": 19.0}
+      ],
+      "rows": [
+        ["R", "R", "R", "R", "RC", "C", "C", "C", "C", "RC", "RC", "C", "C"],
+        ["R", "R", "R", "R", "RC", "C", "C", "C", "RC", "CF", "F", "F", "F"],
+        ["RC", "C", "R", "R", "RC", "C", "CF", "F", "F", "F", "F", "F", "F"],
+        ["RC", "CF", "CF", "R", "RC", "RC", "RC", "F", "F", "F", "F", ".", "."],
+        ["CF", "F", "F", "F", "RC", "RC", "RC", "F", "F", "g", ".", ".", "."],
+        ["F", "F", "F", "F", "F", "C", "RC", "F", "F", ".", ".", ".", "."],
+        ["F", "F", "F", "F", "F", "F", "C", "CF", "F", "F", ".", ".", "."],
+        ["F", "F", ".", ".", ".", ".", "F", "C", "CF", "F", "F", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", "C", "CF", "F", ".", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", ".", "C", "CF", "F", "."],
+        ["F", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", ".", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C", "."],
+        [".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "C"]
+      ],
+      "unreachable_classes": [50, 51, 61, 62, 63, 64, 74, 75, 76, 77, 88, 89, 90, 93, 94, 95, 96, 102, 103, 105, 106, 107, 108, 109, 110, 111, 115, 116, 118, 119, 120, 121, 122, 123, 124, 125, 129, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    }
+  ],
+  "inventory": [
+    {
+      "title": "Raise First In (RFI) - 6 max 200bb Ranges: UTG RFI",
+      "status": "covered",
+      "history": [],
+      "page": 3,
+      "reason": "Grid transcribed (169/169 cells). Every seat before UTG folds explicitly; actor UTG. Menu from the legend panel: Fold, 2.5bb; raise to 2.5bb (to_bb_x1000 2500). History: (empty)."
+    },
+    {
+      "title": "Raise First In (RFI) - 6 max 200bb Ranges: MP RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Grid transcribed (169/169 cells). Every seat before HJ folds explicitly; actor HJ. Menu from the legend panel: Fold, 2.5bb; raise to 2.5bb (to_bb_x1000 2500). History: UTG f."
+    },
+    {
+      "title": "Raise First In (RFI) - 6 max 200bb Ranges: CO RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Grid transcribed (169/169 cells). Every seat before CO folds explicitly; actor CO. Menu from the legend panel: Fold, 2.5bb; raise to 2.5bb (to_bb_x1000 2500). History: UTG f, HJ f."
+    },
+    {
+      "title": "Raise First In (RFI) - 6 max 200bb Ranges: BTN RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Grid transcribed (169/169 cells). Every seat before BTN folds explicitly; actor BTN. Menu from the legend panel: Fold, 2.5bb; raise to 2.5bb (to_bb_x1000 2500). History: UTG f, HJ f, CO f."
+    },
+    {
+      "title": "Raise First In (RFI) - 6 max 200bb Ranges: SB RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Grid transcribed (169/169 cells). Every seat before SB folds explicitly; actor SB. Menu from the legend panel: Fold, Call, 3.0bb; raise to 3.0bb (to_bb_x1000 3000) where 'Call' is the SB completing (limp). History: UTG f, HJ f, CO f, BTN f."
+    },
+    {
+      "title": "MP vs RFI - 6 max 200bb Ranges: MP vs UTG RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500]
+      ],
+      "page": 4,
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (the UTG RFI legend, page 3), every other seat before HJ folds; actor HJ. Menu from the legend panel: Fold, 8.5bb; 3bet to 8.5bb (to_bb_x1000 8500). History: UTG r2.5."
+    },
+    {
+      "title": "CO vs RFI - 6 max 200bb Ranges: CO vs UTG RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0]
+      ],
+      "page": 5,
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (the UTG RFI legend, page 3), every other seat before CO folds; actor CO. Menu from the legend panel: Fold, 8.5bb; 3bet to 8.5bb (to_bb_x1000 8500). History: UTG r2.5, HJ f."
+    },
+    {
+      "title": "CO vs RFI - 6 max 200bb Ranges: CO vs MP RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500]
+      ],
+      "page": 5,
+      "reason": "Grid transcribed (169/169 cells). MP (HJ) opens to 2.5bb (the MP RFI legend, page 3), every other seat before CO folds; actor CO. Menu from the legend panel: Fold, 8.5bb; 3bet to 8.5bb (to_bb_x1000 8500). History: UTG f, HJ r2.5."
+    },
+    {
+      "title": "BTN vs RFI - 6 max 200bb Ranges: BTN vs UTG RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0]
+      ],
+      "page": 6,
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (the UTG RFI legend, page 3), every other seat before BTN folds; actor BTN. Menu from the legend panel: Fold, Call, 8.5bb; 3bet to 8.5bb (to_bb_x1000 8500). History: UTG r2.5, HJ f, CO f."
+    },
+    {
+      "title": "BTN vs RFI - 6 max 200bb Ranges: BTN vs MP RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0]
+      ],
+      "page": 6,
+      "reason": "Grid transcribed (169/169 cells). MP (HJ) opens to 2.5bb (the MP RFI legend, page 3), every other seat before BTN folds; actor BTN. Menu from the legend panel: Fold, Call, 8.5bb; 3bet to 8.5bb (to_bb_x1000 8500). History: UTG f, HJ r2.5, CO f."
+    },
+    {
+      "title": "BTN vs RFI - 6 max 200bb Ranges: BTN vs CO RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500]
+      ],
+      "page": 6,
+      "reason": "Grid transcribed (169/169 cells). CO opens to 2.5bb (the CO RFI legend, page 3), every other seat before BTN folds; actor BTN. Menu from the legend panel: Fold, Call, 8.5bb; 3bet to 8.5bb (to_bb_x1000 8500). The legend's Call row (1.18%) rounds to no cell, so call has weight 0 in every class. History: UTG f, HJ f, CO r2.5."
+    },
+    {
+      "title": "SB vs RFI - 6 max 200bb Ranges: SB vs UTG RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "page": 7,
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (the UTG RFI legend, page 3), every other seat before SB folds; actor SB. Menu from the legend panel: Fold, 10.9bb; 3bet to 10.9bb (to_bb_x1000 10900). History: UTG r2.5, HJ f, CO f, BTN f."
+    },
+    {
+      "title": "SB vs RFI - 6 max 200bb Ranges: SB vs MP RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "page": 7,
+      "reason": "Grid transcribed (169/169 cells). MP (HJ) opens to 2.5bb (the MP RFI legend, page 3), every other seat before SB folds; actor SB. Menu from the legend panel: Fold, 10.9bb; 3bet to 10.9bb (to_bb_x1000 10900). History: UTG f, HJ r2.5, CO f, BTN f."
+    },
+    {
+      "title": "SB vs RFI - 6 max 200bb Ranges: SB vs CO RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0]
+      ],
+      "page": 7,
+      "reason": "Grid transcribed (169/169 cells). CO opens to 2.5bb (the CO RFI legend, page 3), every other seat before SB folds; actor SB. Menu from the legend panel: Fold, 10.9bb; 3bet to 10.9bb (to_bb_x1000 10900). History: UTG f, HJ f, CO r2.5, BTN f."
+    },
+    {
+      "title": "SB vs RFI - 6 max 200bb Ranges: SB vs BTN RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500]
+      ],
+      "page": 7,
+      "reason": "Grid transcribed (169/169 cells). BTN opens to 2.5bb (the BTN RFI legend, page 3), every other seat before SB folds; actor SB. Menu from the legend panel: Fold, 10.9bb; 3bet to 10.9bb (to_bb_x1000 10900). History: UTG f, HJ f, CO f, BTN r2.5."
+    },
+    {
+      "title": "BB vs RFI - 6 max 200bb Ranges: BB vs UTG RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "page": 8,
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (the UTG RFI legend, page 3), every other seat before BB folds; actor BB. Menu from the legend panel: Fold, Call, 11.05bb; 3bet to 11.05bb (to_bb_x1000 11050). History: UTG r2.5, HJ f, CO f, BTN f, SB f."
+    },
+    {
+      "title": "BB vs RFI - 6 max 200bb Ranges: BB vs MP RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "page": 8,
+      "reason": "Grid transcribed (169/169 cells). MP (HJ) opens to 2.5bb (the MP RFI legend, page 3), every other seat before BB folds; actor BB. Menu from the legend panel: Fold, Call, 11.05bb; 3bet to 11.05bb (to_bb_x1000 11050). History: UTG f, HJ r2.5, CO f, BTN f, SB f."
+    },
+    {
+      "title": "BB vs RFI - 6 max 200bb Ranges: BB vs CO RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "page": 8,
+      "reason": "Grid transcribed (169/169 cells). CO opens to 2.5bb (the CO RFI legend, page 3), every other seat before BB folds; actor BB. Menu from the legend panel: Fold, Call, 11.05bb; 3bet to 11.05bb (to_bb_x1000 11050). History: UTG f, HJ f, CO r2.5, BTN f, SB f."
+    },
+    {
+      "title": "BB vs RFI - 6 max 200bb Ranges: BB vs BTN RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500],
+        ["SB", "fold", 0]
+      ],
+      "page": 8,
+      "reason": "Grid transcribed (169/169 cells). BTN opens to 2.5bb (the BTN RFI legend, page 3), every other seat before BB folds; actor BB. Menu from the legend panel: Fold, Call, 11.05bb; 3bet to 11.05bb (to_bb_x1000 11050). History: UTG f, HJ f, CO f, BTN r2.5, SB f."
+    },
+    {
+      "title": "BB vs RFI - 6 max 200bb Ranges: BB vs SB RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 3000]
+      ],
+      "page": 8,
+      "reason": "Grid transcribed (169/169 cells). SB opens to 3.0bb (the SB RFI legend, page 3), every other seat before BB folds; actor BB. Menu from the legend panel: Fold, Call, 10.0bb; 3bet to 10.0bb (to_bb_x1000 10000). History: UTG f, HJ f, CO f, BTN f, SB r3."
+    },
+    {
+      "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs MP 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "raise", 8500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 9,
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), MP (HJ) 3bets to 8.5bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'MP vs UTG RFI' legend of this PDF (page 4), the same two seats. Menu from this page's legend panel: Fold, Call, 23.6bb; 4bet to 23.6bb (to_bb_x1000 23600). 115 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG r2.5, HJ r8.5, CO f, BTN f, SB f, BB f."
+    },
+    {
+      "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs CO 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 8500],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 9,
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), CO 3bets to 8.5bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'CO vs UTG RFI' legend of this PDF (page 5), the same two seats. Menu from this page's legend panel: Fold, Call, 23.6bb; 4bet to 23.6bb (to_bb_x1000 23600). 115 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG r2.5, HJ f, CO r8.5, BTN f, SB f, BB f."
+    },
+    {
+      "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs BTN 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 8500],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 9,
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), BTN 3bets to 8.5bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'BTN vs UTG RFI' legend of this PDF (page 6), the same two seats. Menu from this page's legend panel: Fold, Call, 23.8bb; 4bet to 23.8bb (to_bb_x1000 23800). 114 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG r2.5, HJ f, CO f, BTN r8.5, SB f, BB f."
+    },
+    {
+      "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs SB 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 10900],
+        ["BB", "fold", 0]
+      ],
+      "page": 9,
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), SB 3bets to 10.9bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'SB vs UTG RFI' legend of this PDF (page 7), the same two seats. Menu from this page's legend panel: Fold, Call, 25.05bb; 4bet to 25.05bb (to_bb_x1000 25050). 115 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG r2.5, HJ f, CO f, BTN f, SB r10.9, BB f."
+    },
+    {
+      "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs BB 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "raise", 11050]
+      ],
+      "page": 9,
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), BB 3bets to 11.05bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'BB vs UTG RFI' legend of this PDF (page 8), the same two seats. Menu from this page's legend panel: Fold, Call, 25.0bb; 4bet to 25.0bb (to_bb_x1000 25000). 114 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG r2.5, HJ f, CO f, BTN f, SB f, BB r11.05."
+    },
+    {
+      "title": "MP RFI vs 3bet - 6 max 200bb Ranges: MP vs CO 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "raise", 8500],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 10,
+      "reason": "Grid transcribed (169/169 cells). MP (HJ) opens to 2.5bb (page 3), CO 3bets to 8.5bb, every other seat folds; actor HJ. The 3bet size is not printed on this page: it is resolved from the 'CO vs MP RFI' legend of this PDF (page 5), the same two seats. Menu from this page's legend panel: Fold, Call, 23.8bb; 4bet to 23.8bb (to_bb_x1000 23800). 109 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG f, HJ r2.5, CO r8.5, BTN f, SB f, BB f."
+    },
+    {
+      "title": "MP RFI vs 3bet - 6 max 200bb Ranges: MP vs BTN 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 8500],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 10,
+      "reason": "Grid transcribed (169/169 cells). MP (HJ) opens to 2.5bb (page 3), BTN 3bets to 8.5bb, every other seat folds; actor HJ. The 3bet size is not printed on this page: it is resolved from the 'BTN vs MP RFI' legend of this PDF (page 6), the same two seats. Menu from this page's legend panel: Fold, Call, 23.6bb; 4bet to 23.6bb (to_bb_x1000 23600). 109 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG f, HJ r2.5, CO f, BTN r8.5, SB f, BB f."
+    },
+    {
+      "title": "MP RFI vs 3bet - 6 max 200bb Ranges: MP vs SB 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 10900],
+        ["BB", "fold", 0]
+      ],
+      "page": 10,
+      "reason": "Grid transcribed (169/169 cells). MP (HJ) opens to 2.5bb (page 3), SB 3bets to 10.9bb, every other seat folds; actor HJ. The 3bet size is not printed on this page: it is resolved from the 'SB vs MP RFI' legend of this PDF (page 7), the same two seats. Menu from this page's legend panel: Fold, Call, 25.05bb; 4bet to 25.05bb (to_bb_x1000 25050). 109 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG f, HJ r2.5, CO f, BTN f, SB r10.9, BB f."
+    },
+    {
+      "title": "MP RFI vs 3bet - 6 max 200bb Ranges: MP vs BB 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "raise", 11050]
+      ],
+      "page": 10,
+      "reason": "Grid transcribed (169/169 cells). MP (HJ) opens to 2.5bb (page 3), BB 3bets to 11.05bb, every other seat folds; actor HJ. The 3bet size is not printed on this page: it is resolved from the 'BB vs MP RFI' legend of this PDF (page 8), the same two seats. Menu from this page's legend panel: Fold, Call, 25.0bb; 4bet to 25.0bb (to_bb_x1000 25000). 109 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG f, HJ r2.5, CO f, BTN f, SB f, BB r11.05."
+    },
+    {
+      "title": "CO RFI vs 3bet - 6 max 200bb Ranges: CO vs BTN 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "raise", 8500],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 11,
+      "reason": "Grid transcribed (169/169 cells). CO opens to 2.5bb (page 3), BTN 3bets to 8.5bb, every other seat folds; actor CO. The 3bet size is not printed on this page: it is resolved from the 'BTN vs CO RFI' legend of this PDF (page 6), the same two seats. Menu from this page's legend panel: Fold, Call, 23.6bb; 4bet to 23.6bb (to_bb_x1000 23600). 95 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG f, HJ f, CO r2.5, BTN r8.5, SB f, BB f."
+    },
+    {
+      "title": "CO RFI vs 3bet - 6 max 200bb Ranges: CO vs SB 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 10900],
+        ["BB", "fold", 0]
+      ],
+      "page": 11,
+      "reason": "Grid transcribed (169/169 cells). CO opens to 2.5bb (page 3), SB 3bets to 10.9bb, every other seat folds; actor CO. The 3bet size is not printed on this page: it is resolved from the 'SB vs CO RFI' legend of this PDF (page 7), the same two seats. Menu from this page's legend panel: Fold, Call, 25.05bb; 4bet to 25.05bb (to_bb_x1000 25050). 95 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG f, HJ f, CO r2.5, BTN f, SB r10.9, BB f."
+    },
+    {
+      "title": "CO RFI vs 3bet - 6 max 200bb Ranges: CO vs BB 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "raise", 11050]
+      ],
+      "page": 11,
+      "reason": "Grid transcribed (169/169 cells). CO opens to 2.5bb (page 3), BB 3bets to 11.05bb, every other seat folds; actor CO. The 3bet size is not printed on this page: it is resolved from the 'BB vs CO RFI' legend of this PDF (page 8), the same two seats. Menu from this page's legend panel: Fold, Call, 25.0bb; 4bet to 25.0bb (to_bb_x1000 25000). 95 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG f, HJ f, CO r2.5, BTN f, SB f, BB r11.05."
+    },
+    {
+      "title": "BTN RFI vs 3bet - 6 max 200bb Ranges: BTN vs SB 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500],
+        ["SB", "raise", 10900],
+        ["BB", "fold", 0]
+      ],
+      "page": 12,
+      "reason": "Grid transcribed (169/169 cells). BTN opens to 2.5bb (page 3), SB 3bets to 10.9bb, every other seat folds; actor BTN. The 3bet size is not printed on this page: it is resolved from the 'SB vs BTN RFI' legend of this PDF (page 7), the same two seats. Menu from this page's legend panel: Fold, Call, 25.05bb; 4bet to 25.05bb (to_bb_x1000 25050). 71 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG f, HJ f, CO f, BTN r2.5, SB r10.9, BB f."
+    },
+    {
+      "title": "BTN RFI vs 3bet - 6 max 200bb Ranges: BTN vs BB 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500],
+        ["SB", "fold", 0],
+        ["BB", "raise", 11050]
+      ],
+      "page": 12,
+      "reason": "Grid transcribed (169/169 cells). BTN opens to 2.5bb (page 3), BB 3bets to 11.05bb, every other seat folds; actor BTN. The 3bet size is not printed on this page: it is resolved from the 'BB vs BTN RFI' legend of this PDF (page 8), the same two seats. Menu from this page's legend panel: Fold, Call, 25.0bb; 4bet to 25.0bb (to_bb_x1000 25000). 71 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG f, HJ f, CO f, BTN r2.5, SB f, BB r11.05."
+    },
+    {
+      "title": "SB RFI vs 3bet - 6 max 200bb Ranges: SB vs BB 3bet",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 3000],
+        ["BB", "raise", 10000]
+      ],
+      "page": 13,
+      "reason": "Grid transcribed (169/169 cells). SB opens to 3.0bb (page 3), BB 3bets to 10.0bb, every other seat folds; actor SB. The 3bet size is not printed on this page: it is resolved from the 'BB vs SB RFI' legend of this PDF (page 8), the same two seats. Menu from this page's legend panel: Fold, Call, 27.05bb; 4bet to 27.05bb (to_bb_x1000 27050). 72 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG f, HJ f, CO f, BTN f, SB r3, BB r10."
+    },
+    {
+      "title": "Blind limp lines: SB first-in limp strategy",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Same node as 'SB RFI' (page 3): the SB RFI legend's 'Call 7.19%' row is the SB completing (limping), so the limp strategy is that grid's call column. No separate grid; recorded once in the bundle."
+    },
+    {
+      "title": "Blind limp lines: BB vs SB limp",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "call", 0]
+      ],
+      "page": null,
+      "reason": "Visual audit of pages 3-13: no grid for the BB facing an SB limp. Page 8 ('BB vs RFI') has only 'BB vs SB RFI', i.e. facing the SB's 3.0bb raise."
+    },
+    {
+      "title": "Blind limp lines: SB vs BB isolation raise after an SB limp",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "call", 0]
+      ],
+      "page": null,
+      "reason": "No grid, and the key cannot be formed: no page publishes the BB's raise size over an SB limp. The history recorded is the resolvable prefix (SB limps); the SB decision would follow a BB raise of unpublished size (absent, size unresolved)."
+    },
+    {
+      "title": "Absent-node audit: multiway caller (BTN facing a UTG open and an MP call)",
+      "status": "absent",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "call", 0],
+        ["CO", "fold", 0]
+      ],
+      "page": null,
+      "reason": "No page covers a decision after an open and a flat call. Every vs-RFI grid (pages 4-8) is 'one player acting before you raises first in' (page 2) with all other seats folded."
+    },
+    {
+      "title": "Absent-node audit: squeeze (BB facing a CO open and a BTN call)",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "call", 0],
+        ["SB", "fold", 0]
+      ],
+      "page": null,
+      "reason": "No squeeze grid on any page. 'BB vs CO RFI' (page 8) is keyed with the BTN folding and is not reused for this spot."
+    },
+    {
+      "title": "Absent-node audit: cold call or cold 4bet facing an open and a 3bet (CO facing UTG open, MP 3bet)",
+      "status": "absent",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "raise", 8500]
+      ],
+      "page": null,
+      "reason": "No grid for a third player facing an open and a 3bet. The vs-3bet pages 9-13 are the opener's response only ('you have raised first in and a player acting after you re-raises', page 2)."
+    },
+    {
+      "title": "Absent-node audit: vs-4bet (MP facing the UTG 4bet after MP 3bet)",
+      "status": "absent",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "raise", 8500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0],
+        ["UTG", "raise", 23600]
+      ],
+      "page": null,
+      "reason": "No vs-4bet grid on any page. Sizes in this key are from this PDF (2.5bb page 3, 8.5bb page 4, 23.6bb page 9), recorded only to identify the missing spot."
+    },
+    {
+      "title": "Absent-node audit: vs-4bet (BB facing the SB 4bet after BB 3bet)",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 3000],
+        ["BB", "raise", 10000],
+        ["SB", "raise", 27050]
+      ],
+      "page": null,
+      "reason": "No vs-4bet grid. Sizes from this PDF (3.0bb page 3, 10.0bb page 8, 27.05bb page 13), recorded only to identify the missing spot."
+    },
+    {
+      "title": "Absent-node audit: open-limp outside the SB (MP facing a UTG limp)",
+      "status": "absent",
+      "history": [
+        ["UTG", "call", 0]
+      ],
+      "page": null,
+      "reason": "No position other than the SB has a limp option: the UTG, MP, CO and BTN RFI legends (page 3) list only Fold and 2.5bb. No grid faces a non-SB limp."
+    }
+  ]
+}
