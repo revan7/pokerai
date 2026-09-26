@@ -2036,7 +2036,7 @@
         ["BB", "fold", 0]
       ],
       "page": 9,
-      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), MP (HJ) 3bets to 8.5bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'MP vs UTG RFI' legend of this PDF (page 4), the same two seats. Menu from this page's legend panel: Fold, Call, 23.6bb; 4bet to 23.6bb (to_bb_x1000 23600). 115 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG r2.5, HJ r8.5, CO f, BTN f, SB f, BB f."
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), MP (HJ) 3bets to 8.5bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'MP vs UTG RFI' legend of this PDF (page 4), the same two seats. Menu from this page's legend panel: Fold, Call, 23.6bb; 4bet to 23.6bb (to_bb_x1000 23600). 115 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. Exceptional cells (see docs/data/chart-transcription.md's thin-strip rule): 64s and 75s are both coded 'g' (unreachable) -- only an antialiased tint, no full pixel row of a legend fill colour, so the thin-strip rule leaves them unread rather than a blurred-tint guess; UTG's page-3 raise weight for both is 0, so replay reach through this node is unaffected either way. History: UTG r2.5, HJ r8.5, CO f, BTN f, SB f, BB f."
     },
     {
       "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs CO 3bet",
@@ -2050,7 +2050,7 @@
         ["BB", "fold", 0]
       ],
       "page": 9,
-      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), CO 3bets to 8.5bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'CO vs UTG RFI' legend of this PDF (page 5), the same two seats. Menu from this page's legend panel: Fold, Call, 23.6bb; 4bet to 23.6bb (to_bb_x1000 23600). 115 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG r2.5, HJ f, CO r8.5, BTN f, SB f, BB f."
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), CO 3bets to 8.5bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'CO vs UTG RFI' legend of this PDF (page 5), the same two seats. Menu from this page's legend panel: Fold, Call, 23.6bb; 4bet to 23.6bb (to_bb_x1000 23600). 115 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. Exceptional cells (see docs/data/chart-transcription.md's thin-strip rule): 64s and 75s are both coded 'g' (unreachable) -- only an antialiased tint, no full pixel row of a legend fill colour, so the thin-strip rule leaves them unread rather than a blurred-tint guess; UTG's page-3 raise weight for both is 0, so replay reach through this node is unaffected either way. History: UTG r2.5, HJ f, CO r8.5, BTN f, SB f, BB f."
     },
     {
       "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs BTN 3bet",
@@ -2064,7 +2064,7 @@
         ["BB", "fold", 0]
       ],
       "page": 9,
-      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), BTN 3bets to 8.5bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'BTN vs UTG RFI' legend of this PDF (page 6), the same two seats. Menu from this page's legend panel: Fold, Call, 23.8bb; 4bet to 23.8bb (to_bb_x1000 23800). 114 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG r2.5, HJ f, CO f, BTN r8.5, SB f, BB f."
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), BTN 3bets to 8.5bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'BTN vs UTG RFI' legend of this PDF (page 6), the same two seats. Menu from this page's legend panel: Fold, Call, 23.8bb; 4bet to 23.8bb (to_bb_x1000 23800). 114 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. Exceptional cells (see docs/data/chart-transcription.md's thin-strip rule): 64s is coded 'g' (unreachable) -- only an antialiased tint, no full pixel row of a legend fill colour. 75s is coded 'C' (Call): it carries one full pixel row of Call green, so the thin-strip rule reads it as Call despite that 1-pixel strip. UTG's page-3 raise weight is 0 for both 64s and 75s, so replay reach through this node is unaffected either way. History: UTG r2.5, HJ f, CO f, BTN r8.5, SB f, BB f."
     },
     {
       "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs SB 3bet",
@@ -2078,7 +2078,7 @@
         ["BB", "fold", 0]
       ],
       "page": 9,
-      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), SB 3bets to 10.9bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'SB vs UTG RFI' legend of this PDF (page 7), the same two seats. Menu from this page's legend panel: Fold, Call, 25.05bb; 4bet to 25.05bb (to_bb_x1000 25050). 115 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG r2.5, HJ f, CO f, BTN f, SB r10.9, BB f."
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), SB 3bets to 10.9bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'SB vs UTG RFI' legend of this PDF (page 7), the same two seats. Menu from this page's legend panel: Fold, Call, 25.05bb; 4bet to 25.05bb (to_bb_x1000 25050). 115 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. Exceptional cells (see docs/data/chart-transcription.md's thin-strip rule): 64s and 75s are both coded 'g' (unreachable) -- only an antialiased tint, no full pixel row of a legend fill colour, so the thin-strip rule leaves them unread rather than a blurred-tint guess; UTG's page-3 raise weight for both is 0, so replay reach through this node is unaffected either way. History: UTG r2.5, HJ f, CO f, BTN f, SB r10.9, BB f."
     },
     {
       "title": "UTG RFI vs 3bet - 6 max 200bb Ranges: UTG vs BB 3bet",
@@ -2092,7 +2092,7 @@
         ["BB", "raise", 11050]
       ],
       "page": 9,
-      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), BB 3bets to 11.05bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'BB vs UTG RFI' legend of this PDF (page 8), the same two seats. Menu from this page's legend panel: Fold, Call, 25.0bb; 4bet to 25.0bb (to_bb_x1000 25000). 114 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG r2.5, HJ f, CO f, BTN f, SB f, BB r11.05."
+      "reason": "Grid transcribed (169/169 cells). UTG opens to 2.5bb (page 3), BB 3bets to 11.05bb, every other seat folds; actor UTG. The 3bet size is not printed on this page: it is resolved from the 'BB vs UTG RFI' legend of this PDF (page 8), the same two seats. Menu from this page's legend panel: Fold, Call, 25.0bb; 4bet to 25.0bb (to_bb_x1000 25000). 114 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. Exceptional cells (see docs/data/chart-transcription.md's thin-strip rule): 64s is coded 'g' (unreachable) -- only an antialiased tint, no full pixel row of a legend fill colour. 75s is coded 'C' (Call): it carries one full pixel row within 12 of the Call green, so the thin-strip rule reads it as Call despite that 1-pixel strip. UTG's page-3 raise weight is 0 for both 64s and 75s, so replay reach through this node is unaffected either way. History: UTG r2.5, HJ f, CO f, BTN f, SB f, BB r11.05."
     },
     {
       "title": "MP RFI vs 3bet - 6 max 200bb Ranges: MP vs CO 3bet",
@@ -2232,7 +2232,7 @@
         ["BB", "raise", 10000]
       ],
       "page": 13,
-      "reason": "Grid transcribed (169/169 cells). SB opens to 3.0bb (page 3), BB 3bets to 10.0bb, every other seat folds; actor SB. The 3bet size is not printed on this page: it is resolved from the 'BB vs SB RFI' legend of this PDF (page 8), the same two seats. Menu from this page's legend panel: Fold, Call, 27.05bb; 4bet to 27.05bb (to_bb_x1000 27050). 72 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. History: UTG f, HJ f, CO f, BTN f, SB r3, BB r10."
+      "reason": "Grid transcribed (169/169 cells). SB opens to 3.0bb (page 3), BB 3bets to 10.0bb, every other seat folds; actor SB. The 3bet size is not printed on this page: it is resolved from the 'BB vs SB RFI' legend of this PDF (page 8), the same two seats. Menu from this page's legend panel: Fold, Call, 27.05bb; 4bet to 27.05bb (to_bb_x1000 27050). 72 classes show no action colour and are unreachable_classes; the opener's page-3 raise weight is 0 for each. Exceptional cell (see docs/data/chart-transcription.md's thin-strip rule): T5s is coded 'g' (unreachable) -- only an antialiased tint, no full pixel row of a legend fill colour, so the thin-strip rule leaves it unread rather than a blurred-tint guess; SB's page-3 raise weight for T5s is 0, so replay reach through this node is unaffected either way. History: UTG f, HJ f, CO f, BTN f, SB r3, BB r10."
     },
     {
       "title": "Blind limp lines: SB first-in limp strategy",
