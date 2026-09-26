@@ -28,12 +28,15 @@ pub fn normalize_ev(reference: EvReference, value: Option<f32>, committed: f32, 
     out.is_finite().then_some(out)
 }
 
-/// Whether a *present* fold EV is self-consistent with `committed`/`start` under `reference`,
-/// within section 8.3's `1e-3` cross-check tolerance. `true` for a missing fold value or an
-/// unverified reference: neither is evidence of a contradiction -- a source is not required to
-/// publish fold's EV at all, and an unverified source's numbers are never checked against
-/// anything.
-pub fn verify_fold(reference: EvReference, fold: Option<f32>, committed: f32, start: f32) -> bool {
+/// The one shared fold-consistency predicate (P3.T9 fix round 1, R2), evaluated entirely in
+/// `f64`: `true` for a missing fold value or an unverified reference (neither is evidence of a
+/// contradiction), else the same `1e-3` cross-check `verify_fold` states, computed at wire
+/// precision. [`verify_fold`] (the narrowed `f32` API this module's public interface requires,
+/// used for in-memory validation -- e.g. at [`expand_node`]'s boundary assertion) and
+/// `crate::store::check_fold_consistency_wide` (the load-time admission gate, run on the
+/// ORIGINAL wire-precision `f64` EV cell before `decode` ever narrows anything) both delegate to
+/// this one function rather than keeping two divergent copies of the cross-check arithmetic.
+pub(crate) fn verify_fold_wide(reference: EvReference, fold: Option<f64>, committed: f64, start: f64) -> bool {
     match (reference, fold) {
         (EvReference::Unverified, _) | (_, None) => true,
         (EvReference::DecisionIncrementalVerified, Some(v)) => v.abs() <= 1e-3,
@@ -42,10 +45,46 @@ pub fn verify_fold(reference: EvReference, fold: Option<f32>, committed: f32, st
     }
 }
 
+/// Whether a *present* fold EV is self-consistent with `committed`/`start` under `reference`,
+/// within section 8.3's `1e-3` cross-check tolerance. `true` for a missing fold value or an
+/// unverified reference: neither is evidence of a contradiction -- a source is not required to
+/// publish fold's EV at all, and an unverified source's numbers are never checked against
+/// anything.
+///
+/// A thin `f32` wrapper over [`verify_fold_wide`] (P3.T9 fix round 1, R2): widens its inputs and
+/// delegates, so this and the load-time wide admission gate are one predicate, never two that can
+/// drift apart. Because this widens an *already-narrowed* `f32` value, it can disagree with the
+/// wide gate right at the `1e-3` boundary (narrowing can shift a residual by less than a part in
+/// `1e7`) -- that disagreement is exactly why the wide gate, not this function, is the load-time
+/// admission decision; this narrowed form remains for in-memory/direct-construction validation,
+/// where no wire-precision value is available at all.
+pub fn verify_fold(reference: EvReference, fold: Option<f32>, committed: f32, start: f32) -> bool {
+    verify_fold_wide(reference, fold.map(f64::from), committed as f64, start as f64)
+}
+
+/// The shared checked chip conversion (P3.T9 fix round 1, R1): computes `inc_sb * 0.5 * unit` in
+/// `f64` and checks the narrowed result is still a finite `f32` before returning it. `None` --
+/// never a clamp, never a zero -- for a result that does not fit: an admitted, merely-finite
+/// source EV (section 8.3 bounds only *that* domain) is not guaranteed to stay finite once
+/// multiplied by `0.5 * unit`.
+fn checked_ev_chips(inc_sb: f32, unit: u32) -> Option<f32> {
+    let wide = inc_sb as f64 * 0.5 * unit as f64;
+    let narrowed = wide as f32;
+    narrowed.is_finite().then_some(narrowed)
+}
+
 /// A normalized EV in source-SB units, converted to chips at `unit` chips per source unit: one
 /// source SB is half a source unit, since `source_blinds == [0.5, 1.0]` always (spec section 8.2).
+///
+/// # Panics
+/// Panics (in every build profile, per the standing ruling: an infallible-signature helper
+/// enforces its invariant with an always-on `assert!`) if the conversion does not fit a finite
+/// `f32` -- callers that must not panic on an oversized EV (namely [`expand_node`], since a
+/// public source can carry an arbitrary finite value) use [`checked_ev_chips`] directly and
+/// propagate the failure as `None` instead (P3.T9 fix round 1, R1).
 pub fn ev_chips(inc_sb: f32, unit: u32) -> f32 {
-    inc_sb * 0.5 * unit as f32
+    checked_ev_chips(inc_sb, unit)
+        .unwrap_or_else(|| panic!("ev_chips: {inc_sb} * 0.5 * {unit} does not fit a finite f32"))
 }
 
 /// combo -> class, built once from the 169 indicator expansions (spec section 4.1's 6/4/12
@@ -158,20 +197,36 @@ fn to_chip_action(step: &PreflopStep, unit: u32, actor_max_to: u32) -> Action {
 /// legality after chip conversion is Task 10's.
 ///
 /// A *present* fold EV always normalizes to exactly `0.0` chips here, never a residual near-zero
-/// value: [`crate::store::build_node_map`] rejects, at load time, any bundle whose declared fold EV
-/// fails [`verify_fold`]'s cross-check (this task's Step 5 -- see [`check_fold_consistency`]), so
-/// every fold EV this function ever sees is already known consistent with `committed`/`start` to
-/// within the spec's `1e-3` tolerance. Forcing the exact value is what section 8.3's "verified fold
-/// ... store normalized fold as exact 0.0" means: a source's own rounding is never allowed to leak
-/// a nonzero residual into the one action the root contract (section 6) defines as exactly zero.
-/// This is the one place this function's behavior goes beyond the brief's literal Step 4 code
-/// (which applies `normalize_ev`/`ev_chips` uniformly to every action) -- see the task report for
-/// why the addition is necessary rather than optional polish.
+/// value: `crate::store::check_fold_consistency_wide` rejects, at load time (inside
+/// `checked_envelope`, on the ORIGINAL wire-precision EV cells), any bundle whose declared fold EV
+/// fails the shared cross-check ([`verify_fold_wide`]/[`verify_fold`]), and this function's own
+/// boundary assertion (P3.T9 fix round 1, R3 -- see [`check_fold_consistency`]) re-checks the same
+/// invariant on whatever `node`/`info` it was actually given, for callers that bypassed the loader
+/// entirely. Either way, by the time this line runs, every fold EV is already known consistent
+/// with `committed`/`start` to within the spec's `1e-3` tolerance. Forcing the exact value is what
+/// section 8.3's "verified fold ... store normalized fold as exact 0.0" means: a source's own
+/// rounding is never allowed to leak a nonzero residual into the one action the root contract
+/// (section 6) defines as exactly zero. This is the one place this function's behavior goes beyond
+/// the brief's literal Step 4 code (which applies `normalize_ev`/`ev_chips` uniformly to every
+/// action) -- see the task report for why the addition is necessary rather than optional polish.
 pub fn expand_node(node: &PreflopNode, info: &BundleInfo, actor: Seat, unit: u32, actor_max_to: u32) -> ExpandedNode {
-    let classes = info.combo_classes(); // the table built once at bundle load
+    let classes = info.combo_classes(); // the process-wide table, borrowed, never rebuilt or cloned here
     let charts = matches!(info.source, SourceKind::ChartTranscription);
+    // R3 (P3.T9 fix round 1): before any verified, present fold EV can be forced to exactly
+    // 0.0 below, the shared validator re-checks fold consistency on `node`/`info` as they
+    // actually are at this call -- an always-on assertion, naming the offending class, because
+    // `PreflopNode`/`BundleInfo` are publicly constructible and `PreflopStore::from_sources`
+    // accepts a source without ever running the loader's admission gate (`checked_envelope`'s
+    // `check_fold_consistency_wide`). Skipped exactly where the fold-forcing branch below is
+    // also skipped (charts and `Unverified` never reach it), so it never fires spuriously on
+    // data this function was never going to trust anyway.
+    if !charts && info.ev_reference != EvReference::Unverified {
+        if let Err(msg) = check_fold_consistency(node, info) {
+            panic!("expand_node: fold-EV consistency invariant violated: {msg}");
+        }
+    }
     let actions: Vec<Action> = node.actions.iter().map(|s| to_chip_action(s, unit, actor_max_to)).collect();
-    let cols: Vec<Vec<f32>> = (0..node.actions.len()).map(|a| expand_column(&classes, &node.probs, a)).collect();
+    let cols: Vec<Vec<f32>> = (0..node.actions.len()).map(|a| expand_column(classes, &node.probs, a)).collect();
     let evs: Vec<Vec<Option<f32>>> = (0..node.actions.len())
         .map(|a| {
             if charts || info.ev_reference == EvReference::Unverified {
@@ -179,16 +234,19 @@ pub fn expand_node(node: &PreflopNode, info: &BundleInfo, actor: Seat, unit: u32
             }
             let is_fold = matches!(node.actions[a], PreflopStep::Fold);
             let src = node.ev_source_sb.as_ref();
-            let col = src.map(|rows| expand_optional(&classes, rows, a)).unwrap_or_else(|| vec![None; 1326]);
+            let col = src.map(|rows| expand_optional(classes, rows, a)).unwrap_or_else(|| vec![None; 1326]);
             col.into_iter()
                 .map(|v| {
                     normalize_ev(info.ev_reference, v, node.committed_by_actor_sb, info.source_stack_sb())
-                        .map(|x| if is_fold { 0.0 } else { ev_chips(x, unit) })
+                        // R1 (P3.T9 fix round 1): the checked conversion, never the infallible
+                        // `ev_chips`, so an unrepresentable chip EV propagates as `None` instead
+                        // of panicking or silently becoming `inf`/a fabricated zero.
+                        .and_then(|x| if is_fold { Some(0.0) } else { checked_ev_chips(x, unit) })
                 })
                 .collect()
         })
         .collect();
-    let unreachable = expand_mask(&classes, &node.unreachable);
+    let unreachable = expand_mask(classes, &node.unreachable);
     ExpandedNode {
         actor,
         actions,
@@ -200,20 +258,28 @@ pub fn expand_node(node: &PreflopNode, info: &BundleInfo, actor: Seat, unit: u32
     }
 }
 
-/// The one node-admission check beyond structural validation that this task adds: a *present*,
-/// verified fold reference must be self-consistent (spec section 8.3's cross-check, `1e-3`
-/// tolerance) at every hand class that declares one. [`crate::store::build_node_map`] calls this
-/// for every node and rejects the whole node -- and so, through the same `?` propagation
-/// `build_node_map`'s structural checks already use, the whole bundle -- on the first inconsistent
-/// class, naming it. That failure reaches the store through the same path a structural failure
-/// already takes (`load_bundle` -> `load_contained_bundle` -> `PreflopStore::open`'s quarantine
-/// loop), so a fold-inconsistent bundle is quarantined with a banner exactly like a malformed one,
-/// while every sibling bundle -- validated on its own bytes -- stays active (this task's Step 5).
+/// The narrowed, in-memory fold-consistency check (spec section 8.3's cross-check, `1e-3`
+/// tolerance) at every hand class that declares a fold EV, over an already-constructed
+/// `PreflopNode`/`BundleInfo` pair -- necessarily on `f32` cells, since that is all a
+/// `PreflopNode` ever stores.
+///
+/// P3.T9 fix round 1 (R2/R3): this is **not** the load-time admission decision. That gate is
+/// `crate::store::check_fold_consistency_wide`, run inside `checked_envelope` on the ORIGINAL
+/// wire-precision (`f64`) EV cells before `decode` narrows anything -- a bundle that fails there
+/// is quarantined through the usual `load_bundle` -> `load_contained_bundle` ->
+/// `PreflopStore::open` path, and a bundle that passes is never re-rejected here (a second,
+/// narrow-only check at that stage could disagree with the wide one purely from `f32` rounding
+/// right at the `1e-3` boundary, which is the exact defect R2 fixes). This function instead backs
+/// [`expand_node`]'s own boundary assertion (R3): `PreflopNode`/`BundleInfo` are publicly
+/// constructible and `PreflopStore::from_sources` accepts a source without ever running the
+/// loader, so `expand_node` re-checks fold consistency itself, on whatever it was actually given,
+/// before forcing a verified present fold to exactly `0.0` -- an always-on `assert`-style panic,
+/// naming the offending class, rather than silently trusting an invariant no admission path
+/// enforced.
 ///
 /// A missing fold action, a missing EV column, a missing per-class value, an unverified reference
-/// or a chart source (which never carries EV data at all, already rejected earlier at
-/// `checked_envelope`) are all silently fine -- [`verify_fold`] already returns `true` for every
-/// one of them.
+/// or a chart source (which never carries EV data at all) are all silently fine -- [`verify_fold`]
+/// already returns `true` for every one of them.
 pub(crate) fn check_fold_consistency(node: &PreflopNode, info: &BundleInfo) -> Result<(), String> {
     let Some(fold_idx) = node.actions.iter().position(|s| matches!(s, PreflopStep::Fold)) else {
         return Ok(());
@@ -236,16 +302,73 @@ pub(crate) fn check_fold_consistency(node: &PreflopNode, info: &BundleInfo) -> R
 impl BundleInfo {
     /// The combo -> 169-class table (spec section 4.1), computed once per process and shared by
     /// every bundle: the mapping depends only on `core_ranges::expand_169`'s fixed class order,
-    /// never on any per-bundle data, so every call after the first clones the cached table instead
-    /// of rebuilding it ("the table built once at bundle load", per the brief).
-    pub(crate) fn combo_classes(&self) -> ComboClasses {
+    /// never on any per-bundle data, so every caller **borrows** the one process-wide table
+    /// instead of rebuilding or cloning it.
+    ///
+    /// P3.T9 fix round 1 (R5): returns `&'static ComboClasses`, not an owned clone, and
+    /// `crate::store::load_bundle` calls this once at bundle admission (right after the
+    /// manifest deserializes, before the node bytes are even read) so the table is built at
+    /// load time -- not deferred to whichever bundle happens to be expanded first. Every later
+    /// call, from any bundle, from `expand_node`, or from this eager admission call itself,
+    /// returns the exact same `'static` table.
+    pub(crate) fn combo_classes(&self) -> &'static ComboClasses {
         static CLASSES: std::sync::OnceLock<ComboClasses> = std::sync::OnceLock::new();
-        CLASSES.get_or_init(ComboClasses::build).clone()
+        CLASSES.get_or_init(ComboClasses::build)
     }
 
-    /// The source stack in source SB units at this bundle's own depth: `source_blinds ==
-    /// [0.5, 1.0]` always (checked at load), so one source BB is exactly two source SB.
+    /// The source stack in source SB units at this bundle's own depth, in `f64` (P3.T9 fix round
+    /// 1, R2): `source_blinds == [0.5, 1.0]` always (checked at load), so one source BB is
+    /// exactly two source SB. `depth_bb` is a `u16`, exactly representable in both `f32` and
+    /// `f64`, so this and [`BundleInfo::source_stack_sb`] never disagree -- but the load-time wide
+    /// fold-EV admission gate (`crate::store::check_fold_consistency_wide`) uses this `f64` form
+    /// directly, never routing through the narrowed one first, to stay consistent with the
+    /// wide-before-narrow rule applied to every other quantity in that check.
+    pub(crate) fn source_stack_sb_f64(&self) -> f64 {
+        2.0 * self.depth_bb as f64
+    }
+
+    /// The narrowed `f32` form of [`BundleInfo::source_stack_sb_f64`], for [`expand_node`] and
+    /// every other in-memory (`f32`-domain) computation.
     pub(crate) fn source_stack_sb(&self) -> f32 {
-        2.0 * self.depth_bb as f32
+        self.source_stack_sb_f64() as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P3.T9 fix round 1, R5: `combo_classes` shares one process-wide table rather than handing
+    /// back a fresh clone -- two different `BundleInfo`s (and repeated calls on the same one)
+    /// must all borrow the identical `'static` allocation. `combo_classes` is `pub(crate)`, so
+    /// this white-box check lives inside the crate rather than in `tests/ev.rs`.
+    #[test]
+    fn combo_classes_is_a_shared_static_table_not_a_fresh_clone() {
+        fn info(bundle_id: &str) -> BundleInfo {
+            BundleInfo {
+                bundle_id: bundle_id.into(),
+                source: SourceKind::PokerDataJson,
+                depth_bb: 100,
+                depths: vec![100],
+                source_blinds: [0.5, 1.0],
+                rake_profile: "test".into(),
+                rake: None,
+                straddle: false,
+                version: 2,
+                game: "nl".into(),
+                ev_unit: "source_sb".into(),
+                ev_reference: EvReference::Unverified,
+                license_note: "test".into(),
+                accuracy: "unverified".into(),
+                sha256: String::new(),
+            }
+        }
+        let a = info("a");
+        let b = info("b");
+        let ra = a.combo_classes();
+        let rb = b.combo_classes();
+        let ra_again = a.combo_classes();
+        assert!(std::ptr::eq(ra, rb), "two different bundles must borrow the same static table");
+        assert!(std::ptr::eq(ra, ra_again), "repeated calls must borrow the same static table, never a fresh clone");
     }
 }
