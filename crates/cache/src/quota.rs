@@ -378,10 +378,14 @@ pub fn delete_cell(dir: &Path, cell: [u8; 32], index: &mut Index) -> bool {
 /// (module doc). A readable, correctly filed cell that carries an entry above `LAST_HIT_MAX` is
 /// corrupt in a narrower way (fix round 2 N1): that one row is reported (`eprintln`) and excluded
 /// from the index -- never deleted -- so a corrupt timestamp on one entry can never destroy the
-/// file, or any other entry the same cell holds, including the newest store. A cell with no usable
-/// entry left is itself left unindexed, on disk, rather than deleted or given a placeholder (which
-/// would otherwise let eviction re-derive its rows straight from the corrupt disk content). An
-/// unreadable directory -- including a cache root that does not exist yet -- scans as empty.
+/// file, or any other entry the same cell holds, including the newest store. A cell that ends up
+/// with *no* usable entry left (every row over the ceiling) is corrupt in the same way a misfiled
+/// cell is, not merely in this narrower way: it is deleted through the same identity-checked path,
+/// and a file that survives that deletion is accounted by a placeholder exactly as the misfiled arm
+/// below does, rather than left as an unindexed, unaccounted disk leak (fix round 3 N2). Re-deriving
+/// such a cell's rows during a later eviction pass cannot resurrect the corrupt content either --
+/// `rows_of_usable` excludes it there too, so the same deletion applies. An unreadable directory --
+/// including a cache root that does not exist yet -- scans as empty.
 pub fn scan_index(dir: &Path) -> Index {
     let mut index = Index::default();
     let Ok(shards) = std::fs::read_dir(dir) else { return index };
@@ -406,6 +410,18 @@ pub fn scan_index(dir: &Path) -> Index {
                     let rows = found.entries.iter().filter(|e| e.last_hit <= LAST_HIT_MAX).map(|e| (entry_key(e), e.last_hit)).collect::<Vec<_>>();
                     if !rows.is_empty() {
                         index.set_cell(key, &rows, measured(&path).unwrap_or(0));
+                    } else if !delete_cell(dir, key, &mut index) {
+                        // The file survived a refused deletion. `delete_cell`'s `settle` only
+                        // re-measures rows already in the index, and this cell has none yet --
+                        // this is `scan_index`'s first look at it this pass -- so account it
+                        // explicitly, the same placeholder the misfiled-cell arm below uses for
+                        // the structurally identical case, rather than let a failed deletion here
+                        // silently drop out of the quota's accounting (fix round 3 N2).
+                        if let Ok(m) = std::fs::symlink_metadata(&path) {
+                            if m.is_file() {
+                                index.account_placeholder(key, m.len());
+                            }
+                        }
                     }
                 }
                 found => {
@@ -613,15 +629,19 @@ pub fn enforce_quota(dir: &Path, quota: u64, index: &mut Index) {
     }
 }
 
-/// Evicts the one entry whose row key is `victim` from its cell: a cell that keeps another entry is
-/// rewritten with it; a cell left empty -- or unreadable, or misfiled, or whose rewrite fails (a
-/// full disk, a read-only root; leaving it would leave the store over quota) -- is deleted through
-/// `delete_cell`. A row whose entry is not in its cell at all (a placeholder whose file has since
-/// become readable) is stale: the cell's rows are re-derived from what is on disk and nothing is
-/// removed. A corrupt sibling entry (`last_hit` above `LAST_HIT_MAX`, fix round 2 N1) rides along in
-/// whatever is written back -- it is never itself evicted, and never deleted just for being corrupt
-/// -- but is excluded from the re-derived rows (`rows_of_usable`), so it can never re-enter the
-/// index. Returns `false` only when the cell had to be deleted and could not be.
+/// Evicts the one entry whose row key is `victim` from its cell: a cell that keeps at least one
+/// other *usable* entry is rewritten with it; a cell left with none at all -- empty, unreadable,
+/// misfiled, every surviving entry corrupt (an over-ceiling `last_hit`, fix round 3 N2), or whose
+/// rewrite fails (a full disk, a read-only root; leaving it would leave the store over quota) -- is
+/// deleted through `delete_cell` instead, never left orphaned on disk and unindexed. A row whose
+/// entry is not in its cell at all (a placeholder whose file has since become readable) is stale:
+/// the cell's rows are re-derived from what is on disk and nothing is removed, unless that
+/// re-derivation itself finds nothing usable, in which case the same deletion applies -- re-deriving
+/// a placeholder's rows can only ever filter to the same corrupt-or-empty set `rows_of_usable`
+/// already excludes elsewhere, never resurrect it. A corrupt sibling entry rides along in whatever
+/// is written back, as long as at least one usable entry survives beside it -- excluded from the
+/// re-derived rows (`rows_of_usable`) either way, so it can never re-enter the index. Returns
+/// `false` only when the cell had to be deleted and could not be.
 fn evict_entry(dir: &Path, victim: [u8; 32], index: &mut Index) -> bool {
     let Some(cell) = index.cell_of(&victim) else { return true };
     let path = entry_path(dir, cell);
@@ -633,25 +653,26 @@ fn evict_entry(dir: &Path, victim: [u8; 32], index: &mut Index) -> bool {
     if evicted.is_empty() {
         let rows = rows_of_usable(&kept);
         if rows.is_empty() {
-            index.drop_cell(cell);
-        } else {
-            let bytes = measured(&path).unwrap_or_else(|| index.cell_bytes(cell));
-            index.set_cell(cell, &rows, bytes);
+            return delete_cell(dir, cell, index);
         }
+        let bytes = measured(&path).unwrap_or_else(|| index.cell_bytes(cell));
+        index.set_cell(cell, &rows, bytes);
         return true;
     }
     if kept.is_empty() {
         return delete_cell(dir, cell, index);
     }
     let rows = rows_of_usable(&kept);
+    if rows.is_empty() {
+        // Every surviving entry is corrupt: writing it back would just republish garbage under
+        // the same name for nothing, so the cell is deleted outright instead (fix round 3 N2),
+        // exactly as when `kept` itself is empty above.
+        return delete_cell(dir, cell, index);
+    }
     let rewritten = encode(&Cell { entries: kept.into_iter().map(|(_, e)| e).collect() }).and_then(|bytes| write_atomic(&path, &bytes).map(|()| bytes.len() as u64));
     match rewritten {
         Ok(len) => {
-            if rows.is_empty() {
-                index.drop_cell(cell);
-            } else {
-                index.set_cell(cell, &rows, measured(&path).unwrap_or(len));
-            }
+            index.set_cell(cell, &rows, measured(&path).unwrap_or(len));
             true
         }
         Err(_) => delete_cell(dir, cell, index),
