@@ -6,3 +6,4 @@ table { width: 100%; border-collapse: collapse; } th, td { padding: 6px; text-al
 section, aside, fieldset { border: 1px solid #405260; padding: 12px; margin: 10px 0; }
 [role=alert] { color: #ffbdad; } [data-prominent=true] { font-weight: 700; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; } label { display: inline-block; }
+.experimental { border: 2px dashed #c8a66a; background: #302a21; }
