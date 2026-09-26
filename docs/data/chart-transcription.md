@@ -218,7 +218,249 @@ both `"available"`. Nothing here recorded an `"unsupported"` depth.
 
 ## PokerCoaching 100bb transcription (Task 5)
 
-*Not started.*
+Completed 2026-09-26. Source: the committed `fixtures/charts/sources/pokercoaching_100.pdf`
+(SHA-256 `f5686c6d...149d091b`, as recorded under Task 4). Outputs:
+`fixtures/charts/transcription/pokercoaching_100.json` (22 transcribed grids and a 45-row
+inventory), the built envelope `fixtures/charts/pokercoaching_100.json` (22 nodes, 3718
+classes, SHA-256 `97670f854018a17f6c9e1bcc851ec1a24a3e29492633aa25f60bf6ed19c4fa86`) and its
+manifest `fixtures/charts/pokercoaching_100.manifest.json` (`source = "ChartTranscription"`,
+`ev_reference = "unverified"`, `rake_profile = "undocumented"`, `rake = null`, `accuracy =
+"unverified"`, no `evs` anywhere).
+
+### Page numbering and page content (correction note, 2026-09-26)
+
+This section numbers pages in **physical PDF page order**, which is the order every PDF viewer
+and PDFium use. Task 4 above numbered pages by PDF object order, and so did the plan's Task 5
+checklist. The two orders differ:
+
+| Physical page | Content | Task 4 / plan numbering |
+|---|---|---|
+| 1 | Cover: one full-page photo collage (1920x1483 JPEG), with a promotional title over a tilted, partly hidden fragment of a colour grid. It has no chart title, no legend and no complete grid, so it produces no node. | "page 6 (object 96)": the page with no extracted text |
+| 2 | "Instructions": text only. The bet-sizing paragraph and the "Implementable" rounding rule that Task 4 decoded; the rendered page matches that decoded text. | "page 1" |
+| 3 | "Raise First In (RFI)": 5 grids (Lojack, Hijack, Cutoff, Button, Small Blind) | "page 2" |
+| 4 | "Facing RFI: In Position": 6 grids (HJ vs LJ, CO vs LJ, CO vs HJ, BTN vs LJ, BTN vs HJ, BTN vs CO) | "page 3" |
+| 5 | "Facing RFI: Out of Position": 8 grids (SB vs LJ/HJ/CO/BTN, BB vs LJ/HJ/CO/BTN) | "page 4" |
+| 6 | "Blind vs Blind": 3 grids (Small Blind Strategy, Big Blind vs SB Limp, Big Blind vs SB raise) | "page 5" |
+
+A second correction to Task 4: the 13x13 grids are not vector paths. Each grid, together with
+its legend panel, is one embedded JPEG (`DCTDecode`, about 400x480 px, 30 px cell pitch), so
+there are 22 grid images on pages 3-6. The chart titles are the only text objects on those
+pages. Each title was matched to the image directly beneath it by page coordinates: every
+title's centre lies over its image's centre.
+
+### How the pages were read
+
+- **Renderer (a deviation from the Files list, see the report):** `tools/chart_render.py`,
+  using `pypdfium2==5.13.0` (PDFium 153.0.7999.0), which is now pinned in
+  `tools/pyproject.toml` and `tools/requirements.txt`. PNGs are written by a stdlib encoder, and
+  the output is deterministic (tested). All renders went to the session scratch directory
+  outside the repository and none is committed. Renders made: all six pages at 100 DPI, for
+  layout and titles; each of the 22 grid image regions cropped at 400 DPI, for pass 1; the same
+  regions at 300 DPI, a second rendering, for pass 2; and each embedded JPEG decoded at native
+  resolution, for pass 3.
+- **Orientation check:** every cell prints its own hand label, for example `AKs` at row 0
+  column 1 and `AKo` at row 1 column 0. So row r, column c is class `r*13+c` of `class_names()`:
+  pairs on the diagonal, suited above it, offsuit below it, with the high rank first in both.
+  This was confirmed on every grid before any cell was transcribed.
+- **Pass 1** (400 DPI, top row first) was the transcription.
+- **Pass 2** (300 DPI, read in reverse row order from the 22s row up to the A row) was the
+  reread. It was recorded separately and then compared by script. Limitation, disclosed: a
+  single agent performed both visual passes, so pass 1 was not hidden from pass 2 in the strict
+  sense the brief intends. Pass 3 is the independent read.
+- **Pass 3, a pixel classifier:** a throwaway script that is not committed. It finds each
+  image's 30 px cell lattice from the bright 2 px gaps between cells. For each cell it takes the
+  dominant quantized fill colour of the 22x22 px interior, ignoring the minority text pixels.
+  It flags any cell whose interior holds a second fill colour covering at least 15% of that
+  interior. Its output was written to a file and not viewed until pass 1 had been recorded.
+- **Result:** all three reads agree on **3718/3718 cells** (22 grids x 169). The classifier
+  flagged **0** cells as possibly mixed and found **0** unknown colours. Every grid's per-action
+  combo totals equal the combo counts printed in its own legend panel (table below). There are
+  no mixed cells: every cell is one pure colour, which fits page 2's rule of playing one
+  dominant action per hand. Every weight is therefore exactly `0.0` or `1.0`.
+- **Pass-1 recording slips:** 5 row strings of the page-6 Small Blind Strategy grid (rows A, K,
+  Q, T and 8) were mistyped while being written down, not misread. They were caught on
+  self-review before any comparison ran. No cell needed a correction after comparison.
+
+### Legend as read from the raster pages
+
+Each grid image has its own legend panel. It has columns "Action" and "Hands", and each row
+shows: action label | % of all 1326 combos | combos / denominator | % of played combos.
+
+- **Colours:** red = Raise (RFI and BB vs SB limp), 3Bet or 3bet (facing RFI, BB vs SB raise),
+  or Raise/4bet (SB strategy). Blue = Limp (SB RFI), Call, Check (BB vs SB limp), or Raise/Call
+  (SB strategy). Green = Raise/Fold. Dark grey = Limp/Raise. Orange = Limp/Call. Pink =
+  Limp/Fold. White (uncoloured) = the legend's own "Fold" row in every chart.
+- **Pair borders:** a dark border on the diagonal pair cells marks the pairs. It is not an
+  action.
+- **No bet sizes:** the raster legends carry none. Sizes come only from the page-2 bet-sizing
+  paragraph that Task 4 decoded, which the page-2 render confirms. RFI is 2.5bb, SB RFI 3bb,
+  in-position 3bet 3.5x, out-of-position 3bet 4x, BB raise facing an SB limp 3.5x, out-of-
+  position 4bet 2.5x, in-position 4bet 2.3x.
+- **Rake:** no raster page mentions rake.
+
+Published legend rows, read from each image. Combo counts are what the tests pin through
+`published_combos`:
+
+| Page | Chart | Legend rows (label: % of all, combos) |
+|---|---|---|
+| 3 | Lojack | Raise 17.0% 226/226; Fold 83.0% 1100/1326 |
+| 3 | Hijack | Raise 21.4% 284/284; Fold 78.6% 1042/1326 |
+| 3 | Cutoff | Raise 27.8% 368/368; Fold 72.2% 958/1326 |
+| 3 | Button | Raise 43.3% 574/574; Fold 56.7% 752/1326 |
+| 3 | Small Blind | Raise 24.3% 322/826; Limp 38.0% 504/826; Fold 37.7% 500/1326 |
+| 4 | HJ vs LJ RFI | 3Bet 8.1% 108/108; Fold 91.9% 1218/1326 |
+| 4 | CO vs LJ RFI | 3Bet 8.6% 114/114; Fold 91.4% 1212/1326 |
+| 4 | CO vs HJ RFI | 3Bet 10.1% 134/134; Fold 89.9% 1192/1326 |
+| 4 | BTN vs LJ RFI | 3Bet 7.2% 96/188; Call 6.9% 92/188; Fold 85.8% 1138/1326 |
+| 4 | BTN vs HJ RFI | 3Bet 8.9% 118/202; Call 6.3% 84/202; Fold 84.8% 1124/1326 |
+| 4 | BTN vs CO RFI | 3Bet 12.1% 160/232; Call 5.4% 72/232; Fold 82.5% 1094/1326 |
+| 5 | SB vs LJ RFI | 3Bet 7.2% 96/96; Fold 92.8% 1230/1326 |
+| 5 | SB vs HJ RFI | 3Bet 8.7% 116/116; Fold 91.3% 1210/1326 |
+| 5 | SB vs CO RFI | 3Bet 11.0% 146/146; Fold 89.0% 1180/1326 |
+| 5 | SB vs BTN RFI | 3Bet 15.1% 200/200; Fold 84.9% 1126/1326 |
+| 5 | BB vs LJ RFI | 3Bet 5.7% 76/382; Call 23.1% 306/382; Fold 71.2% 944/1326 |
+| 5 | BB vs HJ RFI | 3Bet 7.4% 98/418; Call 24.1% 320/418; Fold 68.5% 908/1326 |
+| 5 | BB vs CO RFI | 3Bet 9.7% 128/470; Call 25.8% 342/470; Fold 64.6% 856/1326 |
+| 5 | BB vs BTN RFI | 3Bet 13.4% 178/754; Call 43.4% 576/754; Fold 43.1% 572/1326 |
+| 6 | Small Blind Strategy | Raise/4bet 4.4% 58/826; Raise/Call 9.0% 120/826; Raise/Fold 10.9% 144/826; Limp/Raise 5.1% 68/826; Limp/Call 15.4% 204/826; Limp/Fold 17.5% 232/826; Fold 37.7% 500/1326 |
+| 6 | Big Blind vs SB Limp | Raise 40.4% 536/1326; Check 59.6% 790/1326; Fold 0.0% 0/1326 |
+| 6 | Big Blind vs SB raise | 3bet 16.4% 218/858; Call 48.3% 640/858; Fold 35.3% 468/1326 |
+
+### Menus, resolved sizes and judgement calls
+
+Sizes are frozen as raise-to values in `to_bb_x1000`, never as labels.
+
+- **Opens:** 2500 (2.5bb), and 3000 for the SB.
+- **3bets:** in position (HJ/CO/BTN vs an open) 3.5 x 2.5 = 8.75bb, `8750`. Out of position
+  (SB/BB vs an open) 4 x 2.5 = 10bb, `10000`. BB vs an SB 3bb open: the BB has position on the
+  SB, so 3.5 x 3 = 10.5bb, `10500`.
+- **BB raise over an SB limp:** 3.5 x 1bb = 3.5bb, `3500`.
+- **SB 4bet over the BB 3bet:** out of position, 2.5 x 10.5 = 26.25bb, `26250`.
+- **Menus follow each chart's legend rows.** HJ vs LJ, CO vs LJ, CO vs HJ and all four SB-vs-
+  open charts have only the 3Bet and Fold rows, so their menu is `fold / raise` with no
+  zero-weight call invented. Big Blind vs SB Limp shows "Fold 0/1326", but the BB owes nothing
+  after a limp and `core_model` then offers Check rather than Fold, so the menu is
+  `check / raise 3.5bb`.
+- **SB first-in overlap:** page 3 "Small Blind" and page 6 "Small Blind Strategy" are the same
+  node key (four folds, actor SB). The bundle holds that node once, transcribed from page 3.
+  The page-6 first action matches page 3 in 169/169 cells: Raise/4bet, Raise/Call and
+  Raise/Fold count as raise; Limp/Raise, Limp/Call and Limp/Fold count as limp. The totals match
+  too: 322/504/500. Inventory rows 5 and 20 both record this key. The test
+  `test_pokercoaching_100_sb_first_in_is_one_node_reconciled_across_pages_3_and_6` pins the
+  reconciliation.
+- **RFI response to a later 3bet:**
+  - **Pages 3-5 (non-blind openers):** no colour encodes a future response; those legends are
+    Raise/Fold and 3Bet/Call/Fold only. So all 14 opener-vs-3bettor spots are inventoried
+    `absent`.
+  - **Page 6, SB:** the Small Blind Strategy colours each SB raising hand with its complete
+    response to the BB 3bet: Raise/4bet 58, Raise/Call 120, Raise/Fold 144. That covers all 322
+    raise combos. The opponent scope is the BB alone, and every size comes from page 2. So one
+    node was added: SB faces the BB 3bet, history `UTG f, HJ f, CO f, BTN f, SB r3, BB r10.5`,
+    menu `fold / call / raise 26.25bb`.
+  - **Unreachable classes:** the 119 classes the SB limps or folds first are
+    `unreachable_classes`, with all-zero weights. Their page-3 raise weight is exactly 0, which
+    `test_pokercoaching_100_unreachable_classes_are_exactly_those_the_actor_never_raised`
+    checks.
+  - **Raise/call and raise/fold annotations** were not treated as current actions anywhere.
+- **SB limp, then facing the BB raise** (Limp/Raise, Limp/Call, Limp/Fold): inventoried
+  `absent`, because the size is unresolved. No page states the size of the SB's re-raise after
+  limping, and a node cannot exist without a raise-to amount.
+
+### Inventory (45 rows: 23 covered rows for 22 distinct node keys, 22 absent)
+
+| # | Status | Page | Title | History key | Next actor | Menu |
+|---|---|---|---|---|---|---|
+| 1 | covered | 3 | Raise First In (RFI): Lojack | (empty) | UTG | fold / raise 2.5bb |
+| 2 | covered | 3 | Raise First In (RFI): Hijack | UTG f | HJ | fold / raise 2.5bb |
+| 3 | covered | 3 | Raise First In (RFI): Cutoff | UTG f, HJ f | CO | fold / raise 2.5bb |
+| 4 | covered | 3 | Raise First In (RFI): Button | UTG f, HJ f, CO f | BTN | fold / raise 2.5bb |
+| 5 | covered | 3 | Raise First In (RFI): Small Blind | UTG f, HJ f, CO f, BTN f | SB | fold / call / raise 3bb |
+| 6 | covered | 4 | Facing RFI: In Position: HJ vs LJ RFI | UTG r2.5 | HJ | fold / raise 8.75bb |
+| 7 | covered | 4 | Facing RFI: In Position: CO vs LJ RFI | UTG r2.5, HJ f | CO | fold / raise 8.75bb |
+| 8 | covered | 4 | Facing RFI: In Position: CO vs HJ RFI | UTG f, HJ r2.5 | CO | fold / raise 8.75bb |
+| 9 | covered | 4 | Facing RFI: In Position: BTN vs LJ RFI | UTG r2.5, HJ f, CO f | BTN | fold / call / raise 8.75bb |
+| 10 | covered | 4 | Facing RFI: In Position: BTN vs HJ RFI | UTG f, HJ r2.5, CO f | BTN | fold / call / raise 8.75bb |
+| 11 | covered | 4 | Facing RFI: In Position: BTN vs CO RFI | UTG f, HJ f, CO r2.5 | BTN | fold / call / raise 8.75bb |
+| 12 | covered | 5 | Facing RFI: Out of Position: SB vs LJ RFI | UTG r2.5, HJ f, CO f, BTN f | SB | fold / raise 10bb |
+| 13 | covered | 5 | Facing RFI: Out of Position: SB vs HJ RFI | UTG f, HJ r2.5, CO f, BTN f | SB | fold / raise 10bb |
+| 14 | covered | 5 | Facing RFI: Out of Position: SB vs CO RFI | UTG f, HJ f, CO r2.5, BTN f | SB | fold / raise 10bb |
+| 15 | covered | 5 | Facing RFI: Out of Position: SB vs BTN RFI | UTG f, HJ f, CO f, BTN r2.5 | SB | fold / raise 10bb |
+| 16 | covered | 5 | Facing RFI: Out of Position: BB vs LJ RFI | UTG r2.5, HJ f, CO f, BTN f, SB f | BB | fold / call / raise 10bb |
+| 17 | covered | 5 | Facing RFI: Out of Position: BB vs HJ RFI | UTG f, HJ r2.5, CO f, BTN f, SB f | BB | fold / call / raise 10bb |
+| 18 | covered | 5 | Facing RFI: Out of Position: BB vs CO RFI | UTG f, HJ f, CO r2.5, BTN f, SB f | BB | fold / call / raise 10bb |
+| 19 | covered | 5 | Facing RFI: Out of Position: BB vs BTN RFI | UTG f, HJ f, CO f, BTN r2.5, SB f | BB | fold / call / raise 10bb |
+| 20 | covered | 6 | Blind vs Blind: Small Blind Strategy (first action) | UTG f, HJ f, CO f, BTN f | SB | same node as row 5 (reconciled) |
+| 21 | covered | 6 | Blind vs Blind: Big Blind vs SB Limp | UTG f, HJ f, CO f, BTN f, SB c | BB | check / raise 3.5bb |
+| 22 | covered | 6 | Blind vs Blind: Big Blind vs SB raise | UTG f, HJ f, CO f, BTN f, SB r3 | BB | fold / call / raise 10.5bb |
+| 23 | covered | 6 | Blind vs Blind: Small Blind Strategy (second action after Raise, facing the Big Blind 3bet) | UTG f, HJ f, CO f, BTN f, SB r3, BB r10.5 | SB | fold / call / raise 26.25bb |
+| 24 | absent | 6 | Blind vs Blind: Small Blind Strategy (second action after Limp, facing the Big Blind raise) | UTG f, HJ f, CO f, BTN f, SB c, BB r3.5 | SB | -- (re-raise size unpublished) |
+| 25 | absent | 3 | RFI response to a later 3bet: LJ open, HJ 3bet | UTG r2.5, HJ r8.75, CO f, BTN f, SB f, BB f | UTG | -- |
+| 26 | absent | 3 | RFI response to a later 3bet: LJ open, CO 3bet | UTG r2.5, HJ f, CO r8.75, BTN f, SB f, BB f | UTG | -- |
+| 27 | absent | 3 | RFI response to a later 3bet: LJ open, BTN 3bet | UTG r2.5, HJ f, CO f, BTN r8.75, SB f, BB f | UTG | -- |
+| 28 | absent | 3 | RFI response to a later 3bet: LJ open, SB 3bet | UTG r2.5, HJ f, CO f, BTN f, SB r10, BB f | UTG | -- |
+| 29 | absent | 3 | RFI response to a later 3bet: LJ open, BB 3bet | UTG r2.5, HJ f, CO f, BTN f, SB f, BB r10 | UTG | -- |
+| 30 | absent | 3 | RFI response to a later 3bet: HJ open, CO 3bet | UTG f, HJ r2.5, CO r8.75, BTN f, SB f, BB f | HJ | -- |
+| 31 | absent | 3 | RFI response to a later 3bet: HJ open, BTN 3bet | UTG f, HJ r2.5, CO f, BTN r8.75, SB f, BB f | HJ | -- |
+| 32 | absent | 3 | RFI response to a later 3bet: HJ open, SB 3bet | UTG f, HJ r2.5, CO f, BTN f, SB r10, BB f | HJ | -- |
+| 33 | absent | 3 | RFI response to a later 3bet: HJ open, BB 3bet | UTG f, HJ r2.5, CO f, BTN f, SB f, BB r10 | HJ | -- |
+| 34 | absent | 3 | RFI response to a later 3bet: CO open, BTN 3bet | UTG f, HJ f, CO r2.5, BTN r8.75, SB f, BB f | CO | -- |
+| 35 | absent | 3 | RFI response to a later 3bet: CO open, SB 3bet | UTG f, HJ f, CO r2.5, BTN f, SB r10, BB f | CO | -- |
+| 36 | absent | 3 | RFI response to a later 3bet: CO open, BB 3bet | UTG f, HJ f, CO r2.5, BTN f, SB f, BB r10 | CO | -- |
+| 37 | absent | 3 | RFI response to a later 3bet: BTN open, SB 3bet | UTG f, HJ f, CO f, BTN r2.5, SB r10, BB f | BTN | -- |
+| 38 | absent | 3 | RFI response to a later 3bet: BTN open, BB 3bet | UTG f, HJ f, CO f, BTN r2.5, SB f, BB r10 | BTN | -- |
+| 39 | absent | -- | BB RFI (folded to the big blind) | UTG f, HJ f, CO f, BTN f, SB f | (hand over) | -- |
+| 40 | absent | -- | Squeeze: BB facing a LJ open and an HJ call | UTG r2.5, HJ c, CO f, BTN f, SB f | BB | -- |
+| 41 | absent | -- | BB defence facing a BTN open and an SB call | UTG f, HJ f, CO f, BTN r2.5, SB c | BB | -- |
+| 42 | absent | -- | Cold call or cold 4bet facing an open and a 3bet: CO facing LJ open, HJ 3bet | UTG r2.5, HJ r8.75 | CO | -- |
+| 43 | absent | -- | vs-4bet: HJ facing the LJ 4bet after HJ 3bet | UTG r2.5, HJ r8.75, CO f, BTN f, SB f, BB f, UTG r21.875 | HJ | -- |
+| 44 | absent | 6 | vs-4bet: BB facing the SB 4bet after BB 3bet | UTG f, HJ f, CO f, BTN f, SB r3, BB r10.5, SB r26.25 | BB | -- |
+| 45 | absent | -- | Facing a limp outside the blinds: HJ facing a LJ limp | UTG c | HJ | -- |
+
+Notes on the inventory:
+
+- **LJ is always normalized to `UTG`.**
+- **Every covered history lists every intervening fold explicitly.** Its next actor was checked
+  both by the Python test `test_pokercoaching_100_every_node_actor_is_the_next_seat_to_act`,
+  which mirrors `core_preflop::store::next_actor`, and by `build`'s `validate`.
+- **Rows 40-45 are representative keys:** each stands for a whole family of spots that no page
+  covers. Each row's `reason` field records the visual finding.
+- **The BB defence rows are not interchangeable:** row 41, a BB decision after an opener and a
+  caller, is deliberately distinct from the covered row 19, where the SB folds. No chart is
+  inserted under another chart's history.
+- **Physical page 1 (the cover)** was inspected for any encoding of a future response and holds
+  none.
+
+### Per-grid verification record
+
+Every grid meets the same standard:
+
+- page and exact chart title as in the table above;
+- checked class count 169;
+- pass 1 (400 DPI, top-down), pass 2 (300 DPI, reverse row order) and pass 3 (pixel classifier,
+  native JPEG) all agree;
+- per-code combo totals equal the published legend;
+- mixed cells 0, corrections 0, verification complete 2026-09-26.
+
+That record holds for: Lojack, Hijack, Cutoff, Button, Small Blind (page 3); HJ vs LJ, CO vs LJ,
+CO vs HJ, BTN vs LJ, BTN vs HJ, BTN vs CO RFI (page 4); SB vs LJ/HJ/CO/BTN RFI and BB vs
+LJ/HJ/CO/BTN RFI (page 5); Small Blind Strategy, Big Blind vs SB Limp, Big Blind vs SB raise
+(page 6).
+
+- **Boundary hands:** every cell was compared, which includes every range boundary.
+- **Sum-to-one:** the class-sum check was not used as evidence that any cell was read
+  correctly. It is reported only as `validate` output.
+
+### Build / validate / verify (2026-09-26)
+
+```
+> python tools/chart_ingest.py build fixtures/charts/transcription/pokercoaching_100.json fixtures/charts/pokercoaching_100.json fixtures/charts/pokercoaching_100.manifest.json
+(exit 0)
+> python tools/chart_ingest.py validate fixtures/charts/pokercoaching_100.json
+(22 per-node class-sum lines: nodes 0-20 all 169 sums = 1.0; node 21, the SB response to the BB 3bet, has 50 sums = 1.0 and 119 = 0.0, the declared unreachable classes)
+{"aggregate_min": 0.0, "aggregate_max": 1.0}
+> python tools/chart_ingest.py verify fixtures/charts/transcription/pokercoaching_100.json fixtures/charts/pokercoaching_100.json fixtures/charts/pokercoaching_100.manifest.json
+verified 22 nodes, 3718 classes
+```
 
 ## RangeConverter 200bb transcription (Task 6)
 

@@ -1142,3 +1142,170 @@ def test_assert_committed_bytes_match_passes_on_a_genuine_match(tmp_path):
     path = tmp_path / "good.bin"
     path.write_bytes(b"exact-bytes")
     assert_committed_bytes_match(path, len(b"exact-bytes"), hashlib.sha256(b"exact-bytes").hexdigest())
+
+
+# --- P3.T5: the committed PokerCoaching 100bb ChartTranscription bundle ---
+
+
+def _bundle(name):
+    p = ROOT / "fixtures/charts"
+    e = json.loads((p / f"{name}.json").read_text(encoding="utf-8"))
+    t = json.loads((p / "transcription" / f"{name}.json").read_text(encoding="utf-8"))
+    return e, t
+
+
+@pytest.mark.skipif(100 not in available_depths(), reason="depth 100 unsupported")
+def test_pokercoaching_100_bundle():
+    e, t = _bundle("pokercoaching_100")
+    validate(e)
+    assert e["depth_bb"] == 100
+    assert all("evs" not in n for n in e["nodes"])
+    assert build(t) == e
+    assert {json.dumps(n["history"]) for n in e["nodes"]} == {
+        json.dumps(r["history"]) for r in t["inventory"] if r["status"] == "covered"}
+    assert any(r["status"] == "absent" for r in t["inventory"]), "the absent audit is part of the record"
+
+
+@pytest.mark.skipif(100 not in available_depths(), reason="depth 100 unsupported")
+def test_pokercoaching_100_committed_bytes_and_manifest_hash_verify():
+    """The committed envelope/manifest pair is exactly what `build` writes from the committed
+    transcription (byte-for-byte), and the manifest's `sha256` is the hash of the committed
+    envelope's actual bytes read from disk -- never skipped on a mismatch or a missing file."""
+    import hashlib
+
+    base = ROOT / "fixtures/charts"
+    envelope_path = base / "pokercoaching_100.json"
+    manifest_path = base / "pokercoaching_100.manifest.json"
+    transcription_path = base / "transcription" / "pokercoaching_100.json"
+    for path in (envelope_path, manifest_path, transcription_path):
+        assert path.is_file(), f"{path} is missing"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["sha256"] == hashlib.sha256(envelope_path.read_bytes()).hexdigest()
+    assert manifest["source"] == "ChartTranscription"
+    assert manifest["ev_reference"] == "unverified"
+    assert manifest["rake"] is None and manifest["rake_profile"] == "undocumented"
+    assert chart_ingest.verify(transcription_path, envelope_path, manifest_path).startswith("verified ")
+
+
+@pytest.mark.skipif(100 not in available_depths(), reason="depth 100 unsupported")
+def test_pokercoaching_100_every_node_actor_is_the_next_seat_to_act():
+    """Each covered node's declared actor is the seat whose turn it is after its full,
+    explicitly-folded history (the rule `core_preflop::store::next_actor` enforces at load),
+    so no chart is keyed under another spot's prefix."""
+    e, _ = _bundle("pokercoaching_100")
+    for n in e["nodes"]:
+        folded, idx = set(), 0
+        for pos, step, _amount in n["history"]:
+            while POSITIONS_ORDER[idx % 6] in folded:
+                idx += 1
+            assert POSITIONS_ORDER[idx % 6] == pos, f"out-of-turn {pos} in {n['history']}"
+            if step == "fold":
+                folded.add(pos)
+            idx += 1
+        while POSITIONS_ORDER[idx % 6] in folded:
+            idx += 1
+        assert n["actor"] == POSITIONS_ORDER[idx % 6], n["history"]
+
+
+POSITIONS_ORDER = ("UTG", "HJ", "CO", "BTN", "SB", "BB")
+
+
+def _combos(r, c):
+    return 6 if r == c else (4 if r < c else 12)
+
+
+@pytest.mark.skipif(100 not in available_depths(), reason="depth 100 unsupported")
+def test_pokercoaching_100_grids_reproduce_each_published_legend_combo_count():
+    """Every transcribed grid's per-code combo total equals the combo count printed in that
+    chart's own legend panel (e.g. Lojack 'Raise 226 / 226', 'Fold 1100 / 1326') -- an
+    action-total cross-check against the source, independent of the per-class sum-to-one rule."""
+    _, t = _bundle("pokercoaching_100")
+    assert len(t["nodes"]) == 22
+    for n in t["nodes"]:
+        totals = {}
+        for r, row in enumerate(n["rows"]):
+            for c, code in enumerate(row):
+                totals[code] = totals.get(code, 0) + _combos(r, c)
+        assert totals == n["published_combos"], n["title"]
+        assert sum(totals.values()) == 1326, n["title"]
+
+
+def _node_by_history(e, history):
+    matches = [n for n in e["nodes"] if n["history"] == history]
+    assert len(matches) == 1, history
+    return matches[0]
+
+
+@pytest.mark.skipif(100 not in available_depths(), reason="depth 100 unsupported")
+def test_pokercoaching_100_unreachable_classes_are_exactly_those_the_actor_never_raised():
+    """A class is declared unreachable only where the actor's own preceding source action has
+    weight exactly zero (brief Step 4), and every class that action reaches carries a strategy."""
+    e, _ = _bundle("pokercoaching_100")
+    checked = 0
+    for n in e["nodes"]:
+        if not n["unreachable_classes"]:
+            continue
+        k = max(i for i, (pos, _step, _amount) in enumerate(n["history"]) if pos == n["actor"])
+        pos, step, amount = n["history"][k]
+        parent = _node_by_history(e, n["history"][:k])
+        wanted = {"step": step, "to_bb_x1000": amount} if amount else {"step": step}
+        a = parent["actions"].index(wanted)
+        never = {c for c in range(169) if parent["weights"][a][c] == 0}
+        assert set(n["unreachable_classes"]) == never, n["history"]
+        checked += 1
+    assert checked == 1  # the SB's response to the BB 3bet (page 6) is the only such node
+
+
+@pytest.mark.skipif(100 not in available_depths(), reason="depth 100 unsupported")
+def test_pokercoaching_100_sb_first_in_is_one_node_reconciled_across_pages_3_and_6():
+    """Page 3's 'Small Blind' RFI grid and page 6's 'Small Blind Strategy' share one node key;
+    the bundle holds that node once, and page 6's first action (Raise/* or Limp/* or Fold)
+    agrees with page 3 in all 169 cells."""
+    e, t = _bundle("pokercoaching_100")
+    sb_first_in = [["UTG", "fold", 0], ["HJ", "fold", 0], ["CO", "fold", 0], ["BTN", "fold", 0]]
+    rows = [r for r in t["inventory"] if r["history"] == sb_first_in]
+    assert sorted((r["status"], r["page"]) for r in rows) == [("covered", 3), ("covered", 6)]
+    assert sum(1 for n in e["nodes"] if n["history"] == sb_first_in) == 1
+    page3 = next(n for n in t["nodes"] if n["history"] == sb_first_in)
+    page6 = next(n for n in t["nodes"] if n["history"] == sb_first_in + [["SB", "raise", 3000], ["BB", "raise", 10500]])
+    first_action = {"R4": "R", "RC": "R", "RF": "R", "LR": "L", "LC": "L", "LF": "L", "F": "F"}
+    for r in range(13):
+        for c in range(13):
+            assert first_action[page6["rows"][r][c]] == page3["rows"][r][c], (r, c)
+
+
+# --- P3.T5 (deviation, see docs/data/chart-transcription.md): the dev-only page renderer the
+# raster grid pages were read with. ---
+
+
+def test_chart_render_png_bytes_is_a_valid_deterministic_rgb_png():
+    import struct
+    import zlib
+
+    from chart_render import png_bytes
+
+    rgb = bytes([255, 0, 0, 0, 255, 0, 0, 0, 255, 10, 20, 30])  # 2x2 pixels
+    data = png_bytes(2, 2, rgb)
+    assert data == png_bytes(2, 2, rgb)
+    assert data.startswith(b"\x89PNG\r\n\x1a\n")
+    assert data[12:16] == b"IHDR"
+    assert struct.unpack(">IIBBBBB", data[16:29]) == (2, 2, 8, 2, 0, 0, 0)
+    idat_len = struct.unpack(">I", data[33:37])[0]
+    assert data[37:41] == b"IDAT"
+    raw = zlib.decompress(data[41:41 + idat_len])
+    assert raw == b"\x00" + rgb[:6] + b"\x00" + rgb[6:]
+    assert data.endswith(b"IEND\xaeB`\x82")
+
+
+def test_chart_render_renders_a_committed_source_page_deterministically(tmp_path):
+    from chart_render import render_pages
+
+    pdf = ROOT / "fixtures/charts/sources/pokercoaching_100.pdf"
+    first = render_pages(pdf, 2, 2, 72, tmp_path / "a")
+    second = render_pages(pdf, 2, 2, 72, tmp_path / "b")
+    assert [p.name for p in first] == ["page02_72dpi.png"]
+    assert first[0].read_bytes() == second[0].read_bytes()
+    import struct
+
+    width, height = struct.unpack(">II", first[0].read_bytes()[16:24])
+    assert (width, height) == (720, 405)

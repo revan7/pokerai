@@ -1,0 +1,1494 @@
+{
+  "bundle_id": "pokercoaching_100",
+  "depth_bb": 100,
+  "rake_profile": "undocumented",
+  "straddle": false,
+  "license_note": "PokerCoaching 'Implementable GTO Charts' (public PDF online-6max-gto-charts.pdf), transcribed cell by cell for private use; not redistributed. Frequencies are the published pure 0/1 displayed choices; no EVs.",
+  "accuracy": "unverified",
+  "rake": null,
+  "source": {
+    "file": "fixtures/charts/sources/pokercoaching_100.pdf",
+    "sha256": "f5686c6dd672c782249752c60cd4ff5850378271e2139abc2b15e690149d091b",
+    "page_numbering": "physical PDF page order (page 1 cover image, 2 Instructions, 3 RFI, 4 Facing RFI: In Position, 5 Facing RFI: Out of Position, 6 Blind vs Blind)",
+    "cell_orientation": "row r, column c of the 13x13 grid is class r*13+c (A-2 row-major): pairs on the diagonal, suited above, offsuit below, matching the hand label printed in every cell"
+  },
+  "nodes": [
+    {
+      "title": "Raise First In (RFI): Lojack",
+      "page": 3,
+      "source_image": "page 3, embedded grid image 0 of 5 (top left), under the 'Lojack' label",
+      "history": [],
+      "actor": "UTG",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 2500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row 'Raise' (2.5bb open)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 226, "F": 1100},
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "F", "F", "F", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Raise First In (RFI): Hijack",
+      "page": 3,
+      "source_image": "page 3, embedded grid image 1 of 5 (top right), under the 'Hijack' label",
+      "history": [
+        ["UTG", "fold", 0]
+      ],
+      "actor": "HJ",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 2500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row 'Raise' (2.5bb open)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 284, "F": 1042},
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "F", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "R", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "R", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "R", "R", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Raise First In (RFI): Cutoff",
+      "page": 3,
+      "source_image": "page 3, embedded grid image 2 of 5 (bottom left), under the 'Cutoff' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0]
+      ],
+      "actor": "CO",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 2500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row 'Raise' (2.5bb open)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 368, "F": 958},
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F"],
+        ["R", "F", "F", "F", "F", "R", "R", "R", "F", "F", "F", "F", "F"],
+        ["R", "F", "F", "F", "F", "F", "R", "R", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "R", "R", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Raise First In (RFI): Button",
+      "page": 3,
+      "source_image": "page 3, embedded grid image 3 of 5 (bottom centre), under the 'Button' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0]
+      ],
+      "actor": "BTN",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 2500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row 'Raise' (2.5bb open)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 574, "F": 752},
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "R", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "R", "F", "F", "F", "F"],
+        ["R", "R", "F", "F", "R", "R", "R", "R", "R", "R", "F", "F", "F"],
+        ["R", "F", "F", "F", "F", "F", "F", "R", "R", "R", "F", "F", "F"],
+        ["R", "F", "F", "F", "F", "F", "F", "F", "R", "R", "R", "F", "F"],
+        ["R", "F", "F", "F", "F", "F", "F", "F", "F", "R", "R", "R", "F"],
+        ["R", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R"]
+      ]
+    },
+    {
+      "title": "Raise First In (RFI): Small Blind",
+      "page": 3,
+      "source_image": "page 3, embedded grid image 4 of 5 (bottom right), under the 'Small Blind' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 3000}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "L": [0.0, 1.0, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row 'Raise' (3bb open)",
+        "L": "blue cell = legend row 'Limp' (complete the small blind: call)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 322, "L": 504, "F": 500},
+      "rows": [
+        ["L", "R", "L", "L", "R", "R", "R", "R", "L", "R", "L", "L", "L"],
+        ["L", "R", "L", "R", "R", "L", "R", "L", "L", "R", "L", "R", "R"],
+        ["R", "L", "R", "R", "R", "L", "L", "L", "L", "R", "R", "R", "R"],
+        ["R", "R", "L", "R", "R", "L", "L", "R", "R", "R", "R", "L", "L"],
+        ["L", "L", "L", "L", "L", "R", "L", "L", "R", "R", "L", "L", "F"],
+        ["L", "R", "R", "R", "L", "L", "L", "L", "R", "L", "L", "F", "F"],
+        ["R", "R", "L", "L", "R", "R", "L", "L", "L", "L", "L", "F", "F"],
+        ["R", "R", "L", "L", "L", "L", "L", "L", "L", "L", "L", "F", "F"],
+        ["R", "L", "L", "F", "F", "F", "L", "L", "L", "R", "R", "L", "F"],
+        ["L", "L", "L", "F", "F", "F", "F", "F", "F", "L", "R", "R", "F"],
+        ["R", "L", "F", "F", "F", "F", "F", "F", "F", "F", "L", "L", "F"],
+        ["L", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F"],
+        ["L", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "R"]
+      ]
+    },
+    {
+      "title": "Facing RFI: In Position: HJ vs LJ RFI",
+      "page": 4,
+      "source_image": "page 4, embedded grid image 0 of 6 (top left), under the 'HJ vs LJ RFI' label",
+      "history": [
+        ["UTG", "raise", 2500]
+      ],
+      "actor": "HJ",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 8750}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (in position 3.5x of 2.5bb = 8.75bb)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 108, "F": 1218},
+      "rows": [
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "R", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Facing RFI: In Position: CO vs LJ RFI",
+      "page": 4,
+      "source_image": "page 4, embedded grid image 1 of 6 (top centre), under the 'CO vs LJ RFI' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0]
+      ],
+      "actor": "CO",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 8750}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (in position 3.5x of 2.5bb = 8.75bb)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 114, "F": 1212},
+      "rows": [
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "R", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Facing RFI: In Position: CO vs HJ RFI",
+      "page": 4,
+      "source_image": "page 4, embedded grid image 2 of 6 (top right), under the 'CO vs HJ RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500]
+      ],
+      "actor": "CO",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 8750}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (in position 3.5x of 2.5bb = 8.75bb)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 134, "F": 1192},
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "F", "F", "F", "R", "R", "F", "F"],
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Facing RFI: In Position: BTN vs LJ RFI",
+      "page": 4,
+      "source_image": "page 4, embedded grid image 3 of 6 (bottom left), under the 'BTN vs LJ RFI' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0]
+      ],
+      "actor": "BTN",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 8750}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "C": [0.0, 1.0, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (in position 3.5x of 2.5bb = 8.75bb)",
+        "C": "blue cell = legend row 'Call'",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 96, "C": 92, "F": 1138},
+      "rows": [
+        ["R", "R", "R", "C", "C", "R", "R", "F", "F", "C", "R", "R", "F"],
+        ["R", "R", "C", "C", "C", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["C", "R", "R", "R", "C", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "F", "F", "R", "C", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "C", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "C", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "C", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "C", "C", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Facing RFI: In Position: BTN vs HJ RFI",
+      "page": 4,
+      "source_image": "page 4, embedded grid image 4 of 6 (bottom centre), under the 'BTN vs HJ RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0]
+      ],
+      "actor": "BTN",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 8750}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "C": [0.0, 1.0, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (in position 3.5x of 2.5bb = 8.75bb)",
+        "C": "blue cell = legend row 'Call'",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 118, "C": 84, "F": 1124},
+      "rows": [
+        ["R", "R", "R", "C", "C", "R", "R", "R", "F", "C", "R", "R", "F"],
+        ["R", "R", "C", "C", "R", "R", "R", "F", "F", "F", "F", "F", "F"],
+        ["C", "R", "R", "C", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "F", "F", "R", "C", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "C", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "C", "C", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "C", "C", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "C", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Facing RFI: In Position: BTN vs CO RFI",
+      "page": 4,
+      "source_image": "page 4, embedded grid image 5 of 6 (bottom right), under the 'BTN vs CO RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500]
+      ],
+      "actor": "BTN",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 8750}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "C": [0.0, 1.0, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (in position 3.5x of 2.5bb = 8.75bb)",
+        "C": "blue cell = legend row 'Call'",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 160, "C": 72, "F": 1094},
+      "rows": [
+        ["R", "R", "R", "C", "C", "C", "R", "R", "R", "C", "R", "R", "F"],
+        ["R", "R", "R", "C", "C", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["C", "R", "R", "R", "C", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "F", "F", "F", "R", "C", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "C", "C", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "C", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "C", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "C", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Facing RFI: Out of Position: SB vs LJ RFI",
+      "page": 5,
+      "source_image": "page 5, embedded grid image 0 of 8 (top row, 1st), under the 'SB vs LJ RFI' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 10000}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (out of position 4x of 2.5bb = 10bb)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 96, "F": 1230},
+      "rows": [
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "R", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "F", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Facing RFI: Out of Position: SB vs HJ RFI",
+      "page": 5,
+      "source_image": "page 5, embedded grid image 1 of 8 (top row, 2nd), under the 'SB vs HJ RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 10000}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (out of position 4x of 2.5bb = 10bb)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 116, "F": 1210},
+      "rows": [
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "R", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "F", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Facing RFI: Out of Position: SB vs CO RFI",
+      "page": 5,
+      "source_image": "page 5, embedded grid image 2 of 8 (top row, 3rd), under the 'SB vs CO RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 10000}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (out of position 4x of 2.5bb = 10bb)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 146, "F": 1180},
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "F", "F", "F", "R", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Facing RFI: Out of Position: SB vs BTN RFI",
+      "page": 5,
+      "source_image": "page 5, embedded grid image 3 of 8 (top row, 4th), under the 'SB vs BTN RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "raise", "to_bb_x1000": 10000}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "F": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (out of position 4x of 2.5bb = 10bb)",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 200, "F": 1126},
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "R", "F", "R", "R", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "R", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["R", "R", "F", "R", "R", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "R", "R", "R", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "R", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F"]
+      ]
+    },
+    {
+      "title": "Facing RFI: Out of Position: BB vs LJ RFI",
+      "page": 5,
+      "source_image": "page 5, embedded grid image 4 of 8 (bottom row, 1st), under the 'BB vs LJ RFI' label",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "actor": "BB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 10000}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "C": [0.0, 1.0, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (out of position 4x of 2.5bb = 10bb)",
+        "C": "blue cell = legend row 'Call'",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 76, "C": 306, "F": 944},
+      "rows": [
+        ["R", "R", "R", "C", "C", "C", "C", "C", "C", "R", "R", "C", "C"],
+        ["R", "R", "R", "R", "C", "C", "C", "C", "C", "C", "C", "C", "C"],
+        ["C", "C", "R", "R", "C", "C", "C", "C", "C", "C", "F", "F", "F"],
+        ["C", "C", "C", "R", "R", "C", "C", "F", "F", "F", "F", "F", "F"],
+        ["C", "F", "F", "C", "C", "C", "C", "C", "F", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "C", "C", "C", "C", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "C", "C", "C", "C", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "C", "C", "C", "C", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "C", "R", "C", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "R", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C"]
+      ]
+    },
+    {
+      "title": "Facing RFI: Out of Position: BB vs HJ RFI",
+      "page": 5,
+      "source_image": "page 5, embedded grid image 5 of 8 (bottom row, 2nd), under the 'BB vs HJ RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "actor": "BB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 10000}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "C": [0.0, 1.0, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (out of position 4x of 2.5bb = 10bb)",
+        "C": "blue cell = legend row 'Call'",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 98, "C": 320, "F": 908},
+      "rows": [
+        ["R", "R", "R", "C", "C", "R", "C", "C", "C", "R", "R", "C", "C"],
+        ["R", "R", "R", "R", "R", "C", "C", "C", "C", "R", "C", "C", "C"],
+        ["C", "C", "R", "R", "R", "C", "C", "C", "C", "C", "F", "F", "F"],
+        ["C", "C", "C", "R", "R", "C", "C", "C", "F", "F", "F", "F", "F"],
+        ["C", "C", "C", "C", "R", "C", "C", "C", "F", "F", "F", "F", "F"],
+        ["C", "F", "F", "F", "F", "C", "C", "C", "C", "F", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "C", "C", "C", "C", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "C", "C", "C", "C", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "C", "R", "C", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "R", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C"]
+      ]
+    },
+    {
+      "title": "Facing RFI: Out of Position: BB vs CO RFI",
+      "page": 5,
+      "source_image": "page 5, embedded grid image 6 of 8 (bottom row, 3rd), under the 'BB vs CO RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "actor": "BB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 10000}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "C": [0.0, 1.0, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (out of position 4x of 2.5bb = 10bb)",
+        "C": "blue cell = legend row 'Call'",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 128, "C": 342, "F": 856},
+      "rows": [
+        ["R", "R", "R", "R", "C", "R", "C", "C", "C", "R", "R", "C", "C"],
+        ["R", "R", "R", "R", "R", "C", "C", "C", "C", "C", "C", "C", "C"],
+        ["R", "C", "R", "R", "R", "R", "C", "C", "C", "C", "C", "C", "F"],
+        ["C", "C", "C", "R", "R", "R", "C", "C", "C", "F", "F", "F", "F"],
+        ["C", "C", "C", "C", "R", "R", "C", "C", "F", "F", "F", "F", "F"],
+        ["C", "F", "F", "F", "C", "R", "C", "C", "C", "F", "F", "F", "F"],
+        ["C", "F", "F", "F", "F", "F", "C", "C", "C", "C", "F", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "C", "C", "C", "C", "F", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "C", "R", "C", "C", "F"],
+        ["C", "F", "F", "F", "F", "F", "F", "F", "F", "C", "R", "C", "C"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "F"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C"]
+      ]
+    },
+    {
+      "title": "Facing RFI: Out of Position: BB vs BTN RFI",
+      "page": 5,
+      "source_image": "page 5, embedded grid image 7 of 8 (bottom row, 4th), under the 'BB vs BTN RFI' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500],
+        ["SB", "fold", 0]
+      ],
+      "actor": "BB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 10000}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "C": [0.0, 1.0, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3Bet' (out of position 4x of 2.5bb = 10bb)",
+        "C": "blue cell = legend row 'Call'",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 178, "C": 576, "F": 572},
+      "rows": [
+        ["R", "R", "R", "R", "R", "C", "C", "C", "R", "R", "R", "C", "C"],
+        ["R", "R", "R", "R", "R", "R", "C", "C", "C", "C", "C", "C", "C"],
+        ["R", "R", "R", "R", "R", "R", "C", "C", "C", "C", "C", "C", "C"],
+        ["C", "C", "C", "R", "R", "R", "R", "C", "C", "C", "C", "C", "C"],
+        ["C", "C", "C", "C", "R", "R", "R", "C", "C", "C", "C", "C", "C"],
+        ["C", "C", "C", "C", "C", "R", "R", "R", "C", "C", "C", "F", "F"],
+        ["C", "C", "C", "C", "C", "C", "R", "R", "C", "C", "C", "F", "F"],
+        ["C", "C", "F", "F", "F", "F", "C", "C", "R", "C", "C", "C", "F"],
+        ["C", "C", "F", "F", "F", "F", "F", "C", "C", "R", "C", "C", "C"],
+        ["C", "F", "F", "F", "F", "F", "F", "F", "C", "C", "R", "C", "C"],
+        ["C", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "C", "C"],
+        ["C", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C"],
+        ["F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C"]
+      ]
+    },
+    {
+      "title": "Blind vs Blind: Big Blind vs SB Limp",
+      "page": 6,
+      "source_image": "page 6, embedded grid image 1 of 3 (centre), under the 'Big Blind vs SB Limp' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "call", 0]
+      ],
+      "actor": "BB",
+      "actions": [
+        {"step": "check"},
+        {"step": "raise", "to_bb_x1000": 3500}
+      ],
+      "legend": {
+        "R": [0.0, 1.0],
+        "X": [1.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row 'Raise' (3.5x of the 1bb limp = 3.5bb)",
+        "X": "blue cell = legend row 'Check'"
+      },
+      "published_combos": {"R": 536, "X": 790},
+      "rows": [
+        ["R", "R", "R", "R", "R", "R", "R", "X", "X", "R", "R", "R", "X"],
+        ["R", "R", "R", "R", "R", "R", "X", "X", "R", "R", "X", "X", "X"],
+        ["R", "R", "R", "R", "R", "R", "X", "X", "X", "X", "X", "X", "X"],
+        ["R", "R", "X", "R", "R", "R", "R", "X", "X", "X", "X", "X", "R"],
+        ["R", "X", "X", "R", "R", "R", "R", "X", "X", "X", "R", "R", "R"],
+        ["X", "X", "X", "X", "R", "R", "R", "R", "X", "X", "R", "R", "R"],
+        ["X", "X", "X", "X", "X", "X", "R", "R", "R", "X", "R", "X", "X"],
+        ["X", "X", "X", "R", "X", "X", "X", "R", "R", "R", "R", "R", "X"],
+        ["X", "X", "R", "R", "R", "R", "X", "X", "R", "R", "R", "R", "X"],
+        ["R", "R", "R", "R", "R", "R", "R", "R", "X", "R", "R", "X", "X"],
+        ["X", "R", "R", "X", "X", "X", "X", "R", "X", "X", "R", "X", "X"],
+        ["X", "X", "X", "X", "X", "X", "X", "X", "X", "X", "X", "R", "R"],
+        ["X", "X", "X", "X", "X", "X", "X", "X", "X", "X", "X", "X", "X"]
+      ]
+    },
+    {
+      "title": "Blind vs Blind: Big Blind vs SB raise",
+      "page": 6,
+      "source_image": "page 6, embedded grid image 2 of 3 (right), under the 'Big Blind vs SB raise' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 3000]
+      ],
+      "actor": "BB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 10500}
+      ],
+      "legend": {
+        "R": [0.0, 0.0, 1.0],
+        "C": [0.0, 1.0, 0.0],
+        "F": [1.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R": "red cell = legend row '3bet' (big blind is in position: 3.5x of 3bb = 10.5bb)",
+        "C": "blue cell = legend row 'Call'",
+        "F": "white (uncoloured) cell = legend row 'Fold'"
+      },
+      "published_combos": {"R": 218, "C": 640, "F": 468},
+      "rows": [
+        ["R", "R", "R", "R", "R", "C", "C", "C", "C", "R", "R", "C", "C"],
+        ["R", "R", "R", "R", "R", "C", "C", "C", "C", "C", "C", "C", "C"],
+        ["R", "C", "R", "R", "C", "C", "C", "C", "C", "C", "C", "C", "C"],
+        ["C", "C", "C", "R", "C", "C", "C", "C", "C", "R", "C", "C", "C"],
+        ["C", "C", "C", "C", "R", "C", "C", "C", "C", "R", "C", "C", "C"],
+        ["C", "C", "C", "C", "C", "R", "C", "C", "C", "R", "C", "C", "C"],
+        ["C", "C", "C", "R", "C", "C", "R", "R", "C", "C", "C", "F", "F"],
+        ["C", "C", "C", "R", "R", "C", "C", "C", "R", "C", "C", "C", "F"],
+        ["R", "R", "R", "F", "F", "F", "C", "C", "C", "R", "C", "C", "C"],
+        ["C", "R", "F", "F", "F", "F", "F", "F", "C", "C", "R", "C", "C"],
+        ["C", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C", "C", "C"],
+        ["C", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C", "C"],
+        ["C", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "C"]
+      ]
+    },
+    {
+      "title": "Blind vs Blind: Small Blind Strategy (second action after Raise, facing the Big Blind 3bet)",
+      "page": 6,
+      "source_image": "page 6, embedded grid image 0 of 3 (left), under the 'Small Blind Strategy' label",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 3000],
+        ["BB", "raise", 10500]
+      ],
+      "actor": "SB",
+      "actions": [
+        {"step": "fold"},
+        {"step": "call"},
+        {"step": "raise", "to_bb_x1000": 26250}
+      ],
+      "legend": {
+        "R4": [0.0, 0.0, 1.0],
+        "RC": [0.0, 1.0, 0.0],
+        "RF": [1.0, 0.0, 0.0],
+        "LR": [0.0, 0.0, 0.0],
+        "LC": [0.0, 0.0, 0.0],
+        "LF": [0.0, 0.0, 0.0],
+        "F": [0.0, 0.0, 0.0]
+      },
+      "legend_source": {
+        "R4": "red cell = legend row 'Raise/4bet' (out of position 4bet 2.5x of 10.5bb = 26.25bb)",
+        "RC": "blue cell = legend row 'Raise/Call'",
+        "RF": "green cell = legend row 'Raise/Fold'",
+        "LR": "dark grey cell = legend row 'Limp/Raise' (this class limps first: never reaches this node; unreachable)",
+        "LC": "orange cell = legend row 'Limp/Call' (limps first; unreachable here)",
+        "LF": "pink cell = legend row 'Limp/Fold' (limps first; unreachable here)",
+        "F": "white (uncoloured) cell = legend row 'Fold' (folds first; unreachable here)"
+      },
+      "published_combos": {
+        "R4": 58,
+        "RC": 120,
+        "RF": 144,
+        "LR": 68,
+        "LC": 204,
+        "LF": 232,
+        "F": 500
+      },
+      "rows": [
+        ["LR", "R4", "LR", "LR", "RC", "RC", "RC", "RC", "LC", "RC", "LC", "LC", "LC"],
+        ["LR", "R4", "LR", "RC", "RC", "LR", "RC", "LC", "LC", "RC", "LC", "RF", "RF"],
+        ["R4", "LC", "R4", "RC", "RC", "LR", "LC", "LC", "LC", "RF", "RF", "RF", "RF"],
+        ["R4", "R4", "LC", "R4", "RC", "LR", "LC", "RF", "RF", "RF", "RF", "LF", "LF"],
+        ["LC", "LC", "LC", "LC", "LR", "RC", "LC", "LC", "RF", "RF", "LF", "LF", "F"],
+        ["LC", "RC", "RC", "RC", "LC", "LR", "LR", "LC", "RF", "LF", "LF", "F", "F"],
+        ["RF", "RF", "LF", "LF", "RF", "RC", "LR", "LR", "LC", "LC", "LF", "F", "F"],
+        ["RF", "RF", "LF", "LF", "LF", "LF", "LF", "LC", "LC", "LC", "LF", "F", "F"],
+        ["RF", "LF", "LF", "F", "F", "F", "LF", "LF", "LC", "RC", "RF", "LF", "F"],
+        ["LC", "LF", "LF", "F", "F", "F", "F", "F", "F", "LC", "RC", "RF", "F"],
+        ["RF", "LF", "F", "F", "F", "F", "F", "F", "F", "F", "LC", "LF", "F"],
+        ["LF", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RC", "F"],
+        ["LF", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "F", "RC"]
+      ],
+      "unreachable_classes": [0, 2, 3, 8, 10, 11, 12, 13, 15, 18, 20, 21, 23, 27, 31, 32, 33, 34, 41, 44, 45, 50, 51, 52, 53, 54, 55, 56, 58, 59, 62, 63, 64, 65, 69, 70, 71, 72, 74, 75, 76, 77, 80, 81, 84, 85, 86, 87, 88, 89, 90, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 105, 106, 107, 108, 109, 110, 111, 112, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 129, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167]
+    }
+  ],
+  "inventory": [
+    {
+      "title": "Raise First In (RFI): Lojack",
+      "status": "covered",
+      "history": [],
+      "page": 3,
+      "reason": "Grid transcribed (169/169 cells). Every seat before UTG folds explicitly; actor UTG. Actions fold / raise to 2.5bb (to_bb_x1000 2500), from the page-2 bet-sizing paragraph (RFI 2.5bb except SB)."
+    },
+    {
+      "title": "Raise First In (RFI): Hijack",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Grid transcribed (169/169 cells). Every seat before HJ folds explicitly; actor HJ. Actions fold / raise to 2.5bb (to_bb_x1000 2500), from the page-2 bet-sizing paragraph (RFI 2.5bb except SB)."
+    },
+    {
+      "title": "Raise First In (RFI): Cutoff",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Grid transcribed (169/169 cells). Every seat before CO folds explicitly; actor CO. Actions fold / raise to 2.5bb (to_bb_x1000 2500), from the page-2 bet-sizing paragraph (RFI 2.5bb except SB)."
+    },
+    {
+      "title": "Raise First In (RFI): Button",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Grid transcribed (169/169 cells). Every seat before BTN folds explicitly; actor BTN. Actions fold / raise to 2.5bb (to_bb_x1000 2500), from the page-2 bet-sizing paragraph (RFI 2.5bb except SB)."
+    },
+    {
+      "title": "Raise First In (RFI): Small Blind",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Grid transcribed (169/169 cells). Every seat before SB folds explicitly; actor SB. Actions fold / call (limp) / raise to 3bb (to_bb_x1000 3000), from the page-2 bet-sizing paragraph (SB RFI 3bb); legend rows Raise, Limp, Fold."
+    },
+    {
+      "title": "Facing RFI: In Position: HJ vs LJ RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500]
+      ],
+      "page": 4,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before HJ folds; actor HJ. Actions fold / raise to 8.75bb (3bet); the legend shows no Call row; in-position 3bet 3.5x of 2.5bb = 8.75bb (to_bb_x1000 8750) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: In Position: CO vs LJ RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0]
+      ],
+      "page": 4,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before CO folds; actor CO. Actions fold / raise to 8.75bb (3bet); the legend shows no Call row; in-position 3bet 3.5x of 2.5bb = 8.75bb (to_bb_x1000 8750) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: In Position: CO vs HJ RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500]
+      ],
+      "page": 4,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before CO folds; actor CO. Actions fold / raise to 8.75bb (3bet); the legend shows no Call row; in-position 3bet 3.5x of 2.5bb = 8.75bb (to_bb_x1000 8750) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: In Position: BTN vs LJ RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0]
+      ],
+      "page": 4,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before BTN folds; actor BTN. Actions fold / call / raise to 8.75bb (3bet); in-position 3bet 3.5x of 2.5bb = 8.75bb (to_bb_x1000 8750) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: In Position: BTN vs HJ RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0]
+      ],
+      "page": 4,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before BTN folds; actor BTN. Actions fold / call / raise to 8.75bb (3bet); in-position 3bet 3.5x of 2.5bb = 8.75bb (to_bb_x1000 8750) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: In Position: BTN vs CO RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500]
+      ],
+      "page": 4,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before BTN folds; actor BTN. Actions fold / call / raise to 8.75bb (3bet); in-position 3bet 3.5x of 2.5bb = 8.75bb (to_bb_x1000 8750) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: Out of Position: SB vs LJ RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "page": 5,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before SB folds; actor SB. Actions fold / raise to 10bb (3bet); the legend shows no Call row; out-of-position 3bet 4x of 2.5bb = 10bb (to_bb_x1000 10000) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: Out of Position: SB vs HJ RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "page": 5,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before SB folds; actor SB. Actions fold / raise to 10bb (3bet); the legend shows no Call row; out-of-position 3bet 4x of 2.5bb = 10bb (to_bb_x1000 10000) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: Out of Position: SB vs CO RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0]
+      ],
+      "page": 5,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before SB folds; actor SB. Actions fold / raise to 10bb (3bet); the legend shows no Call row; out-of-position 3bet 4x of 2.5bb = 10bb (to_bb_x1000 10000) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: Out of Position: SB vs BTN RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500]
+      ],
+      "page": 5,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before SB folds; actor SB. Actions fold / raise to 10bb (3bet); the legend shows no Call row; out-of-position 3bet 4x of 2.5bb = 10bb (to_bb_x1000 10000) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: Out of Position: BB vs LJ RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "page": 5,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before BB folds; actor BB. Actions fold / call / raise to 10bb (3bet); out-of-position 3bet 4x of 2.5bb = 10bb (to_bb_x1000 10000) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: Out of Position: BB vs HJ RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "page": 5,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before BB folds; actor BB. Actions fold / call / raise to 10bb (3bet); out-of-position 3bet 4x of 2.5bb = 10bb (to_bb_x1000 10000) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: Out of Position: BB vs CO RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "page": 5,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before BB folds; actor BB. Actions fold / call / raise to 10bb (3bet); out-of-position 3bet 4x of 2.5bb = 10bb (to_bb_x1000 10000) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Facing RFI: Out of Position: BB vs BTN RFI",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500],
+        ["SB", "fold", 0]
+      ],
+      "page": 5,
+      "reason": "Grid transcribed (169/169 cells). One 2.5bb opener, every other seat before BB folds; actor BB. Actions fold / call / raise to 10bb (3bet); out-of-position 3bet 4x of 2.5bb = 10bb (to_bb_x1000 10000) from page 2. LJ is normalized to UTG."
+    },
+    {
+      "title": "Blind vs Blind: Small Blind Strategy (first action)",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0]
+      ],
+      "page": 6,
+      "reason": "Same node key as page 3 'Raise First In (RFI): Small Blind' (four folds, actor SB), so no second node is created. Reconciled: the page-6 first action (Raise/4bet, Raise/Call, Raise/Fold = raise 3bb; Limp/Raise, Limp/Call, Limp/Fold = limp; Fold = fold) equals the page-3 grid in 169/169 cells, and the page-6 combo totals 58+120+144 = 322 raise, 68+204+232 = 504 limp, 500 fold equal page 3's 322/504/500. The single node is the page-3 transcription."
+    },
+    {
+      "title": "Blind vs Blind: Big Blind vs SB Limp",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "call", 0]
+      ],
+      "page": 6,
+      "reason": "Grid transcribed (169/169 cells). Four folds, SB limps (call), actor BB. Actions check / raise to 3.5bb (to_bb_x1000 3500; page 2: 3.5x raise facing a small blind limp). The legend's third row 'Fold 0.0% 0/1326' is omitted from the menu: the BB owes nothing after a limp, so fold is not a legal action (core_model offers Check, not Fold)."
+    },
+    {
+      "title": "Blind vs Blind: Big Blind vs SB raise",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 3000]
+      ],
+      "page": 6,
+      "reason": "Grid transcribed (169/169 cells). Four folds, SB raises to 3bb, actor BB. Actions fold / call / raise to 10.5bb (to_bb_x1000 10500): the legend labels the raise '3bet'; the big blind has position on the small blind, so page 2's in-position 3bet rule (3.5x of 3bb) applies."
+    },
+    {
+      "title": "Blind vs Blind: Small Blind Strategy (second action after Raise, facing the Big Blind 3bet)",
+      "status": "covered",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 3000],
+        ["BB", "raise", 10500]
+      ],
+      "page": 6,
+      "reason": "RFI response to a later 3bet, SB only. The page-6 Small Blind Strategy colours every SB raising hand with its complete response to the BB 3bet (Raise/4bet, Raise/Call, Raise/Fold: 58+120+144 = 322 combos = the whole page-3 raise range); opponent scope is the BB alone (four folds, SB opens, BB 3bets); sizes come from page 2: SB open 3bb, BB in-position 3bet 3.5x = 10.5bb, SB out-of-position 4bet 2.5x of 10.5bb = 26.25bb (to_bb_x1000 26250). Actions fold / call / raise 26.25bb. The 119 classes the SB limps or folds first (preceding raise weight exactly 0 on page 3) are unreachable_classes with all-zero weights."
+    },
+    {
+      "title": "Blind vs Blind: Small Blind Strategy (second action after Limp, facing the Big Blind raise)",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "call", 0],
+        ["BB", "raise", 3500]
+      ],
+      "page": 6,
+      "reason": "Unresolved size, not loadable. Page 6 colours the SB limping hands Limp/Raise, Limp/Call, Limp/Fold, and the BB raise after a limp is 3.5bb (page 2), but no page states the size of the SB's re-raise after limping (page 2 sizes RFI, 3bets, the BB raise facing a limp, and 4bets only; the chart calls this action 'Raise', not '3bet'). A node would need a raise-to amount, which is never assigned without a published size."
+    },
+    {
+      "title": "RFI response to a later 3bet: LJ open, HJ 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "raise", 8750],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' LJ grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (8.75bb, page 2's in-position 3.5x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: LJ open, CO 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 8750],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' LJ grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (8.75bb, page 2's in-position 3.5x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: LJ open, BTN 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 8750],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' LJ grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (8.75bb, page 2's in-position 3.5x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: LJ open, SB 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 10000],
+        ["BB", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' LJ grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (10bb, page 2's out-of-position 4x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: LJ open, BB 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "raise", 10000]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' LJ grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (10bb, page 2's out-of-position 4x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: HJ open, CO 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "raise", 8750],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' HJ grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (8.75bb, page 2's in-position 3.5x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: HJ open, BTN 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 8750],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' HJ grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (8.75bb, page 2's in-position 3.5x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: HJ open, SB 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 10000],
+        ["BB", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' HJ grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (10bb, page 2's out-of-position 4x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: HJ open, BB 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "raise", 2500],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "raise", 10000]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' HJ grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (10bb, page 2's out-of-position 4x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: CO open, BTN 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "raise", 8750],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' CO grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (8.75bb, page 2's in-position 3.5x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: CO open, SB 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 10000],
+        ["BB", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' CO grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (10bb, page 2's out-of-position 4x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: CO open, BB 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "raise", 2500],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "raise", 10000]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' CO grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (10bb, page 2's out-of-position 4x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: BTN open, SB 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500],
+        ["SB", "raise", 10000],
+        ["BB", "fold", 0]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' BTN grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (10bb, page 2's out-of-position 4x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "RFI response to a later 3bet: BTN open, BB 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500],
+        ["SB", "fold", 0],
+        ["BB", "raise", 10000]
+      ],
+      "page": 3,
+      "reason": "Page 3 'Raise First In (RFI)' BTN grid and legend show only Raise and Fold; no colour encodes a response to a 3bet and no page has an opener-facing-3bet grid (page 6 does so only for the SB, recorded separately). The 3bet size in this key (10bb, page 2's out-of-position 4x rule) names the spot looked for; no node is created."
+    },
+    {
+      "title": "BB RFI (folded to the big blind)",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "page": null,
+      "reason": "No decision exists: when all five other seats fold the hand ends and the BB wins the blinds; no page shows a BB first-in chart."
+    },
+    {
+      "title": "Squeeze: BB facing a LJ open and an HJ call",
+      "status": "absent",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "call", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0]
+      ],
+      "page": null,
+      "reason": "Representative of every squeeze spot (any open plus one or more callers): no page 1-6 grid covers a squeeze. Page 2 says the charts assume the action folds to the player and stop applying once there are raisers or limpers in front."
+    },
+    {
+      "title": "BB defence facing a BTN open and an SB call",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "raise", 2500],
+        ["SB", "call", 0]
+      ],
+      "page": null,
+      "reason": "Distinct from the covered 'BB vs BTN RFI' node, whose history has the SB folding: a BB decision after an opener and a caller has no grid on any page, and the folded-SB chart is not inserted under this history."
+    },
+    {
+      "title": "Cold call or cold 4bet facing an open and a 3bet: CO facing LJ open, HJ 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "raise", 8750]
+      ],
+      "page": null,
+      "reason": "Representative of every third-party decision facing an open and a 3bet: no page 1-6 grid covers it."
+    },
+    {
+      "title": "vs-4bet: HJ facing the LJ 4bet after HJ 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "raise", 2500],
+        ["HJ", "raise", 8750],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "fold", 0],
+        ["BB", "fold", 0],
+        ["UTG", "raise", 21875]
+      ],
+      "page": null,
+      "reason": "Representative of every response to a 4bet for the non-blind positions (the 4bet here is page 2's out-of-position 2.5x of 8.75bb = 21.875bb): no page 1-6 grid covers a 4bet response."
+    },
+    {
+      "title": "vs-4bet: BB facing the SB 4bet after BB 3bet",
+      "status": "absent",
+      "history": [
+        ["UTG", "fold", 0],
+        ["HJ", "fold", 0],
+        ["CO", "fold", 0],
+        ["BTN", "fold", 0],
+        ["SB", "raise", 3000],
+        ["BB", "raise", 10500],
+        ["SB", "raise", 26250]
+      ],
+      "page": 6,
+      "reason": "Page 6 shows the SB's Raise/4bet choice but no grid for the BB's response to that 4bet (the 'Big Blind vs SB raise' chart ends at 3bet/call/fold)."
+    },
+    {
+      "title": "Facing a limp outside the blinds: HJ facing a LJ limp",
+      "status": "absent",
+      "history": [
+        ["UTG", "call", 0]
+      ],
+      "page": null,
+      "reason": "Representative of every non-blind limp spot: no grid covers it; page 2 says the charts stop applying when there are limpers in front. The only limp chart is the blind-vs-blind 'Big Blind vs SB Limp' (covered above)."
+    }
+  ]
+}
