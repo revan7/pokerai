@@ -10,6 +10,7 @@ pub mod lookup;
 mod numeric;
 pub mod store;
 pub mod straddle;
+pub mod translate;
 pub mod validate;
 
 pub use depth::*;
@@ -18,4 +19,5 @@ pub use ev::*;
 pub use lookup::*;
 pub use store::*;
 pub use straddle::*;
+pub use translate::*;
 pub use validate::*;
