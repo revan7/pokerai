@@ -107,6 +107,75 @@ test('obsolete_admission_is_cancelled_and_never_adopted', async () => {
   store.dispose();
 });
 
+// N1 (re-review round 1): none of the other buffering tests prove that several
+// *non-Progress* events buffered while admission is pending replay in their
+// original arrival order once admission succeeds -- only the single-event
+// abandon/cancel path above was covered. This test buffers three different-kind
+// events (Equity, Fast, Provisional) on the sink before resolving admission, each
+// carrying its own seat-2 Ready equity value, then asserts the display state after
+// *each* replayed event. Because mergeEquity lets a later Ready value replace an
+// earlier one for the same population (events.ts:55-60, "only a newer Ready ...
+// may replace a previous Ready"), the surviving value after each step proves which
+// event was applied most recently -- a reordered or reversed replay would produce
+// a different sequence of intermediate values, not just a different final one.
+test('buffered_nonprogress_events_of_different_kinds_replay_in_arrival_order', async () => {
+  const fake = new FakeBackend(); installMockIpc(fake);
+  let sink!: (e: RecommendationEvent) => void;
+  let resolveAdmission!: (id: DecisionIdentity) => void;
+  const held = new Promise<DecisionIdentity>(done => { resolveAdmission = done; });
+  vi.spyOn(fake, 'recommend').mockImplementationOnce(s => { sink = s; return held; });
+  const store = new Recommendations(tauriBackend, () => {});
+
+  const seen: Array<{ phase: string | null; value: number | null }> = [];
+  store.subscribe(() => {
+    const snap = store.snapshot();
+    seen.push({
+      phase: snap.recommendation?.phase ?? null,
+      value: snap.equity.hero_combo_vs_each.find(([seat]) => seat === 2)?.[1].value ?? null,
+    });
+  });
+
+  const request = store.request(hand());
+  const before = seen.length;
+
+  // Three buffered events, three different kinds, arriving in this exact order
+  // while admission is still pending.
+  sink({kind:'Equity', identity, equity:{...emptyEquity,
+    hero_combo_vs_each:[[2,{value:.3,availability:{kind:'Ready'},method:{kind:'Exact'}}]]}});
+  sink({kind:'Fast', ...recommendation({phase:'fast', equity:{...emptyEquity,
+    hero_combo_vs_each:[[2,{value:.9,availability:{kind:'Ready'},method:{kind:'Exact'}}]]}})});
+  sink({kind:'Provisional', ...recommendation({phase:'provisional', equity:{...emptyEquity,
+    hero_combo_vs_each:[[2,{value:.5,availability:{kind:'Ready'},method:{kind:'Exact'}}]]}})});
+
+  // Still buffered: nothing has been applied yet, admission has not resolved.
+  expect(seen.length).toBe(before);
+  expect(store.snapshot().recommendation).toBeNull();
+
+  resolveAdmission(identity);
+  await request;
+
+  const applied = seen.slice(before);
+  // One publish per replayed buffered event (none of these three kinds coalesce
+  // the way Progress does), plus request()'s own trailing publish after the loop.
+  expect(applied).toHaveLength(4);
+
+  // Step 1 (Equity, applied first): no recommendation was ever adopted before
+  // admission, so it stays null; equity shows the Equity event's own .3.
+  expect(applied[0]).toEqual({ phase: null, value: .3 });
+  // Step 2 (Fast, applied second): its own .9 replaces the Equity event's .3,
+  // proving Fast replayed *after* Equity, not before it.
+  expect(applied[1]).toEqual({ phase: 'fast', value: .9 });
+  // Step 3 (Provisional, applied third and last): its own .5 replaces Fast's .9,
+  // proving Provisional replayed *after* Fast -- i.e. all three replayed in
+  // exactly their arrival order.
+  expect(applied[2]).toEqual({ phase: 'provisional', value: .5 });
+  // Step 4: request()'s own trailing publish; state unchanged from step 3.
+  expect(applied[3]).toEqual({ phase: 'provisional', value: .5 });
+
+  expect(store.snapshot().active).toEqual(identity);
+  store.dispose();
+});
+
 test('ready_before_final_survives_pending_per_population',async()=>{
   const fake=new FakeBackend();installMockIpc(fake);const store=new Recommendations(tauriBackend,()=>{});
   await store.request(hand());
