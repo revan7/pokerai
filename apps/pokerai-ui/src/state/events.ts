@@ -10,6 +10,12 @@ type Progress = Extract<RecommendationEvent, { kind: 'Progress' }>;
 // store currently accepts events for (spec §2, §4.4: "anything not matching the
 // active identity is discarded"); `requestedAt`/`finalAt` are monotonic timestamps
 // (performance.now()) used only by the e2e latency assertions, never rendered.
+// `staleEventCount` (review round 1, R1) is the visible counter of every event this
+// store has ever dropped for not matching the active decision -- an identity
+// mismatch in `accept()`, an obsolete-generation callback delivered after
+// `invalidate()`, or a buffered event abandoned because its own request went stale
+// before admission landed. It is a lifetime diagnostic, not per-hand state: it
+// survives `invalidate()`'s reset of the rest of `DisplayState`.
 export type DisplayState = {
   active: DecisionIdentity | null;
   recommendation: Recommendation | null;
@@ -18,6 +24,7 @@ export type DisplayState = {
   noDecision: string | null;
   requestedAt: number | null;
   finalAt: number | null;
+  staleEventCount: number;
 };
 
 function emptyEquitySummary(): EquitySummary {
@@ -28,6 +35,7 @@ function initialState(): DisplayState {
   return {
     active: null, recommendation: null, equity: emptyEquitySummary(),
     progress: null, noDecision: null, requestedAt: null, finalAt: null,
+    staleEventCount: 0,
   };
 }
 
@@ -38,13 +46,14 @@ export function sameIdentity(a: DecisionIdentity | null, b: DecisionIdentity): b
     && a.model_revision === b.model_revision;
 }
 
-// MI-8: this only guards a Ready estimate against a later Pending for the SAME
-// population, not against Unavailable. Spec §4.4 promises "a Ready estimate is
-// never replaced by a Pending one," and the engine emits at most one Ready per
-// population, so this narrower guard is literal-correct and deliberate, not an
-// omission of the Unavailable case.
+// MI-8 (superseded by review round 1, R2): refine-only merging. Spec §4.4's own
+// text only promises a Ready estimate survives a later Pending, but review round 1
+// ruled the guard must be stronger: a completed (Ready) estimate for a population
+// is never erased by ANY non-Ready event for that same population -- Pending or
+// Unavailable alike, including a late Unavailable arriving after Final. Only a
+// newer Ready (a refined completed value) may replace a previous Ready.
 function preferReady(previous: EquityEstimate | undefined, next: EquityEstimate): EquityEstimate {
-  if (previous && previous.availability.kind === 'Ready' && next.availability.kind === 'Pending') {
+  if (previous && previous.availability.kind === 'Ready' && next.availability.kind !== 'Ready') {
     return previous;
   }
   return next;
@@ -111,15 +120,27 @@ export class Recommendations {
     this.pendingProgress = null;
   }
 
+  // R1: count every event this store drops for not matching the active decision --
+  // an identity mismatch in `accept()`, a callback whose request generation is no
+  // longer current, or a batch of events buffered for a request that went stale
+  // before admission landed. `n` lets a whole abandoned buffer be counted in one
+  // step instead of one call per event.
+  private countStale(n = 1) {
+    if (n <= 0) return;
+    this.value = { ...this.value, staleEventCount: this.value.staleEventCount + n };
+    this.publish();
+  }
+
   // Spec §5 step 3 / §12: any mutation (here, a fresh request or an abandon) cancels
   // in-flight work and invalidates every descendant identity. Bumping `generation`
   // makes every callback already registered for the previous request a no-op,
   // including one delivered after this call but before its own `invoke` resolves.
   invalidate() {
     const previousActive = this.value.active;
+    const staleEventCount = this.value.staleEventCount;
     this.generation += 1;
     this.clearProgressTimer();
-    this.value = initialState();
+    this.value = { ...initialState(), staleEventCount };
     this.publish();
     if (previousActive) {
       void this.backend.cancel(previousActive.decision_id).catch(this.onError);
@@ -135,7 +156,7 @@ export class Recommendations {
     this.publish();
     try {
       const id = await this.backend.recommend(event => {
-        if (generation !== this.generation) return;
+        if (generation !== this.generation) { this.countStale(); return; }
         if (!admitted) {
           // Only the latest buffered Progress matters once admission completes.
           if (event.kind === 'Progress') {
@@ -151,8 +172,11 @@ export class Recommendations {
         // This request was invalidated while admission was still in flight: the
         // returned identity was never adopted as `active`, so cancel it directly
         // rather than routing through `invalidate()` (which would cancel whatever
-        // *is* active now instead).
+        // *is* active now instead). Every event buffered for this now-abandoned
+        // request is dropped right here and must be counted (R1) -- it was
+        // received, held, and never replayed into `accept()`.
         await this.backend.cancel(id.decision_id);
+        this.countStale(buffered.length);
         return;
       }
       // MA-8: config_revision is deliberately excluded from this admission check.
@@ -181,7 +205,7 @@ export class Recommendations {
   }
 
   accept(event: RecommendationEvent): void {
-    if (!sameIdentity(this.value.active, eventIdentity(event))) return;
+    if (!sameIdentity(this.value.active, eventIdentity(event))) { this.countStale(); return; }
     if (event.kind === 'NoDecision') {
       this.clearProgressTimer();
       this.value = { ...this.value, recommendation: null, noDecision: event.reason, progress: null };
