@@ -473,3 +473,7 @@ verified 22 nodes, 3718 classes
 ## Replay/bet-translation goldens audit (Task 19)
 
 *Not started.*
+
+## Independent blind re-read of the 100bb grids (2026-09-26)
+
+A second agent, different from the transcriber, re-read all 22 grids (pages 3-6 physical) from fresh pypdfium2 renders in reverse row order with the committed transcription closed, wrote its own values for every cell, and only then diffed them programmatically against `fixtures/charts/transcription/pokercoaching_100.json`: 3,718 cells read, 0 mismatches; the page-6 SB grid reduced to its first action also matches node 4 (169 cells, 0 mismatches); an independent pixel classification agrees on all 3,718 cells and no cell is mixed. Orientation (suited above the diagonal, offsuit below) and grid-to-node assignment were confirmed on the pages, and eight absent inventory rows were spot-checked as genuinely absent. The flagged node "SB facing the BB 3bet" (row 23) is kept as transcribed: its 10.5bb 3bet is page 2's in-position 3.5x rule (the BB acts in position against the SB preflop); node 20 (BB vs SB raise) uses the same size, so any later change must update both. This blind re-read satisfies the Step 5 hidden-first-pass requirement; the transcriber's own reverse re-read was not blind (disclosed above). Evidence: the plan-3 SDD workspace file `task-5-visual-verification.md`.
