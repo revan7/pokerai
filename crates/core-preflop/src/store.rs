@@ -57,6 +57,10 @@ pub fn bounded_read(path: &Path) -> Result<Vec<u8>, BundleError> {
 /// load time -- `ChartTranscription::lookup` additionally clears `ev_source_sb` on every
 /// result as a second, independent guarantee, but that lookup-time behavior is not a
 /// substitute for rejecting the bad bundle in the first place.
+///
+/// P3.T9 fix round 1, R2: also runs [`check_fold_consistency_wide`] on `raw` -- the load-time
+/// fold-EV admission gate, on the ORIGINAL wire-precision (`f64`) EV cells, before anything is
+/// narrowed to the `f32` `Envelope` this function returns.
 pub fn checked_envelope(info: &BundleInfo, raw: &[u8]) -> Result<Envelope, BundleError> {
     let digest = format!("{:x}", Sha256::digest(raw));
     if digest != info.sha256 {
@@ -78,7 +82,72 @@ pub fn checked_envelope(info: &BundleInfo, raw: &[u8]) -> Result<Envelope, Bundl
     if info.source == SourceKind::ChartTranscription && e.nodes.iter().any(|n| n.evs.is_some()) {
         return Err(BundleError::Content("chart bundle must not carry EV data".into()));
     }
+    check_fold_consistency_wide(raw, info)?;
     Ok(e)
+}
+
+/// Wide-form (`f64`) mirror of just enough of the wire node shape to check fold-EV consistency
+/// (P3.T9 fix round 1, R2) against the ORIGINAL wire-precision cells -- before `decode` (in
+/// `validate.rs`) ever narrows them to `f32` for the `Envelope`/`PreflopNode` this bundle
+/// otherwise uses everywhere else. A private, read-only second parse of the same `raw` bytes
+/// `checked_envelope` already hash-verified and structurally decoded (via `decode`, above),
+/// mirroring the existing `WideSourceBlinds` pattern already in this file: a second wide-precision
+/// pass over the same bytes, for exactly the same reason (standing ruling (a), wide before
+/// narrow). `evs` here is action-major, matching the wire's own `EnvelopeNode::evs` shape --
+/// `build_node_map`'s `transpose` step (class-major) has not run at this point.
+#[derive(serde::Deserialize)]
+struct WideFoldNode {
+    history: Vec<(String, String, u32)>,
+    actor: String,
+    actions: Vec<EnvelopeAction>,
+    #[serde(default)]
+    evs: Option<Vec<Vec<Option<f64>>>>,
+}
+
+#[derive(serde::Deserialize)]
+struct WideFoldEnvelope {
+    nodes: Vec<WideFoldNode>,
+}
+
+/// The load-time fold-EV admission gate (P3.T9 fix round 1, R2). Checks every node's *present*
+/// fold EV, at every hand class, against [`crate::ev::verify_fold_wide`] -- the one shared
+/// predicate [`crate::ev::verify_fold`] (the narrowed `f32` twin used for in-memory validation,
+/// e.g. at the `expand_node` boundary) also calls -- on the ORIGINAL wire-precision (`f64`) cell,
+/// never a value that has already been narrowed to `f32`. The commitment each class is checked
+/// against is computed in `f64` throughout too ([`committed_before_f64`]), never rounded to `f32`
+/// before the check runs.
+///
+/// This is the sole fold-EV admission decision: once a bundle passes here, `build_node_map` never
+/// runs a second, narrow-only check that could reject it again -- a narrow-only re-check can
+/// disagree with this wide one purely from `f32` rounding, right at the `1e-3` tolerance boundary,
+/// which is exactly the defect this fix corrects. A failing node's error names its index, history
+/// and offending class, matching `check_envelope`'s own per-node wrapping.
+fn check_fold_consistency_wide(raw: &[u8], info: &BundleInfo) -> Result<(), BundleError> {
+    let wide: WideFoldEnvelope = serde_json::from_slice(raw)?;
+    for (index, n) in wide.nodes.iter().enumerate() {
+        let Some(fold_idx) = n.actions.iter().position(|a| a.step == "fold") else {
+            continue;
+        };
+        let Some(evs) = n.evs.as_ref() else {
+            continue;
+        };
+        let Some(fold_row) = evs.get(fold_idx) else {
+            continue;
+        };
+        let history = parse_history(&n.history)?;
+        let actor = parse_position(&n.actor)?;
+        let committed = committed_before_f64(&history, actor, info.depth_bb);
+        let start = info.source_stack_sb_f64();
+        for (c, fold_ev) in fold_row.iter().enumerate() {
+            if !crate::ev::verify_fold_wide(info.ev_reference, *fold_ev, committed, start) {
+                return Err(BundleError::Content(format!(
+                    "node {index} (history {:?}): class {c}'s fold EV {fold_ev:?} is inconsistent with committed {committed} under {:?} (tolerance 1e-3)",
+                    n.history, info.ev_reference
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Every acquired depth a manifest declares is at least one bb (P3.T8 fix round 1, R2).
@@ -240,8 +309,18 @@ fn next_actor(history: &[(Position, PreflopStep)], straddle: bool) -> Result<Pos
 /// immediately before `actor`'s decision at this node -- their blind post if they have not yet
 /// acted in `history`. `combos` never enters this calculation.
 fn committed_before(history: &[(Position, PreflopStep)], actor: Position, depth_bb: u16) -> f32 {
-    let stack_sb = 2.0 * depth_bb as f32;
-    let mut committed: std::collections::HashMap<Position, f32> = [
+    committed_before_f64(history, actor, depth_bb) as f32
+}
+
+/// [`committed_before`]'s `f64` twin (P3.T9 fix round 1, R2): every seat's contribution tracked
+/// in `f64` throughout, narrowed to `f32` only by [`committed_before`] itself (for storage in
+/// [`PreflopNode::committed_by_actor_sb`]). [`check_fold_consistency_wide`] calls this directly so
+/// the load-time wide fold-EV admission check never rounds a commitment to `f32` before comparing
+/// it against a wire-precision EV cell -- the one implementation of the committed-so-far walk,
+/// never a second copy that could drift from this one.
+fn committed_before_f64(history: &[(Position, PreflopStep)], actor: Position, depth_bb: u16) -> f64 {
+    let stack_sb = 2.0 * depth_bb as f64;
+    let mut committed: std::collections::HashMap<Position, f64> = [
         (Position::Utg, 0.0),
         (Position::Hj, 0.0),
         (Position::Co, 0.0),
@@ -252,11 +331,11 @@ fn committed_before(history: &[(Position, PreflopStep)], actor: Position, depth_
     .into_iter()
     .collect();
     for (pos, step) in history {
-        let highest = committed.values().cloned().fold(0.0f32, f32::max);
+        let highest = committed.values().cloned().fold(0.0f64, f64::max);
         let amount = match step {
             PreflopStep::Fold | PreflopStep::Check => committed[pos],
             PreflopStep::Call => highest.min(stack_sb),
-            PreflopStep::Raise { to_bb_x1000 } => (*to_bb_x1000 as f32) / 500.0,
+            PreflopStep::Raise { to_bb_x1000 } => (*to_bb_x1000 as f64) / 500.0,
             PreflopStep::AllIn => stack_sb,
         };
         committed.insert(*pos, amount);
@@ -270,10 +349,12 @@ fn committed_before(history: &[(Position, PreflopStep)], actor: Position, depth_
 /// `committed_by_actor_sb` for each node's actor. A duplicate `node_key` (two nodes with the
 /// same `(depth_bb, rake_profile, straddle, history)`) is rejected.
 ///
-/// P3.T9: also runs [`crate::ev::check_fold_consistency`] on every constructed node -- a present,
-/// verified fold EV that fails its reference's `1e-3` cross-check makes the node, and so the whole
-/// bundle, unloadable (spec section 8.3), reaching the store's existing quarantine-and-banner path
-/// exactly like any other content failure while every sibling bundle stays active.
+/// P3.T9 fix round 1 (R2): fold-EV consistency is **not** re-checked here. That admission
+/// decision is [`check_fold_consistency_wide`], run inside [`checked_envelope`] on the original
+/// wire-precision EV cells before this function is ever called -- running a second, narrow-only
+/// check on the already-`f32`-narrowed `PreflopNode` here could reject an already-accepted wire
+/// value purely from rounding right at the `1e-3` boundary (the exact defect this fix corrects),
+/// so the wide gate's decision is preserved through node construction rather than re-litigated.
 pub fn build_node_map(info: &BundleInfo, e: &Envelope) -> Result<BTreeMap<String, PreflopNode>, BundleError> {
     let mut map = BTreeMap::new();
     for n in &e.nodes {
@@ -297,7 +378,6 @@ pub fn build_node_map(info: &BundleInfo, e: &Envelope) -> Result<BTreeMap<String
             unreachable,
             committed_by_actor_sb: committed_before(&history, actor, info.depth_bb),
         };
-        crate::ev::check_fold_consistency(&node, info).map_err(BundleError::Content)?;
         let key = node_key(&PreflopNodeKey {
             depth_bb: info.depth_bb,
             rake_profile: info.rake_profile.clone(),
@@ -361,10 +441,18 @@ impl PreflopSource for ChartTranscription {
 /// bytes -> hash-checked, content-validated `Envelope`, then the class-major node map keyed
 /// by `node_key`. The wide blind check runs on the manifest's raw bytes before `BundleInfo`
 /// is deserialized, so it sees the original `f64` values, never the narrowed `f32` ones.
+///
+/// P3.T9 fix round 1 (R5): forces the process-wide combo-class table
+/// ([`BundleInfo::combo_classes`]) to initialize right here, at bundle admission -- not deferred
+/// to whichever bundle's node happens to be expanded first. The table depends only on
+/// `core_ranges::expand_169`'s fixed class order, never on this (or any) bundle's own data, so
+/// every bundle forces the same one-time build and every later caller borrows the identical
+/// `'static` table.
 pub fn load_bundle(manifest: &Path, nodes: &Path) -> Result<Box<dyn PreflopSource>, BundleError> {
     let manifest_bytes = bounded_read(manifest)?;
     check_exact_source_blinds(&manifest_bytes)?;
     let info: BundleInfo = serde_json::from_slice(&manifest_bytes)?;
+    let _ = info.combo_classes();
     let envelope = checked_envelope(&info, &bounded_read(nodes)?)?;
     let map = build_node_map(&info, &envelope)?;
     Ok(match info.source {
