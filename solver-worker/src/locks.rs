@@ -49,7 +49,9 @@ fn check_matrix(l: &NodeLock) -> Result<usize, String> {
 /// whose actor and menu width match the lock; the combo-major rows `[1326][action]` are written onto
 /// the library's action-major `[action][hand]` layout over `private_cards(player)`. An all-zero row
 /// leaves its combo free; a row for a combo outside the player's compact hand list (not in the range,
-/// or on the board) has no hand to lock and is not read.
+/// or on the board) has no hand to lock and is not read. A lock with no positive row for any hand of
+/// that list would lock nothing, so it is a mismatch, refused before `lock_current_strategy` with the
+/// node left unlocked (review I2); the job must not count it in `locks_applied`.
 ///
 /// Precondition: memory allocated and no iteration run yet — the job applies locks between
 /// `allocate_memory` and the solve loop. An unallocated or already solved game is refused rather than
@@ -85,15 +87,22 @@ fn lock_here(game: &mut PostFlopGame, lock: &NodeLock, node: &MaterializedNode) 
     if lib_actions.as_deref() != Some(node.actions.as_slice()) {
         return Err(format!("the library's menu {lib_actions:?} differs from the skeleton's {:?}", node.actions));
     }
-    let slice = {
+    let (slice, effective, n) = {
         let hands = game.private_cards(player);
         let n = hands.len();
         let mut slice = vec![0.0f32; n * node.actions.len()];
+        let mut effective = false;
         for (h, hand) in hands.iter().enumerate() {
-            for (a, p) in lock.probs[usize::from(lib_hand_to_combo(*hand))].iter().enumerate() { slice[a * n + h] = *p; }
+            let row = &lock.probs[usize::from(lib_hand_to_combo(*hand))];
+            // the library locks a hand iff some entry of its row is positive
+            effective |= row.iter().any(|p| *p > 0.0);
+            for (a, p) in row.iter().enumerate() { slice[a * n + h] = *p; }
         }
-        slice
+        (slice, effective, n)
     };
+    if !effective {
+        return Err(format!("lock mismatch: no hand of the {} range ({n} hands) has a positive row, so nothing would be locked", node.actor));
+    }
     game.lock_current_strategy(&slice);
     Ok(())
 }
@@ -237,6 +246,47 @@ mod tests {
                 assert!(if call > 0.0 { calls > 0.9 } else { calls < 0.1 }, "combo {c} calls {calls} with call EV {call}");
             }
         }
+    }
+
+    /// Review I2 (fix round 1): a lock whose positive rows name no hand of the actor's compact range
+    /// (an off-range combo, a combo blocked by the board, or no positive row at all) would lock
+    /// nothing, so `apply` refuses it as a mismatch before `lock_current_strategy` and the node stays
+    /// unlocked. Both matrices are valid at the protocol boundary: the refusal needs the actor's
+    /// range. A partially matching lock succeeds and locks exactly its in-range rows; the off-range
+    /// row is not read. An empty lock set stays valid.
+    #[test]
+    fn a_lock_that_names_no_actor_hand_is_a_mismatch() {
+        let req = lock_request();
+        let m = &req.tree.materialized;
+        let free = NodeLock { path: vec![CHECK], actor: "ip".into(), probs: vec![vec![0.0, 0.0]; 1326] };
+        let mut off_range = free.clone();
+        off_range.probs[combo("As", "Ah")] = vec![0.0, 1.0];      // IP holds QQ and 54o only
+        off_range.probs[combo("Qs", "Qh")] = vec![0.0, 1.0];      // Qs is on the board
+        let mut game = allocated(&req);
+        for (lock, what) in [(&off_range, "out-of-range rows only"), (&free, "free rows only")] {
+            validate(std::slice::from_ref(lock)).unwrap();
+            let e = apply(&mut game, lock, m).unwrap_err();
+            assert!(e.contains("mismatch") && e.contains("no hand"), "{what}: {e}");
+            assert!(game.history().is_empty(), "{what}: back at the root");
+            game.play(0);
+            assert!(game.current_locking_strategy().is_none(), "{what}: the node stays unlocked");
+            game.back_to_root();
+        }
+
+        let queens = combo("Qc", "Qd");
+        let mut partial = off_range.clone();
+        partial.probs[queens] = vec![0.0, 1.0];
+        apply(&mut game, &partial, m).unwrap();
+        game.play(0);
+        let locking = game.current_locking_strategy().expect("the partial lock took effect");
+        let hands = game.private_cards(1).to_vec();
+        let n = hands.len();
+        for (h, hand) in hands.iter().enumerate() {
+            let c = usize::from(lib_hand_to_combo(*hand));
+            let want = if c == queens { [0.0, 1.0] } else { [-1.0, -1.0] };
+            assert_eq!([locking[h], locking[n + h]], want, "combo {c}");
+        }
+        validate(&[]).unwrap();
     }
 
     /// Every refusal is an `Err` (the job's `lock_mismatch`), never a library panic, and locks nothing:
