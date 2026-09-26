@@ -10,6 +10,20 @@ use serde::{Deserialize, Serialize};
 pub trait PreflopSource: Send + Sync {
     fn bundle_info(&self) -> &BundleInfo;
     fn lookup(&self, key: &PreflopNodeKey) -> Option<PreflopNode>;
+
+    /// True if none of this source's stored nodes carry EV data (spec section 8.2/8.3: a
+    /// `ChartTranscription` bundle never carries `evs`; `checked_envelope`/`ChartTranscription::
+    /// lookup` already enforce this at load time and at lookup time respectively -- this is a
+    /// third, read-only view over the same guarantee, added for P3.T7's Rust-boundary proof
+    /// that a shipped chart bundle loads with no EV anywhere in its node map).
+    ///
+    /// Defaults to `true` for any source whose node map is not reachable through this trait
+    /// (e.g. a test double with no nodes at all, vacuously true); `PokerDataJson` and
+    /// `ChartTranscription` (`store.rs`) both override it with the real
+    /// `self.nodes.values().all(|n| n.ev_source_sb.is_none())` check over their own map.
+    fn nodes_have_no_ev(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

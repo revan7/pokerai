@@ -790,7 +790,159 @@ For Task 7, the covered prefixes at 200bb include:
 
 ## Frozen coverage and Plan 4 handoff (Task 7)
 
-*Not started.*
+Completed 2026-09-26. This section freezes the coverage checklist Tasks 5 and 6 built and
+proves both shipped chart bundles load through the Rust boundary. It changes no cell value and
+no inventory row -- the Inventory tables under "PokerCoaching 100bb transcription (Task 5)" and
+"RangeConverter 200bb transcription (Task 6)" above remain the row-by-row record; this section
+only adds the frozen summary and the Plan 4 handoff text, machine-checked by
+`tools/tests/test_chart_ingest.py`'s new P3.T7 section and by
+`crates/core-preflop/tests/envelope.rs`'s `published_chart_bundles_load`.
+
+### Frozen availability
+
+`fixtures/charts/sources.manifest.json` (Task 4) declares both depths `"available"` in this
+build, unchanged since Task 4: `100` -> `pokercoaching_100`, `200` -> `rangeconverter_200`. Both
+bundles are committed (`fixtures/charts/pokercoaching_100.{json,manifest.json}`,
+`fixtures/charts/rangeconverter_200.{json,manifest.json}`) and their manifests match this
+section's numbers exactly (`test_frozen_availability_both_depths_shipped`, hard-failing rather
+than skipping if either depth is ever demoted to `"unsupported"` without this section being
+updated in the same change).
+
+### Frozen coverage counts
+
+| Depth | Bundle | Inventory rows | Covered rows | Distinct covered node keys | Absent rows | Envelope nodes |
+|---|---|---|---|---|---|---|
+| 100bb | `pokercoaching_100` | 45 | 23 | 22 | 22 | 22 |
+| 200bb | `rangeconverter_200` | 44 | 36 | 35 | 8 | 35 |
+
+(100bb's 23 covered rows collapse to 22 distinct keys because the SB first-in spot is
+reconciled across pages 3 and 6, one node; 200bb's 36 covered rows collapse to 35 distinct keys
+because the SB first-in-limp spot is reconciled the same way across the RFI grid and the blind
+limp line.) Pinned by `test_frozen_coverage_counts_100bb`/`test_frozen_coverage_counts_200bb`.
+
+### Frozen Plan 4 handoff prefixes
+
+The three prefix families the Task 6 section's closing note already anticipated for this task
+are confirmed as real covered chart nodes (never the synthetic §9.3 fallback) by exact history-
+key lookup against the committed envelopes:
+
+- **100bb, opener folds around to a BB decision with `call` on the menu** -- all four non-blind
+  openers: UTG (row 16), HJ (row 17), CO (row 18), BTN (row 19) vs BB, each `fold / call / raise
+  10bb`. Pinned by `test_frozen_plan4_handoff_prefixes_covered_100bb`.
+- **200bb, opener folds around to a BB decision with `call` on the menu** -- CO (row 18) and BTN
+  (row 19) vs BB, each `fold / call / raise 11.05bb`.
+- **200bb, BTN open -> BB 3bet -> a BTN decision with `call` on the menu** -- "BTN vs BB 3bet"
+  (row 34), `fold / call / raise 25bb`.
+
+Both pinned by `test_frozen_plan4_handoff_prefixes_covered_200bb`.
+
+A missing response (any `absent` inventory row, both depths) contributes only the §9.3 frozen-
+range fallback (`UnconditionedPriorStreet`) at lookup time; it is never promoted to a chart node
+and is never reported to Plan 4 as a fully conditioned benchmark. This is now itself checked, not
+just asserted: no `absent` row's history appears among the committed envelope's actual node keys
+(`test_pokercoaching_100_absent_rows_never_become_chart_nodes` at 100bb,
+`test_rangeconverter_200_audit_matrix_counts` at 200bb, already committed under Task 6).
+
+### Plan 4 handoff paragraph
+
+Both chart depths ship in this build (100bb `pokercoaching_100`, 200bb `rangeconverter_200`);
+the "if depth 200 is unsupported" caveat this task would otherwise have to state does not apply
+here -- §13.5's 200bb baseline spots and §10.5's tier-3 pre-solver scenarios that land on one of
+this section's frozen prefixes above do have a chart range source in this build. Plan 4 may use,
+as fully chart-conditioned scenarios: the four 100bb opener-vs-BB-call prefixes, the two 200bb
+opener-vs-BB-call prefixes, and the one 200bb BTN-open/BB-3bet/BTN-call prefix listed above --
+and no others without re-checking this section, since every other node key is either a different
+covered spot (with its own, possibly different, menu) or genuinely `absent` and must go through
+the §9.3 fallback rather than being treated as chart-conditioned. Any future acquisition that
+changes a depth's availability, or any correction to an already-transcribed cell, must update
+this section's counts and prefix list in the same change (a new dated note under Task 5/6, per
+this file's own append-only rule, plus an update here) -- Plan 4 is not expected to re-derive
+this checklist itself.
+
+### Rust boundary proof
+
+`crates/core-preflop/tests/envelope.rs`'s `published_chart_bundles_load` reads
+`fixtures/charts/sources.manifest.json`, and for every depth marked `"available"` calls
+`core_preflop::load_bundle` on the matching `<bundle_id>.manifest.json`/`<bundle_id>.json` pair,
+asserting: `source == ChartTranscription`, the loaded `depth_bb` matches the manifest's declared
+depth, `ev_reference == Unverified`, `rake_profile == "undocumented"`, `rake` is `None`, and no
+loaded node carries EV data. It runs against both committed bundles in this build (`loaded == 2`
+after the loop), replacing the Task 6 section's scratch-crate sanity load with a committed test.
+
+**Deviation from the brief, orchestrator pre-flight ruling applied:** the brief's draft test
+calls `info.nodes_have_no_ev()` on `info: &BundleInfo` returned by `source.bundle_info()`, but
+`BundleInfo` (`crates/core-preflop/src/envelope.rs`) carries no `nodes` field at all -- only the
+two adapters, `PokerDataJson` and `ChartTranscription` (`crates/core-preflop/src/store.rs`),
+hold `nodes: BTreeMap<String, PreflopNode>`. Per the orchestrator's ruling, the test instead
+calls `source.nodes_have_no_ev()` on `source: &Box<dyn PreflopSource>` (auto-derefs to `&dyn
+PreflopSource`), against a new trait method:
+
+- `PreflopSource::nodes_have_no_ev(&self) -> bool` (`envelope.rs`), with a default body
+  `{ true }` for any source whose node map is not reachable through the trait (there is one such
+  test-only implementor in the existing suite, `EmptyBundle` in
+  `crates/core-preflop/tests/lookup.rs`, which is outside this task's Files list and is left
+  untouched -- the default keeps it compiling without a required-method break).
+- `PokerDataJson`/`ChartTranscription` (`store.rs`) both override it with
+  `self.nodes.values().all(|n| n.ev_source_sb.is_none())`, the exact body the brief specified.
+
+This touches `envelope.rs` and `store.rs` in addition to the brief's named
+`crates/core-preflop/tests/envelope.rs` -- reported here as the "trait method if needed"
+exception the task's dispatch explicitly allowed, not an undisclosed scope expansion. No other
+file outside the brief's Files list was touched.
+
+### Gate evidence (2026-09-26)
+
+```
+> cargo test -p core-preflop --test envelope published_chart_bundles_load --locked
+error[E0599]: no method named `nodes_have_no_ev` found for struct `Box<dyn PreflopSource>` in the current scope
+   --> crates\core-preflop\tests\envelope.rs:987:24
+    |
+987 |         assert!(source.nodes_have_no_ev(), "charts omit evs entirely");
+    |                        ^^^^^^^^^^^^^^^^ method not found in `Box<dyn PreflopSource>`
+error: could not compile `core-preflop` (test "envelope") due to 1 previous error
+```
+
+(RED, before `PreflopSource::nodes_have_no_ev` existed.) After adding the trait method and both
+adapter overrides:
+
+```
+> cargo test -p core-preflop --test envelope --locked
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+```
+
+(GREEN, includes `published_chart_bundles_load`.)
+
+```
+> python tools/chart_ingest.py verify fixtures/charts/transcription/pokercoaching_100.json fixtures/charts/pokercoaching_100.json fixtures/charts/pokercoaching_100.manifest.json
+verified 22 nodes, 3718 classes
+> python tools/chart_ingest.py verify fixtures/charts/transcription/rangeconverter_200.json fixtures/charts/rangeconverter_200.json fixtures/charts/rangeconverter_200.manifest.json
+verified 35 nodes, 5915 classes
+```
+
+```
+> python -m pytest tools -q -W error
+168 passed in 1.64s
+```
+
+(162 pre-existing plus the 6 new P3.T7 tests: `test_frozen_availability_both_depths_shipped`,
+`test_frozen_coverage_counts_100bb`, `test_frozen_coverage_counts_200bb`,
+`test_frozen_plan4_handoff_prefixes_covered_100bb`,
+`test_frozen_plan4_handoff_prefixes_covered_200bb`,
+`test_pokercoaching_100_absent_rows_never_become_chart_nodes`.)
+
+```
+> cargo test --workspace --locked
+(exit 0; every crate's "test result: ok", 0 failed, across every unit/integration/doc-test
+target; the only warnings anywhere in the log are the 6 disclosed vendored
+`mismatched_lifetime_syntaxes` warnings in `third_party/postflop-solver` (out of the gate's
+scope per plan 3's standing ruling (f)) and the 13 disclosed ts-rs "failed to parse serde
+attribute" diagnostics (orchestrator ruling, 2026-09-17) -- zero first-party warnings)
+```
+
+### Proposed `docs/INDEX.md` rows (orchestrator applies)
+
+No new document was created; `docs/data/chart-transcription.md`'s existing INDEX row (if any)
+needs no change -- this task only filled in one of its already-listed pending sections.
 
 ## Replay/bet-translation goldens audit (Task 19)
 

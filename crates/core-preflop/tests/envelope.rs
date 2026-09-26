@@ -950,3 +950,42 @@ fn open_reports_missing_directory_without_panicking() {
     assert_eq!(store.bundles().len(), 0);
     assert_eq!(banners.len(), 1);
 }
+
+// --- P3.T7: both shipped chart bundles load through the Rust boundary (spec section 8.2/8.1) ---
+
+/// The exact brief scenario, with the orchestrator's pre-flight ruling applied: the brief's
+/// draft called `info.nodes_have_no_ev()` on `info: &BundleInfo`, but `BundleInfo` carries no
+/// `nodes` field at all (only the adapters -- `PokerDataJson`/`ChartTranscription` -- hold
+/// `nodes: BTreeMap<String, PreflopNode>`). This calls it on `source: &Box<dyn PreflopSource>`
+/// instead (auto-derefs to `&dyn PreflopSource`), against the new `PreflopSource::
+/// nodes_have_no_ev` trait method (see `envelope.rs`/`store.rs`; deviation reported in
+/// `docs/data/chart-transcription.md`'s Task 7 section and the task report).
+///
+/// Reads the same `fixtures/charts/sources.manifest.json` availability manifest Task 4 froze
+/// (spec section 13.0), so an unshipped depth is skipped here rather than failed -- the
+/// separate frozen-checklist tests in `tools/tests/test_chart_ingest.py` are what hard-fail if
+/// a depth this build actually depends on goes missing.
+#[test]
+fn published_chart_bundles_load() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let raw = std::fs::read(root.join("fixtures/charts/sources.manifest.json")).unwrap();
+    let m: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let mut loaded = 0;
+    for d in m["depths"].as_array().unwrap() {
+        if d["status"] != "available" {
+            continue;
+        }
+        let id = d["bundle_id"].as_str().unwrap();
+        let dir = root.join("fixtures/charts");
+        let source = core_preflop::load_bundle(&dir.join(format!("{id}.manifest.json")), &dir.join(format!("{id}.json"))).unwrap();
+        let info = source.bundle_info();
+        assert_eq!(info.source, core_preflop::SourceKind::ChartTranscription);
+        assert_eq!(info.depth_bb as u64, d["depth_bb"].as_u64().unwrap());
+        assert_eq!(info.ev_reference, core_preflop::EvReference::Unverified);
+        assert_eq!(info.rake_profile, "undocumented");
+        assert!(info.rake.is_none(), "an unpublished chart rake is never assigned a profile");
+        assert!(source.nodes_have_no_ev(), "charts omit evs entirely");
+        loaded += 1;
+    }
+    assert!(loaded > 0, "at least one chart depth must ship");
+}

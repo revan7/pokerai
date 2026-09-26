@@ -428,6 +428,9 @@ impl PreflopSource for PokerDataJson {
     fn lookup(&self, key: &PreflopNodeKey) -> Option<PreflopNode> {
         self.nodes.get(&node_key(key)).cloned()
     }
+    fn nodes_have_no_ev(&self) -> bool {
+        self.nodes.values().all(|n| n.ev_source_sb.is_none())
+    }
 }
 
 impl PreflopSource for ChartTranscription {
@@ -444,6 +447,9 @@ impl PreflopSource for ChartTranscription {
             node.ev_source_sb = None;
             node
         })
+    }
+    fn nodes_have_no_ev(&self) -> bool {
+        self.nodes.values().all(|n| n.ev_source_sb.is_none())
     }
 }
 
