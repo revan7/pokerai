@@ -714,14 +714,16 @@ fn an_unusable_last_hit_is_refused_without_advancing_the_counter() {
     cache.shutdown();
 }
 
-/// Review R5, restart side, revised by fix round 2 N1: a cell already on disk whose entry carries
-/// an unusable `last_hit` must not seed the writer's counter (it would leave no headroom for the
-/// strictly increasing bump) -- but it is no longer deleted at scan, only reported and excluded
-/// from the index (the re-review's N1: deleting it destroyed the newest store whenever the corrupt
-/// row was the writer's own bug rather than external tampering, so scan-time deletion for this
-/// specific reason was removed; a misfiled cell is still deleted, see `scan_index_...` above).
+/// Review R5, restart side, revised by fix round 2 N1 and fix round 3 N2: a cell already on disk
+/// whose *only* entry carries an unusable `last_hit` must not seed the writer's counter (it would
+/// leave no headroom for the strictly increasing bump) -- and, since it holds no usable entry left
+/// once that row is excluded, it is corrupt garbage exactly like a misfiled cell and is deleted at
+/// scan through the same identity-checked path (fix round 3 N2: leaving it on disk, unindexed and
+/// unaccounted, was an invisible quota leak). This is different from N1's own case -- a corrupt row
+/// found *beside* a legitimate entry in the same file, which must survive untouched; see the restart
+/// test below for that mixed case.
 #[test]
-fn a_cell_on_disk_with_an_unusable_last_hit_neither_seeds_the_counter_nor_is_deleted() {
+fn a_wholly_corrupt_cell_on_disk_neither_seeds_the_counter_nor_survives() {
     let dir = TempDir::new("unusable-on-disk");
     let mut bad = entry_in_cell("cell_a_test_v1", 500, 0.004);
     bad.last_hit = u64::MAX;
@@ -732,7 +734,7 @@ fn a_cell_on_disk_with_an_unusable_last_hit_neither_seeds_the_counter_nor_is_del
     let b = entry_in_cell("cell_b_test_v1", 500, 0.004);
     assert!(store_at(&cache, &b, 1), "the writer must still be storing");
     assert_eq!(last_hits(dir.path(), b.key.digest()), Some(vec![1]), "a disk timestamp above LAST_HIT_MAX must not seed the counter");
-    assert!(bad_path.exists(), "a cell carrying an unusable last_hit is reported and skipped, never deleted for that reason alone (fix round 2 N1)");
+    assert!(!bad_path.exists(), "a cell with no usable entry left is deleted at scan, not left as an unindexed leak (fix round 3 N2)");
     cache.shutdown();
 }
 
@@ -886,14 +888,17 @@ fn apply_touch_rejects_an_over_ceiling_last_hit_directly() {
     assert_eq!(last_hits(dir.path(), e.key.digest()), Some(vec![e.last_hit]), "a rejected touch changes nothing");
 }
 
-/// Fix round 2 N1: a persisted `last_hit` above `LAST_HIT_MAX` can now only reach disk through
-/// direct tampering -- the writer itself refuses to ever produce one (the two tests above) -- but
-/// if one is found there anyway, `scan_index` must report and skip that one row, never delete the
-/// cell that holds it or disturb any other, legitimate store made in the same session. This is the
-/// re-review's own reachable state: a store at exactly `LAST_HIT_MAX`, followed (pre-fix) by
-/// another store whose bump landed one past it.
+/// Fix round 2 N1, revised by fix round 3 N2: a persisted `last_hit` above `LAST_HIT_MAX` can now
+/// only reach disk through direct tampering -- the writer itself refuses to ever produce one (the
+/// two tests above). This is the re-review's own reachable state: a store at exactly
+/// `LAST_HIT_MAX`, followed (pre-fix) by another store, *in its own cell*, whose bump landed one
+/// past it. That other cell holds no usable entry once its one row is excluded, so it is deleted
+/// through the same identity-checked path as any other corrupt cell -- never left as an unindexed,
+/// unaccounted leak (fix round 3 N2) -- while the legitimate store in the first cell is completely
+/// undisturbed (N1's own concern: a corrupt row must never take a co-located or unrelated
+/// legitimate store down with it).
 #[test]
-fn a_restart_reports_and_skips_a_persisted_over_ceiling_row_without_deleting_any_cell() {
+fn a_restart_deletes_a_wholly_corrupt_cell_and_leaves_other_cells_untouched() {
     let dir = TempDir::new("corrupt-last-hit-restart");
     let legitimate = entry_in_cell("cell_a_test_v1", 500, 0.004);
     let first = Cache::open(dir.path().to_path_buf(), CACHE_QUOTA_BYTES);
@@ -901,25 +906,54 @@ fn a_restart_reports_and_skips_a_persisted_over_ceiling_row_without_deleting_any
     first.shutdown();
 
     // What the pre-fix writer bug could persist: a correctly filed, otherwise valid cell whose
-    // entry carries a last_hit one above the ceiling.
+    // only entry carries a last_hit one above the ceiling -- a cell left with zero usable entries.
     let mut corrupt = entry_in_cell("cell_b_test_v1", 500, 0.004);
     corrupt.last_hit = quota::LAST_HIT_MAX + 1;
     let corrupt_path = storage::entry_path(dir.path(), corrupt.key.digest());
     storage::write_atomic(&corrupt_path, &storage::encode(&Cell { entries: vec![corrupt.clone()] }).unwrap()).unwrap();
 
     let index = quota::scan_index(dir.path());
-    assert!(corrupt_path.exists(), "a persisted over-ceiling row must not be deleted at scan");
-    assert!(!index.contains(&entry_key(&corrupt)), "the corrupt row is skipped, never indexed");
+    assert!(!corrupt_path.exists(), "a cell with no usable entry left is deleted at scan, not left as an unindexed leak (fix round 3 N2)");
+    assert!(!index.contains(&entry_key(&corrupt)), "the corrupt row is never indexed");
+    assert_eq!(index.used(), measured_bytes(dir.path(), legitimate.key.digest()) as u128, "the deleted cell's bytes leave the accounting only once the file is confirmed gone");
     assert!(index.contains(&entry_key(&legitimate)), "the newest legitimate store survives the scan untouched");
     assert_eq!(index.max_last_hit(), legitimate.last_hit, "the corrupt row must not seed the writer's counter");
     assert_eq!(last_hits(dir.path(), legitimate.key.digest()), Some(vec![legitimate.last_hit]), "the legitimate cell's content is untouched");
 
     let reopened = Cache::open(dir.path().to_path_buf(), CACHE_QUOTA_BYTES);
     assert!(cell_on_disk(dir.path(), legitimate.key.digest()).is_some(), "the restart itself must not remove the legitimate store");
-    assert!(corrupt_path.exists(), "the restart itself must not remove the corrupt file either");
     let next = entry_in_cell("cell_c_test_v1", 500, 0.004);
-    assert!(store_at(&reopened, &next, 1), "the writer must still be able to store after opening onto a corrupt row");
+    assert!(store_at(&reopened, &next, 1), "the writer must still be able to store after a corrupt cell is cleaned up");
     reopened.shutdown();
+}
+
+/// Fix round 3 N2: a cell drained to zero usable entries *during eviction* -- its only surviving
+/// entry corrupt (`last_hit` above `LAST_HIT_MAX`) once the last usable entry alongside it is
+/// evicted -- must be deleted through the same identity-checked path, never rewritten with the
+/// corrupt leftover and then silently un-indexed. The corrupt entry here can only reach disk by
+/// direct tampering (the writer refuses to ever persist one, fix round 2 N1); it stands in for a
+/// cell that carried one over from before this fix landed. Covers both of `evict_entry`'s
+/// `rows_of_usable(&kept).is_empty()` branches (the stale-row branch takes the same path whenever a
+/// placeholder's rows are re-derived as all-corrupt, per the re-review's own trace).
+#[test]
+fn a_cell_drained_during_eviction_is_deleted_not_orphaned() {
+    let dir = TempDir::new("drained-during-eviction");
+    let mut usable = entry_at(495, 0.004);
+    usable.last_hit = 1;
+    let mut corrupt = entry_at(500, 0.001);
+    corrupt.last_hit = quota::LAST_HIT_MAX + 1;
+    assert_eq!(usable.key.digest(), corrupt.key.digest(), "both entries must land in one cell (bucket 81 spans both stacks), or this is not a mixed cell");
+    let path = storage::entry_path(dir.path(), usable.key.digest());
+    storage::write_atomic(&path, &storage::encode(&Cell { entries: vec![usable.clone(), corrupt.clone()] }).unwrap()).unwrap();
+
+    // The cell's whole measured size is charged to its one indexed (usable) row -- the corrupt row
+    // is excluded entirely -- so a quota one byte under that size forces this cell's only row to be
+    // evicted, leaving nothing usable behind.
+    let quota = measured_bytes(dir.path(), usable.key.digest()) - 1;
+    let cache = Cache::open(dir.path().to_path_buf(), quota);
+    quota_pass(&cache);
+    assert!(!path.exists(), "a cell drained to zero usable entries by eviction is deleted, not rewritten and left unindexed (fix round 3 N2)");
+    cache.shutdown();
 }
 
 /// Review R3's sharing mode: read and write sharing, but no `FILE_SHARE_DELETE` (0x4), so Windows
