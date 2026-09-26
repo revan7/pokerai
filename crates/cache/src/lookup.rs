@@ -8,6 +8,14 @@
 
 use crate::entry::sorted_by_path;
 
+/// A command for the cache's bounded reader thread, the type `Cache::reader`'s channel carries
+/// (plan 4 task 6's `crate::lookup::ReadCommand`). Task 6 leaves `Cache::reader` as `None` and
+/// needs only `Shutdown`, which `Cache::shutdown` sends; task 7 adds the `Cells` read request here
+/// and installs the reader thread (`Cache::start_reader`) that consumes both.
+pub enum ReadCommand {
+    Shutdown,
+}
+
 /// The exact-rational comparison of a candidate `CacheEntry` against a live query: `delta` is
 /// the SPR relative difference, `max_dev` the maximum pot-fraction deviation across every wager
 /// menu entry that survived the topology check (spec section 10.4 `delta`/`dev`). The `f64`

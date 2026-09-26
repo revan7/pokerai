@@ -12,47 +12,18 @@
 //! best-effort delete").
 
 mod support;
+// The per-invocation temp directory (review R5; one shared file since task 6 review R7):
+// exclusively created, unique per process and call, removed on `Drop` -- including while a
+// failing assertion unwinds -- and clearing a dead process's stale leftover before it is created.
+#[path = "support/temp_dir.rs"]
+mod temp_dir;
 
 use bincode::Options;
 use cache::entry::{validate_entry, CacheEntry};
 use cache::storage::{self, Cell, COMPRESSED_MAX, DECODED_MAX};
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-// --- shared filesystem test helper (review R5) --------------------------------------------------
-
-static UNIQUE: AtomicU64 = AtomicU64::new(0);
-
-/// A per-invocation-unique temp directory (review R5): created with an *exclusive*
-/// `std::fs::create_dir` (never `create_dir_all`, which would silently accept -- "adopt" -- a
-/// directory a prior failed run, or an earlier PID reuse, left behind) under a name unique to
-/// this process *and* this call (PID plus a process-wide atomic counter, so two guards created
-/// in the same test binary, even from different threads, can never collide), and removed on
-/// `Drop`. `Drop` also runs while a panicking assertion unwinds the stack, so a failed test case
-/// still cleans up its own directory instead of leaking one for a later run to find -- and,
-/// because `create_dir` is exclusive, that later run always gets a fresh directory rather than
-/// silently reusing whatever such a leak left behind.
-struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        let id = UNIQUE.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("pokerai-cache-{label}-{}-{id}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("TempDir::new must get a fresh, exclusively-created directory at {dir:?}: {e}"));
-        TempDir(dir)
-    }
-
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use temp_dir::TempDir;
 
 fn assert_miss_and_deleted(bytes: &[u8], dir: &std::path::Path, name: &str) {
     let path = dir.join(name);
@@ -128,34 +99,27 @@ fn cache_corrupt_entry_deleted() {
 
 // --- task 6: atomic publication (`write_atomic`) -------------------------------------------------
 
-/// Brief step 1's replacement test, plus step 5's crash cases: a publication that never reached
-/// its `rename` leaves the previously published cell byte-for-byte intact and readable, and a
-/// publication that did rename is complete -- there is no state in which a reader can observe
-/// half of either version.
+/// Brief step 1's replacement test and step 5's "after rename: the new cell is complete", entirely
+/// inside one per-invocation `TempDir` (review R7: no global, PID-only path, and cleanup on
+/// unwind). Step 5's "inject failure before rename" runs the *production* `write_atomic` with a
+/// failure injected between its temp write and its rename, which only a crate-internal
+/// `#[cfg(test)]` seam can do -- see `crates/cache/src/storage.rs`'s unit tests (review R6); the
+/// crash leftovers a killed writer would leave are `sweep_temporaries`'s test in
+/// `crates/cache/tests/quota.rs`.
 #[test]
 fn cache_atomic_write_and_quota() {
-    let path = std::env::temp_dir().join(format!("pokerai-atomic-{}.bin", std::process::id()));
+    let dir = TempDir::new("atomic");
+    let path = dir.path().join("pokerai-atomic.bin");
     cache::storage::write_atomic(&path, b"old").unwrap();
     cache::storage::write_atomic(&path, b"new").unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"new");
-    std::fs::remove_file(path).unwrap();
 
-    // Step 5, "inject failure before rename": a crashed writer's temp file is a sibling in the
-    // same directory, and the old cell is still the only thing at the published path.
-    let dir = TempDir::new("atomic-crash");
+    // Step 5, "after rename": a real cell replacing a real cell lands whole, and leaves no temp
+    // file of its own behind.
     let e = support::entry();
     let published = storage::entry_path(dir.path(), e.key.digest());
     let old = storage::encode(&Cell { entries: vec![e.clone()] }).unwrap();
     storage::write_atomic(&published, &old).unwrap();
-    assert_eq!(std::fs::read_dir(published.parent().unwrap()).unwrap().count(), 1, "a completed publication leaves only the cell itself");
-
-    let crashed = published.with_extension(format!("{}.4242.tmp", std::process::id()));
-    std::fs::write(&crashed, &old[..old.len() / 2]).unwrap();
-    assert_eq!(std::fs::read(&published).unwrap(), old, "a half-written temp sibling must not touch the published bytes");
-    let back = storage::read_cell(&published).expect("the old cell must still read back while a partial write sits beside it");
-    assert_eq!(back.entries[0].key, e.key);
-
-    // Step 5, "after rename": the replacement is whole, and its own temp file is gone.
     let mut replacement_entry = support::entry();
     replacement_entry.iterations = 4_321;
     let new = storage::encode(&Cell { entries: vec![replacement_entry] }).unwrap();
@@ -163,8 +127,24 @@ fn cache_atomic_write_and_quota() {
     storage::write_atomic(&published, &new).unwrap();
     assert_eq!(std::fs::read(&published).unwrap(), new, "the replacement lands whole");
     assert_eq!(storage::read_cell(&published).unwrap().entries[0].iterations, 4_321);
-    std::fs::remove_file(&crashed).unwrap();
     assert_eq!(std::fs::read_dir(published.parent().unwrap()).unwrap().count(), 1, "write_atomic leaves no temp file of its own behind");
+}
+
+/// Review R7: the shared helper never inherits a previous run's files -- a stale leftover at a
+/// fresh name (a dead process that had this process id) is cleared before the exclusive create --
+/// and removes its directory on `Drop`.
+#[test]
+fn temp_dir_clears_a_stale_leftover_and_removes_itself_on_drop() {
+    let parent = TempDir::new("temp-dir-parent");
+    let stale = parent.path().join("stale");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("leftover.bin"), b"a dead run's file").unwrap();
+
+    let fresh = TempDir::fresh(stale.clone());
+    assert_eq!(fresh.path(), stale);
+    assert_eq!(std::fs::read_dir(fresh.path()).unwrap().count(), 0, "a fresh TempDir starts empty, never adopting a leftover");
+    drop(fresh);
+    assert!(!stale.exists(), "a TempDir removes its directory on drop");
 }
 
 /// A publication that cannot complete reports the failure and cleans up after itself: the
