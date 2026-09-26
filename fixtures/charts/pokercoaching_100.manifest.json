@@ -1,0 +1,22 @@
+{
+  "bundle_id": "pokercoaching_100",
+  "source": "ChartTranscription",
+  "depth_bb": 100,
+  "depths": [
+    100
+  ],
+  "source_blinds": [
+    0.5,
+    1.0
+  ],
+  "rake_profile": "undocumented",
+  "rake": null,
+  "straddle": false,
+  "version": 2,
+  "game": "nl",
+  "ev_unit": "source_sb",
+  "ev_reference": "unverified",
+  "license_note": "PokerCoaching 'Implementable GTO Charts' (public PDF online-6max-gto-charts.pdf), transcribed cell by cell for private use; not redistributed. Frequencies are the published pure 0/1 displayed choices; no EVs.",
+  "accuracy": "unverified",
+  "sha256": "97670f854018a17f6c9e1bcc851ec1a24a3e29492633aa25f60bf6ed19c4fa86"
+}

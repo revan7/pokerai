@@ -3,7 +3,7 @@ name = "pokerai-tools"
 version = "0.1.0"
 description = "Dev-only oracles and fixture generators for the PokerAI assistant (never a runtime dependency)"
 requires-python = ">=3.12"
-dependencies = ["pokerkit==0.7.5", "phevaluator==0.6.0", "pytest>=9.0"]
+dependencies = ["pokerkit==0.7.5", "phevaluator==0.6.0", "pypdfium2==5.13.0", "pytest>=9.0"]
 
 [tool.setuptools]
 py-modules = ["gen_fixtures", "gen_eval_oracle"]
