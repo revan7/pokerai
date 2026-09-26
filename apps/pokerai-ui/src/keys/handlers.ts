@@ -5,7 +5,7 @@ import {describeError} from '../state/session';
 import {Recommendations} from '../state/events';
 import {decisionReason,newWizard,wizardKey,wizardResult,prefill,parseCards} from '../state/hand';
 import type {Wizard} from '../state/hand';
-import {actionForKey,canWager,wager} from './keymap';
+import {actionForKey,canWager,wager,isMappedKey} from './keymap';
 export type EntryState={hand:HandState|null;lastHand:HandState|null;wizard:Wizard|null;
   mode:'idle'|'hero'|'bet'|'board'|'tag';text:string;tagSeat:Seat|null;error:string|null;busy:boolean};
 // Spec §5.1's key map, one entry point for keyboard and on-screen controls alike. Every hand
@@ -27,12 +27,24 @@ export class EntryController {
   // Keys are handled strictly in order, each against the engine snapshot the previous key left
   // behind. At most 64 keys wait behind a pending IPC call; beyond that the key is dropped and the
   // overflow is shown instead of retaining unbounded input. A rejection never breaks the chain.
+  // A key outside the frozen vocabulary is excluded here -- before queue accounting and before any
+  // engine call -- so it can never consume a slot or displace a mapped key (I2). Ctrl+Z is gated by
+  // the same disabled-Undo predicate the on-screen button uses, checked now (at admission), not once
+  // dequeued: the button disables on `busy` too, and by the time a queued key would be dequeued a
+  // prior mutation's own `busy:false` reset could otherwise let a stale Ctrl+Z slip through (I3).
   key(key:string):Promise<void>{
     if(this.disposed)return Promise.resolve();
+    if(!isMappedKey(key))return Promise.resolve();
+    if(key==='Ctrl+Z'&&this.undoDisabled())return Promise.resolve();
     if(this.queued>=64){this.report(new Error('Input queue full; wait for the current action'));return Promise.resolve();}
     this.queued++;
     this.chain=this.chain.then(()=>this.run(key)).catch(this.report).finally(()=>{this.queued--;});
     return this.chain;
+  }
+  // Mirrors the on-screen Undo control's own disabled predicate (Entry.tsx: `!s.hand&&!s.lastHand`,
+  // combined with the shared `busy` gate every button uses via `disabled={disabled||s.busy}`).
+  private undoDisabled():boolean{
+    return this.value.busy||(!this.value.hand&&!this.value.lastHand);
   }
   // A rejected key press -- local validation or an engine rejection -- leaves the entry exactly as
   // it was before that key (open field, typed text, wizard step; the engine snapshot is only ever
@@ -60,8 +72,8 @@ export class EntryController {
     if(this.disposed)return;
     const h=this.value.hand;
     if(key==='Ctrl+Z'){
-      // Same gate as the on-screen Undo control: with neither a hand nor a previous one it is disabled.
-      if(!h&&!this.value.lastHand)return;
+      // The disabled-Undo predicate (busy, or neither a hand nor a previous one) already gated
+      // admission in `key()`; a Ctrl+Z reaching here is always eligible to run.
       this.update({wizard:null,mode:'idle',text:''});await this.mutate(()=>this.backend.undo());return;
     }
     if(key==='Escape'){this.update({wizard:null,mode:'idle',text:'',tagSeat:null,error:null});return;}
@@ -136,9 +148,16 @@ export function attachKeys(target:Window,controller:EntryController):()=>void{
     if(event.repeat||event.isComposing||event.altKey||event.metaKey)return;
     const element=event.target;
     if(element instanceof HTMLElement&&(element.matches('input,textarea,select')||element.isContentEditable))return;
-    if(event.ctrlKey&&event.key.toLowerCase()!=='z')return;
-    const key=event.ctrlKey?'Ctrl+Z':event.key;
-    if(!/^[a-z0-9 ]$/i.test(key)&&!['Enter','Backspace','Escape','Ctrl+Z'].includes(key))return;
+    if(event.ctrlKey){
+      // Only the exact Ctrl+Z chord is Undo (I1): any additional modifier -- Ctrl+Shift+Z and the
+      // like -- is outside the frozen map and left completely alone: neither forwarded nor
+      // `preventDefault`ed, and no engine call. Ordinary shifted letters (no ctrlKey) are unaffected
+      // by this branch and keep working for uppercase action/card entry.
+      if(event.shiftKey||event.key.toLowerCase()!=='z')return;
+      event.preventDefault();void controller.key('Ctrl+Z');return;
+    }
+    const key=event.key;
+    if(!isMappedKey(key))return;
     event.preventDefault();void controller.key(key);
   };
   target.addEventListener('keydown',handler);return()=>target.removeEventListener('keydown',handler);
