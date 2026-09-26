@@ -1,5 +1,7 @@
 pub mod cards;
+pub mod extract;
 pub mod history;
+pub mod locks;
 pub mod memory;
 pub mod solve_loop;
 #[cfg(test)]
