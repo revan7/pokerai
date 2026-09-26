@@ -4,11 +4,13 @@ pub mod history;
 pub mod job;
 pub mod locks;
 pub mod memory;
+pub mod protocol;
 pub mod solve_loop;
 #[cfg(test)]
 pub mod testutil;
 pub mod tree_build;
 pub mod win;
+pub mod writer;
 
 use proto::worker::{Ready, WorkerMessage, ADAPTER_VERSION, PROTO_VERSION};
 
