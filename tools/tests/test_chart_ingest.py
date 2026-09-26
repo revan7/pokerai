@@ -1442,3 +1442,106 @@ def test_rangeconverter_200_unreachable_classes_have_zero_opening_weight():
         assert set(n["unreachable_classes"]) <= never, n["history"]
         checked += 1
     assert checked == 15
+
+
+# --- P3.T7: freeze the chart coverage checklist and the Plan 4 handoff ---
+#
+# Unlike the Task 5/Task 6 tests above (which `skipif` when a depth is genuinely not part of
+# this build, e.g. a future "unsupported" acquisition outcome), the tests in this section
+# encode the frozen checklist itself: this build's `sources.manifest.json` already declares
+# both depths `"available"`, so a checklist test here must fail, never skip, if either bundle
+# goes missing later -- Plan 4 reads this checklist before generating any bench suite or
+# 50-hand input, and a silently-skipped checklist test would let that generation proceed
+# against stale coverage.
+
+
+def test_frozen_availability_both_depths_shipped():
+    """Pins the exact state the frozen checklist below assumes: both chart depths ship in
+    this build. If a future change drops one to `"unsupported"`, this must fail so the
+    checklist and the Plan 4 handoff paragraph are updated together, never silently."""
+    depths = available_depths()
+    assert 100 in depths, "depth 100bb (pokercoaching_100) must be available for the frozen P3.T7 checklist"
+    assert 200 in depths, "depth 200bb (rangeconverter_200) must be available for the frozen P3.T7 checklist"
+
+
+def test_frozen_coverage_counts_100bb():
+    """The exact row/node counts the Task 5 section's inventory table already records (45 rows:
+    23 covered rows for 22 distinct node keys, 22 absent), pinned here as the machine-checkable
+    half of the frozen checklist."""
+    e, t = _bundle("pokercoaching_100")
+    inventory = t["inventory"]
+    covered = [r for r in inventory if r["status"] == "covered"]
+    absent = [r for r in inventory if r["status"] == "absent"]
+    assert len(inventory) == 45
+    assert len(covered) == 23
+    assert len(absent) == 22
+    assert len({json.dumps(r["history"]) for r in covered}) == 22, "23 covered rows collapse to 22 distinct node keys (the SB first-in reconciliation)"
+    assert len(e["nodes"]) == 22
+
+
+def test_frozen_coverage_counts_200bb():
+    """The exact row/node counts the Task 6 section's inventory table already records (44 rows:
+    36 covered rows for 35 distinct node keys, 8 absent)."""
+    e, t = _bundle("rangeconverter_200")
+    inventory = t["inventory"]
+    covered = [r for r in inventory if r["status"] == "covered"]
+    absent = [r for r in inventory if r["status"] == "absent"]
+    assert len(inventory) == 44
+    assert len(covered) == 36
+    assert len(absent) == 8
+    assert len({json.dumps(r["history"]) for r in covered}) == 35, "36 covered rows collapse to 35 distinct node keys (the SB first-in-limp reconciliation)"
+    assert len(e["nodes"]) == 35
+
+
+def test_frozen_plan4_handoff_prefixes_covered_100bb():
+    """The four opener-vs-BB-call prefixes the Plan 4 handoff paragraph names at 100bb (an
+    open from UTG/HJ/CO/BTN, folded around to the BB, whose own menu includes `call`) are
+    real covered chart nodes, not the synthetic §9.3 fallback -- looked up by their exact
+    history keys in the committed envelope."""
+    e, _ = _bundle("pokercoaching_100")
+    opener_histories = {
+        "UTG": [["UTG", "raise", 2500], ["HJ", "fold", 0], ["CO", "fold", 0], ["BTN", "fold", 0], ["SB", "fold", 0]],
+        "HJ": [["UTG", "fold", 0], ["HJ", "raise", 2500], ["CO", "fold", 0], ["BTN", "fold", 0], ["SB", "fold", 0]],
+        "CO": [["UTG", "fold", 0], ["HJ", "fold", 0], ["CO", "raise", 2500], ["BTN", "fold", 0], ["SB", "fold", 0]],
+        "BTN": [["UTG", "fold", 0], ["HJ", "fold", 0], ["CO", "fold", 0], ["BTN", "raise", 2500], ["SB", "fold", 0]],
+    }
+    for opener, history in opener_histories.items():
+        node = _node_by_history(e, history)
+        assert node["actor"] == "BB", f"{opener} open must fold around to a BB decision"
+        assert any(a["step"] == "call" for a in node["actions"]), f"{opener} open -> BB must have call on the menu"
+
+
+def test_frozen_plan4_handoff_prefixes_covered_200bb():
+    """The 200bb Plan 4 handoff prefixes: CO and BTN opens folded to the BB (menu includes
+    `call`), and BTN open -> BB 3bet -> a BTN decision (menu includes `call`)."""
+    e, _ = _bundle("rangeconverter_200")
+    co_open_bb = [["UTG", "fold", 0], ["HJ", "fold", 0], ["CO", "raise", 2500], ["BTN", "fold", 0], ["SB", "fold", 0]]
+    btn_open_bb = [["UTG", "fold", 0], ["HJ", "fold", 0], ["CO", "fold", 0], ["BTN", "raise", 2500], ["SB", "fold", 0]]
+    btn_open_bb_3bet = [
+        ["UTG", "fold", 0], ["HJ", "fold", 0], ["CO", "fold", 0],
+        ["BTN", "raise", 2500], ["SB", "fold", 0], ["BB", "raise", 11050],
+    ]
+    for history, expected_actor, label in (
+        (co_open_bb, "BB", "CO open -> BB"),
+        (btn_open_bb, "BB", "BTN open -> BB"),
+        (btn_open_bb_3bet, "BTN", "BTN open -> BB 3bet -> BTN"),
+    ):
+        node = _node_by_history(e, history)
+        assert node["actor"] == expected_actor, label
+        assert any(a["step"] == "call" for a in node["actions"]), f"{label} must have call on the menu"
+
+
+def test_pokercoaching_100_absent_rows_never_become_chart_nodes():
+    """A missing response is recorded as `absent` in the inventory and contributes the §9.3
+    frozen-range (`UnconditionedPriorStreet`) fallback at lookup time -- it must never appear
+    as an actual node in the committed envelope, at 100bb symmetric with the existing 200bb
+    check (`test_rangeconverter_200_audit_matrix_counts`)."""
+    e, t = _bundle("pokercoaching_100")
+    absent = [r for r in t["inventory"] if r["status"] == "absent"]
+    assert absent, "the absent audit must be part of the frozen record"
+    node_histories = {json.dumps(n["history"]) for n in e["nodes"]}
+    for r in absent:
+        assert json.dumps(r["history"]) not in node_histories, (
+            f"absent row {r['title']!r} must never be promoted to a chart node "
+            "(the Plan 4 fallback is the synthetic UnconditionedPriorStreet range, never a chart hit)"
+        )
