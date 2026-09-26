@@ -197,15 +197,22 @@ impl Cache {
 /// clock jumps backwards -- a fresh hit can never tie with, let alone be recorded as older than,
 /// any entry already in the store (review R5).
 ///
-/// `None` when `proposed` is above `quota::LAST_HIT_MAX`: an unusable timestamp is refused, never
-/// clamped, and the caller leaves the counter where it was. The `+ 1` is checked, never
+/// `None` when `proposed` is above `quota::LAST_HIT_MAX`, *or* when the monotonic bump
+/// (`previous + 1`) alone would land above it: either way the result would be unusable, so it is
+/// refused, never clamped, and the caller leaves the counter where it was (fix round 2 N1 -- the
+/// re-review found that the old code let `proposed.max(bumped)` exceed `LAST_HIT_MAX` whenever
+/// `previous` was already at the ceiling, even though `proposed` alone was usable; the writer then
+/// persisted that value, and its own next restart deleted the cell as unusable). Validating the
+/// bump against the same ceiling as `proposed` closes that gap: the writer can never itself
+/// produce a value `quota::scan_index` would consider corrupt. The `+ 1` is checked, never
 /// saturating.
 ///
 /// # Panics
-/// If `previous` is `u64::MAX` (always-on, standing ruling (b)). The writer's counter cannot get
-/// there: it starts at most `LAST_HIT_MAX` (`quota::scan_index` removes any cell carrying more)
-/// and each command raises it to at most `max(LAST_HIT_MAX, previous + 1)`, so exhausting it
-/// takes 2^63 commands.
+/// If `previous` is `u64::MAX` (always-on, standing ruling (b)) -- true arithmetic overflow,
+/// distinct from the (far lower) `LAST_HIT_MAX` ceiling this function also enforces. The writer's
+/// counter cannot get there: it starts at most `LAST_HIT_MAX` (`quota::scan_index` never indexes a
+/// row above it) and this function refuses to raise it any higher, so reaching `u64::MAX` is
+/// unreachable in practice, not just distant.
 fn next_last_hit(previous: u64, proposed: u64) -> Option<u64> {
     if proposed > crate::quota::LAST_HIT_MAX {
         return None;
@@ -213,6 +220,9 @@ fn next_last_hit(previous: u64, proposed: u64) -> Option<u64> {
     let Some(bumped) = previous.checked_add(1) else {
         panic!("last_hit counter exhausted at {previous}: the writer's strictly increasing counter has no successor");
     };
+    if bumped > crate::quota::LAST_HIT_MAX {
+        return None;
+    }
     Some(proposed.max(bumped))
 }
 
@@ -220,20 +230,24 @@ fn next_last_hit(previous: u64, proposed: u64) -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// Review R5: `max(proposed, previous + 1)` for every usable proposal, strictly increasing
-    /// through and past `LAST_HIT_MAX`; a proposal above `LAST_HIT_MAX` is refused (`None`) rather
-    /// than clamped or saturated.
+    /// Review R5, tightened by fix round 2 N1: `max(proposed, previous + 1)` for every usable
+    /// proposal, strictly increasing up to and including `LAST_HIT_MAX` -- but never past it. A
+    /// proposal above `LAST_HIT_MAX` is refused (`None`) exactly as before; *now* a bump that would
+    /// land above `LAST_HIT_MAX` is refused the same way, even though `previous` and `proposed` are
+    /// each individually usable, so the writer can never itself persist an over-ceiling value.
     #[test]
     fn next_last_hit_is_strictly_monotone_and_refuses_unusable_timestamps() {
         let ceiling = crate::quota::LAST_HIT_MAX;
         assert_eq!(next_last_hit(0, 5), Some(5), "a caller clock ahead of the counter is honored");
         assert_eq!(next_last_hit(10, 5), Some(11), "a caller clock behind the counter cannot make a hit older");
-        assert_eq!(next_last_hit(ceiling, 1), Some(ceiling + 1), "the bump past LAST_HIT_MAX is exact");
-        assert_eq!(next_last_hit(ceiling, ceiling), Some(ceiling + 1));
+        assert_eq!(next_last_hit(ceiling - 1, 1), Some(ceiling), "the bump from one below the ceiling lands exactly on it");
+        assert_eq!(next_last_hit(ceiling - 1, ceiling), Some(ceiling));
         assert_eq!(next_last_hit(7, ceiling), Some(ceiling), "LAST_HIT_MAX itself is usable");
         assert_eq!(next_last_hit(7, ceiling + 1), None, "a timestamp above LAST_HIT_MAX is refused");
         assert_eq!(next_last_hit(7, u64::MAX), None);
-        assert_eq!(next_last_hit(u64::MAX - 1, 0), Some(u64::MAX), "checked arithmetic reaches the top exactly");
+        assert_eq!(next_last_hit(ceiling, 1), None, "a bump that would land one past LAST_HIT_MAX is refused, not persisted above it (fix round 2 N1)");
+        assert_eq!(next_last_hit(ceiling, ceiling), None, "even a proposal that is itself usable is refused once the bump alone would exceed the ceiling");
+        assert_eq!(next_last_hit(u64::MAX - 1, 0), None, "checked arithmetic reaches u64::MAX without overflow, but that is still far past LAST_HIT_MAX and is refused");
     }
 
     /// Review R5: the counter's `+ 1` is checked, never saturating -- at `u64::MAX` it is an

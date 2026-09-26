@@ -714,11 +714,14 @@ fn an_unusable_last_hit_is_refused_without_advancing_the_counter() {
     cache.shutdown();
 }
 
-/// Review R5, restart side: a cell already on disk whose entry carries an unusable `last_hit` must
-/// not seed the writer's counter (it would leave no headroom for the strictly increasing bump) and
-/// is removed at scan as an unusable cell.
+/// Review R5, restart side, revised by fix round 2 N1: a cell already on disk whose entry carries
+/// an unusable `last_hit` must not seed the writer's counter (it would leave no headroom for the
+/// strictly increasing bump) -- but it is no longer deleted at scan, only reported and excluded
+/// from the index (the re-review's N1: deleting it destroyed the newest store whenever the corrupt
+/// row was the writer's own bug rather than external tampering, so scan-time deletion for this
+/// specific reason was removed; a misfiled cell is still deleted, see `scan_index_...` above).
 #[test]
-fn a_cell_on_disk_with_an_unusable_last_hit_neither_seeds_the_counter_nor_stays() {
+fn a_cell_on_disk_with_an_unusable_last_hit_neither_seeds_the_counter_nor_is_deleted() {
     let dir = TempDir::new("unusable-on-disk");
     let mut bad = entry_in_cell("cell_a_test_v1", 500, 0.004);
     bad.last_hit = u64::MAX;
@@ -729,7 +732,7 @@ fn a_cell_on_disk_with_an_unusable_last_hit_neither_seeds_the_counter_nor_stays(
     let b = entry_in_cell("cell_b_test_v1", 500, 0.004);
     assert!(store_at(&cache, &b, 1), "the writer must still be storing");
     assert_eq!(last_hits(dir.path(), b.key.digest()), Some(vec![1]), "a disk timestamp above LAST_HIT_MAX must not seed the counter");
-    assert!(!bad_path.exists(), "a cell carrying an unusable last_hit is removed at scan");
+    assert!(bad_path.exists(), "a cell carrying an unusable last_hit is reported and skipped, never deleted for that reason alone (fix round 2 N1)");
     cache.shutdown();
 }
 
@@ -785,25 +788,138 @@ fn entry_key(e: &CacheEntry) -> [u8; 32] {
     quota::entry_digest(e).try_into().expect("a sha256 digest is 32 bytes")
 }
 
-/// Review R5's boundary: `LAST_HIT_MAX` itself is a usable timestamp, and the store after it is
-/// strictly newer by exactly one (checked arithmetic, never a saturating tie) -- so under a
-/// one-cell quota the older entry is the victim and the newest store survives, even though the
-/// newest store sorts first on every tie-break.
+/// Review R5's boundary, tightened by fix round 2 N1: one below `LAST_HIT_MAX` is a usable
+/// timestamp, and the store after it is strictly newer by exactly one, landing exactly *on* the
+/// ceiling rather than past it (checked arithmetic, never a saturating tie, and never persisted
+/// above `LAST_HIT_MAX` either) -- so under a one-cell quota the older entry is the victim and the
+/// newest store survives, even though the newest store sorts first on every tie-break.
 #[test]
 fn the_newest_store_survives_at_the_last_hit_boundary() {
     let (older, newer) = tie_pair();
     let boundary = quota::LAST_HIT_MAX;
-    let (older_size, newer_size) = (cell_size(&[(&older, boundary)]), cell_size(&[(&newer, boundary + 1)]));
+    let (older_size, newer_size) = (cell_size(&[(&older, boundary - 1)]), cell_size(&[(&newer, boundary)]));
     let quota = older_size.max(newer_size);
     assert!(older_size + newer_size > quota, "the quota must hold only one of the two cells, or this test is mis-sized");
 
     let dir = TempDir::new("tie-boundary");
     let cache = Cache::open(dir.path().to_path_buf(), quota);
-    assert!(store_at(&cache, &older, boundary), "LAST_HIT_MAX itself is a usable timestamp");
+    assert!(store_at(&cache, &older, boundary - 1), "one below LAST_HIT_MAX is a usable timestamp");
     assert!(store_at(&cache, &newer, 1), "the newest store must be retained");
-    assert_eq!(last_hits(dir.path(), newer.key.digest()), Some(vec![boundary + 1]), "the store after LAST_HIT_MAX is exactly one newer");
+    assert_eq!(last_hits(dir.path(), newer.key.digest()), Some(vec![boundary]), "the store after boundary-1 is exactly one newer, landing exactly on LAST_HIT_MAX");
     assert!(cell_on_disk(dir.path(), older.key.digest()).is_none(), "the older entry is the victim");
     cache.shutdown();
+}
+
+/// Fix round 2 N1: a `last_hit` at or above `LAST_HIT_MAX` is validated the same way whether it
+/// arrives as a caller's raw proposal or as the writer's own monotonic bump -- one below, at, and
+/// one above the ceiling, for both a store and a touch. Below and at are usable; one above is
+/// refused as an error that changes nothing, however it was reached.
+#[test]
+fn store_and_touch_reject_last_hit_one_above_the_ceiling_however_it_is_reached() {
+    let dir = TempDir::new("ceiling-boundary");
+    let cache = Cache::open(dir.path().to_path_buf(), CACHE_QUOTA_BYTES);
+    let ceiling = quota::LAST_HIT_MAX;
+
+    // Directly proposed: below, at, and one above the ceiling.
+    let below = entry_in_cell("cell_a_test_v1", 500, 0.004);
+    assert!(store_at(&cache, &below, ceiling - 1), "one below the ceiling is a usable proposal");
+    let at = entry_in_cell("cell_b_test_v1", 500, 0.004);
+    assert!(store_at(&cache, &at, ceiling), "the ceiling itself is a usable proposal, and the bump from ceiling-1 lands exactly on it");
+    assert_eq!(last_hits(dir.path(), at.key.digest()), Some(vec![ceiling]));
+    let over = entry_in_cell("cell_c_test_v1", 500, 0.004);
+    assert!(!store_at(&cache, &over, ceiling + 1), "a proposal one above the ceiling is refused outright");
+    assert!(cell_on_disk(dir.path(), over.key.digest()).is_none(), "a refused store writes nothing");
+
+    // The counter is now exactly at the ceiling (from `at`'s store): the next bump would itself
+    // land one past it, so an otherwise-ordinary proposal must be refused too, not silently
+    // persisted above LAST_HIT_MAX -- the writer can never produce that value itself (fix round 2
+    // N1).
+    let bumped = entry_in_cell("cell_d_test_v1", 500, 0.004);
+    assert!(!store_at(&cache, &bumped, 1), "a store whose bump would land one past the ceiling is refused");
+    assert!(cell_on_disk(dir.path(), bumped.key.digest()).is_none());
+
+    cache.touch(at.key.digest(), quota::entry_digest(&at), ceiling);
+    quota_pass(&cache);
+    assert_eq!(last_hits(dir.path(), at.key.digest()), Some(vec![ceiling]), "a touch proposing exactly the ceiling is usable");
+
+    cache.touch(at.key.digest(), quota::entry_digest(&at), ceiling + 1);
+    quota_pass(&cache);
+    assert_eq!(last_hits(dir.path(), at.key.digest()), Some(vec![ceiling]), "a touch proposing one above the ceiling re-dates nothing");
+
+    cache.touch(below.key.digest(), quota::entry_digest(&below), 1); // an ordinary proposal, but the bump would land one past the ceiling
+    quota_pass(&cache);
+    assert_eq!(last_hits(dir.path(), below.key.digest()), Some(vec![ceiling - 1]), "a touch whose bump would land one past the ceiling re-dates nothing either");
+
+    assert!(cell_on_disk(dir.path(), below.key.digest()).is_some(), "no earlier store is disturbed by any of the refusals");
+    cache.shutdown();
+}
+
+/// Fix round 2 N1: `store_entry` and `apply_touch` validate `last_hit` against `LAST_HIT_MAX`
+/// directly, not only through the writer's `next_last_hit` gate -- so a caller reaching either
+/// function any other way still gets an error and changes nothing on disk.
+#[test]
+fn store_entry_rejects_an_over_ceiling_last_hit_directly() {
+    let dir = TempDir::new("store-entry-ceiling");
+    let mut e = entry_at(500, 0.004);
+    e.last_hit = quota::LAST_HIT_MAX + 1;
+    let path = storage::entry_path(dir.path(), e.key.digest());
+    let mut index = quota::Index::default();
+    match quota::store_entry(dir.path(), e, &mut index) {
+        Err(CacheError::Invalid(_)) => {}
+        other => panic!("expected an over-ceiling last_hit to be rejected directly, got {other:?}"),
+    }
+    assert!(!path.exists(), "a rejected store publishes nothing");
+    assert!(index.rows().is_empty());
+}
+
+/// The same direct validation on the touch path.
+#[test]
+fn apply_touch_rejects_an_over_ceiling_last_hit_directly() {
+    let dir = TempDir::new("apply-touch-ceiling");
+    let e = entry_at(500, 0.004);
+    let _path = publish(dir.path(), &e);
+    let mut index = quota::scan_index(dir.path());
+    match quota::apply_touch(dir.path(), e.key.digest(), &quota::entry_digest(&e), quota::LAST_HIT_MAX + 1, &mut index) {
+        Err(CacheError::Invalid(_)) => {}
+        other => panic!("expected an over-ceiling last_hit to be rejected directly, got {other:?}"),
+    }
+    assert_eq!(last_hits(dir.path(), e.key.digest()), Some(vec![e.last_hit]), "a rejected touch changes nothing");
+}
+
+/// Fix round 2 N1: a persisted `last_hit` above `LAST_HIT_MAX` can now only reach disk through
+/// direct tampering -- the writer itself refuses to ever produce one (the two tests above) -- but
+/// if one is found there anyway, `scan_index` must report and skip that one row, never delete the
+/// cell that holds it or disturb any other, legitimate store made in the same session. This is the
+/// re-review's own reachable state: a store at exactly `LAST_HIT_MAX`, followed (pre-fix) by
+/// another store whose bump landed one past it.
+#[test]
+fn a_restart_reports_and_skips_a_persisted_over_ceiling_row_without_deleting_any_cell() {
+    let dir = TempDir::new("corrupt-last-hit-restart");
+    let legitimate = entry_in_cell("cell_a_test_v1", 500, 0.004);
+    let first = Cache::open(dir.path().to_path_buf(), CACHE_QUOTA_BYTES);
+    store_and_wait(&first, &legitimate);
+    first.shutdown();
+
+    // What the pre-fix writer bug could persist: a correctly filed, otherwise valid cell whose
+    // entry carries a last_hit one above the ceiling.
+    let mut corrupt = entry_in_cell("cell_b_test_v1", 500, 0.004);
+    corrupt.last_hit = quota::LAST_HIT_MAX + 1;
+    let corrupt_path = storage::entry_path(dir.path(), corrupt.key.digest());
+    storage::write_atomic(&corrupt_path, &storage::encode(&Cell { entries: vec![corrupt.clone()] }).unwrap()).unwrap();
+
+    let index = quota::scan_index(dir.path());
+    assert!(corrupt_path.exists(), "a persisted over-ceiling row must not be deleted at scan");
+    assert!(!index.contains(&entry_key(&corrupt)), "the corrupt row is skipped, never indexed");
+    assert!(index.contains(&entry_key(&legitimate)), "the newest legitimate store survives the scan untouched");
+    assert_eq!(index.max_last_hit(), legitimate.last_hit, "the corrupt row must not seed the writer's counter");
+    assert_eq!(last_hits(dir.path(), legitimate.key.digest()), Some(vec![legitimate.last_hit]), "the legitimate cell's content is untouched");
+
+    let reopened = Cache::open(dir.path().to_path_buf(), CACHE_QUOTA_BYTES);
+    assert!(cell_on_disk(dir.path(), legitimate.key.digest()).is_some(), "the restart itself must not remove the legitimate store");
+    assert!(corrupt_path.exists(), "the restart itself must not remove the corrupt file either");
+    let next = entry_in_cell("cell_c_test_v1", 500, 0.004);
+    assert!(store_at(&reopened, &next, 1), "the writer must still be able to store after opening onto a corrupt row");
+    reopened.shutdown();
 }
 
 /// Review R3's sharing mode: read and write sharing, but no `FILE_SHARE_DELETE` (0x4), so Windows

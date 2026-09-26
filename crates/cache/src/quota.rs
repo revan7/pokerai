@@ -43,14 +43,24 @@
 //! placeholder row keyed by the cell key its path names, with `last_hit` 0, so it is the first
 //! thing a later pass retries.
 //!
-//! ## `last_hit` domain (review R5)
+//! ## `last_hit` domain (review R5, fix round 2 N1)
 //!
 //! The writer persists `max(proposed, previous + 1)` with a *checked* `+ 1` (`crate::lib`), so the
 //! counter is strictly increasing and a fresh hit can never tie with, let alone fall behind, an
-//! older one. `LAST_HIT_MAX` bounds what a caller may propose and what a cell on disk may carry: a
-//! larger value is refused (a store is not stored, a touch re-dates nothing, a cell on disk is
-//! removed at scan as unusable) rather than clamped, which leaves the counter 2^63 increments of
-//! headroom -- it cannot legitimately be exhausted.
+//! older one. `LAST_HIT_MAX` is validated in this same, wide form at every entry point -- store,
+//! touch, scan -- rather than only at the writer thread's own gate: a caller's proposal above it is
+//! refused (`crate::next_last_hit` returns `None`; `store_entry` and `apply_touch` refuse it again,
+//! directly, so a caller reaching either function any other way is still safe), and so is a bump
+//! that would land above it even though `previous` and `proposed` were each individually usable --
+//! the re-review's own finding (N1): the old code let that bump through, the writer persisted the
+//! result, and its own next scan then deleted the cell as unusable, taking a legitimate, newer
+//! store down with it. With the bump validated the same way, the writer can never itself produce a
+//! value above `LAST_HIT_MAX`; this leaves 2^63 increments of headroom below the ceiling, so it
+//! cannot legitimately be exhausted. A row above `LAST_HIT_MAX` found on disk regardless (only
+//! reachable now by tampering, never by the writer) is therefore corrupt in a narrower way than a
+//! misfiled or unreadable cell: `scan_index` reports it and excludes just that row from the index,
+//! never deleting the file over it -- a corrupt timestamp on one entry must not destroy the cell,
+//! or any other entry sharing it, including the newest store.
 //!
 //! ## Replacement reference
 //!
@@ -290,12 +300,29 @@ fn measured(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.len())
 }
 
-/// Whether entries read from `path` may stay in the store: filed under their own key (a lookup
-/// only ever reaches a cell through the path derived from its key, so a misfiled cell is
-/// unreachable quota garbage) and carrying only usable timestamps (at most `LAST_HIT_MAX`, so the
-/// writer's counter always has headroom above them). `decode` already guarantees one shared key.
-fn usable(dir: &Path, path: &Path, entries: &[CacheEntry]) -> bool {
-    entries.first().is_some_and(|first| entry_path(dir, first.key.digest()) == path) && entries.iter().all(|e| e.last_hit <= LAST_HIT_MAX)
+/// Whether `path` is the path this cell's own key addresses -- a lookup only ever reaches a cell
+/// through the path derived from its key, so a misfiled cell is unreachable quota garbage and is
+/// deleted outright, at scan and during eviction alike. `decode` already guarantees the entries
+/// found at `path` share one key, so checking the first is enough.
+///
+/// This used to also gate on every entry's `last_hit` being at most `LAST_HIT_MAX` (review R5), but
+/// that conflated two different kinds of "unusable" (fix round 2 N1): a misfiled cell really is
+/// unreachable garbage, but a correctly filed cell carrying one corrupt timestamp is not -- the
+/// entries the timestamp doesn't touch are still exactly as valid as ever. `scan_index` and
+/// `evict_entry` handle that narrower case themselves, at the row level, instead of asking this
+/// function to condemn the whole file over it.
+fn correctly_filed(dir: &Path, path: &Path, entries: &[CacheEntry]) -> bool {
+    entries.first().is_some_and(|first| entry_path(dir, first.key.digest()) == path)
+}
+
+/// `(payload digest, last_hit)` for each tagged entry whose `last_hit` is within `LAST_HIT_MAX` --
+/// the rows `Index::set_cell` may hold. An entry above the ceiling (fix round 2 N1) is dropped here
+/// rather than indexed: the writer itself can no longer produce one (`crate::next_last_hit`,
+/// `store_entry`, `apply_touch` all refuse it), so the only way one reaches this filter is a file
+/// that predates the fix or was tampered with, and it must never re-enter the index -- doing so
+/// would wrongly seed the writer's counter above the ceiling on the next restart.
+fn rows_of_usable(tagged: &[([u8; 32], CacheEntry)]) -> Vec<([u8; 32], u64)> {
+    tagged.iter().filter(|(_, e)| e.last_hit <= LAST_HIT_MAX).map(|(key, e)| (*key, e.last_hit)).collect()
 }
 
 /// The cell key `path` is addressed by -- its file stem as the 64 lowercase hex digits
@@ -346,10 +373,15 @@ pub fn delete_cell(dir: &Path, cell: [u8; 32], index: &mut Index) -> bool {
 /// miss and is best-effort deleted as it is scanned, exactly as a lookup would treat it), one row
 /// per entry with its own `last_hit`, and each cell's measured bytes split across its rows.
 ///
-/// A readable cell that is not `usable` -- filed under a path its own key does not produce, or
-/// carrying a `last_hit` above `LAST_HIT_MAX` -- is deleted as quota garbage. Any unusable file that
-/// survives its deletion stays accounted by a placeholder row (module doc). An unreadable
-/// directory -- including a cache root that does not exist yet -- scans as empty.
+/// A readable cell filed under a path its own key does not produce is unreachable quota garbage
+/// and is deleted outright; a file that survives its deletion stays accounted by a placeholder row
+/// (module doc). A readable, correctly filed cell that carries an entry above `LAST_HIT_MAX` is
+/// corrupt in a narrower way (fix round 2 N1): that one row is reported (`eprintln`) and excluded
+/// from the index -- never deleted -- so a corrupt timestamp on one entry can never destroy the
+/// file, or any other entry the same cell holds, including the newest store. A cell with no usable
+/// entry left is itself left unindexed, on disk, rather than deleted or given a placeholder (which
+/// would otherwise let eviction re-derive its rows straight from the corrupt disk content). An
+/// unreadable directory -- including a cache root that does not exist yet -- scans as empty.
 pub fn scan_index(dir: &Path) -> Index {
     let mut index = Index::default();
     let Ok(shards) = std::fs::read_dir(dir) else { return index };
@@ -365,14 +397,20 @@ pub fn scan_index(dir: &Path) -> Index {
                 continue;
             }
             match read_cell(&path) {
-                Some(found) if usable(dir, &path, &found.entries) => {
+                Some(found) if correctly_filed(dir, &path, &found.entries) => {
                     let key = found.entries[0].key.digest();
-                    let rows = found.entries.iter().map(|e| (entry_key(e), e.last_hit)).collect::<Vec<_>>();
-                    index.set_cell(key, &rows, measured(&path).unwrap_or(0));
+                    for e in found.entries.iter().filter(|e| e.last_hit > LAST_HIT_MAX) {
+                        let hit = e.last_hit;
+                        eprintln!("cache scan: cell {key:02x?} carries a last_hit {hit} above LAST_HIT_MAX ({LAST_HIT_MAX}); the row is reported and skipped, the cell is kept");
+                    }
+                    let rows = found.entries.iter().filter(|e| e.last_hit <= LAST_HIT_MAX).map(|e| (entry_key(e), e.last_hit)).collect::<Vec<_>>();
+                    if !rows.is_empty() {
+                        index.set_cell(key, &rows, measured(&path).unwrap_or(0));
+                    }
                 }
                 found => {
-                    // Unreadable (`read_cell` has already tried to delete it), misfiled, or carrying
-                    // an unusable timestamp: remove it, and keep counting it if that failed.
+                    // Unreadable (`read_cell` has already tried to delete it), or misfiled: remove
+                    // it, and keep counting it if that failed.
                     if found.is_some() {
                         let _ = std::fs::remove_file(&path);
                     }
@@ -437,13 +475,18 @@ pub fn sweep_temporaries(dir: &Path) {
 /// corrupt-file cleanup (`crate::storage`'s publication lock).
 ///
 /// # Errors
-/// `CacheError` from `validate_entry` (the entry never reaches the disk), from `encode` (an
-/// oversized cell is rejected by its preflight, before anything is written or renamed), or from
-/// `write_atomic` (a full disk, a read-only root, a blocked path). Every one of them leaves the
-/// previously published cell exactly as it was; the cell's rows are then re-settled against the
-/// disk, so a file that reading it just removed stops being counted.
+/// `CacheError` from `validate_entry` (the entry never reaches the disk), an over-ceiling
+/// `last_hit` (fix round 2 N1: validated here directly, not only through the writer thread's own
+/// `crate::next_last_hit` gate, so a caller reaching this function any other way is still safe),
+/// from `encode` (an oversized cell is rejected by its preflight, before anything is written or
+/// renamed), or from `write_atomic` (a full disk, a read-only root, a blocked path). Every one of
+/// them leaves the previously published cell exactly as it was; the cell's rows are then
+/// re-settled against the disk, so a file that reading it just removed stops being counted.
 pub fn store_entry(dir: &Path, entry: CacheEntry, index: &mut Index) -> Result<Option<[u8; 32]>, CacheError> {
     validate_entry(&entry)?;
+    if entry.last_hit > LAST_HIT_MAX {
+        return Err(CacheError::Invalid("last_hit exceeds LAST_HIT_MAX"));
+    }
     let cell = entry.key.digest();
     let stored = store_into(dir, cell, entry, index);
     if stored.is_err() {
@@ -454,13 +497,12 @@ pub fn store_entry(dir: &Path, entry: CacheEntry, index: &mut Index) -> Result<O
 
 fn store_into(dir: &Path, cell: [u8; 32], entry: CacheEntry, index: &mut Index) -> Result<Option<[u8; 32]>, CacheError> {
     let path = entry_path(dir, cell);
-    let existing = read_cell(&path)
-        .map(|c| c.entries)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| e.key == entry.key && e.last_hit <= LAST_HIT_MAX)
-        .map(|e| (entry_key(&e), e))
-        .collect::<Vec<_>>();
+    let raw = read_cell(&path).map(|c| c.entries).unwrap_or_default();
+    for e in raw.iter().filter(|e| e.key == entry.key && e.last_hit > LAST_HIT_MAX) {
+        let hit = e.last_hit;
+        eprintln!("cache store: cell {cell:02x?} already held an entry with last_hit {hit} above LAST_HIT_MAX ({LAST_HIT_MAX}); it is corrupt and is dropped by this store");
+    }
+    let existing = raw.into_iter().filter(|e| e.key == entry.key && e.last_hit <= LAST_HIT_MAX).map(|e| (entry_key(&e), e)).collect::<Vec<_>>();
     if existing.is_empty() {
         // A first store (or one replacing an unreadable cell): the cell is exactly this entry.
         // Encoding before digesting means an oversized entry is refused by `encode`'s preflight
@@ -494,13 +536,18 @@ fn store_into(dir: &Path, cell: [u8; 32], entry: CacheEntry, index: &mut Index) 
 /// re-reads the cell, sets `last_hit` on that entry, and republishes the cell atomically.
 ///
 /// # Errors
-/// `CacheError::Invalid` if the cell is missing or unreadable -- its rows are dropped only if the
-/// file is confirmed gone (`read_cell` best-effort deletes a corrupt file, and that can fail too;
-/// review R3) -- or if no entry in it carries that payload digest: a lookup result that has since
-/// been replaced or evicted is not an error the caller can act on, and must not silently re-date
-/// the *wrong* entry. Propagates an `encode`/`write_atomic` failure, which leaves the cell exactly
-/// as it was.
+/// `CacheError::Invalid` if `last_hit` exceeds `LAST_HIT_MAX` (fix round 2 N1: validated here
+/// directly, not only through the writer thread's own `crate::next_last_hit` gate, so a caller
+/// reaching this function any other way is still safe -- and nothing is re-read or touched first),
+/// if the cell is missing or unreadable -- its rows are dropped only if the file is confirmed gone
+/// (`read_cell` best-effort deletes a corrupt file, and that can fail too; review R3) -- or if no
+/// entry in it carries that payload digest: a lookup result that has since been replaced or evicted
+/// is not an error the caller can act on, and must not silently re-date the *wrong* entry.
+/// Propagates an `encode`/`write_atomic` failure, which leaves the cell exactly as it was.
 pub fn apply_touch(dir: &Path, key: [u8; 32], payload_digest: &[u8], last_hit: u64, index: &mut Index) -> Result<(), CacheError> {
+    if last_hit > LAST_HIT_MAX {
+        return Err(CacheError::Invalid("last_hit exceeds LAST_HIT_MAX"));
+    }
     let path = entry_path(dir, key);
     let Some(found) = read_cell(&path) else {
         settle(dir, key, index);
@@ -517,7 +564,10 @@ pub fn apply_touch(dir: &Path, key: [u8; 32], payload_digest: &[u8], last_hit: u
     if !touched {
         return Err(CacheError::Invalid("no entry in the touched cache cell carries that payload digest"));
     }
-    let rows = rows_of(&tagged);
+    // `rows_of_usable`, not `rows_of`: the touched entry itself is always usable (`last_hit` was
+    // validated against `LAST_HIT_MAX` above), but a corrupt sibling entry (fix round 2 N1) must
+    // ride along in the rewritten cell without re-entering the index.
+    let rows = rows_of_usable(&tagged);
     let bytes = encode(&Cell { entries: tagged.into_iter().map(|(_, e)| e).collect() })?;
     write_atomic(&path, &bytes)?;
     index.set_cell(key, &rows, measured(&path).unwrap_or(bytes.len() as u64));
@@ -564,32 +614,44 @@ pub fn enforce_quota(dir: &Path, quota: u64, index: &mut Index) {
 }
 
 /// Evicts the one entry whose row key is `victim` from its cell: a cell that keeps another entry is
-/// rewritten with it; a cell left empty -- or unreadable, or no longer usable, or whose rewrite
-/// fails (a full disk, a read-only root; leaving it would leave the store over quota) -- is deleted
-/// through `delete_cell`. A row whose entry is not in its cell at all (a placeholder whose file has
-/// since become readable) is stale: the cell's rows are re-derived from what is on disk and nothing
-/// is removed. Returns `false` only when the cell had to be deleted and could not be.
+/// rewritten with it; a cell left empty -- or unreadable, or misfiled, or whose rewrite fails (a
+/// full disk, a read-only root; leaving it would leave the store over quota) -- is deleted through
+/// `delete_cell`. A row whose entry is not in its cell at all (a placeholder whose file has since
+/// become readable) is stale: the cell's rows are re-derived from what is on disk and nothing is
+/// removed. A corrupt sibling entry (`last_hit` above `LAST_HIT_MAX`, fix round 2 N1) rides along in
+/// whatever is written back -- it is never itself evicted, and never deleted just for being corrupt
+/// -- but is excluded from the re-derived rows (`rows_of_usable`), so it can never re-enter the
+/// index. Returns `false` only when the cell had to be deleted and could not be.
 fn evict_entry(dir: &Path, victim: [u8; 32], index: &mut Index) -> bool {
     let Some(cell) = index.cell_of(&victim) else { return true };
     let path = entry_path(dir, cell);
     let Some(found) = read_cell(&path) else { return delete_cell(dir, cell, index) };
-    if !usable(dir, &path, &found.entries) {
+    if !correctly_filed(dir, &path, &found.entries) {
         return delete_cell(dir, cell, index);
     }
     let (evicted, kept): (Vec<_>, Vec<_>) = found.entries.into_iter().map(|e| (entry_key(&e), e)).partition(|(key, _)| *key == victim);
     if evicted.is_empty() {
-        let bytes = measured(&path).unwrap_or_else(|| index.cell_bytes(cell));
-        index.set_cell(cell, &rows_of(&kept), bytes);
+        let rows = rows_of_usable(&kept);
+        if rows.is_empty() {
+            index.drop_cell(cell);
+        } else {
+            let bytes = measured(&path).unwrap_or_else(|| index.cell_bytes(cell));
+            index.set_cell(cell, &rows, bytes);
+        }
         return true;
     }
     if kept.is_empty() {
         return delete_cell(dir, cell, index);
     }
-    let rows = rows_of(&kept);
+    let rows = rows_of_usable(&kept);
     let rewritten = encode(&Cell { entries: kept.into_iter().map(|(_, e)| e).collect() }).and_then(|bytes| write_atomic(&path, &bytes).map(|()| bytes.len() as u64));
     match rewritten {
         Ok(len) => {
-            index.set_cell(cell, &rows, measured(&path).unwrap_or(len));
+            if rows.is_empty() {
+                index.drop_cell(cell);
+            } else {
+                index.set_cell(cell, &rows, measured(&path).unwrap_or(len));
+            }
             true
         }
         Err(_) => delete_cell(dir, cell, index),
