@@ -5,6 +5,7 @@
 
 pub mod depth;
 pub mod envelope;
+pub mod ev;
 pub mod lookup;
 mod numeric;
 pub mod store;
@@ -13,6 +14,7 @@ pub mod validate;
 
 pub use depth::*;
 pub use envelope::*;
+pub use ev::*;
 pub use lookup::*;
 pub use store::*;
 pub use straddle::*;
