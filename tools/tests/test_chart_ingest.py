@@ -1193,6 +1193,15 @@ def test_pokercoaching_100_every_node_actor_is_the_next_seat_to_act():
     explicitly-folded history (the rule `core_preflop::store::next_actor` enforces at load),
     so no chart is keyed under another spot's prefix."""
     e, _ = _bundle("pokercoaching_100")
+    _assert_every_node_actor_is_the_next_seat_to_act(e)
+
+
+POSITIONS_ORDER = ("UTG", "HJ", "CO", "BTN", "SB", "BB")
+
+
+def _assert_every_node_actor_is_the_next_seat_to_act(e):
+    """Shared oracle for the actor-order tests (kept test-local, not production code): each
+    node's declared actor is the seat whose turn it is after its explicitly-folded history."""
     for n in e["nodes"]:
         folded, idx = set(), 0
         for pos, step, _amount in n["history"]:
@@ -1205,9 +1214,6 @@ def test_pokercoaching_100_every_node_actor_is_the_next_seat_to_act():
         while POSITIONS_ORDER[idx % 6] in folded:
             idx += 1
         assert n["actor"] == POSITIONS_ORDER[idx % 6], n["history"]
-
-
-POSITIONS_ORDER = ("UTG", "HJ", "CO", "BTN", "SB", "BB")
 
 
 def _combos(r, c):
@@ -1361,18 +1367,7 @@ def test_rangeconverter_200_every_node_actor_is_the_next_seat_to_act():
     """Each node's declared actor is the seat whose turn it is after its explicitly folded
     history (the rule `core_preflop::store::next_actor` enforces at load)."""
     e, _ = _bundle("rangeconverter_200")
-    for n in e["nodes"]:
-        folded, idx = set(), 0
-        for pos, step, _amount in n["history"]:
-            while POSITIONS_ORDER[idx % 6] in folded:
-                idx += 1
-            assert POSITIONS_ORDER[idx % 6] == pos, f"out-of-turn {pos} in {n['history']}"
-            if step == "fold":
-                folded.add(pos)
-            idx += 1
-        while POSITIONS_ORDER[idx % 6] in folded:
-            idx += 1
-        assert n["actor"] == POSITIONS_ORDER[idx % 6], n["history"]
+    _assert_every_node_actor_is_the_next_seat_to_act(e)
 
 
 @pytest.mark.skipif(200 not in available_depths(), reason="depth 200 unsupported")

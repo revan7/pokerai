@@ -466,7 +466,7 @@ verified 22 nodes, 3718 classes
 
 Completed 2026-09-26. Depth 200 is `"available"` in `fixtures/charts/sources.manifest.json`, so
 the bundle ships. Source: the committed `fixtures/charts/sources/rangeconverter_200.pdf`
-(SHA-256 `f0797be2...9afeda3a76d`, as recorded under Task 4). Outputs:
+(SHA-256 `f0797be2...e8cc81bf70e2`, as recorded under Task 4). Outputs:
 `fixtures/charts/transcription/rangeconverter_200.json` (35 transcribed grids and a 44-row
 inventory), the built envelope `fixtures/charts/rangeconverter_200.json` (35 nodes, 5915
 classes, SHA-256 `8595c0a803d4d07bce0ea136b3dcb195d784ca9a5a7bbfdff4f986e352f9434d`) and its
