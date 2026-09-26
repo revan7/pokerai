@@ -413,7 +413,7 @@ Sizes are frozen as raise-to values in `to_bb_x1000`, never as labels.
 | 41 | absent | -- | BB defence facing a BTN open and an SB call | UTG f, HJ f, CO f, BTN r2.5, SB c | BB | -- |
 | 42 | absent | -- | Cold call or cold 4bet facing an open and a 3bet: CO facing LJ open, HJ 3bet | UTG r2.5, HJ r8.75 | CO | -- |
 | 43 | absent | -- | vs-4bet: HJ facing the LJ 4bet after HJ 3bet | UTG r2.5, HJ r8.75, CO f, BTN f, SB f, BB f, UTG r21.875 | HJ | -- |
-| 44 | absent | 6 | vs-4bet: BB facing the SB 4bet after BB 3bet | UTG f, HJ f, CO f, BTN f, SB r3, BB r10.5, SB r26.25 | BB | -- |
+| 44 | absent | 6 | Absent-node audit: vs-4bet (BB facing the SB 4bet after BB 3bet) | UTG f, HJ f, CO f, BTN f, SB r3, BB r10.5, SB r26.25 | BB | -- |
 | 45 | absent | -- | Facing a limp outside the blinds: HJ facing a LJ limp | UTG c | HJ | -- |
 
 Notes on the inventory:
@@ -464,7 +464,329 @@ verified 22 nodes, 3718 classes
 
 ## RangeConverter 200bb transcription (Task 6)
 
-*Not started.*
+Completed 2026-09-26. Depth 200 is `"available"` in `fixtures/charts/sources.manifest.json`, so
+the bundle ships. Source: the committed `fixtures/charts/sources/rangeconverter_200.pdf`
+(SHA-256 `f0797be2...9afeda3a76d`, as recorded under Task 4). Outputs:
+`fixtures/charts/transcription/rangeconverter_200.json` (35 transcribed grids and a 44-row
+inventory), the built envelope `fixtures/charts/rangeconverter_200.json` (35 nodes, 5915
+classes, SHA-256 `8595c0a803d4d07bce0ea136b3dcb195d784ca9a5a7bbfdff4f986e352f9434d`) and its
+manifest `fixtures/charts/rangeconverter_200.manifest.json` (`source = "ChartTranscription"`,
+`ev_reference = "unverified"`, `rake_profile = "undocumented"`, `rake = null`, `accuracy =
+"unverified"`, no `evs` anywhere).
+
+### Page numbering and page content
+
+Pages are numbered in **physical PDF page order** (PDFium's order). For this PDF that order
+matches Task 4's numbering above.
+
+| Physical page | Text-layer title | Content |
+|---|---|---|
+| 1 | "No Limit Texas Holdem 6 max Poker Charts: 200bb" | Intro text and one 1200x407 image. No grid. |
+| 2 | "How to Use the 6 max Preflop Range Charts" | Text only: the three chart families and the 50% rounding rule quoted under Task 4. |
+| 3 | "Raise First In (RFI) - 6 max 200bb Ranges" | 5 grids: UTG, MP, CO, BTN, SB RFI |
+| 4 | "MP vs RFI - 6 max 200bb Ranges" | 1 grid: MP vs UTG RFI |
+| 5 | "CO vs RFI - 6 max 200bb Ranges" | 2 grids: CO vs UTG, CO vs MP RFI |
+| 6 | "BTN vs RFI - 6 max 200bb Ranges" | 3 grids: BTN vs UTG, MP, CO RFI |
+| 7 | "SB vs RFI - 6 max 200bb Ranges" | 4 grids: SB vs UTG, MP, CO, BTN RFI |
+| 8 | "BB vs RFI - 6 max 200bb Ranges" | 5 grids: BB vs UTG, MP, CO, BTN, SB RFI |
+| 9 | "UTG RFI vs 3bet - 6 max 200bb Ranges" | 5 grids: UTG vs MP, CO, BTN, SB, BB 3bet |
+| 10 | "MP RFI vs 3bet - 6 max 200bb Ranges" | 4 grids: MP vs CO, BTN, SB, BB 3bet |
+| 11 | "CO RFI vs 3bet - 6 max 200bb Ranges" | 3 grids: CO vs BTN, SB, BB 3bet |
+| 12 | "BTN RFI vs 3bet - 6 max 200bb Ranges" | 2 grids: BTN vs SB, BB 3bet |
+| 13 | "SB RFI vs 3bet - 6 max 200bb Ranges" | 1 grid: SB vs BB 3bet |
+
+Each of pages 3-13 places one 2048x1313 RGB image (with a grey soft mask; these 11 + 11 are
+Task 4's "22 images"). The image holds up to five grids laid out four across and one below. Each
+grid has its chart label above it (for example "UTG vs MP 3bet") and its legend panel below it.
+The publisher's **MP is HJ** here.
+
+Correction note (2026-09-26): Task 4 quoted the page titles as "6max 200bb". The text layer
+reads "6 max 200bb", with a space.
+
+### How the pages were read
+
+- **Renderer:** `tools/chart_render.py` and `pypdfium2` (Task 5's tooling), used unchanged.
+  Every image went to the session scratch directory outside the repository. No PNG is committed.
+  Renders made:
+  - pages 1-13 at 60 DPI, for layout;
+  - each grid page's embedded image, decoded at native resolution (2048x1313);
+  - each of the 35 grids cropped from it and magnified 2x;
+  - each grid re-cropped from a separate 300 DPI PDFium page render (a second rendering path,
+    with the soft mask applied);
+  - 4x-6x crops of every disputed cell;
+  - 2x-3x crops of every legend panel.
+- **Lattice:** the cell lattice is 38.2 x 42.13 px in the native image. It was fitted from the
+  dark separator lines of every grid, with a residual under 1.2 px.
+- **Orientation check:** every cell prints its own hand label. For example `AKs` is at row 0,
+  column 1 and `AKo` is at row 1, column 0. So row r, column c is class `r*13+c` of
+  `class_names()`: pairs on the diagonal, suited above it, offsuit below it, with the high rank
+  first. This was confirmed on every grid before transcription.
+- **Pass 1 (the transcription):** native image, 2x, top row first, left to right. Written to a
+  scratch file per grid.
+- **Pass 2 (blind reread, per the orchestrator's instruction):**
+  - The 300 DPI page render, read bottom row first and right to left within each row.
+  - Written to a separate scratch file per grid. The pass-1 files were not opened during pass 2.
+  - The two passes were then diffed by script.
+  - Limitation, disclosed: one agent did both passes in one session, so pass 1 was in that
+    agent's working context even though its file was not viewed. Pass 3 is the fully
+    independent read.
+  - One pass-2 recording slip was caught before the diff. The pass-2 file for "CO vs BTN 3bet"
+    was first written with inconsistent row orientation. That grid was re-read from its pass-2
+    image and the file rewritten. Pass 1 was not consulted.
+- **Pass 3 (pixel classifier, a throwaway script, not committed):**
+  - For each cell it finds its own separator lines and classifies every interior pixel to the
+    nearest legend fill colour: orange, green, blue, grey or navy.
+  - It separates the action-coloured strip rows from the grey or navy background.
+  - It measures each action colour's share of the strip width by a per-column vote.
+  - Mixed cells split 0.441-0.559 of the width. Pure cells are 1.000. No cell has a third
+    colour.
+- **Comparison:** 35 x 169 = 5915 cells. There were **13 disagreements**, each re-inspected at
+  4x-6x from the native image:
+  - "SB vs CO RFI": 87o, 76s, 76o, 65s. "SB vs BTN RFI": 87o, 77, 76s. "MP vs BB 3bet": ATs,
+    A9s, A7s, A6s. These 11 were pass-2 recording slips (values shifted along a row). The zoom
+    confirmed pass 1 and pass 3.
+  - "UTG vs BTN 3bet" 75s and "UTG vs BB 3bet" 75s were recorded as grey with no strip by pass 1
+    (and by pass 2 for the BB grid). The zoom shows one full pixel row of the legend's Call green
+    at the bottom of the cell: (63,143,107) and (62,137,104), within 6 and 12 of the fill colour.
+    Both were **corrected to Call**, per the thin-strip rule below.
+  - After resolution all three reads agree on 5915/5915 cells. First-pass corrections: 2.
+
+### What the cells mean
+
+- **Colours:**
+  - orange = the legend's raise row (for example "2.5bb" or "8.5bb");
+  - green = "Call" (on "SB RFI", the SB completing, i.e. a limp);
+  - blue = "Fold";
+  - a cell split into two colours = 50% each, per page 2's rule that "the frequency of an action
+    for each hand combo is rounded to the nearest 50%". Every weight is exactly 0, 0.5 or 1.
+- **Pages 3-8 (RFI, vs-RFI):** every cell is full height. No cell is uncoloured.
+- **Pages 9-13 (vs-3bet):**
+  - Each cell shows the opener's range. The action colours fill a strip whose height is how much
+    of the class the opener raised; the rest of the cell is grey. Only the strip's horizontal
+    colour split is transcribed. Its height is reach, not an action frequency.
+  - Navy cells are outside the opener's displayed range.
+  - These charts omit no action: every legend has Fold, Call and a 4bet size.
+- **Unreachable classes:** navy cells, and grey cells with no readable strip, give no action
+  data. They are the node's `unreachable_classes`, with all-zero weights, and are recorded as
+  codes `.` and `g`. For every one of them the opener's own page-3 raise weight is exactly 0.
+  `test_rangeconverter_200_unreachable_classes_have_zero_opening_weight` checks this.
+- **Thin-strip rule:**
+  - A strip counts only when at least one full pixel row inside the cell matches a legend fill
+    colour (within 20 of it).
+  - Cells whose bottom edge only has an antialiased tint, i.e. a blend between grey and a fill
+    colour, are unreadable and are recorded as `g`. These are:
+    - 64s in all five UTG vs-3bet grids: (57,113,93) x3, (52,90,83) and (54,100,87);
+    - 75s in UTG vs MP, CO and SB 3bet, where the tint merges into the cell separator;
+    - T5s in "SB vs BB 3bet": (20,64,95).
+  - Each has an opening weight of 0.
+- **Classes with data but zero published opening weight:** a thin strip means the opener raises
+  the class at a frequency the page-3 grid rounds to 0. These classes keep their published
+  strategy, and their reach is 0 through the page-3 node. They are:
+  - UTG vs 3bet: A2s, K7s, QTo, T8s, 97s, 86s, 55, 44, 33, plus 75s against the BTN and BB;
+  - MP: 97s, 86s;
+  - CO: Q9o, J9o, A7o;
+  - BTN: 74s;
+  - SB: K7o, 87o, 74s.
+
+### Legend as read from the raster pages
+
+Each legend panel is one bar per action, labelled with the action or the raise-to size and the
+publisher's percentage. The percentages are unrounded solver frequencies. On pages 3-8 they are
+a share of all 1326 combos. On pages 9-13 they are a share of the opener's range reaching the
+node. Every panel's percentages sum to 100 within 0.02 (display rounding).
+`test_rangeconverter_200_published_legends_are_complete` pins this, independently of the cells.
+No raster page mentions rake.
+
+| Page | Chart | Legend rows as read | Codes used | Mixed cells | Unreachable |
+|---|---|---|---|---|---|
+| 3 | UTG RFI | Fold 81.95%; 2.5bb 18.05% | R RF F | 9 | 0 |
+| 3 | MP RFI | Fold 77.49%; 2.5bb 22.51% | R RF F | 16 | 0 |
+| 3 | CO RFI | Fold 69.85%; 2.5bb 30.15% | R RF F | 8 | 0 |
+| 3 | BTN RFI | Fold 53.37%; 2.5bb 46.63% | R RF F | 1 | 0 |
+| 3 | SB RFI | Fold 53.65%; Call 7.19%; 3.0bb 39.16% | R RC RF CF F | 18 | 0 |
+| 4 | MP vs UTG RFI | Fold 91.44%; 8.5bb 8.56% | R RF F | 12 | 0 |
+| 5 | CO vs UTG RFI | Fold 90.63%; 8.5bb 9.37% | R RF F | 11 | 0 |
+| 5 | CO vs MP RFI | Fold 89.1%; 8.5bb 10.9% | R RF F | 11 | 0 |
+| 6 | BTN vs UTG RFI | Fold 87.0%; Call 4.37%; 8.5bb 8.63% | R RC RF F | 28 | 0 |
+| 6 | BTN vs MP RFI | Fold 85.81%; Call 2.85%; 8.5bb 11.34% | R RC RF F | 19 | 0 |
+| 6 | BTN vs CO RFI | Fold 83.64%; Call 1.18%; 8.5bb 15.19% | R RF F | 13 | 0 |
+| 7 | SB vs UTG RFI | Fold 93.99%; 10.9bb 6.01% | R RF F | 7 | 0 |
+| 7 | SB vs MP RFI | Fold 92.6%; 10.9bb 7.4% | R RF F | 6 | 0 |
+| 7 | SB vs CO RFI | Fold 90.63%; 10.9bb 9.37% | R RF F | 8 | 0 |
+| 7 | SB vs BTN RFI | Fold 86.44%; 10.9bb 13.56% | R RF F | 5 | 0 |
+| 8 | BB vs UTG RFI | Fold 73.13%; Call 22.4%; 11.05bb 4.47% | R RC C CF F | 24 | 0 |
+| 8 | BB vs MP RFI | Fold 69.76%; Call 24.47%; 11.05bb 5.77% | R RC C CF F | 18 | 0 |
+| 8 | BB vs CO RFI | Fold 64.3%; Call 27.71%; 11.05bb 7.99% | R RC C CF F | 27 | 0 |
+| 8 | BB vs BTN RFI | Fold 50.15%; Call 37.2%; 11.05bb 12.64% | R RC C CF F | 31 | 0 |
+| 8 | BB vs SB RFI | Fold 42.19%; Call 39.91%; 10.0bb 17.89% | R RC RF C CF F | 37 | 0 |
+| 9 | UTG vs MP 3bet | Fold 58.08%; Call 23.23%; 23.6bb 18.69% | R RC C CF F g . | 23 | 115 |
+| 9 | UTG vs CO 3bet | Fold 54.99%; Call 25.05%; 23.6bb 19.96% | R RC C CF F g . | 22 | 115 |
+| 9 | UTG vs BTN 3bet | Fold 48.52%; Call 32.11%; 23.8bb 19.36% | R RC C CF F g . | 21 | 114 |
+| 9 | UTG vs SB 3bet | Fold 50.38%; Call 36.79%; 25.05bb 12.82% | R RC C CF F g . | 14 | 115 |
+| 9 | UTG vs BB 3bet | Fold 49.08%; Call 41.8%; 25.0bb 9.11% | R RC C CF F g . | 13 | 114 |
+| 10 | MP vs CO 3bet | Fold 56.69%; Call 24.55%; 23.8bb 18.75% | R RC C CF F . | 25 | 109 |
+| 10 | MP vs BTN 3bet | Fold 51.82%; Call 28.42%; 23.6bb 19.75% | R RC C CF F . | 24 | 109 |
+| 10 | MP vs SB 3bet | Fold 50.37%; Call 37.09%; 25.05bb 12.54% | R RC C CF F . | 10 | 109 |
+| 10 | MP vs BB 3bet | Fold 49.76%; Call 41.08%; 25.0bb 9.14% | R RC C CF F . | 9 | 109 |
+| 11 | CO vs BTN 3bet | Fold 53.56%; Call 27.79%; 23.6bb 18.65% | R RC C CF F . | 31 | 95 |
+| 11 | CO vs SB 3bet | Fold 50.54%; Call 37.83%; 25.05bb 11.63% | R RC C CF F . | 12 | 95 |
+| 11 | CO vs BB 3bet | Fold 50.72%; Call 39.37%; 25.0bb 9.91% | R RC C CF F . | 11 | 95 |
+| 12 | BTN vs SB 3bet | Fold 52.29%; Call 37.83%; 25.05bb 9.88% | R RC C CF F . | 18 | 71 |
+| 12 | BTN vs BB 3bet | Fold 53.14%; Call 37.19%; 25.0bb 9.66% | R RC C CF F . | 14 | 71 |
+| 13 | SB vs BB 3bet | Fold 53.98%; Call 27.02%; 27.05bb 19.0% | R RC C CF F g . | 24 | 72 |
+
+The raise-size labels were re-read at 3x, because 23.6 and 23.8 differ between charts.
+
+The rounded grids' reach-weighted action shares track these unrounded percentages. For example,
+"UTG RFI" grid 82.2/17.8 against legend 81.95/18.05, and "BB vs SB RFI" 42.23/41.63/16.14
+against 42.19/39.91/17.89. This is informational only, never evidence that a cell was read
+correctly. "BTN vs CO RFI"'s Call row (1.18%) rounds to no cell, so its call weight is 0 in
+every class. The call stays on the menu, because the legend lists it.
+
+### Menus and resolved sizes
+
+Every size comes from this PDF's own legend panels and is frozen as a raise-to in `to_bb_x1000`.
+
+- **Opens:** 2.5bb (`2500`) for UTG, MP, CO and BTN. 3.0bb (`3000`) for the SB, which also has
+  Call (a limp) on its menu.
+- **3bets (vs-RFI legends, pages 4-8):**
+  - MP, CO and BTN vs any open: 8.5bb (`8500`);
+  - SB: 10.9bb (`10900`);
+  - BB vs UTG, MP, CO and BTN: 11.05bb (`11050`);
+  - BB vs SB: 10.0bb (`10000`).
+- **4bets (vs-3bet legends, pages 9-13):**
+  - UTG vs MP and vs CO: 23.6bb; UTG vs BTN: 23.8bb;
+  - MP vs CO: 23.8bb; MP vs BTN: 23.6bb; CO vs BTN: 23.6bb;
+  - any opener vs the SB: 25.05bb; any opener vs the BB: 25.0bb;
+  - SB vs BB: 27.05bb.
+- **vs-3bet keys (judgement call, disclosed):**
+  - A vs-3bet page prints only the 4bet size. The 3bet the opener faces is resolved from the
+    matching vs-RFI legend in this PDF, for the same two seats. For example "UTG vs MP 3bet"
+    uses the 8.5bb from "MP vs UTG RFI" (page 4).
+  - Each inventory reason names its source page.
+  - `test_rangeconverter_200_every_history_raise_is_a_published_menu_size` checks every raise
+    in every history against the menu of the node that published it.
+  - The key lists every fold: before the open, between the open and the 3bet, and after the
+    3bettor until action returns to the opener.
+- **Menus follow each chart's legend rows:**
+  - fold / raise where the legend has no Call row (MP and CO vs RFI, SB vs RFI, the non-SB RFI
+    grids);
+  - fold / call / raise otherwise.
+
+### Inventory (44 rows: 36 covered rows for 35 distinct node keys, 8 absent)
+
+| # | Status | Page | Title | History key | Next actor | Menu |
+|---|---|---|---|---|---|---|
+| 1 | covered | 3 | UTG RFI | (empty) | UTG | fold / raise 2.5bb |
+| 2 | covered | 3 | MP RFI | UTG f | HJ | fold / raise 2.5bb |
+| 3 | covered | 3 | CO RFI | UTG f, HJ f | CO | fold / raise 2.5bb |
+| 4 | covered | 3 | BTN RFI | UTG f, HJ f, CO f | BTN | fold / raise 2.5bb |
+| 5 | covered | 3 | SB RFI | UTG f, HJ f, CO f, BTN f | SB | fold / call / raise 3bb |
+| 6 | covered | 4 | MP vs UTG RFI | UTG r2.5 | HJ | fold / raise 8.5bb |
+| 7 | covered | 5 | CO vs UTG RFI | UTG r2.5, HJ f | CO | fold / raise 8.5bb |
+| 8 | covered | 5 | CO vs MP RFI | UTG f, HJ r2.5 | CO | fold / raise 8.5bb |
+| 9 | covered | 6 | BTN vs UTG RFI | UTG r2.5, HJ f, CO f | BTN | fold / call / raise 8.5bb |
+| 10 | covered | 6 | BTN vs MP RFI | UTG f, HJ r2.5, CO f | BTN | fold / call / raise 8.5bb |
+| 11 | covered | 6 | BTN vs CO RFI | UTG f, HJ f, CO r2.5 | BTN | fold / call / raise 8.5bb |
+| 12 | covered | 7 | SB vs UTG RFI | UTG r2.5, HJ f, CO f, BTN f | SB | fold / raise 10.9bb |
+| 13 | covered | 7 | SB vs MP RFI | UTG f, HJ r2.5, CO f, BTN f | SB | fold / raise 10.9bb |
+| 14 | covered | 7 | SB vs CO RFI | UTG f, HJ f, CO r2.5, BTN f | SB | fold / raise 10.9bb |
+| 15 | covered | 7 | SB vs BTN RFI | UTG f, HJ f, CO f, BTN r2.5 | SB | fold / raise 10.9bb |
+| 16 | covered | 8 | BB vs UTG RFI | UTG r2.5, HJ f, CO f, BTN f, SB f | BB | fold / call / raise 11.05bb |
+| 17 | covered | 8 | BB vs MP RFI | UTG f, HJ r2.5, CO f, BTN f, SB f | BB | fold / call / raise 11.05bb |
+| 18 | covered | 8 | BB vs CO RFI | UTG f, HJ f, CO r2.5, BTN f, SB f | BB | fold / call / raise 11.05bb |
+| 19 | covered | 8 | BB vs BTN RFI | UTG f, HJ f, CO f, BTN r2.5, SB f | BB | fold / call / raise 11.05bb |
+| 20 | covered | 8 | BB vs SB RFI | UTG f, HJ f, CO f, BTN f, SB r3 | BB | fold / call / raise 10bb |
+| 21 | covered | 9 | UTG vs MP 3bet | UTG r2.5, HJ r8.5, CO f, BTN f, SB f, BB f | UTG | fold / call / raise 23.6bb |
+| 22 | covered | 9 | UTG vs CO 3bet | UTG r2.5, HJ f, CO r8.5, BTN f, SB f, BB f | UTG | fold / call / raise 23.6bb |
+| 23 | covered | 9 | UTG vs BTN 3bet | UTG r2.5, HJ f, CO f, BTN r8.5, SB f, BB f | UTG | fold / call / raise 23.8bb |
+| 24 | covered | 9 | UTG vs SB 3bet | UTG r2.5, HJ f, CO f, BTN f, SB r10.9, BB f | UTG | fold / call / raise 25.05bb |
+| 25 | covered | 9 | UTG vs BB 3bet | UTG r2.5, HJ f, CO f, BTN f, SB f, BB r11.05 | UTG | fold / call / raise 25bb |
+| 26 | covered | 10 | MP vs CO 3bet | UTG f, HJ r2.5, CO r8.5, BTN f, SB f, BB f | HJ | fold / call / raise 23.8bb |
+| 27 | covered | 10 | MP vs BTN 3bet | UTG f, HJ r2.5, CO f, BTN r8.5, SB f, BB f | HJ | fold / call / raise 23.6bb |
+| 28 | covered | 10 | MP vs SB 3bet | UTG f, HJ r2.5, CO f, BTN f, SB r10.9, BB f | HJ | fold / call / raise 25.05bb |
+| 29 | covered | 10 | MP vs BB 3bet | UTG f, HJ r2.5, CO f, BTN f, SB f, BB r11.05 | HJ | fold / call / raise 25bb |
+| 30 | covered | 11 | CO vs BTN 3bet | UTG f, HJ f, CO r2.5, BTN r8.5, SB f, BB f | CO | fold / call / raise 23.6bb |
+| 31 | covered | 11 | CO vs SB 3bet | UTG f, HJ f, CO r2.5, BTN f, SB r10.9, BB f | CO | fold / call / raise 25.05bb |
+| 32 | covered | 11 | CO vs BB 3bet | UTG f, HJ f, CO r2.5, BTN f, SB f, BB r11.05 | CO | fold / call / raise 25bb |
+| 33 | covered | 12 | BTN vs SB 3bet | UTG f, HJ f, CO f, BTN r2.5, SB r10.9, BB f | BTN | fold / call / raise 25.05bb |
+| 34 | covered | 12 | BTN vs BB 3bet | UTG f, HJ f, CO f, BTN r2.5, SB f, BB r11.05 | BTN | fold / call / raise 25bb |
+| 35 | covered | 13 | SB vs BB 3bet | UTG f, HJ f, CO f, BTN f, SB r3, BB r10 | SB | fold / call / raise 27.05bb |
+| 36 | covered | 3 | Blind limp lines: SB first-in limp strategy | UTG f, HJ f, CO f, BTN f | SB | same node as row 5 (its call column) |
+| 37 | absent | -- | Blind limp lines: BB vs SB limp | UTG f, HJ f, CO f, BTN f, SB c | BB | -- |
+| 38 | absent | -- | Blind limp lines: SB vs BB isolation raise after an SB limp | UTG f, HJ f, CO f, BTN f, SB c (resolvable prefix only) | SB | -- (BB raise size unpublished) |
+| 39 | absent | -- | Absent-node audit: multiway caller (BTN facing a UTG open and an MP call) | UTG r2.5, HJ c, CO f | BTN | -- |
+| 40 | absent | -- | Absent-node audit: squeeze (BB facing a CO open and a BTN call) | UTG f, HJ f, CO r2.5, BTN c, SB f | BB | -- |
+| 41 | absent | -- | Absent-node audit: cold call or cold 4bet facing an open and a 3bet (CO facing UTG open, MP 3bet) | UTG r2.5, HJ r8.5 | CO | -- |
+| 42 | absent | -- | Absent-node audit: vs-4bet (MP facing the UTG 4bet after MP 3bet) | UTG r2.5, HJ r8.5, CO f, BTN f, SB f, BB f, UTG r23.6 | HJ | -- |
+| 43 | absent | -- | Absent-node audit: vs-4bet (BB facing the SB 4bet after BB 3bet) | UTG f, HJ f, CO f, BTN f, SB r3, BB r10, SB r27.05 | BB | -- |
+| 44 | absent | -- | Absent-node audit: open-limp outside the SB (MP facing a UTG limp) | UTG c | HJ | -- |
+
+Notes on the inventory:
+
+- **Every audit-matrix candidate in the brief is covered:** RFI 5, vs-RFI 15, vs-3bet 15. Each
+  row's `reason` states the page, the resolved sizes and where each size came from.
+- **The SB first-in limp strategy is not a separate grid.** It is the call column of "SB RFI",
+  so rows 5 and 36 share one node key and the bundle holds that node once.
+- **Rows 37-44 are the visual audit's absences.** No page has a BB-vs-limp, SB-vs-isolation,
+  multiway, squeeze, cold-call-vs-3bet or vs-4bet grid. No non-SB RFI legend has a limp row.
+- **Row 38 cannot be keyed.** The BB's isolation size is published nowhere, so it records only
+  the resolvable prefix and says so in its reason.
+- **The sizes in rows 42-43 are from this PDF.** They are recorded only to identify the missing
+  spot.
+- **Next actors are checked twice:** by
+  `test_rangeconverter_200_every_node_actor_is_the_next_seat_to_act` (which mirrors
+  `core_preflop::store::next_actor`) and by `build`'s `validate`.
+
+### Per-grid verification record
+
+Every one of the 35 grids in the legend table above meets the same standard:
+
+- page and exact chart label as in the table;
+- checked class count 169;
+- pass 1 (native 2x, top-down), pass 2 (300 DPI render, bottom row first and right to left,
+  written blind to a separate file) and pass 3 (pixel classifier) compared by script, every
+  disagreement re-inspected at 4x-6x;
+- verification complete 2026-09-26.
+
+Per-grid disagreements and corrections:
+
+- **0 disagreements on 30 grids:** all 5 RFI grids; MP vs UTG; CO vs UTG and MP; BTN vs UTG,
+  MP and CO; SB vs UTG and MP; BB vs UTG, MP, CO, BTN and SB; UTG vs MP, CO and SB 3bet; MP vs
+  CO, BTN and SB 3bet; CO vs BTN, SB and BB 3bet; BTN vs SB and BB 3bet; SB vs BB 3bet.
+- **SB vs CO RFI (page 7):** 4 disagreements, all pass-2 slips. Pass 1 stands; 0 corrections.
+- **SB vs BTN RFI (page 7):** 3 disagreements, all pass-2 slips. Pass 1 stands; 0 corrections.
+- **MP vs BB 3bet (page 10):** 4 disagreements, all pass-2 slips. Pass 1 stands; 0 corrections.
+- **UTG vs BTN 3bet (page 9):** 1 disagreement, 75s. Corrected from `g` to Call (thin-strip
+  rule).
+- **UTG vs BB 3bet (page 9):** 1 disagreement, 75s. Corrected from `g` to Call (thin-strip rule).
+
+- **Boundary hands:** every cell was compared, which includes every range boundary.
+- **Sum-to-one:** the class-sum check was not used as evidence that any cell was read
+  correctly. It is reported only as `validate` output.
+
+### Build / validate / verify (2026-09-26)
+
+```
+> python tools/chart_ingest.py build fixtures/charts/transcription/rangeconverter_200.json fixtures/charts/rangeconverter_200.json fixtures/charts/rangeconverter_200.manifest.json
+(exit 0)
+> python tools/chart_ingest.py validate fixtures/charts/rangeconverter_200.json
+(35 per-node class-sum lines: nodes 0-19 (RFI, vs-RFI) all 169 sums = 1.0; the 15 vs-3bet nodes 20-34 have 54/54/55/54/55, 60 x4, 74 x3, 98, 98, 97 sums = 1.0 and the rest = 0.0, exactly their declared unreachable classes)
+{"aggregate_min": 0.0, "aggregate_max": 1.0}
+> python tools/chart_ingest.py verify fixtures/charts/transcription/rangeconverter_200.json fixtures/charts/rangeconverter_200.json fixtures/charts/rangeconverter_200.manifest.json
+verified 35 nodes, 5915 classes
+```
+
+A sanity load through the Rust boundary was also run. It used a scratch crate outside the
+repository, which is not committed; Task 7 owns the committed Rust test.
+`core_preflop::load_bundle` accepted the bundle as `ChartTranscription`, depth 200,
+`EvReference::Unverified`.
+
+For Task 7, the covered prefixes at 200bb include:
+
+- BTN open, then BB call ("BB vs BTN RFI", page 8);
+- CO open, then BB call ("BB vs CO RFI", page 8);
+- BTN open, then BB 3bet, then BTN call ("BTN vs BB 3bet", page 12).
 
 ## Frozen coverage and Plan 4 handoff (Task 7)
 

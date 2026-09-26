@@ -1,0 +1,22 @@
+{
+  "bundle_id": "rangeconverter_200",
+  "source": "ChartTranscription",
+  "depth_bb": 200,
+  "depths": [
+    200
+  ],
+  "source_blinds": [
+    0.5,
+    1.0
+  ],
+  "rake_profile": "undocumented",
+  "rake": null,
+  "straddle": false,
+  "version": 2,
+  "game": "nl",
+  "ev_unit": "source_sb",
+  "ev_reference": "unverified",
+  "license_note": "RangeConverter '6-Max 200BB Poker Charts - No Limit Texas Holdem Cash' (public PDF, '6 max 200bb 500z GTO Ranges'), transcribed cell by cell for private use; not redistributed. Frequencies are the published cells rounded to the nearest 50% (0, 0.5 or 1); no EVs.",
+  "accuracy": "unverified",
+  "sha256": "8595c0a803d4d07bce0ea136b3dcb195d784ca9a5a7bbfdff4f986e352f9434d"
+}
