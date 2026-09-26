@@ -9,6 +9,10 @@ build = "build.rs"
 name = "solver-worker"
 path = "src/main.rs"
 
+[features]
+# Long-running suites outside the default gate (CLAUDE.md section 5): `cargo test -p solver-worker --features exhaustive`.
+exhaustive = []
+
 [dependencies]
 proto = { path = "../crates/proto" }
 postflop-solver = { path = "../third_party/postflop-solver", features = ["zstd"] }

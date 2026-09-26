@@ -126,34 +126,46 @@ fn combo_major(hands: &[(LibCard, LibCard)], reach: &[f32], support: &[f32], str
 #[derive(Debug, Clone, Copy)]
 pub struct SolutionMeta { pub exploitability_chips: f32, pub iterations: u32, pub memory_bytes: u64, pub mode: &'static str, pub locks_applied: u16 }
 
-/// Review ruling (c) of P2.T10: the deepest a measured exploitability may dip below zero and still
-/// count as floating-point noise (`compute_exploitability` averages two sums of differences). A fixed
-/// policy for this one computed diagnostic, never a proof that all roundoff at every chip scale fits.
-pub const EXPLOITABILITY_NOISE_FLOOR_CHIPS: f64 = 1e-6;
+/// Review ruling (c) of P2.T10: the smallest noise tolerance, in chips, whatever the pot.
+pub const EXPLOITABILITY_NOISE_MIN_CHIPS: f64 = 1e-6;
+/// P2.T11 review I2: the tolerance scales with the pot, in units of `f32::EPSILON * pot` chips.
+pub const EXPLOITABILITY_NOISE_POT_EPSILONS: f64 = 8.0;
+
+/// P2.T11 review I2: the deepest a measured exploitability may dip below zero at `pot` chips and still
+/// count as floating-point noise, `max(1e-6, 8 * f32::EPSILON * pot)` chips, computed in `f64`.
+/// `compute_exploitability` combines `f32` EV terms whose rounding scales with the chip values, so a
+/// fixed absolute floor sits below one ULP at ordinary pots (7.6e-6 chips at 100). A bounded reporting
+/// policy for this one computed diagnostic, never a proof that all roundoff in every tree fits.
+pub fn exploitability_tolerance_chips(pot: u32) -> f64 {
+    EXPLOITABILITY_NOISE_MIN_CHIPS.max(EXPLOITABILITY_NOISE_POT_EPSILONS * f64::from(f32::EPSILON) * f64::from(pot))
+}
 
 /// A measured exploitability as the worker reports it, plus the diagnostic line (for stderr, §4.5)
 /// that keeps the raw measurement whenever the reported value differs from it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReportedExploitability { pub chips: f32, pub log_line: Option<String> }
 
-/// Review ruling (c): the one place a raw `compute_exploitability` value becomes the reported
-/// `exploitability_chips`. A finite value in `[-1e-6, 0)` chips is noise and is reported as exactly
-/// `+0.0`, with the raw value in `log_line`; a zero (either sign) is `+0.0` and anything positive is
-/// unchanged, neither with a log line; a value below the floor, or a non-finite one, is an error. It
-/// is not an unconditional `max(0.0)` and never applies to ranges, probabilities or action EVs.
+/// Review ruling (c), with the pot-relative tolerance of P2.T11 review I2: the one place a raw
+/// `compute_exploitability` value at `pot` chips becomes the reported `exploitability_chips`. A finite
+/// value in `[-tolerance, 0)` chips ([`exploitability_tolerance_chips`]) is noise and is reported as
+/// exactly `+0.0`, with the raw value and the tolerance in `log_line`; a zero (either sign) is `+0.0`
+/// and anything positive is unchanged, neither with a log line; a value below `-tolerance`, or a
+/// non-finite one, is an error. It is not an unconditional `max(0.0)` and never applies to ranges,
+/// probabilities or action EVs.
 ///
-/// The job calls it once where the measurement feeds progress and result metadata, before emitting
-/// either, and writes `log_line` to stderr; `street_solution` copies the caller's metadata and does
-/// not call it, and `proto::worker::validate_solution` stays strict about negative values.
-pub fn report_exploitability(raw: f32) -> Result<ReportedExploitability, String> {
+/// The job calls it where the measurement feeds progress and result metadata, before emitting either,
+/// and writes `log_line` to stderr; `street_solution` copies the caller's metadata and does not call
+/// it, and `proto::worker::validate_solution` stays strict about negative values.
+pub fn report_exploitability(raw: f32, pot: u32) -> Result<ReportedExploitability, String> {
     if !raw.is_finite() { return Err(format!("exploitability measurement {raw} is not finite")); }
     if raw > 0.0 { return Ok(ReportedExploitability { chips: raw, log_line: None }); }
     if raw == 0.0 { return Ok(ReportedExploitability { chips: 0.0, log_line: None }); }
-    if f64::from(raw) >= -EXPLOITABILITY_NOISE_FLOOR_CHIPS {
-        let line = format!("exploitability: raw measurement {raw:e} chips is within the [-1e-6, 0) noise floor; reported as 0");
+    let tolerance = exploitability_tolerance_chips(pot);
+    if f64::from(raw) >= -tolerance {
+        let line = format!("exploitability: raw measurement {raw:e} chips is within the {tolerance:e}-chip noise tolerance at pot {pot}; reported as 0");
         return Ok(ReportedExploitability { chips: 0.0, log_line: Some(line) });
     }
-    Err(format!("exploitability measurement {raw:e} chips is below the -1e-6 noise floor"))
+    Err(format!("exploitability measurement {raw:e} chips is below the -{tolerance:e}-chip noise tolerance at pot {pot}"))
 }
 
 /// The §4.5 export limits `street_solution` applies (`MAX_EXPORTED_NODES`, `RESULT_LINE_MAX`); a
@@ -422,41 +434,79 @@ mod tests {
         refuse(&reach, &support[..2], &strat, &evs, "shape");
     }
 
-    /// Review ruling (c) (fix round 1): a measured exploitability in `[-1e-6, 0)` chips is
-    /// floating-point noise, reported as exactly `+0.0` with the raw value kept in the log line;
-    /// below the floor, or non-finite, it is an error. Nothing else is touched: a zero or positive
-    /// value passes bit for bit (a `-0.0` becomes `+0.0`) with no log line. `validate_solution` stays
-    /// strict: it accepts the reported value and still rejects the raw negative.
+    /// P2.T11 review I2: the noise tolerance is `max(1e-6, 8 * f32::EPSILON * pot)` chips, computed in
+    /// `f64`: the absolute 1e-6 floor below a 2-chip pot, and above it at least eight ULPs of any pot an
+    /// `f32` holds exactly (at a 100-chip pot one ULP is 7.62939453125e-6 chips, already past the old
+    /// floor).
+    #[test]
+    fn exploitability_noise_tolerance_scales_with_the_pot() {
+        let ulp = |pot: u32| f64::from((pot as f32).next_up() - pot as f32);
+        assert_eq!(ulp(100), 7.62939453125e-6, "one f32 ULP of a 100-chip pot");
+        for (pot, tolerance) in [
+            (0u32, 1e-6),
+            (1, 1e-6),                                            // 8 * EPSILON = 9.5367431640625e-7 < 1e-6
+            (2, 1.9073486328125e-6),
+            (100, 9.5367431640625e-5),
+            (10_000, 9.5367431640625e-3),
+            (u32::MAX, 4096.0 - 2f64.powi(-20)),
+        ] {
+            assert_eq!(exploitability_tolerance_chips(pot), tolerance, "pot {pot}");
+        }
+        // pots an f32 represents exactly (every pot up to 2^24)
+        for pot in [2u32, 3, 100, 180, 1 << 20, (1 << 24) - 1] {
+            assert!(exploitability_tolerance_chips(pot) >= 8.0 * ulp(pot), "pot {pot}: at least eight ULPs");
+        }
+    }
+
+    /// Review ruling (c) with the pot-relative tolerance of P2.T11 review I2, over several pot sizes: a
+    /// measured exploitability in `[-tolerance, 0)` chips is floating-point noise, reported as exactly
+    /// `+0.0` with the raw value and the tolerance kept in the log line; the representable value just
+    /// inside the tolerance is noise and the next `f32` below it is an error, as is anything non-finite.
+    /// Nothing else is touched: a zero or positive value passes bit for bit (a `-0.0` becomes `+0.0`)
+    /// with no log line. `validate_solution` stays strict: it accepts the reported value and still
+    /// rejects the raw negative.
     #[test]
     fn exploitability_noise_is_reported_as_zero_and_logged() {
-        let floor = -1e-6f32;
-        let below = f32::from_bits(floor.to_bits() + 1);            // the next f32 below the floor
-        assert!(below < floor && f64::from(below) < -1e-6);
-        for raw in [floor, -5e-7, -1e-12, -f32::MIN_POSITIVE] {
-            let r = report_exploitability(raw).unwrap();
-            assert_eq!(r.chips.to_bits(), 0.0f32.to_bits(), "{raw:e} is reported as +0.0");
-            let line = r.log_line.unwrap_or_else(|| panic!("{raw:e}: the raw value is logged"));
-            assert!(line.contains(&format!("{raw:e}")), "{raw:e} in {line}");
+        for pot in [1u32, 2, 100, 180, 10_000, 1_000_000, u32::MAX] {
+            let tolerance = exploitability_tolerance_chips(pot);
+            // the f32 nearest -tolerance from above (towards zero), and the next f32 below it
+            let mut inside = (-tolerance) as f32;
+            if f64::from(inside) < -tolerance { inside = f32::from_bits(inside.to_bits() - 1); }
+            let outside = f32::from_bits(inside.to_bits() + 1);
+            assert!(f64::from(inside) >= -tolerance && f64::from(outside) < -tolerance, "pot {pot}: {inside:e} / {outside:e} around {tolerance:e}");
+
+            for raw in [inside, inside / 2.0, -1e-12, -f32::MIN_POSITIVE] {
+                let r = report_exploitability(raw, pot).unwrap_or_else(|e| panic!("pot {pot}: {raw:e}: {e}"));
+                assert_eq!(r.chips.to_bits(), 0.0f32.to_bits(), "pot {pot}: {raw:e} is reported as +0.0");
+                let line = r.log_line.unwrap_or_else(|| panic!("pot {pot}: {raw:e}: the raw value is logged"));
+                assert!(line.contains(&format!("{raw:e}")) && line.contains(&format!("{tolerance:e}")), "pot {pot}: {raw:e} and {tolerance:e} in {line}");
+            }
+            for (raw, reported) in [(0.0f32, 0.0f32), (-0.0, 0.0), (f32::MIN_POSITIVE, f32::MIN_POSITIVE), (1e-7, 1e-7), (0.25, 0.25), (-inside, -inside), (-outside, -outside)] {
+                let r = report_exploitability(raw, pot).unwrap();
+                assert_eq!((r.chips.to_bits(), r.log_line), (reported.to_bits(), None), "pot {pot}: {raw:e}");
+            }
+            for (raw, needle) in [(outside, "below"), (outside * 2.0, "below"), (-f32::MAX, "below"), (f32::NAN, "finite"), (f32::INFINITY, "finite"), (f32::NEG_INFINITY, "finite")] {
+                let e = report_exploitability(raw, pot).unwrap_err();
+                assert!(e.contains(needle) && (needle == "finite" || e.contains(&format!("{tolerance:e}"))), "pot {pot}: {raw:e}: {needle:?} in {e}");
+            }
         }
-        for (raw, reported) in [(0.0f32, 0.0f32), (-0.0, 0.0), (1e-7, 1e-7), (0.25, 0.25)] {
-            let r = report_exploitability(raw).unwrap();
-            assert_eq!((r.chips.to_bits(), r.log_line), (reported.to_bits(), None), "{raw:e}");
-        }
-        for (raw, needle) in [(below, "below"), (-0.01, "below"), (-5.0, "below"), (f32::NAN, "finite"), (f32::INFINITY, "finite"), (f32::NEG_INFINITY, "finite")] {
-            let e = report_exploitability(raw).unwrap_err();
-            assert!(e.contains(needle), "{raw:e}: {needle:?} in {e}");
-        }
+        // the old absolute floor refused this one-ULP-scale sample at a 100-chip pot
+        assert!(f64::from(-7.6293945e-6f32) < -1e-6);
+        assert_eq!(report_exploitability(-7.6293945e-6, 100).unwrap().chips.to_bits(), 0.0f32.to_bits());
 
         let req = solve_request("river_two_combo", 0);
         let (mut game, _) = solved(&req, 50, 0.0);
         let mut m = meta();
-        m.exploitability_chips = report_exploitability(-5e-7).unwrap().chips;
+        let noise = -(8.0 * f32::EPSILON * req.pot as f32);
+        m.exploitability_chips = report_exploitability(noise, req.pot).unwrap().chips;
         let sol = street_solution(&mut game, &req, m, &no_cancel()).unwrap().unwrap();
         assert_eq!(sol.exploitability_chips.to_bits(), 0.0f32.to_bits());
         validate_solution(&sol, &req.tree.materialized).unwrap();
-        m.exploitability_chips = -5e-7;
-        let raw = street_solution(&mut game, &req, m, &no_cancel()).unwrap().unwrap();
-        assert!(validate_solution(&raw, &req.tree.materialized).unwrap_err().contains("non-negative"), "the wire gate stays strict");
+        for raw in [noise, -5e-7] {
+            m.exploitability_chips = raw;
+            let unreported = street_solution(&mut game, &req, m, &no_cancel()).unwrap().unwrap();
+            assert!(validate_solution(&unreported, &req.tree.materialized).unwrap_err().contains("non-negative"), "{raw:e}: the wire gate stays strict");
+        }
     }
 
     /// `available` needs reach > 0 (§4.5), not range membership: with OOP's turn root locked to bet
