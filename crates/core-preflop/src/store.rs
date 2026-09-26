@@ -355,6 +355,13 @@ fn committed_before_f64(history: &[(Position, PreflopStep)], actor: Position, de
 /// check on the already-`f32`-narrowed `PreflopNode` here could reject an already-accepted wire
 /// value purely from rounding right at the `1e-3` boundary (the exact defect this fix corrects),
 /// so the wide gate's decision is preserved through node construction rather than re-litigated.
+///
+/// P3.T9 fix round 2 (N1): every node this function produces is stamped
+/// `fold_wide_verified: true`, because this function is only ever called (from [`load_bundle`])
+/// on an envelope [`checked_envelope`] has already run [`check_fold_consistency_wide`] against
+/// and accepted. [`crate::ev::expand_node`] trusts that stamp instead of re-deriving its own
+/// narrow residual from the node's already-`f32`-narrowed EV cell, which is exactly the re-check
+/// that could disagree with this wide admission purely from rounding at the tolerance boundary.
 pub fn build_node_map(info: &BundleInfo, e: &Envelope) -> Result<BTreeMap<String, PreflopNode>, BundleError> {
     let mut map = BTreeMap::new();
     for n in &e.nodes {
@@ -377,6 +384,9 @@ pub fn build_node_map(info: &BundleInfo, e: &Envelope) -> Result<BTreeMap<String
             ev_source_sb: n.evs.as_ref().map(|rows| transpose(rows)),
             unreachable,
             committed_by_actor_sb: committed_before(&history, actor, info.depth_bb),
+            // This function only ever runs on an envelope `checked_envelope` already ran
+            // `check_fold_consistency_wide` against and accepted (P3.T9 fix round 2, N1).
+            fold_wide_verified: true,
         };
         let key = node_key(&PreflopNodeKey {
             depth_bb: info.depth_bb,

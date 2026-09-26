@@ -202,25 +202,36 @@ fn to_chip_action(step: &PreflopStep, unit: u32, actor_max_to: u32) -> Action {
 /// fails the shared cross-check ([`verify_fold_wide`]/[`verify_fold`]), and this function's own
 /// boundary assertion (P3.T9 fix round 1, R3 -- see [`check_fold_consistency`]) re-checks the same
 /// invariant on whatever `node`/`info` it was actually given, for callers that bypassed the loader
-/// entirely. Either way, by the time this line runs, every fold EV is already known consistent
-/// with `committed`/`start` to within the spec's `1e-3` tolerance. Forcing the exact value is what
-/// section 8.3's "verified fold ... store normalized fold as exact 0.0" means: a source's own
-/// rounding is never allowed to leak a nonzero residual into the one action the root contract
-/// (section 6) defines as exactly zero. This is the one place this function's behavior goes beyond
-/// the brief's literal Step 4 code (which applies `normalize_ev`/`ev_chips` uniformly to every
-/// action) -- see the task report for why the addition is necessary rather than optional polish.
+/// entirely -- but only when `node.fold_wide_verified` is `false` (P3.T9 fix round 2, N1): a node
+/// the loader already admitted through the wide gate is trusted as-is, never re-decided from its
+/// own narrowed `f32` cell (see the assertion's own comment below for why). Either way, by the
+/// time this line runs, every fold EV is already known consistent with `committed`/`start` to
+/// within the spec's `1e-3` tolerance. Forcing the exact value is what section 8.3's "verified
+/// fold ... store normalized fold as exact 0.0" means: a source's own rounding is never allowed to
+/// leak a nonzero residual into the one action the root contract (section 6) defines as exactly
+/// zero. This is the one place this function's behavior goes beyond the brief's literal Step 4
+/// code (which applies `normalize_ev`/`ev_chips` uniformly to every action) -- see the task report
+/// for why the addition is necessary rather than optional polish.
 pub fn expand_node(node: &PreflopNode, info: &BundleInfo, actor: Seat, unit: u32, actor_max_to: u32) -> ExpandedNode {
     let classes = info.combo_classes(); // the process-wide table, borrowed, never rebuilt or cloned here
     let charts = matches!(info.source, SourceKind::ChartTranscription);
-    // R3 (P3.T9 fix round 1): before any verified, present fold EV can be forced to exactly
-    // 0.0 below, the shared validator re-checks fold consistency on `node`/`info` as they
-    // actually are at this call -- an always-on assertion, naming the offending class, because
-    // `PreflopNode`/`BundleInfo` are publicly constructible and `PreflopStore::from_sources`
-    // accepts a source without ever running the loader's admission gate (`checked_envelope`'s
-    // `check_fold_consistency_wide`). Skipped exactly where the fold-forcing branch below is
-    // also skipped (charts and `Unverified` never reach it), so it never fires spuriously on
-    // data this function was never going to trust anyway.
-    if !charts && info.ev_reference != EvReference::Unverified {
+    // R3 (P3.T9 fix round 1), refined by N1 (fix round 2): before any verified, present fold EV
+    // can be forced to exactly 0.0 below, this re-checks fold consistency on `node`/`info` as
+    // they actually are at this call -- but ONLY when `node.fold_wide_verified` is false. A node
+    // stamped `true` already passed `check_fold_consistency_wide` (the load-time gate, run on the
+    // ORIGINAL `f64` wire cells) inside `checked_envelope`; re-deriving a *narrow* (`f32`)
+    // residual from that same, already-narrowed node here can disagree with the wide gate purely
+    // from rounding right at the `1e-3` boundary (the re-review's own repro: wire 195.0009999
+    // under `AbsoluteStackVerified` has a wide residual of 0.0009999, which accepts, but narrows
+    // to a residual of ~0.0010071, which would reject) -- panicking on data the loader already
+    // admitted. `PreflopNode`/`BundleInfo` are publicly constructible and `PreflopStore::
+    // from_sources` accepts a source without ever running the loader's admission gate at all, so
+    // a node built that way carries `fold_wide_verified: false` and still gets this narrow,
+    // in-memory check as its only safety net -- an always-on assertion, naming the offending
+    // class. Skipped entirely, either way, where the fold-forcing branch below is also skipped
+    // (charts and `Unverified` never reach it), so it never fires spuriously on data this
+    // function was never going to trust anyway.
+    if !charts && info.ev_reference != EvReference::Unverified && !node.fold_wide_verified {
         if let Err(msg) = check_fold_consistency(node, info) {
             panic!("expand_node: fold-EV consistency invariant violated: {msg}");
         }
@@ -276,6 +287,15 @@ pub fn expand_node(node: &PreflopNode, info: &BundleInfo, actor: Seat, unit: u32
 /// before forcing a verified present fold to exactly `0.0` -- an always-on `assert`-style panic,
 /// naming the offending class, rather than silently trusting an invariant no admission path
 /// enforced.
+///
+/// P3.T9 fix round 2 (N1): `expand_node` now calls this only when `node.fold_wide_verified` is
+/// `false` -- i.e. only for a node that never passed the wide gate in the first place. Calling
+/// this narrow check *again* on a node that already carries `fold_wide_verified: true` is exactly
+/// the defect N1 identifies: a narrow-only re-check right at the `1e-3` boundary can disagree with
+/// the wide gate that already admitted the bundle, purely from `f32` rounding, and panic on
+/// otherwise-valid, loader-admitted data. So this function's role narrows to backing the
+/// direct-construction safety net alone, never a second opinion on a node the loader already
+/// vouched for.
 ///
 /// A missing fold action, a missing EV column, a missing per-class value, an unverified reference
 /// or a chart source (which never carries EV data at all) are all silently fine -- [`verify_fold`]

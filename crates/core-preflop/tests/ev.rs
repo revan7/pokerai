@@ -128,6 +128,9 @@ fn expand_node_expands_classes_to_combos() {
         ev_source_sb: Some(ev_source_sb),
         unreachable,
         committed_by_actor_sb: 0.0, // consistent with the fold EV of exactly 0.0 at class 0
+        // Direct construction, not through the loader: `expand_node`'s narrow in-memory
+        // check is still the safety net for this node (P3.T9 fix round 2, N1).
+        fold_wide_verified: false,
     };
     let info = bundle_info(EvReference::DecisionIncrementalVerified, 100);
 
@@ -177,6 +180,7 @@ fn expand_node_suppresses_ev_for_charts_and_unverified_sources() {
         ev_source_sb: Some(ev_source_sb),
         unreachable: [false; 169],
         committed_by_actor_sb: 0.0,
+        fold_wide_verified: false, // direct construction, not through the loader
     };
     for info in [
         {
@@ -306,6 +310,10 @@ fn expand_node_panics_on_an_unvalidated_inconsistent_fold_from_direct_constructi
         ev_source_sb: Some(ev_source_sb),
         unreachable: [false; 169],
         committed_by_actor_sb: 0.0,
+        // Direct construction, never through the loader's wide gate: `expand_node` must still
+        // run its own narrow in-memory check as the only safety net for this data (P3.T9 fix
+        // round 2, N1) -- this is exactly the case that must still panic.
+        fold_wide_verified: false,
     };
     let info = bundle_info(EvReference::DecisionIncrementalVerified, 100);
     let _ = expand_node(&node, &info, Seat(0), 100, 1000);
@@ -353,6 +361,7 @@ fn expand_node_propagates_an_unrepresentable_ev_as_none_never_infinite_or_zeroed
         ev_source_sb: Some(ev_source_sb),
         unreachable: [false; 169],
         committed_by_actor_sb: 0.0,
+        fold_wide_verified: false, // direct construction, not through the loader
     };
     let info = bundle_info(EvReference::DecisionIncrementalVerified, 100);
     let expanded = expand_node(&node, &info, Seat(1), 4, 777);
@@ -520,6 +529,84 @@ fn straddle_mapped_node_through_the_store_exercises_expand_node() {
         expanded.ev_chips.iter().all(|row| row[fold_idx] == Some(0.0)),
         "the fixture's uniform fold EV must force to exactly 0.0 chips even under the straddle mapping"
     );
+}
+
+/// Wire JSON for a small three-node tree rooted at the empty prefix: an opening node (UTG facing
+/// fold/raise-to-2500-thousandths), the node UTG's raise reaches (HJ facing fold/raise-to-8750-
+/// thousandths), and the actual node under test (UTG facing HJ's 3bet after CO/BTN/SB/BB fold,
+/// the same `three_bet_history` prefix `fold_node_envelope_json` uses). The two extra nodes exist
+/// only so `resolve_against_source`'s menu resolution -- which the real `PreflopStore::query`
+/// path always runs before a raise can enter a lookup key -- can resolve UTG's and HJ's raises
+/// onto this bundle's own menu sizes, exactly as a real multi-node bundle would; folds never need
+/// a menu lookup, so no further nodes are required. Only the third node carries a declared fold
+/// EV (`fold_ev`, at every one of the 169 classes) -- the two menu-only nodes carry no `evs` field
+/// at all (`EnvelopeNode::evs` defaults to `None`).
+fn three_node_envelope_json(fold_ev: f64) -> String {
+    let row = |v: String| format!("[{}]", vec![v; 169].join(","));
+    let ones = row("1".into());
+    let zeros = row("0".into());
+    let fold_row = row(fold_ev.to_string());
+    let raise_row = row("1.0".into());
+    let node = |history: &str, actor: &str, raise_to_bb_x1000: u32, evs: Option<(&str, &str)>| {
+        let evs_field = match evs {
+            Some((f, r)) => format!(r#","evs":[{f},{r}]"#),
+            None => String::new(),
+        };
+        format!(
+            r#"{{"history":{history},"actor":"{actor}","actions":[{{"step":"fold"}},{{"step":"raise","to_bb_x1000":{raise_to_bb_x1000}}}],"weights":[{ones},{zeros}]{evs_field},"unreachable_classes":[]}}"#
+        )
+    };
+    let opening = node("[]", "UTG", 2500, None);
+    let facing_open = node(r#"[["UTG","raise",2500]]"#, "HJ", 8750, None);
+    let history3 = serde_json::to_string(&three_bet_history()).unwrap();
+    let answer_node = node(&history3, "UTG", 22000, Some((&fold_row, &raise_row)));
+    format!(
+        r#"{{"bundle_id":"t9_test","depth_bb":100,"rake_profile":"test","straddle":false,"class_order":"A-2 row-major, section 4.1","nodes":[{opening},{facing_open},{answer_node}]}}"#
+    )
+}
+
+/// N1 (P3.T9 fix round 1 re-review, fix round 2): `expand_node`'s boundary assertion must trust
+/// the wide admission verdict already made at load time (`check_fold_consistency_wide`, run on
+/// the ORIGINAL `f64` wire bytes inside `checked_envelope`) rather than re-deriving its own
+/// residual from the already-`f32`-narrowed EV cell -- narrowing can shift a residual by less
+/// than a part in `1e7`, right across the `1e-3` tolerance boundary. The re-review's own exact
+/// repro: wire fold EV `195.0009999` under `AbsoluteStackVerified` with `committed = 5`,
+/// `start = 200` (the same `three_bet_history` prefix as the tests above) -- wide residual
+/// `0.0009999` accepts, but the `f32`-narrowed residual `0.0010071` would reject. A bundle at
+/// exactly this boundary must load through `load_bundle`/`PreflopStore::open` and answer a real
+/// `PreflopStore::query` (which always reaches `expand_node`) without panicking.
+#[test]
+fn expand_node_through_the_store_trusts_the_wide_fold_verdict_at_the_narrow_boundary() {
+    let dir = std::env::temp_dir().join(format!("core_preflop_p3t9_fix2_n1_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("boundary")).unwrap();
+
+    // stack_dec = source_stack_sb(100) - committed(5) = 200 - 5 = 195; wire residual 0.0009999
+    // is wide-consistent (<=1e-3) but f32-narrows to a residual of ~0.0010071 (>1e-3).
+    let raw = three_node_envelope_json(195.0009999).into_bytes();
+    let mut info = bundle_info(EvReference::AbsoluteStackVerified, 100);
+    info.sha256 = sha256_hex(&raw);
+    std::fs::write(dir.join("boundary/manifest.json"), serde_json::to_string(&info).unwrap()).unwrap();
+    std::fs::write(dir.join("boundary/nodes.json"), &raw).unwrap();
+
+    let (store, banners) = PreflopStore::open(&dir);
+    assert!(banners.is_empty(), "the boundary-accepting bundle must load cleanly through the wide gate: {banners:?}");
+
+    let unit = 1000u32;
+    let cfg = config(unit / 2, unit, None, exact_rake(unit));
+    let root = table(&cfg, 6, &vec![100 * unit; 6]);
+    let three_bet_state = act(
+        &root,
+        &[Action::Raise { to: 2500 }, Action::Raise { to: 8750 }, Action::Fold, Action::Fold, Action::Fold, Action::Fold],
+    );
+
+    // Must not panic: expand_node's own boundary assertion must not re-derive a narrow residual
+    // against data the wide loader gate already admitted.
+    let answer = store.query(&cfg, &three_bet_state, 6);
+    assert_eq!(answer.unsupported, None, "{answer:?}");
+    assert!(answer.expanded.is_some(), "expand_node must run and succeed at this boundary value");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// R4/R2: `PreflopStore::open` on a directory holding one fold-inconsistent bundle (rejected by
