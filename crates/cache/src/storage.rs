@@ -146,6 +146,17 @@
 //! regression that needs the hook moved into that unit-test module with it, with every one of
 //! its assertions unchanged; `crates/cache/tests/storage.rs` now uses only the five sanctioned
 //! public interfaces.
+//!
+//! ## Task 6 fix round 1 (review `task-6-review.md`, R6/R7)
+//!
+//! - **R6:** `write_atomic`'s failure-before-rename guarantee is now proved against the production
+//!   function itself: a `#[cfg(test)]`, private, one-shot hook registry (`inject_before_rename`)
+//!   lets a unit test fail the publication after the fsynced temp write and before the rename --
+//!   directly, and through the `Cache` writer thread -- and assert the old cell is byte-for-byte
+//!   intact, the temp file is gone, and the next publication lands. The registry does not exist in
+//!   a normal build.
+//! - **R7:** the unit tests below use the one shared `TempDir` (`tests/support/temp_dir.rs`,
+//!   included by `#[path]`), so their directories are removed even when an assertion fails.
 
 use crate::entry::CacheEntry;
 use crate::CacheError;
@@ -401,6 +412,11 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
+        // Test builds only (task 6 review R6): a failure injected here strikes after the whole
+        // payload is written and fsynced to the temp file and before the rename -- the window a
+        // crash or I/O error between those two steps would hit. Absent from every normal build.
+        #[cfg(test)]
+        injected_before_rename(path, &tmp)?;
         // The publication itself. Nothing above this line runs under the lock.
         let mut tickets = publication();
         std::fs::rename(&tmp, path)?;
@@ -413,6 +429,38 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
         let _ = std::fs::remove_file(tmp);
     }
     result
+}
+
+/// A one-shot hook run by `write_atomic` between its fsynced temp write and its rename.
+#[cfg(test)]
+type BeforeRename = Box<dyn FnOnce(&Path) -> Result<(), CacheError> + Send>;
+
+/// Test-only failure seam (task 6 review R6), following task 5's `read_cell_with_hook`
+/// precedent: `#[cfg(test)]` and private, so it does not exist in a normal build and is not
+/// reachable from `crates/cache/tests/` (a separate crate, built against the non-test library).
+/// Each armed hook fires once, for the next `write_atomic` publishing at exactly its path, and is
+/// handed the temp file's path; an `Err` it returns becomes that call's error. It is a registry
+/// rather than a parameter because the publication a unit test needs to fail may be the one the
+/// writer thread performs inside `Cache`; keying hooks by path keeps tests running in parallel
+/// from ever tripping one another's.
+#[cfg(test)]
+static BEFORE_RENAME: std::sync::Mutex<Vec<(PathBuf, BeforeRename)>> = std::sync::Mutex::new(Vec::new());
+
+/// Arms a one-shot `BEFORE_RENAME` hook for the next publication at `path`.
+#[cfg(test)]
+fn inject_before_rename(path: &Path, hook: impl FnOnce(&Path) -> Result<(), CacheError> + Send + 'static) {
+    BEFORE_RENAME.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push((path.to_path_buf(), Box::new(hook)));
+}
+
+/// Runs (and disarms) the hook armed for `path`, if any; `Ok` when there is none. The registry lock
+/// is released before the hook runs.
+#[cfg(test)]
+fn injected_before_rename(path: &Path, tmp: &Path) -> Result<(), CacheError> {
+    let hook = {
+        let mut hooks = BEFORE_RENAME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        hooks.iter().position(|(armed, _)| armed == path).map(|i| hooks.remove(i).1)
+    };
+    hook.map_or(Ok(()), |hook| hook(tmp))
 }
 
 /// Reads and decodes the cell stored at `path`. Equivalent to `read_cell_core(path, || {})`; see
@@ -478,6 +526,13 @@ fn read_cell_core(path: &Path, between_read_and_delete: impl FnOnce()) -> Option
 fn read_cell_with_hook(path: &Path, between_read_and_delete: impl FnOnce()) -> Option<Cell> {
     read_cell_core(path, between_read_and_delete)
 }
+
+/// The one per-invocation temp-directory helper the cache's tests share (task 6 review R7):
+/// `crates/cache/tests/{quota,storage}.rs` include this same file with `#[path]` too, so there is
+/// a single definition rather than a copy per test crate.
+#[cfg(test)]
+#[path = "../tests/support/temp_dir.rs"]
+mod test_temp_dir;
 
 #[cfg(test)]
 mod tests {
@@ -654,14 +709,9 @@ mod tests {
         }
     }
 
-    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static UNIQUE: AtomicU64 = AtomicU64::new(0);
-        let id = UNIQUE.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("pokerai-cache-src-{label}-{}-{id}", std::process::id()));
-        std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("unique_temp_dir must get a fresh, exclusively-created directory at {dir:?}: {e}"));
-        dir
-    }
+    /// The one shared per-invocation temp directory (task 6 review R7): exclusively created,
+    /// removed on `Drop` (so also while a failing assertion unwinds).
+    use super::test_temp_dir::TempDir;
 
     /// The controlled-interleaving regression review R3 asked for: a valid replacement is
     /// published at `path` in the exact window between `read_cell`'s read (of the original
@@ -671,8 +721,8 @@ mod tests {
     /// longer agrees with what was captured from the *original* file's opened handle.
     #[test]
     fn read_cell_does_not_delete_a_replacement_published_between_read_and_cleanup() {
-        let dir = unique_temp_dir("race");
-        let path = dir.join("cell.bin");
+        let dir = TempDir::new("src-race");
+        let path = dir.path().join("cell.bin");
         std::fs::write(&path, b"not a cache header").unwrap();
 
         let e = fixture_entry();
@@ -692,8 +742,6 @@ mod tests {
 
         let reread = read_cell(&path).expect("the surviving replacement must still be a hit");
         assert_eq!(reread.entries[0].key, e.key);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The structural regression task 6 owes review R3 (orchestrator ruling): a *real*
@@ -707,8 +755,8 @@ mod tests {
     /// publication lock and the ticket `write_atomic` marked under it.
     #[test]
     fn a_publication_racing_a_corrupt_read_survives_even_when_len_and_mtime_agree() {
-        let dir = unique_temp_dir("publish-race");
-        let path = dir.join("cell.bin");
+        let dir = TempDir::new("src-publish-race");
+        let path = dir.path().join("cell.bin");
         let e = fixture_entry();
         let replacement = encode(&Cell { entries: vec![e.clone()] }).unwrap();
         // Corrupt bytes of exactly the replacement's length: zeros fail the magic check.
@@ -733,8 +781,6 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), replacement, "the published replacement must survive the cleanup");
         let reread = read_cell(&path).expect("the surviving replacement must still be a hit");
         assert_eq!(reread.entries[0].key, e.key);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The other ordering: a cleanup that commits first unlinks only the corrupt bytes it read,
@@ -742,8 +788,8 @@ mod tests {
     /// covers both of the two orderings the publication lock allows.
     #[test]
     fn a_publication_after_a_cleanup_still_lands() {
-        let dir = unique_temp_dir("publish-after");
-        let path = dir.join("cell.bin");
+        let dir = TempDir::new("src-publish-after");
+        let path = dir.path().join("cell.bin");
         std::fs::write(&path, b"not a cache header").unwrap();
         assert!(read_cell(&path).is_none());
         assert!(!path.exists(), "the corrupt file it read is unlinked");
@@ -752,7 +798,85 @@ mod tests {
         let bytes = encode(&Cell { entries: vec![e.clone()] }).unwrap();
         write_atomic(&path, &bytes).unwrap();
         assert_eq!(read_cell(&path).expect("the later publication must be a hit").entries[0].key, e.key);
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    fn injected_failure() -> CacheError {
+        CacheError::Io(std::io::Error::other("injected failure between the temp write and the rename"))
+    }
+
+    /// The files in `dir` (one shard directory), so a test can assert that nothing but the cell
+    /// itself is left -- in particular no `*.tmp` from the failed publication.
+    fn files_in(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir).unwrap().flatten().map(|f| f.path()).collect()
+    }
+
+    /// Review R6, brief step 5 "inject failure before rename": the *production* `write_atomic`,
+    /// failing after the whole replacement has been written and fsynced to its temp file but
+    /// before the rename (the `#[cfg(test)]` `inject_before_rename` seam), reports the error,
+    /// leaves the previously published cell byte-for-byte intact and readable, and removes its
+    /// temp file. The seam fires once, so the next publication goes through.
+    #[test]
+    fn a_failure_between_the_temp_write_and_the_rename_leaves_the_old_cell_intact() {
+        let dir = TempDir::new("src-pre-rename");
+        let e = fixture_entry();
+        let path = entry_path(dir.path(), e.key.digest());
+        let old = encode(&Cell { entries: vec![e.clone()] }).unwrap();
+        write_atomic(&path, &old).unwrap();
+        let mut replacement = fixture_entry();
+        replacement.iterations = 4_321;
+        let new = encode(&Cell { entries: vec![replacement] }).unwrap();
+        assert_ne!(new, old);
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let record = std::sync::Arc::clone(&seen);
+        inject_before_rename(&path, move |tmp| {
+            *record.lock().unwrap() = Some((tmp.to_path_buf(), std::fs::read(tmp).unwrap_or_default()));
+            Err(injected_failure())
+        });
+        assert!(matches!(write_atomic(&path, &new), Err(CacheError::Io(_))), "the injected failure is reported to the caller");
+
+        let (tmp, staged) = seen.lock().unwrap().take().expect("the failure must have been injected inside write_atomic");
+        assert_eq!(staged, new, "the failure struck after the full replacement was written to its temp file");
+        assert_eq!(tmp.parent(), path.parent(), "the temp file is a sibling of the cell, on the same volume");
+        assert!(!tmp.exists(), "the failed publication removed its temp file");
+        assert_eq!(std::fs::read(&path).unwrap(), old, "the old cell is byte-for-byte intact");
+        assert_eq!(read_cell(&path).expect("the old cell is still a hit").entries[0].iterations, e.iterations);
+        assert_eq!(files_in(path.parent().unwrap()), vec![path.clone()], "nothing but the cell itself remains");
+
+        write_atomic(&path, &new).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), new, "the seam fired once: the next publication lands whole");
+    }
+
+    /// Review R6 through the real writer: a `Cache` store whose publication fails between the temp
+    /// write and the rename reports `false`, keeps the old cell exactly as it was, leaves no temp
+    /// file, and the writer carries on -- the next store of the same entry publishes it.
+    #[test]
+    fn a_writer_store_failing_before_its_rename_keeps_the_old_cell_and_recovers() {
+        const BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+        let dir = TempDir::new("src-writer-pre-rename");
+        let cache = crate::Cache::open(dir.path().to_path_buf(), crate::CACHE_QUOTA_BYTES);
+        let e = fixture_entry();
+        let path = entry_path(dir.path(), e.key.digest());
+        assert!(cache.store_tracked(&e).wait(BUDGET));
+        let old = std::fs::read(&path).unwrap();
+
+        // Strictly more accurate at the same SPR: it replaces `e` as the cell's representative.
+        let mut better = fixture_entry();
+        better.exploitability_over_P = 0.001;
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&fired);
+        inject_before_rename(&path, move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(injected_failure())
+        });
+        assert!(!cache.store_tracked(&better).wait(BUDGET), "a store whose publication failed is reported as not stored");
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "the failure was injected into the writer's own publication");
+        assert_eq!(std::fs::read(&path).unwrap(), old, "the old cell is byte-for-byte intact");
+        assert!(read_cell(&path).is_some(), "the old cell is still a hit");
+        assert_eq!(files_in(path.parent().unwrap()), vec![path.clone()], "no temp file remains");
+
+        assert!(cache.store_tracked(&better).wait(BUDGET), "the writer recovers: the next store publishes");
+        assert_eq!(read_cell(&path).expect("the replacement is a hit").entries[0].exploitability_over_P, 0.001);
+        cache.shutdown();
     }
 }

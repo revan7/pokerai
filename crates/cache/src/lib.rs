@@ -40,20 +40,9 @@ pub enum WriteCommand {
     Store(Box<crate::entry::CacheEntry>, Option<std::sync::mpsc::SyncSender<bool>>),
     /// Re-date the entry with this payload digest in this cell: it was just served.
     Touch { key: [u8; 32], payload_digest: Vec<u8>, last_hit: u64 },
-    /// Remove this cell outright (used by the pre-solver's reconciliation, plan 4 task 14+).
+    /// Remove this cell outright (used by the pre-solver's reconciliation, plan 4 task 14+). A
+    /// deletion the filesystem refuses keeps the cell accounted until a later pass removes it.
     Delete([u8; 32]),
-    Shutdown,
-}
-
-/// The reader thread's command channel type. Task 7 owns the bounded reader thread and the rest
-/// of its variants; this task needs only the `Shutdown` the handle's own `shutdown` sends, so
-/// `Cache::reader` and `Cache::shutdown` have the shape the plan specifies while `reader` stays
-/// `None`. Plan 4 task 6 spells this type `crate::lookup::ReadCommand`; it is declared here
-/// because `crates/cache/src/lookup.rs` is outside this task's file list -- task 7 can keep it
-/// here or add `pub use crate::ReadCommand;` to `lookup`, which makes that path resolve without
-/// moving the definition or changing this field's type.
-#[derive(Debug)]
-pub enum ReadCommand {
     Shutdown,
 }
 
@@ -63,12 +52,14 @@ pub enum ReadCommand {
 pub struct StoreReceipt(Option<std::sync::mpsc::Receiver<bool>>);
 
 impl StoreReceipt {
-    /// True only when the writer reported a durable, validated cell on disk. The writer answers
-    /// after that store's quota pass has finished, so a `true` also means the store is not about
-    /// to be undone by eviction in the same pass, and a caller that then reads the cell sees the
-    /// settled state. False covers every other case: a disabled cache, a full or disconnected
-    /// writer queue, a rejected or unwritable entry, and a writer that did not answer inside
-    /// `budget`.
+    /// The store's outcome *after* its own quota pass (review R2): true only when the entry was
+    /// validated, published, and is still on disk once that pass has run -- so a caller that then
+    /// reads the cell sees it. False covers every other case: a disabled cache, a full or
+    /// disconnected writer queue, a rejected or unwritable entry, a `last_hit` above
+    /// `quota::LAST_HIT_MAX`, a *dominated* insertion (`quota::retain_two` kept the cell's
+    /// existing representatives instead of it, so this entry was not stored -- the cell is left as
+    /// it was), a store the same quota pass evicted again (a quota smaller than its cell), and a
+    /// writer that did not answer inside `budget`.
     pub fn wait(self, budget: std::time::Duration) -> bool {
         self.0.map_or(false, |rx| rx.recv_timeout(budget).unwrap_or(false))
     }
@@ -80,7 +71,7 @@ impl StoreReceipt {
 pub struct Cache {
     root: std::path::PathBuf,
     writer: Option<std::sync::mpsc::SyncSender<WriteCommand>>,
-    reader: Option<std::sync::mpsc::SyncSender<crate::ReadCommand>>, // Task 7
+    reader: Option<std::sync::mpsc::SyncSender<crate::lookup::ReadCommand>>, // Task 7
     skipped: std::sync::atomic::AtomicBool,
 }
 
@@ -113,34 +104,39 @@ impl Cache {
             .spawn(move || {
                 let mut index = crate::quota::scan_index(&dir);
                 crate::quota::sweep_temporaries(&dir);
-                let mut max_last_hit = index.iter().map(|r| r.last_hit).max().unwrap_or(0);
+                let mut max_last_hit = index.max_last_hit();
                 while let Ok(command) = rx.recv() {
                     // The receipt is answered at the end of the iteration, after this command's
-                    // quota pass, so a waiting caller that then reads the cell sees the settled
-                    // state rather than one an eviction is about to change.
+                    // quota pass, with whether the stored entry is *still* indexed -- i.e. still on
+                    // disk -- once that pass has run (review R2).
                     let mut receipt = None;
-                    let mut stored = false;
+                    let mut stored = None;
                     match command {
                         WriteCommand::Shutdown => break,
                         WriteCommand::Delete(key) => {
-                            let _ = std::fs::remove_file(crate::storage::entry_path(&dir, key));
-                            index.retain(|r| r.key != key);
+                            crate::quota::delete_cell(&dir, key, &mut index);
                         }
                         WriteCommand::Touch { key, payload_digest, last_hit } => {
-                            max_last_hit = next_last_hit(max_last_hit, last_hit);
-                            let _ = crate::quota::apply_touch(&dir, key, &payload_digest, max_last_hit, &mut index);
+                            // An unusable timestamp re-dates nothing and leaves the counter alone.
+                            if let Some(hit) = next_last_hit(max_last_hit, last_hit) {
+                                max_last_hit = hit;
+                                let _ = crate::quota::apply_touch(&dir, key, &payload_digest, hit, &mut index);
+                            }
                         }
                         WriteCommand::Store(entry, sender) => {
-                            max_last_hit = next_last_hit(max_last_hit, entry.last_hit);
-                            let mut entry = *entry;
-                            entry.last_hit = max_last_hit;
                             receipt = sender;
-                            stored = crate::quota::store_entry(&dir, entry, &mut index).is_ok();
+                            // An unusable timestamp refuses the store and leaves the counter alone.
+                            if let Some(hit) = next_last_hit(max_last_hit, entry.last_hit) {
+                                max_last_hit = hit;
+                                let mut entry = *entry;
+                                entry.last_hit = hit;
+                                stored = crate::quota::store_entry(&dir, entry, &mut index).ok().flatten();
+                            }
                         }
                     }
                     crate::quota::enforce_quota(&dir, quota_bytes, &mut index);
                     if let Some(r) = receipt {
-                        let _ = r.try_send(stored);
+                        let _ = r.try_send(stored.is_some_and(|entry| index.contains(&entry)));
                     }
                 }
             })
@@ -177,7 +173,8 @@ impl Cache {
     /// Records that the entry with this payload digest (`quota::entry_digest`) in cell `key` was
     /// just served, so eviction sees it as fresh. `last_hit` is the caller's clock reading; the
     /// writer persists `max(last_hit, its own maximum + 1)` so a clock reversal cannot make a
-    /// fresh hit look like the oldest entry in the store.
+    /// fresh hit look like the oldest entry in the store. A reading above `quota::LAST_HIT_MAX`
+    /// is refused: the touch re-dates nothing.
     pub fn touch(&self, key: [u8; 32], payload_digest: Vec<u8>, last_hit: u64) {
         self.send(WriteCommand::Touch { key, payload_digest, last_hit });
     }
@@ -189,7 +186,7 @@ impl Cache {
             let _ = tx.send(WriteCommand::Shutdown);
         }
         if let Some(tx) = self.reader.as_ref() {
-            let _ = tx.send(crate::ReadCommand::Shutdown);
+            let _ = tx.send(crate::lookup::ReadCommand::Shutdown);
         }
     }
 }
@@ -197,8 +194,65 @@ impl Cache {
 /// The `last_hit` the writer persists for a hit whose caller-supplied timestamp is `proposed`:
 /// `max(proposed, previous + 1)`, so the value is strictly monotone across the process's whole
 /// run *and* across restarts (the maximum is rebuilt from disk on open) even when the system
-/// clock jumps backwards -- a fresh hit can never be recorded as the oldest entry in the store.
-/// `saturating_add` keeps that true at the top of the range instead of wrapping to zero.
-fn next_last_hit(previous: u64, proposed: u64) -> u64 {
-    proposed.max(previous.saturating_add(1))
+/// clock jumps backwards -- a fresh hit can never tie with, let alone be recorded as older than,
+/// any entry already in the store (review R5).
+///
+/// `None` when `proposed` is above `quota::LAST_HIT_MAX`: an unusable timestamp is refused, never
+/// clamped, and the caller leaves the counter where it was. The `+ 1` is checked, never
+/// saturating.
+///
+/// # Panics
+/// If `previous` is `u64::MAX` (always-on, standing ruling (b)). The writer's counter cannot get
+/// there: it starts at most `LAST_HIT_MAX` (`quota::scan_index` removes any cell carrying more)
+/// and each command raises it to at most `max(LAST_HIT_MAX, previous + 1)`, so exhausting it
+/// takes 2^63 commands.
+fn next_last_hit(previous: u64, proposed: u64) -> Option<u64> {
+    if proposed > crate::quota::LAST_HIT_MAX {
+        return None;
+    }
+    let Some(bumped) = previous.checked_add(1) else {
+        panic!("last_hit counter exhausted at {previous}: the writer's strictly increasing counter has no successor");
+    };
+    Some(proposed.max(bumped))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review R5: `max(proposed, previous + 1)` for every usable proposal, strictly increasing
+    /// through and past `LAST_HIT_MAX`; a proposal above `LAST_HIT_MAX` is refused (`None`) rather
+    /// than clamped or saturated.
+    #[test]
+    fn next_last_hit_is_strictly_monotone_and_refuses_unusable_timestamps() {
+        let ceiling = crate::quota::LAST_HIT_MAX;
+        assert_eq!(next_last_hit(0, 5), Some(5), "a caller clock ahead of the counter is honored");
+        assert_eq!(next_last_hit(10, 5), Some(11), "a caller clock behind the counter cannot make a hit older");
+        assert_eq!(next_last_hit(ceiling, 1), Some(ceiling + 1), "the bump past LAST_HIT_MAX is exact");
+        assert_eq!(next_last_hit(ceiling, ceiling), Some(ceiling + 1));
+        assert_eq!(next_last_hit(7, ceiling), Some(ceiling), "LAST_HIT_MAX itself is usable");
+        assert_eq!(next_last_hit(7, ceiling + 1), None, "a timestamp above LAST_HIT_MAX is refused");
+        assert_eq!(next_last_hit(7, u64::MAX), None);
+        assert_eq!(next_last_hit(u64::MAX - 1, 0), Some(u64::MAX), "checked arithmetic reaches the top exactly");
+    }
+
+    /// Review R5: the counter's `+ 1` is checked, never saturating -- at `u64::MAX` it is an
+    /// always-on assertion, not a silent tie with the previous hit.
+    #[test]
+    #[should_panic(expected = "last_hit counter exhausted")]
+    fn next_last_hit_never_saturates() {
+        let _ = next_last_hit(u64::MAX, 0);
+    }
+
+    /// Review R4: `Cache::reader` carries the canonical `crate::lookup::ReadCommand`. This is
+    /// exactly what task 7's `start_reader` does -- build `sync_channel::<ReadCommand>(4)` and
+    /// assign the sender to `self.reader` -- and `shutdown` must reach that reader.
+    #[test]
+    fn the_reader_channel_carries_lookup_read_command() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<crate::lookup::ReadCommand>(4);
+        let mut cache = Cache::disabled();
+        cache.reader = Some(tx);
+        cache.shutdown();
+        assert!(matches!(rx.try_recv(), Ok(crate::lookup::ReadCommand::Shutdown)), "shutdown must reach the reader as lookup::ReadCommand::Shutdown");
+    }
 }
