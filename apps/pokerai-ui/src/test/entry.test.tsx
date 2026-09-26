@@ -1,6 +1,15 @@
 import {expect,test} from 'vitest';
+import {render,screen,waitFor} from '@testing-library/react';
 import {newWizard,wizardKey,wizardResult,prefill,parseCards,cardText,decisionReason} from '../state/hand';
-import {hand} from './fixtures';
+import {hand,config,identity} from './fixtures';
+import {FakeBackend} from './fakeBackend';
+import {installMockIpc} from './mockIpc';
+import {tauriBackend} from '../ipc/backend';
+import type {HandState} from '../ipc/types.gen';
+import {Recommendations} from '../state/events';
+import {EntryController,attachKeys} from '../keys/handlers';
+import {Entry} from '../components/Entry';
+import {Table} from '../components/Table';
 
 test('wizard_defers_begin_until_every_stack_is_confirmed',()=>{
   const previous=hand();const stacks=prefill(previous,{});
@@ -139,4 +148,275 @@ test('keys_after_done_are_no_ops',()=>{
   expect(wizardKey(w,'3')).toBe(w);
   expect(wizardKey(w,'Backspace')).toBe(w);
   expect(wizardResult(wizardKey(w,'Enter'))).toEqual(result);
+});
+
+test('undo_is_engine_command',async()=>{
+  const fake=new FakeBackend();installMockIpc(fake);
+  const h=hand();fake.hands=[hand({hand_revision:42})];
+  const rec=new Recommendations(tauriBackend,()=>{});
+  const entry=new EntryController(tauriBackend,rec,config,{});entry.setHand(h);
+  await entry.key('Ctrl+Z');
+  expect(fake.calls.filter(([name])=>name==='undo')).toHaveLength(1);
+  expect(entry.snapshot().hand?.hand_revision).toBe(42);
+  expect(entry.snapshot().hand).toEqual(hand({hand_revision:42}));entry.dispose();
+});
+test('illegal_keys_disabled',async()=>{
+  const fake=new FakeBackend();installMockIpc(fake);
+  const rec=new Recommendations(tauriBackend,()=>{});
+  const entry=new EntryController(tauriBackend,rec,config,{});
+  const h=hand();entry.setHand({...h,derived:{...h.derived,legal:[{kind:'check'}]}});
+  render(<Entry state={entry.snapshot()} press={key=>entry.key(key)}/>);
+  expect(screen.getByRole('button',{name:'F Fold'})).toBeDisabled();
+  expect(screen.getByRole('button',{name:'A All-in'})).toBeDisabled();
+  expect(screen.getByRole('button',{name:'B Bet/raise to'})).toBeDisabled();
+  for(const key of ['F','A','B'])await entry.key(key);
+  expect(fake.calls).toHaveLength(0);entry.dispose();
+});
+test('begin_hand_stack_confirmation',async()=>{
+  // MA-9: spec §13.4 names this test; it must exercise the *behavioural* requirement spec §4.3
+  // actually cares about — no `begin_hand` command reaches the backend before every selected stack
+  // is confirmed — by driving the real controller. Task 9's `wizard_defers_...` test covers the
+  // pure `wizardKey`/`wizardResult` reducer directly but, on its own, could never fail this
+  // requirement, since it never constructs an `EntryController` or inspects `fake.calls`.
+  const fake=new FakeBackend();installMockIpc(fake);fake.hands=[hand()];
+  const rec=new Recommendations(tauriBackend,()=>{});
+  const entry=new EntryController(tauriBackend,rec,config,{});
+  await entry.key('N');await entry.key('1');await entry.key('1');await entry.key('Enter'); // button, hero, dealt
+  for(let i=0;i<5;i++){
+    await entry.key('Enter'); // confirm one more of six stacks
+    expect(fake.calls.filter(([name])=>name==='begin_hand')).toHaveLength(0);
+  }
+  await entry.key('Enter'); // sixth stack confirmed; wizard now prompts for cards
+  await entry.key('Enter'); // defer hero cards to H
+  expect(fake.calls.filter(([name])=>name==='begin_hand')).toHaveLength(1);
+  entry.dispose();
+});
+test('bet_bounds_escape_call_allin_and_undo_clear_partial_input',async()=>{
+  const fake=new FakeBackend();installMockIpc(fake);
+  const rec=new Recommendations(tauriBackend,()=>{});
+  const entry=new EntryController(tauriBackend,rec,config,{});
+  entry.setHand(hand()); // legal: fold, call(10), raise(20..1000), all_in(1000)
+  await entry.key('B');await entry.key('1');await entry.key('9');await entry.key('Enter'); // 19 < min_to 20
+  expect(entry.snapshot().error).toMatch(/legal bet\/raise-to interval/);
+  expect(fake.calls).toHaveLength(0);
+  await entry.key('Escape');
+  await entry.key('B');await entry.key('9');await entry.key('9');await entry.key('9');await entry.key('9');await entry.key('Enter'); // 9999 > max_to 1000
+  expect(entry.snapshot().error).toMatch(/legal bet\/raise-to interval/);
+  expect(fake.calls).toHaveLength(0);
+  await entry.key('Escape');
+  await entry.key('B');await entry.key('5');await entry.key('0');await entry.key('Escape');
+  expect(entry.snapshot().mode).toBe('idle');expect(entry.snapshot().text).toBe('');
+  expect(fake.calls).toHaveLength(0);
+  const checkable={...hand(),derived:{...hand().derived,legal:[{kind:'check'} as const,{kind:'call',cost:10} as const]}};
+  entry.setHand(checkable);fake.hands=[hand({hand_revision:2})];
+  await entry.key('C'); // C chooses Check before Call when both are legal.
+  expect(fake.calls.filter(([n])=>n==='apply_action').at(-1)).toEqual(['apply_action',{action:{kind:'check'}}]);
+  entry.setHand(hand());fake.hands=[hand({hand_revision:3})];
+  await entry.key('A'); // A uses the engine's own `to`, never a locally recomputed stack.
+  expect(fake.calls.filter(([n])=>n==='apply_action').at(-1)).toEqual(['apply_action',{action:{kind:'allin',to:1000}}]);
+  fake.hands=[hand({hand_revision:4})];
+  await entry.key('B');await entry.key('7');await entry.key('Ctrl+Z'); // clears partial bet text too.
+  expect(entry.snapshot().mode).toBe('idle');expect(entry.snapshot().text).toBe('');
+  expect(fake.calls.filter(([n])=>n==='undo')).toHaveLength(1);
+  entry.dispose();
+});
+test('attach_keys_ignores_repeats_and_native_form_inputs',()=>{
+  const calls:string[]=[];
+  const stub={key:(k:string)=>{calls.push(k);return Promise.resolve();}} as unknown as EntryController;
+  const input=document.createElement('input');document.body.appendChild(input);
+  const remove=attachKeys(window,stub);
+  input.dispatchEvent(new KeyboardEvent('keydown',{key:'f',bubbles:true,cancelable:true}));
+  expect(calls).toHaveLength(0); // a focused native <input> is never intercepted
+  window.dispatchEvent(new KeyboardEvent('keydown',{key:'f',repeat:true,cancelable:true}));
+  expect(calls).toHaveLength(0); // a held key's repeat events never reach the controller
+  window.dispatchEvent(new KeyboardEvent('keydown',{key:'f',cancelable:true}));
+  expect(calls).toEqual(['f']);
+  remove();document.body.removeChild(input);
+});
+
+// ---- Standing rulings for the key map (orchestrator, P5.T10 dispatch) ----
+// One controller per scenario, wired through the real `tauriBackend` + mockIPC seam so every
+// command's argument shape is validated exactly as a Tauri `invoke` would carry it.
+function controller(h:HandState|null=hand()){
+  const fake=new FakeBackend();installMockIpc(fake);
+  const rec=new Recommendations(tauriBackend,()=>{});
+  const entry=new EntryController(tauriBackend,rec,config,{});
+  if(h)entry.setHand(h);
+  return {fake,rec,entry};
+}
+// Mirrors the Tauri-serialized `AppError` (`{type,detail}`, src-tauri/src/error.rs) as a real
+// `Error` subclass, the same way session.test.tsx scripts an engine rejection.
+class FakeAppError extends Error {
+  readonly type:string;
+  readonly detail:unknown;
+  constructor(type:string,detail:unknown){super(`fake AppError: ${type}`);this.name='FakeAppError';this.type=type;this.detail=detail;}
+}
+
+test('each_mapped_key_does_exactly_one_thing',async()=>{
+  // Letters arrive lowercase from `attachKeys` (event.key without Shift). F/C/A act for
+  // Derived.to_act (seat 4 in the fixture, a villain), each as exactly one engine command.
+  for(const [key,action] of [['f',{kind:'fold'}],['c',{kind:'call'}],['a',{kind:'allin',to:1000}]] as const){
+    const {fake,entry}=controller();fake.hands=[hand({hand_revision:8})];
+    await entry.key(key);
+    expect(fake.calls).toEqual([['apply_action',{action}]]);
+    expect(entry.snapshot().hand?.hand_revision).toBe(8);entry.dispose();
+  }
+  // B, H and T only open their own entry field; nothing reaches the engine.
+  for(const [key,mode] of [['b','bet'],['h','hero'],['t','tag']] as const){
+    const {fake,entry}=controller();await entry.key(key);
+    expect(entry.snapshot().mode).toBe(mode);expect(fake.calls).toHaveLength(0);entry.dispose();
+  }
+  {const {entry}=controller();await entry.key('t');expect(entry.snapshot().tagSeat).toBe(3);entry.dispose();}
+  // Space re-requests exactly one recommendation, and only when hero is the one deciding.
+  {const heroTurn=hand();heroTurn.derived.to_act=0;const {fake,entry}=controller(heroTurn);
+    await entry.key(' ');expect(fake.calls.map(([n])=>n)).toEqual(['recommend']);entry.dispose();}
+  // E / X end the hand with exactly one command; the ended snapshot becomes the prefill source.
+  for(const [key,command] of [['e','finish_hand'],['x','abandon_hand']] as const){
+    const {fake,entry}=controller();await entry.key(key);
+    expect(fake.calls).toEqual([[command,{}]]);
+    expect(entry.snapshot().hand).toBeNull();expect(entry.snapshot().lastHand).toEqual(hand());entry.dispose();
+  }
+  // Ctrl+Z is exactly one engine `undo`.
+  {const {fake,entry}=controller();fake.hands=[hand({hand_revision:6})];await entry.key('Ctrl+Z');
+    expect(fake.calls).toEqual([['undo',{}]]);expect(entry.snapshot().hand?.hand_revision).toBe(6);entry.dispose();}
+  // N opens the wizard without a command, and is refused while a hand is live.
+  {const {fake,entry}=controller(null);await entry.key('n');
+    expect(entry.snapshot().wizard?.step).toBe('button');expect(fake.calls).toHaveLength(0);entry.dispose();}
+  {const {fake,entry}=controller();await entry.key('n');expect(entry.snapshot().wizard).toBeNull();
+    expect(entry.snapshot().error).toMatch(/Finish \(E\) or abandon \(X\)/);expect(fake.calls).toHaveLength(0);entry.dispose();}
+  // Escape closes the open field and nothing else.
+  {const {fake,entry}=controller();await entry.key('b');await entry.key('4');await entry.key('Escape');
+    expect(entry.snapshot()).toMatchObject({mode:'idle',text:'',hand:hand()});expect(fake.calls).toHaveLength(0);entry.dispose();}
+});
+
+test('unmapped_keys_are_no_ops',async()=>{
+  const {fake,entry}=controller();const before=entry.snapshot();
+  for(const key of ['q','z','g','0','1','9','Enter','Backspace','Tab','ArrowUp','Delete'])await entry.key(key);
+  expect(fake.calls).toHaveLength(0);expect(entry.snapshot()).toBe(before); // not even a re-render
+  // With neither a hand nor a previous one the Undo control is disabled, and so is its key.
+  const idle=controller(null);await idle.entry.key('Ctrl+Z');
+  expect(idle.fake.calls).toHaveLength(0);expect(idle.entry.snapshot().error).toBeNull();
+  // The window listener neither forwards nor swallows keys outside the map.
+  const calls:string[]=[];
+  const stub={key:(k:string)=>{calls.push(k);return Promise.resolve();}} as unknown as EntryController;
+  const remove=attachKeys(window,stub);
+  for(const init of [{key:'Tab'},{key:'ArrowUp'},{key:'c',ctrlKey:true},{key:'f',altKey:true},{key:'Shift',shiftKey:true}]){
+    const event=new KeyboardEvent('keydown',{...init,cancelable:true});window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+  }
+  expect(calls).toHaveLength(0);
+  const mapped=new KeyboardEvent('keydown',{key:'z',ctrlKey:true,cancelable:true});window.dispatchEvent(mapped);
+  expect(mapped.defaultPrevented).toBe(true);expect(calls).toEqual(['Ctrl+Z']);
+  remove();entry.dispose();idle.entry.dispose();
+});
+
+test('engine_rejection_is_a_field_error_and_leaves_state_unchanged',async()=>{
+  const {fake,entry}=controller();const h=entry.snapshot().hand;
+  const scripted=fake.apply_action.bind(fake);
+  fake.apply_action=action=>{fake.apply_action=scripted;fake.calls.push(['apply_action',{action}]);
+    return Promise.reject(new FakeAppError('Engine',{message:'raise to 30 does not reopen the betting'}));};
+  for(const key of ['b','3','0','Enter'])await entry.key(key);
+  expect(fake.calls).toEqual([['apply_action',{action:{kind:'raise',to:30}}]]);
+  expect(entry.snapshot()).toMatchObject({mode:'bet',text:'30',busy:false,error:'raise to 30 does not reopen the betting'});
+  expect(entry.snapshot().hand).toBe(h); // the last engine snapshot, untouched
+  render(<Entry state={entry.snapshot()} press={key=>entry.key(key)}/>);
+  expect(screen.getByRole('alert')).toHaveTextContent('raise to 30 does not reopen the betting');
+  expect(screen.getByTestId('entry-prompt')).toHaveTextContent('Bet/raise TO (chips): 30');
+  expect(screen.getByTestId('entry-prompt')).toHaveAccessibleDescription('raise to 30 does not reopen the betting');
+  // The rejection never breaks later input: the same Enter retries against the same snapshot.
+  fake.hands=[hand({hand_revision:8})];await entry.key('Enter');
+  expect(fake.calls).toHaveLength(2);
+  expect(entry.snapshot()).toMatchObject({mode:'idle',text:'',error:null});
+  expect(entry.snapshot().hand?.hand_revision).toBe(8);entry.dispose();
+  // A rejected begin_hand leaves the wizard where it was, so no later key silently re-sends it.
+  const next=controller(null);const begin=next.fake.begin_hand.bind(next.fake);
+  next.fake.begin_hand=b=>{next.fake.begin_hand=begin;next.fake.calls.push(['begin_hand',{begin:b}]);
+    return Promise.reject(new FakeAppError('Engine',{message:'stacks exceed the chip limit'}));};
+  for(const key of ['n','1','1','Enter','Enter','Enter','Enter','Enter','Enter','Enter','Enter'])await next.entry.key(key);
+  const begins=()=>next.fake.calls.filter(([n])=>n==='begin_hand');
+  expect(begins()).toHaveLength(1);
+  expect(next.entry.snapshot().error).toBe('stacks exceed the chip limit');
+  expect(next.entry.snapshot().wizard?.step).toBe('cards');expect(next.entry.snapshot().hand).toBeNull();
+  await next.entry.key('5');await next.entry.key('Backspace');
+  expect(begins()).toHaveLength(1);
+  next.fake.hands=[hand()];await next.entry.key('Enter');
+  expect(begins()).toHaveLength(2);
+  expect(next.entry.snapshot().wizard).toBeNull();expect(next.entry.snapshot().hand).toEqual(hand());
+  next.entry.dispose();
+});
+
+test('input_is_serialized_against_the_next_snapshot_and_capped_at_64_keys',async()=>{
+  const {fake,entry}=controller();
+  let release=():void=>undefined;const held=new Promise<void>(resolve=>{release=resolve;});
+  const scripted=fake.apply_action.bind(fake);
+  fake.apply_action=async action=>{const result=scripted(action);await held;return result;};
+  const checkable=hand({hand_revision:8});
+  checkable.derived.legal=[{kind:'check'},{kind:'bet',min_to:10,max_to:990},{kind:'all_in',to:990}];
+  fake.hands=[checkable,hand({hand_revision:9})];
+  const first=entry.key('f');const second=entry.key('c');
+  const fillers=Array.from({length:62},()=>entry.key('q'));
+  expect(entry.snapshot().error).toBeNull();
+  const dropped=entry.key('f'); // the 65th key while the first IPC call is still pending
+  expect(entry.snapshot().error).toMatch(/Input queue full/);
+  release();await Promise.all([first,second,...fillers,dropped]);
+  // `c` ran against the snapshot the fold returned (Check legal there), never the one it was typed on.
+  expect(fake.calls).toEqual([['apply_action',{action:{kind:'fold'}}],['apply_action',{action:{kind:'check'}}]]);
+  expect(entry.snapshot().hand?.hand_revision).toBe(9);entry.dispose();
+});
+
+test('every_mutation_invalidates_the_recommendation_identity_first',async()=>{
+  const heroTurn=hand();heroTurn.derived.to_act=0;
+  const {fake,rec,entry}=controller(heroTurn);
+  await entry.key(' ');await waitFor(()=>expect(rec.snapshot().active).toEqual(identity));
+  fake.hands=[hand({hand_revision:8})];await entry.key('f');
+  expect(fake.calls.map(([n])=>n)).toEqual(['recommend','cancel','apply_action']);
+  expect(fake.calls[1]).toEqual(['cancel',{decision_id:90}]);expect(rec.snapshot().active).toBeNull();
+  entry.setHand(heroTurn);await entry.key(' ');await waitFor(()=>expect(rec.snapshot().active).toEqual(identity));
+  const mark=fake.calls.length;await entry.key('e');
+  expect(fake.calls.slice(mark).map(([n])=>n)).toEqual(['cancel','finish_hand']);
+  expect(rec.snapshot().active).toBeNull();entry.dispose();
+});
+
+test('hero_and_board_entry_reject_duplicates_and_stop_after_an_all_in_runout',async()=>{
+  const flopBetting=hand({board:['Kh','7d','2c'],hero_cards:null,phase:{phase:'betting',street:'flop'}});
+  const {fake,entry}=controller(flopBetting);
+  for(const key of ['h','k','h','q','s'])await entry.key(key); // Kh is already on the board
+  expect(entry.snapshot().error).toBe('Hero cards duplicate board');
+  expect(entry.snapshot()).toMatchObject({mode:'hero',text:'khq'});expect(fake.calls).toHaveLength(0);
+  for(const key of ['Backspace','Backspace','Backspace'])await entry.key(key);
+  fake.hands=[hand({hand_revision:8})];
+  for(const key of ['a','s','k','d'])await entry.key(key);
+  expect(fake.calls).toEqual([['set_hero_cards',{cards:['As','Kd']}]]);entry.dispose();
+  // AwaitingBoard: rank+suit characters then Enter; duplicates and wrong counts never reach the engine.
+  const awaiting=hand({phase:{phase:'awaiting_board',street:'flop'}});awaiting.derived.to_act=null;awaiting.derived.legal=[];
+  const board=controller(awaiting);
+  for(const key of ['a','s','7','d','2','c','Enter'])await board.entry.key(key); // As is hero's card
+  expect(board.entry.snapshot().error).toBe('Duplicate board or hero card');
+  await board.entry.key('Escape');
+  for(const key of ['k','h','7','d','Enter'])await board.entry.key(key);
+  expect(board.entry.snapshot().error).toBe('Enter 3 board card(s)');expect(board.fake.calls).toHaveLength(0);
+  board.fake.hands=[hand({hand_revision:8,board:['Kh','7d','2c'],phase:{phase:'betting',street:'flop'}})];
+  for(const key of ['2','c','Enter'])await board.entry.key(key);
+  expect(board.fake.calls).toEqual([['set_board',{board:['Kh','7d','2c']}]]);board.entry.dispose();
+  // Ruling (h): after Complete{AllInRunout} no board entry is accepted or solicited.
+  const runout=hand({phase:{phase:'complete',reason:'all_in_runout'}});runout.derived.to_act=null;runout.derived.legal=[];
+  const done=controller(runout);
+  for(const key of ['k','s','7','d','2','c','Enter'])await done.entry.key(key);
+  expect(done.fake.calls).toHaveLength(0);expect(done.entry.snapshot()).toMatchObject({mode:'idle',text:''});
+  render(<Entry state={done.entry.snapshot()} press={key=>done.entry.key(key)}/>);
+  expect(screen.getByTestId('entry-prompt')).not.toHaveTextContent(/board/i);done.entry.dispose();
+});
+
+test('table_shows_the_engine_actor_and_controls_share_the_key_path',async()=>{
+  const {fake,entry}=controller();fake.hands=[hand({hand_revision:8})];
+  render(<><Table hand={entry.snapshot().hand}/><Entry state={entry.snapshot()} press={key=>entry.key(key)}/></>);
+  expect(screen.getByTestId('seat-to-act')).toHaveTextContent('Seat 4 to act');
+  expect(screen.getByTestId('table')).toHaveAttribute('data-hand-revision','7');
+  expect(screen.getByRole('row',{current:true})).toHaveTextContent('Seat 4');
+  screen.getByRole('button',{name:'C Check/call'}).click(); // the button runs the identical `key('C')` path
+  await waitFor(()=>expect(fake.calls).toEqual([['apply_action',{action:{kind:'call'}}]]));
+  await waitFor(()=>expect(entry.snapshot().hand?.hand_revision).toBe(8));entry.dispose();
+  const runout=hand({phase:{phase:'complete',reason:'all_in_runout'}});runout.derived.to_act=null;
+  render(<Table hand={runout}/>);expect(screen.getAllByTestId('seat-to-act').at(-1)).toHaveTextContent('No seat to act');
+  render(<Table hand={null}/>);expect(screen.getByText('No hand. Press N.')).toBeVisible();
 });
