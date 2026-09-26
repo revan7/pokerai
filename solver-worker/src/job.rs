@@ -2,9 +2,14 @@
 //! allocation, locks) -> Solving (the §7 `solve_step` loop) -> Extracting (`finalize`, the street export,
 //! self-validation). A cancel is answered at the next checkpoint of the current stage (§4.5): after every
 //! Building step, before the first iteration and at every iteration boundary (the solve loop's own polls),
-//! at the Solving -> Extracting boundary, and after every extracted node (the export's own polls). Every
-//! failure is a typed §4.5 `WorkerError`, and a returned solution has passed
+//! at the Solving -> Extracting boundary, after the Extracting notification, `finalize`, the export (which
+//! also polls around every node) and self-validation, so no expensive step starts once a cancel is
+//! visible. Every failure is a typed §4.5 `WorkerError`, and a returned solution has passed
 //! `proto::worker::validate_solution`, which stays strict.
+//!
+//! `out_of_memory` has no producer here (P2.T11 review ruling 1): `memory::admit` is the job's preventive
+//! check (`tree_too_large`), and an allocation that fails anyway aborts the process, which the engine
+//! sees as a worker exit (§10.3).
 use crate::{cards, extract, locks, memory, solve_loop, tree_build, win};
 use postflop_solver::{finalize, CardConfig, PostFlopGame};
 use proto::worker::{validate_solution, NodeLock, SolveRequest, Stage, StreetSolution, WorkerError, FAILURE_CODES};
@@ -39,28 +44,47 @@ fn ms(t: Instant) -> u32 { t.elapsed().as_millis().min(u32::MAX as u128) as u32 
 
 /// §3.4: BELOW_NORMAL while a `background: true` job runs, NORMAL otherwise. Restored on drop, so every
 /// exit (success, cancel, error, or a panic unwinding to the executor's boundary) returns the worker to
-/// NORMAL, not only the success path.
-struct Priority;
-impl Priority {
-    fn set(background: bool) -> Priority { win::set_priority_class(background); Priority }
+/// NORMAL, not only the success path. The job holds it from before its first step until after its last
+/// local (the game's buffers included) is dropped. `set` is the setter seam (`win::set_priority_class`
+/// in production; P2.T11 review M2), called with `true` for BELOW_NORMAL.
+struct Priority<'s> { set: &'s mut dyn FnMut(bool) }
+impl<'s> Priority<'s> {
+    fn set(set: &'s mut dyn FnMut(bool), background: bool) -> Priority<'s> {
+        set(background);
+        Priority { set }
+    }
 }
-impl Drop for Priority {
-    fn drop(&mut self) { win::set_priority_class(false); }
+impl Drop for Priority<'_> {
+    fn drop(&mut self) { (self.set)(false); }
 }
 
 /// The job's own cancel checkpoints: §4.5 "in `Building` after the current step (tree build, cross-check,
-/// memory check, allocation, lock application are each a step)", plus one before the first step and one at
-/// the Solving -> Extracting boundary, ahead of the uninterruptible `finalize`. The polls at iteration
-/// boundaries belong to `solve_loop::run` and those after each node to `extract::street_solution`.
+/// memory check, allocation, lock application are each a step)", plus one before the first step, one
+/// after the staged lock set is validated, one at the Solving -> Extracting boundary, and in `Extracting`
+/// one right after the `Extracting` notification (ahead of the uninterruptible `finalize`), one after
+/// `finalize`, one after the export and one after self-validation, before the terminal is chosen
+/// (P2.T11 review I1). The polls at iteration boundaries belong to `solve_loop::run` and those around
+/// each node to `extract::street_solution`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Checkpoint { Start, TreeBuilt, TreeChecked, GameConfigured, MemoryChecked, Allocated, LockApplied(u16), SolveEnded }
+enum Checkpoint { Start, TreeBuilt, TreeChecked, GameConfigured, MemoryChecked, Allocated, LocksValidated, LockApplied(u16), SolveEnded, ExtractingNotified, Finalized, Exported, Validated }
 
-/// Deterministic seams for the tests (standing ruling: a hook places a cancel or a measurement exactly,
-/// never a sleep racing the computation). Production (`Stderr`) keeps every default: nothing at a
-/// checkpoint, the measurement unchanged, and diagnostics on stderr (§4.5: stdout carries protocol only).
+/// The job's expensive operations, as the seam observes them: `Hooks::enter` and `Hooks::leave` bracket
+/// each one, so a test sees exactly which work started after a cancel. `LockApply(k)` applies the
+/// `k`-th staged lock (from 1); `Solve` is the whole §7 loop, `Export` the whole street export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op { TreeBuild, TreeCheck, GameConfig, MemoryCheck, Allocate, LockValidate, LockApply(u16), Solve, Finalize, Export, Validate }
+
+/// The hooks seam, deterministic for the tests (standing ruling: a hook places a cancel or a measurement
+/// exactly, never a sleep racing the computation). Production (`Stderr`) keeps every default: nothing
+/// at a checkpoint or around an operation, the measurement unchanged, and diagnostics on stderr (§4.5:
+/// stdout carries protocol only).
 trait Hooks {
     /// Called at each checkpoint, immediately before the cancel flag is polled.
     fn checkpoint(&mut self, _at: Checkpoint) {}
+    /// Called immediately before an operation starts.
+    fn enter(&mut self, _op: Op) {}
+    /// Called as soon as an operation has returned, before its result is looked at.
+    fn leave(&mut self, _op: Op) {}
     /// A raw measurement as the solve loop produced it, before it is reported.
     fn measured(&mut self, raw: f32) -> f32 { raw }
     fn log(&mut self, line: &str) { eprintln!("{line}"); }
@@ -69,22 +93,23 @@ struct Stderr;
 impl Hooks for Stderr {}
 
 /// Review ruling (c) of P2.T10 at the job's measurement boundary: every measurement the job emits (in a
-/// progress report or the solution metadata) first passes `extract::report_exploitability`. A noise-floor
-/// value is emitted as `+0.0` with its raw value on stderr (`Hooks::log`); a value the policy refuses
-/// (below the floor, or non-finite) is never emitted: a progress report omits it (its refusal is logged)
-/// and, as the final measurement, it fails the job as `internal`. The solve loop repeats its latest
-/// measurement with every coalesced progress report, so a repeat of the value just reported is answered
-/// from `last` rather than logged again. A refused measurement is in practice also the final one: a NaN
-/// persists through later iterations, and a negative value is at or below every target, so the loop
-/// stops at it.
-#[derive(Default)]
-struct Reporter { last: Option<(u32, Result<f32, String>)> }
+/// progress report or the solution metadata) first passes `extract::report_exploitability` at the
+/// request's pot (P2.T11 review I2: the noise tolerance is pot-relative). A noise value is emitted as
+/// `+0.0` with its raw value on stderr (`Hooks::log`); a value the policy refuses (below the tolerance,
+/// or non-finite) is never emitted: a progress report omits it (its refusal is logged) and, as the
+/// final measurement, it fails the job as `internal`. The solve loop repeats its latest measurement
+/// with every coalesced progress report, so a repeat of the value just reported is answered from
+/// `last` rather than logged again. A negative or refused measurement is in practice also the final
+/// one: a NaN persists through later iterations, and a negative value is at or below every target, so
+/// the loop stops at it; a solve therefore logs one line.
+struct Reporter { pot: u32, last: Option<(u32, Result<f32, String>)> }
 impl Reporter {
+    fn new(pot: u32) -> Reporter { Reporter { pot, last: None } }
     fn report(&mut self, raw: f32, hooks: &mut dyn Hooks) -> Result<f32, String> {
         if let Some((bits, reported)) = &self.last {
             if *bits == raw.to_bits() { return reported.clone(); }
         }
-        let reported = match extract::report_exploitability(raw) {
+        let reported = match extract::report_exploitability(raw, self.pot) {
             Ok(r) => {
                 if let Some(line) = &r.log_line { hooks.log(line); }
                 Ok(r.chips)
@@ -99,19 +124,47 @@ impl Reporter {
     }
 }
 
+/// The job's three seams. Production (`run`) passes `Stderr` hooks, the real §7 loop (`real_loop`) and
+/// `win::set_priority_class`; a test records events, scripts a loop's stop over real iterations
+/// (P2.T11 review M1) or records the priority calls (review M2). `solve` receives the game, the loop
+/// parameters, the cancel flag and the job's per-report callback, exactly what `solve_loop::run` takes.
+struct Seams<'s> {
+    hooks: &'s mut dyn Hooks,
+    solve: &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>)) -> solve_loop::LoopOutcome,
+    set_priority: &'s mut dyn FnMut(bool),
+}
+
+/// The production loop seam: `solve_loop::run`, unchanged.
+fn real_loop(game: &PostFlopGame, params: &solve_loop::LoopParams, cancel: &AtomicBool, progress: &mut dyn FnMut(u32, Option<f32>)) -> solve_loop::LoopOutcome {
+    solve_loop::run(game, params, cancel, progress)
+}
+
 /// Runs one `solve` (module docs). `staged` is the lock set this request consumes (§4.5; the executor has
 /// matched its `spot`). The deadline is the absolute instant `deadline_ms` after entry: Building counts
 /// against it (§7).
-pub fn run(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl) -> JobResult { run_with(req, staged, ctl, &mut Stderr) }
+pub fn run(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl) -> JobResult {
+    run_with(req, staged, ctl, Seams { hooks: &mut Stderr, solve: &mut real_loop, set_priority: &mut win::set_priority_class })
+}
 
-fn run_with(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl, hooks: &mut dyn Hooks) -> JobResult {
+fn run_with(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl, seams: Seams<'_>) -> JobResult {
     let t0 = Instant::now();
-    let _priority = Priority::set(req.background);
+    let Seams { hooks, solve, set_priority } = seams;
+    let _priority = Priority::set(set_priority, req.background);
     let done = |o: JobOutcome| JobResult { outcome: o, elapsed_ms: ms(t0) };
     macro_rules! checkpoint {
         ($at:expr) => {{
             hooks.checkpoint($at);
             if ctl.cancel.load(Ordering::SeqCst) { return done(JobOutcome::Cancelled); }
+        }};
+    }
+    // One expensive operation, bracketed for the seam; its result is matched only afterwards, so an
+    // early return never skips `leave`.
+    macro_rules! op {
+        ($op:expr, $e:expr) => {{
+            hooks.enter($op);
+            let r = $e;
+            hooks.leave($op);
+            r
         }};
     }
     let invalid = |m: String| JobOutcome::Error(error("invalid_request", m, false, None));
@@ -122,10 +175,15 @@ fn run_with(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobContro
     (ctl.progress)(Stage::Building, 0, None, ms(t0), 0);
     checkpoint!(Checkpoint::Start);
     let eff = req.stack_oop.min(req.stack_ip);
-    let mut tree = match tree_build::build(&req.tree, req.pot, eff, req.rake_rate, req.rake_cap_mchips, &req.history) { Ok(t) => t, Err(e) => return done(invalid(e)) };
+    let built = op!(Op::TreeBuild, tree_build::build(&req.tree, req.pot, eff, req.rake_rate, req.rake_cap_mchips, &req.history));
+    let mut tree = match built { Ok(t) => t, Err(e) => return done(invalid(e)) };
     checkpoint!(Checkpoint::TreeBuilt);
-    let lib = match tree_build::enumerate(&mut tree, req.tree.root_street, req.pot) { Ok(l) => l, Err(e) => return done(invalid(e)) };
-    if let Err(e) = tree_build::cross_check(&lib, &req.tree.materialized) { return done(JobOutcome::Error(error("tree_mismatch", e, false, None))); }
+    let checked = op!(Op::TreeCheck, tree_build::enumerate(&mut tree, req.tree.root_street, req.pot).map(|lib| tree_build::cross_check(&lib, &req.tree.materialized)));
+    match checked {
+        Err(e) => return done(invalid(e)),
+        Ok(Err(e)) => return done(JobOutcome::Error(error("tree_mismatch", e, false, None))),
+        Ok(Ok(())) => {}
+    }
     checkpoint!(Checkpoint::TreeChecked);
     let street_nodes = req.tree.materialized.iter().filter(|n| n.street == req.tree.root_street).count();
     if street_nodes > extract::MAX_EXPORTED_NODES { return done(invalid(format!("{street_nodes} street nodes exceed the export limit"))); }
@@ -141,58 +199,75 @@ fn run_with(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobContro
     if req.board.len() != expected_cards { return done(invalid(format!("{} board cards for a {:?} root", req.board.len(), req.tree.root_street))); }
     let (flop, turn, river) = match cards::board_to_lib(&req.board) { Ok(b) => b, Err(e) => return done(invalid(e)) };
     let ranges = match (cards::range_to_lib(&req.oop_range), cards::range_to_lib(&req.ip_range)) { (Ok(o), Ok(i)) => [o, i], (Err(e), _) | (_, Err(e)) => return done(invalid(e)) };
-    let mut game = match PostFlopGame::with_config(CardConfig { range: ranges, flop, turn, river }, tree) { Ok(g) => g, Err(e) => return done(invalid(e)) };
+    let configured = op!(Op::GameConfig, PostFlopGame::with_config(CardConfig { range: ranges, flop, turn, river }, tree));
+    let mut game = match configured { Ok(g) => g, Err(e) => return done(invalid(e)) };
     checkpoint!(Checkpoint::GameConfigured);
-    let (f32_bytes, i16_bytes) = game.memory_usage();
-    let adm = match memory::admit(f32_bytes, i16_bytes, req.memory_limit_bytes) { Ok(a) => a, Err(e) => return done(JobOutcome::Error(e)) };
+    let admitted = op!(Op::MemoryCheck, {
+        let (f32_bytes, i16_bytes) = game.memory_usage();
+        memory::admit(f32_bytes, i16_bytes, req.memory_limit_bytes)
+    });
+    let adm = match admitted { Ok(a) => a, Err(e) => return done(JobOutcome::Error(e)) };
     (ctl.progress)(Stage::Building, 0, None, ms(t0), adm.estimate_bytes);
     checkpoint!(Checkpoint::MemoryChecked);
-    game.allocate_memory(adm.compressed);
+    op!(Op::Allocate, game.allocate_memory(adm.compressed));
     checkpoint!(Checkpoint::Allocated);
     let mut locks_applied = 0u16;
     if let Some(ls) = staged {
         // Validated at the protocol boundary already; checked again because `run` is public and
         // `locks_applied` must count distinct locked nodes: two locks naming one node would both apply
         // while only the last takes effect.
-        if let Err(e) = locks::validate(ls) { return done(lock_mismatch(e)); }
+        if let Err(e) = op!(Op::LockValidate, locks::validate(ls)) { return done(lock_mismatch(e)); }
         if u16::try_from(ls.len()).is_err() { return done(lock_mismatch(format!("{} staged locks exceed the u16 locks_applied count", ls.len()))); }
+        checkpoint!(Checkpoint::LocksValidated);
         for l in ls {
             // `apply` refuses a lock that would lock nothing (P2.T10 review I2): only a lock that took
             // effect is counted, and the length check above bounds the count.
-            if let Err(e) = locks::apply(&mut game, l, &req.tree.materialized) { return done(lock_mismatch(e)); }
-            locks_applied += 1;
+            let k = locks_applied + 1;
+            if let Err(e) = op!(Op::LockApply(k), locks::apply(&mut game, l, &req.tree.materialized)) { return done(lock_mismatch(e)); }
+            locks_applied = k;
             checkpoint!(Checkpoint::LockApplied(locks_applied));
         }
     }
 
-    // Solving: the §7 loop polls the cancel flag at every iteration boundary.
+    // Solving: the §7 loop polls the cancel flag before the first iteration and at every boundary.
     (ctl.progress)(Stage::Solving, 0, None, ms(t0), adm.estimate_bytes);
     let target_chips = (f64::from(req.pot) * f64::from(req.target_bp) / 10_000.0) as f32;
     let params = solve_loop::LoopParams { deadline_ms: req.deadline_ms, extraction_margin_ms: req.extraction_margin_ms, target_chips, started: t0 };
     let cancel = Arc::clone(&ctl.cancel);
-    let mut reporter = Reporter::default();
+    let mut reporter = Reporter::new(req.pot);
+    hooks.enter(Op::Solve);
     let out = {
         let (progress, reporter, hooks) = (&mut ctl.progress, &mut reporter, &mut *hooks);
-        solve_loop::run(&game, &params, &cancel, |iterations, raw| {
+        let mut report = |iterations: u32, raw: Option<f32>| {
             let reported = match raw {
                 None => None,
                 Some(raw) => match reporter.report(hooks.measured(raw), &mut *hooks) { Ok(chips) => Some(chips), Err(_) => return },
             };
             progress(Stage::Solving, iterations, reported, ms(t0), adm.estimate_bytes);
-        })
+        };
+        solve(&game, &params, &cancel, &mut report)
     };
+    hooks.leave(Op::Solve);
     if out.cancelled { return done(JobOutcome::Cancelled); }
     checkpoint!(Checkpoint::SolveEnded);
     let Some(raw) = out.exploitability else { return done(JobOutcome::Error(error("no_iteration", "no exploitability measurement before stop point", false, None))); };
     let expl = match reporter.report(hooks.measured(raw), &mut *hooks) { Ok(chips) => chips, Err(e) => return done(internal(e)) };
 
-    // Extracting: `finalize` is not interruptible; the export polls after every node.
+    // Extracting: `finalize` is not interruptible; the export polls around every node; a checkpoint
+    // follows each of the three operations, so a cancel raised by the notification or during any of
+    // them never starts the next.
     (ctl.progress)(Stage::Extracting, out.iterations, Some(expl), ms(t0), adm.estimate_bytes);
-    finalize(&mut game);
+    checkpoint!(Checkpoint::ExtractingNotified);
+    op!(Op::Finalize, finalize(&mut game));
+    checkpoint!(Checkpoint::Finalized);
     let meta = extract::SolutionMeta { exploitability_chips: expl, iterations: out.iterations, memory_bytes: adm.estimate_bytes, mode: adm.mode, locks_applied };
-    let sol = match extract::street_solution(&mut game, req, meta, &ctl.cancel) { Ok(Some(s)) => s, Ok(None) => return done(JobOutcome::Cancelled), Err(e) => return done(internal(e)) };
+    let exported = op!(Op::Export, extract::street_solution(&mut game, req, meta, &ctl.cancel));
+    let sol = match exported { Ok(Some(s)) => s, Ok(None) => return done(JobOutcome::Cancelled), Err(e) => return done(internal(e)) };
+    // The export's last poll precedes its result-line sizing: a cancel during the sizing is answered here.
+    checkpoint!(Checkpoint::Exported);
     // The last gate before a solution leaves the worker, and a strict one (a raw negative fails it).
-    if let Err(e) = validate_solution(&sol, &req.tree.materialized) { return done(internal(format!("self-validation failed: {e}"))); }
+    if let Err(e) = op!(Op::Validate, validate_solution(&sol, &req.tree.materialized)) { return done(internal(format!("self-validation failed: {e}"))); }
+    checkpoint!(Checkpoint::Validated);
     done(if out.reached_target { JobOutcome::Ok(sol) } else { JobOutcome::BestSoFar(sol) })
 }
 
@@ -245,6 +320,8 @@ mod tests {
     use crate::testutil::fixture_lines;
     use proto::worker::EngineMessage;
     use proto::Action;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Mutex;
 
     const CHECK: Action = Action::Check;
@@ -270,19 +347,69 @@ mod tests {
     }
     fn stages(reports: &Reports) -> Vec<Stage> { reports.lock().unwrap().iter().map(|r| r.0).collect() }
 
-    /// The job's deterministic seams: records every checkpoint, raises the cancel flag at one of them,
-    /// substitutes the raw exploitability measurement, and keeps the stderr lines.
-    struct Probe { cancel: Arc<AtomicBool>, cancel_at: Option<Checkpoint>, substitute: Option<f32>, checkpoints: Vec<Checkpoint>, lines: Vec<String> }
+    /// What the seams saw, in order: a checkpoint (just before its poll), an operation's entry or
+    /// completion, or a call of the priority setter.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Event { At(Checkpoint), Enter(Op), Leave(Op), Priority(bool) }
+    type Log = Rc<RefCell<Vec<Event>>>;
+
+    /// The job's deterministic hooks: records every event in the shared log, raises the cancel flag on
+    /// one of them (at a checkpoint, or as an operation starts or completes: a cancel arriving during
+    /// it), substitutes the raw exploitability measurement, and keeps the stderr lines.
+    struct Probe { cancel: Arc<AtomicBool>, cancel_at: Option<Event>, substitute: Option<f32>, log: Log, lines: Vec<String> }
     impl Probe {
-        fn new(c: &JobControl) -> Probe { Probe { cancel: c.cancel.clone(), cancel_at: None, substitute: None, checkpoints: Vec::new(), lines: Vec::new() } }
+        fn new(c: &JobControl) -> Probe { Probe { cancel: c.cancel.clone(), cancel_at: None, substitute: None, log: Log::default(), lines: Vec::new() } }
+        fn record(&mut self, e: Event) {
+            self.log.borrow_mut().push(e);
+            if self.cancel_at == Some(e) { self.cancel.store(true, Ordering::SeqCst); }
+        }
     }
     impl Hooks for Probe {
-        fn checkpoint(&mut self, at: Checkpoint) {
-            self.checkpoints.push(at);
-            if self.cancel_at == Some(at) { self.cancel.store(true, Ordering::SeqCst); }
-        }
+        fn checkpoint(&mut self, at: Checkpoint) { self.record(Event::At(at)); }
+        fn enter(&mut self, op: Op) { self.record(Event::Enter(op)); }
+        fn leave(&mut self, op: Op) { self.record(Event::Leave(op)); }
         fn measured(&mut self, raw: f32) -> f32 { self.substitute.unwrap_or(raw) }
         fn log(&mut self, line: &str) { self.lines.push(line.to_string()); }
+    }
+
+    /// The loop seam's type, as a test writes a scripted loop.
+    type Scripted<'s> = &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>)) -> solve_loop::LoopOutcome;
+
+    /// Runs the job through all three seams: `probe` as the hooks, `solve` as the loop (the real §7
+    /// loop, as in production, when `None`), and a priority setter that records its calls in the
+    /// probe's log instead of changing the process priority.
+    fn run_seamed(req: &SolveRequest, staged: Option<&[NodeLock]>, c: &mut JobControl, probe: &mut Probe, solve: Option<Scripted<'_>>) -> JobResult {
+        let log = Rc::clone(&probe.log);
+        let mut set_priority = move |below_normal: bool| log.borrow_mut().push(Event::Priority(below_normal));
+        let mut real = real_loop;
+        let solve: Scripted<'_> = match solve { Some(s) => s, None => &mut real };
+        run_with(req, staged, c, Seams { hooks: probe, solve, set_priority: &mut set_priority })
+    }
+
+    /// One job run through the seams: its outcome, the progress reports, the full seam log, the hook
+    /// events alone (the log without the priority calls) and the stderr lines.
+    struct Trace { outcome: JobOutcome, reports: Vec<Report>, log: Vec<Event>, events: Vec<Event>, lines: Vec<String> }
+    impl Trace {
+        fn new(r: JobResult, reports: &Reports, probe: Probe) -> Trace {
+            let log = probe.log.borrow().clone();
+            let events = log.iter().copied().filter(|e| !matches!(e, Event::Priority(_))).collect();
+            Trace { outcome: r.outcome, reports: reports.lock().unwrap().clone(), log, events, lines: probe.lines }
+        }
+        fn checkpoints(&self) -> Vec<Checkpoint> { self.events.iter().filter_map(|e| match e { Event::At(c) => Some(*c), _ => None }).collect() }
+        fn started(&self) -> Vec<Op> { self.events.iter().filter_map(|e| match e { Event::Enter(o) => Some(*o), _ => None }).collect() }
+        fn stages(&self) -> Vec<Stage> { self.reports.iter().map(|r| r.0).collect() }
+        fn priority(&self) -> Vec<bool> { self.log.iter().filter_map(|e| match e { Event::Priority(b) => Some(*b), _ => None }).collect() }
+    }
+
+    /// Runs `req` (the real loop) with a cancel raised on the first progress report `cancel_on`
+    /// accepts, or on the seam event `cancel_at`, and the raw measurement replaced by `substitute`.
+    fn traced(req: &SolveRequest, staged: Option<&[NodeLock]>, cancel_on: impl Fn(&Report) -> bool + Send + 'static, cancel_at: Option<Event>, substitute: Option<f32>) -> Trace {
+        let (mut c, reports) = recording(cancel_on);
+        let mut probe = Probe::new(&c);
+        probe.cancel_at = cancel_at;
+        probe.substitute = substitute;
+        let r = run_seamed(req, staged, &mut c, &mut probe, None);
+        Trace::new(r, &reports, probe)
     }
 
     /// `lock_river`: line 0 stages IP's lock at `[check]` (QQ bets always, 54o one time in five), line 1
@@ -295,109 +422,117 @@ mod tests {
         (solve_request("lock_river", 1), locks)
     }
 
-    /// §4.5 `cancel` in `Building`: answered "after the current step (tree build, cross-check, memory
-    /// check, allocation, lock application are each a step)"; the job also polls before its first step
-    /// and at the Solving -> Extracting boundary, so a cancel that lands after the last iteration never
-    /// pays for `finalize`. The checkpoints come in this order, and a cancel raised at any one of them is
-    /// answered there: nothing past it runs (no later checkpoint, no later stage).
+    /// §4.5 cancel checkpoints (P2.T11 review I1). In `Building` a cancel is answered "after the current
+    /// step" (tree build, cross-check, game configuration, memory check, allocation, the staged set's
+    /// validation, each lock); in `Solving` by the loop's own polls; in `Extracting` right after the
+    /// notification (before the uninterruptible `finalize`), after `finalize`, after the export (whose
+    /// own polls answer a cancel before and between nodes) and after self-validation, before a terminal
+    /// is chosen. The uncancelled run shows every operation completing into a checkpoint before anything
+    /// else starts. A cancel placed on every event of that run (at a checkpoint, or as an operation
+    /// starts or completes: a cancel arriving during it) then returns `Cancelled` with the trace ending
+    /// exactly where it is answered, so no further expensive operation starts: in particular a cancel
+    /// during the export's sizing or during self-validation never becomes a solution.
     #[test]
-    fn a_cancel_at_every_building_step_and_stage_boundary_stops_the_job_there() {
+    fn a_cancel_at_or_during_any_step_starts_no_further_operation() {
         use Checkpoint::*;
+        use Op::*;
         let (mut req, locks) = lock_job();
         req.target_bp = u16::MAX;                        // the first measurement reaches it: a short uncancelled run
-        let (mut c, reports) = recording(|_| false);
-        let mut probe = Probe::new(&c);
-        let full = run_with(&req, Some(&locks), &mut c, &mut probe);
+        let full = traced(&req, Some(&locks), |_| false, None, None);
         assert!(matches!(full.outcome, JobOutcome::Ok(_)), "{:?}", full.outcome);
-        let all = probe.checkpoints;
-        assert_eq!(all, [Start, TreeBuilt, TreeChecked, GameConfigured, MemoryChecked, Allocated, LockApplied(1), SolveEnded]);
-        assert_eq!(stages(&reports).last(), Some(&Stage::Extracting));
-
-        for (k, &at) in all.iter().enumerate() {
-            let (mut c, reports) = recording(|_| false);
-            let mut probe = Probe::new(&c);
-            probe.cancel_at = Some(at);
-            let r = run_with(&req, Some(&locks), &mut c, &mut probe);
-            assert!(matches!(r.outcome, JobOutcome::Cancelled), "cancel at {at:?}: {:?}", r.outcome);
-            assert_eq!(probe.checkpoints, all[..=k], "cancel at {at:?}: no step after it");
-            let seen = stages(&reports);
-            match at {
-                Start | TreeBuilt | TreeChecked | GameConfigured => assert_eq!(seen, [Stage::Building], "cancel at {at:?}"),
-                MemoryChecked | Allocated | LockApplied(_) => assert_eq!(seen, [Stage::Building, Stage::Building], "cancel at {at:?}"),
-                SolveEnded => assert!(seen.contains(&Stage::Solving) && !seen.contains(&Stage::Extracting), "cancel at {at:?}: {seen:?}"),
+        for (k, e) in full.events.iter().enumerate() {
+            if let Event::Leave(op) = e {
+                assert!(matches!(full.events.get(k + 1), Some(Event::At(_))), "{op:?} completes into a checkpoint, not {:?}", full.events.get(k + 1));
             }
+        }
+        assert_eq!(full.checkpoints(), [Start, TreeBuilt, TreeChecked, GameConfigured, MemoryChecked, Allocated, LocksValidated, LockApplied(1), SolveEnded, ExtractingNotified, Finalized, Exported, Validated]);
+        assert_eq!(full.started(), [TreeBuild, TreeCheck, GameConfig, MemoryCheck, Allocate, LockValidate, LockApply(1), Solve, Finalize, Export, Validate]);
+        assert_eq!(full.events.last(), Some(&Event::At(Validated)), "the terminal is chosen after the last checkpoint");
+        assert_eq!(full.stages().last(), Some(&Stage::Extracting));
+
+        for (k, &at) in full.events.iter().enumerate() {
+            // Where the cancel is answered: at that checkpoint; at the checkpoint that follows a completed
+            // operation; inside the loop or the export, which poll before any iteration or node; after any
+            // other operation (never interrupted) at the checkpoint that follows it.
+            let end = match at {
+                Event::At(_) => k,
+                Event::Leave(_) | Event::Enter(Solve | Export) => k + 1,
+                Event::Enter(_) => k + 2,
+                Event::Priority(_) => unreachable!("`events` leaves out the priority calls"),
+            };
+            let t = traced(&req, Some(&locks), |_| false, Some(at), None);
+            assert!(matches!(t.outcome, JobOutcome::Cancelled), "cancel at {at:?}: {:?}", t.outcome);
+            assert_eq!(t.events, full.events[..=end], "cancel at {at:?}: answered at {:?}, and nothing starts after it", full.events[end]);
+            if at == Event::Enter(Solve) { assert!(t.reports.iter().all(|r| r.1 == 0), "cancel at {at:?}: no iteration: {:?}", t.reports); }
         }
         // the second Building report is the memory check: it carries the admitted estimate
-        let (mut c, reports) = recording(|_| false);
-        let mut probe = Probe::new(&c);
-        probe.cancel_at = Some(MemoryChecked);
-        run_with(&req, Some(&locks), &mut c, &mut probe);
-        let r = reports.lock().unwrap();
-        assert_eq!((r[0].3, r[1].2), (0, None));
-        assert!(r[1].3 > 0, "the memory check reports the estimate: {:?}", r[1]);
+        let t = traced(&req, Some(&locks), |_| false, Some(Event::At(MemoryChecked)), None);
+        assert_eq!((t.reports[0].3, t.reports[1].2), (0, None));
+        assert!(t.reports[1].3 > 0, "the memory check reports the estimate: {:?}", t.reports[1]);
     }
 
-    /// §4.5 `cancel` in `Solving` (at the next iteration boundary) and in `Extracting` (after the node
-    /// being extracted), placed deterministically from inside the progress callback: raised on the
-    /// Solving transition it is seen before the first iteration; raised on the report that carries the
-    /// target-reaching measurement (after the loop's last poll) it is answered at the Solving ->
-    /// Extracting boundary without `finalize`; raised on the Extracting transition it is answered by the
-    /// export before its first node. Never a solution.
+    /// A cancel raised synchronously by a progress notification (the callback runs inside the job) is
+    /// answered before the next operation starts: on the first `Building` report at `Start`, before the
+    /// tree build; on the memory-check report at `MemoryChecked`, before allocation; on the `Solving`
+    /// transition by the loop's first poll, before any iteration; on the report carrying the
+    /// target-reaching measurement (after the loop's last poll) at `SolveEnded`; on the `Extracting`
+    /// transition at `ExtractingNotified`, before `finalize`. Nothing is reported after the cancelling
+    /// notification, and never a solution.
     #[test]
-    fn a_cancel_in_solving_or_extracting_is_answered_at_the_next_checkpoint() {
+    fn a_cancel_raised_by_a_notification_is_answered_before_the_next_operation() {
+        use Checkpoint::*;
         let (mut req, _) = lock_job();
         req.target_bp = u16::MAX;
-        let cases: [(&str, fn(&Report) -> bool); 3] = [
-            ("solving transition", |r| r.0 == Stage::Solving && r.2.is_none()),
-            ("target-reaching measurement", |r| r.0 == Stage::Solving && r.2.is_some()),
-            ("extracting transition", |r| r.0 == Stage::Extracting),
+        let cases: [(&str, fn(&Report) -> bool, Event); 5] = [
+            ("building transition", |r| r.0 == Stage::Building && r.3 == 0, Event::At(Start)),
+            ("memory estimate", |r| r.0 == Stage::Building && r.3 > 0, Event::At(MemoryChecked)),
+            ("solving transition", |r| r.0 == Stage::Solving && r.2.is_none(), Event::Leave(Op::Solve)),
+            ("target-reaching measurement", |r| r.0 == Stage::Solving && r.2.is_some(), Event::At(SolveEnded)),
+            ("extracting transition", |r| r.0 == Stage::Extracting, Event::At(ExtractingNotified)),
         ];
-        for (what, cancel_on) in cases {
-            let (mut c, reports) = recording(cancel_on);
-            let mut probe = Probe::new(&c);
-            let r = run_with(&req, None, &mut c, &mut probe);
-            assert!(matches!(r.outcome, JobOutcome::Cancelled), "{what}: {:?}", r.outcome);
-            let seen = reports.lock().unwrap().clone();
-            let last = *seen.last().unwrap();
-            match what {
-                "solving transition" => assert_eq!((last.0, last.1, last.2), (Stage::Solving, 0, None), "{what}: nothing after the transition"),
-                "target-reaching measurement" => {
-                    assert!(last.0 == Stage::Solving && last.2.is_some(), "{what}: {last:?}");
-                    assert_eq!(probe.checkpoints.last(), Some(&Checkpoint::SolveEnded), "{what}");
-                }
-                _ => assert_eq!(last.0, Stage::Extracting, "{what}"),
-            }
+        for (what, cancel_on, answered) in cases {
+            let t = traced(&req, None, cancel_on, None, None);
+            assert!(matches!(t.outcome, JobOutcome::Cancelled), "{what}: {:?}", t.outcome);
+            assert_eq!(t.events.last(), Some(&answered), "{what}: {:?}", t.events);
+            let last = t.reports.last().unwrap();
+            assert!(cancel_on(last), "{what}: nothing reported after the cancelling notification: {:?}", t.reports);
+            if what == "solving transition" { assert!(t.reports.iter().all(|r| r.1 == 0), "{what}: no iteration: {:?}", t.reports); }
         }
     }
 
-    /// Review ruling (c) of P2.T10, wired at the job's measurement boundary: every measured value passes
-    /// `extract::report_exploitability` before any progress report or the solution carries it. A value in
-    /// `[-1e-6, 0)` is reported as exactly `+0.0` with the raw value in ONE stderr line (the solve loop
-    /// repeats its latest measurement with every coalesced report); a positive value passes unchanged
-    /// with no line; a value below the floor or a non-finite one is never emitted (its refusal is logged
-    /// once) and, as the final measurement, fails the job as `internal`. `validate_solution` stays strict
-    /// and accepts what is reported.
+    /// Review ruling (c) of P2.T10 with the pot-relative tolerance of P2.T11 review I2, wired at the job's
+    /// measurement boundary: every measured value passes `extract::report_exploitability(raw, pot)`
+    /// before any progress report or the solution carries it. At this 100-chip pot the tolerance is
+    /// `8 * f32::EPSILON * 100` = 9.5367431640625e-5 chips, a hundred times the old absolute 1e-6 floor:
+    /// a value in `[-tolerance, 0)` is reported as exactly `+0.0` with the raw value in exactly ONE
+    /// stderr line per solve (the solve loop repeats its latest measurement with every coalesced report,
+    /// and the final measurement is the same sample); a positive value passes unchanged with no line; the
+    /// next `f32` below the tolerance, a larger negative or a non-finite value is never emitted (its
+    /// refusal is logged once) and, as the final measurement, fails the job as `internal`.
+    /// `validate_solution` stays strict and accepts what is reported.
     #[test]
     fn measurements_are_reported_through_the_noise_floor_policy() {
         let req = solve_request("river_two_combo", 0);
+        assert_eq!(req.pot, 100);
+        let inside = -(8.0 * f32::EPSILON * 100.0);                 // exactly -tolerance: the inclusive edge
+        assert_eq!(f64::from(inside), -9.5367431640625e-5);
+        let outside = f32::from_bits(inside.to_bits() + 1);        // the next f32 below it
         let run_substituted = |raw: f32| {
-            let (mut c, reports) = recording(|_| false);
-            let mut probe = Probe::new(&c);
-            probe.substitute = Some(raw);
-            let r = run_with(&req, None, &mut c, &mut probe);
-            let seen = reports.lock().unwrap().clone();
-            (r.outcome, seen, probe.lines)
+            let t = traced(&req, None, |_| false, None, Some(raw));
+            (t.outcome, t.reports, t.lines)
         };
 
-        let (outcome, seen, lines) = run_substituted(-5e-7);
-        let sol = match outcome { JobOutcome::Ok(s) | JobOutcome::BestSoFar(s) => s, other => panic!("{other:?}") };
-        assert_eq!(sol.exploitability_chips.to_bits(), 0.0f32.to_bits(), "noise is reported as +0.0");
-        validate_solution(&sol, &req.tree.materialized).unwrap();
-        let measured: Vec<f32> = seen.iter().filter_map(|r| r.2).collect();
-        assert!(!measured.is_empty() && measured.iter().all(|e| e.to_bits() == 0.0f32.to_bits()), "progress carries the reported value only: {measured:?}");
-        assert_eq!(*seen.last().unwrap(), (Stage::Extracting, sol.iterations, Some(sol.exploitability_chips), sol.memory_bytes));
-        assert_eq!(lines.len(), 1, "one line per raw measurement: {lines:?}");
-        assert!(lines[0].contains("-5e-7"), "the raw value is logged: {}", lines[0]);
+        for raw in [inside, -5e-7, -f32::MIN_POSITIVE] {
+            let (outcome, seen, lines) = run_substituted(raw);
+            let sol = match outcome { JobOutcome::Ok(s) | JobOutcome::BestSoFar(s) => s, other => panic!("{raw:e}: {other:?}") };
+            assert_eq!(sol.exploitability_chips.to_bits(), 0.0f32.to_bits(), "{raw:e}: noise is reported as +0.0");
+            validate_solution(&sol, &req.tree.materialized).unwrap();
+            let measured: Vec<f32> = seen.iter().filter_map(|r| r.2).collect();
+            assert!(measured.len() >= 2 && measured.iter().all(|e| e.to_bits() == 0.0f32.to_bits()), "{raw:e}: progress carries the reported value only: {measured:?}");
+            assert_eq!(*seen.last().unwrap(), (Stage::Extracting, sol.iterations, Some(sol.exploitability_chips), sol.memory_bytes));
+            assert_eq!(lines.len(), 1, "{raw:e}: one diagnostic line per solve: {lines:?}");
+            assert!(lines[0].contains(&format!("{raw:e}")), "the raw value is logged: {}", lines[0]);
+        }
 
         let (outcome, seen, lines) = run_substituted(0.25);
         let sol = match outcome { JobOutcome::Ok(s) | JobOutcome::BestSoFar(s) => s, other => panic!("{other:?}") };
@@ -405,7 +540,7 @@ mod tests {
         assert!(seen.iter().filter_map(|r| r.2).all(|e| e == 0.25));
         assert!(lines.is_empty(), "{lines:?}");
 
-        for (raw, needle) in [(-0.01f32, "below"), (f32::NAN, "finite"), (f32::NEG_INFINITY, "finite")] {
+        for (raw, needle) in [(outside, "below"), (-0.01f32, "below"), (f32::NAN, "finite"), (f32::NEG_INFINITY, "finite")] {
             let (outcome, seen, lines) = run_substituted(raw);
             match outcome {
                 JobOutcome::Error(e) => {
@@ -461,12 +596,15 @@ mod tests {
         match run(&quick, Some(&[]), &mut ctl()).outcome { JobOutcome::Ok(s) => assert_eq!(s.locks_applied, 0), other => panic!("{other:?}") }
     }
 
-    /// §7 at the stop point: §13.0's `flop_best_so_far` fixture asks a 179 x 264-combo flop for 1 bp
-    /// (0.018 chips) inside 2 s, which R8 puts far out of reach (0.5% alone takes 4-7 s on this size
-    /// class), so the deadline ends the solve after at least one measurement and the job returns
-    /// `BestSoFar`: every flop decision node exported, the reported exploitability above the target, and
-    /// a solution `validate_solution` accepts.
+    /// §7 at the stop point, on the full workload (P2.T11 review M1: behind `exhaustive`, since it
+    /// allocates about 825 MB and depends on how much work fits in a real 2 s window; the default gate
+    /// covers the same mapping with the scripted stop below): §13.0's `flop_best_so_far` fixture asks a
+    /// 179 x 264-combo flop for 1 bp (0.018 chips) inside 2 s, which R8 puts far out of reach (0.5% alone
+    /// takes 4-7 s on this size class), so the deadline ends the solve after at least one measurement
+    /// and the job returns `BestSoFar`: every flop decision node exported, the reported exploitability
+    /// above the target, and a solution `validate_solution` accepts.
     #[test]
+    #[cfg_attr(not(feature = "exhaustive"), ignore = "enable the exhaustive feature for the full flop workload (about 825 MB)")]
     fn the_flop_best_so_far_fixture_returns_a_validated_best_so_far() {
         let req = solve_request("flop_best_so_far", 0);
         let (mut c, reports) = recording(|_| false);
@@ -478,6 +616,92 @@ mod tests {
         let flop_nodes = req.tree.materialized.iter().filter(|n| n.street == proto::Street::Flop).count();
         assert_eq!((sol.nodes.len(), sol.requested, sol.export.as_str(), sol.locks_applied), (flop_nodes, 0, "street", 0));
         assert_eq!(*reports.lock().unwrap().last().unwrap(), (Stage::Extracting, sol.iterations, Some(sol.exploitability_chips), sol.memory_bytes));
+    }
+
+    /// §7 at a non-target stop, in the default gate (P2.T11 review M1): the loop seam runs three real
+    /// `solve_step` iterations and one real `compute_exploitability` on the river spot, reports the
+    /// measurement, and stops as the deadline would, above the target. The job then really finalizes,
+    /// exports and validates, and maps the stop to `BestSoFar`: every river decision node exported, the
+    /// measured value reported unchanged, and a solution `validate_solution` accepts.
+    #[test]
+    fn a_non_target_stop_after_real_iterations_is_a_validated_best_so_far() {
+        use postflop_solver::{compute_exploitability, solve_step};
+        let req = solve_request("river_two_combo", 0);
+        let target = (f64::from(req.pot) * f64::from(req.target_bp) / 10_000.0) as f32;
+        let mut measured = None;
+        let mut scripted = |game: &PostFlopGame, params: &solve_loop::LoopParams, cancel: &AtomicBool, progress: &mut dyn FnMut(u32, Option<f32>)| {
+            assert_eq!(params.target_chips, target);
+            for i in 0..3 {
+                assert!(!cancel.load(Ordering::SeqCst));
+                solve_step(game, i);
+            }
+            let e = compute_exploitability(game);
+            assert!(e > target, "three iterations are far from the {target}-chip target: {e}");
+            measured = Some(e);
+            progress(3, Some(e));
+            solve_loop::LoopOutcome { iterations: 3, exploitability: Some(e), reached_target: false, cancelled: false }
+        };
+        let (mut c, reports) = recording(|_| false);
+        let mut probe = Probe::new(&c);
+        let r = run_seamed(&req, None, &mut c, &mut probe, Some(&mut scripted));
+        let t = Trace::new(r, &reports, probe);
+        let e = measured.expect("the scripted loop ran");
+        let sol = match &t.outcome { JobOutcome::BestSoFar(s) => s, other => panic!("{other:?}") };
+        assert_eq!((sol.iterations, sol.exploitability_chips.to_bits()), (3, e.to_bits()));
+        assert_eq!((sol.nodes.len(), sol.requested, sol.export.as_str(), sol.locks_applied), (3, 1, "street", 0));
+        validate_solution(sol, &req.tree.materialized).unwrap();
+        assert_eq!(t.started(), [Op::TreeBuild, Op::TreeCheck, Op::GameConfig, Op::MemoryCheck, Op::Allocate, Op::Solve, Op::Finalize, Op::Export, Op::Validate]);
+        assert_eq!(t.events.last(), Some(&Event::At(Checkpoint::Validated)));
+        assert_eq!(t.reports.iter().filter(|r| r.0 == Stage::Solving && r.2.is_some()).count(), 1);
+        assert_eq!(*t.reports.last().unwrap(), (Stage::Extracting, 3, Some(e), sol.memory_bytes));
+        assert!(t.lines.is_empty(), "{:?}", t.lines);
+    }
+
+    /// §3.4 (P2.T11 review M2): a `background: true` job runs at BELOW_NORMAL from before its first step
+    /// until after its last, and every exit restores NORMAL exactly once: success, an early cancel, a
+    /// Building error, and a panic unwinding out of a progress callback. A foreground job sets NORMAL
+    /// and resets it the same way. The seam's setter records the calls in order with the job's other
+    /// events; production passes `win::set_priority_class`.
+    #[test]
+    fn every_exit_restores_normal_priority() {
+        let mut background = solve_request("river_two_combo", 0);
+        background.background = true;
+        background.target_bp = u16::MAX;                 // the first measurement reaches it: a short run
+        let mut bad_pot = background.clone();
+        bad_pot.pot = 0;
+        let mut foreground = background.clone();
+        foreground.background = false;
+
+        let t = traced(&background, None, |_| false, None, None);
+        assert!(matches!(t.outcome, JobOutcome::Ok(_)), "{:?}", t.outcome);
+        assert_eq!(t.priority(), [true, false], "success");
+        assert_eq!(t.log.first(), Some(&Event::Priority(true)), "set before the first step: {:?}", t.log);
+        assert_eq!(t.log[t.log.len() - 2..], [Event::At(Checkpoint::Validated), Event::Priority(false)], "reset after the last step");
+
+        let t = traced(&background, None, |_| false, Some(Event::At(Checkpoint::Start)), None);
+        assert!(matches!(t.outcome, JobOutcome::Cancelled), "{:?}", t.outcome);
+        assert_eq!(t.log, [Event::Priority(true), Event::At(Checkpoint::Start), Event::Priority(false)], "early cancel");
+
+        let t = traced(&bad_pot, None, |_| false, None, None);
+        match &t.outcome { JobOutcome::Error(e) => assert_eq!(e.code, "invalid_request"), other => panic!("{other:?}") }
+        assert_eq!(t.priority(), [true, false], "Building error");
+        assert_eq!(t.log.last(), Some(&Event::Priority(false)));
+
+        // a panic in the progress callback, mid-solve, unwinds through the job and past the guard
+        let (mut c, _) = recording(|r: &Report| if r.0 == Stage::Solving && r.2.is_some() { panic!("progress callback panics") } else { false });
+        let mut probe = Probe::new(&c);
+        let log = Rc::clone(&probe.log);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_seamed(&background, None, &mut c, &mut probe, None)));
+        assert!(unwound.is_err(), "the callback's panic propagates");
+        let log = log.borrow().clone();
+        let calls: Vec<bool> = log.iter().filter_map(|e| match e { Event::Priority(b) => Some(*b), _ => None }).collect();
+        assert_eq!(calls, [true, false], "unwinding: {log:?}");
+        assert_eq!(log[log.len() - 2..], [Event::Enter(Op::Solve), Event::Priority(false)], "reset while unwinding out of the loop");
+
+        let t = traced(&foreground, None, |_| false, None, None);
+        assert!(matches!(t.outcome, JobOutcome::Ok(_)), "{:?}", t.outcome);
+        assert_eq!(t.priority(), [false, false], "a foreground job sets NORMAL and resets it");
+        assert_eq!(t.log.last(), Some(&Event::Priority(false)));
     }
 
     /// Every failure is a typed §4.5 `WorkerError` with the spec's code and retryability, returned before
