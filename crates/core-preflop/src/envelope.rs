@@ -17,13 +17,15 @@ pub trait PreflopSource: Send + Sync {
     /// third, read-only view over the same guarantee, added for P3.T7's Rust-boundary proof
     /// that a shipped chart bundle loads with no EV anywhere in its node map).
     ///
-    /// Defaults to `true` for any source whose node map is not reachable through this trait
-    /// (e.g. a test double with no nodes at all, vacuously true); `PokerDataJson` and
-    /// `ChartTranscription` (`store.rs`) both override it with the real
-    /// `self.nodes.values().all(|n| n.ev_source_sb.is_none())` check over their own map.
-    fn nodes_have_no_ev(&self) -> bool {
-        true
-    }
+    /// P3.T7 fix round 1, R1: no default body. A default of `true` let any future implementor
+    /// (including one whose stored nodes do carry EV data) inherit an affirmative "no EV" result
+    /// without ever inspecting its own node map -- a false positive on the exact guarantee this
+    /// method exists to prove. Every implementor now states its own answer: `PokerDataJson` and
+    /// `ChartTranscription` (`store.rs`) both compute the real
+    /// `self.nodes.values().all(|n| n.ev_source_sb.is_none())` check over their own map; the
+    /// test-only `EmptyBundle` double (`tests/lookup.rs`, which has no nodes at all) states its
+    /// own explicit, still-vacuously-true `true`.
+    fn nodes_have_no_ev(&self) -> bool;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

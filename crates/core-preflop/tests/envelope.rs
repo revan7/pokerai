@@ -638,6 +638,60 @@ fn chart_lookup_clears_ev_even_when_constructed_directly() {
     assert_eq!(node.ev_source_sb, None, "ChartTranscription::lookup must clear EV regardless of what is stored");
 }
 
+// --- P3.T7 fix round 1, R1: `PreflopSource::nodes_have_no_ev` has no default body any more, so
+// every implementor states its own answer -- these two focused checks are the review's required
+// proof that each real adapter returns `false` when a stored node does carry EV data and `true`
+// when every stored node omits it (the test-only `EmptyBundle` double's own explicit `true` is
+// in `tests/lookup.rs`). ---
+
+#[test]
+fn poker_data_json_nodes_have_no_ev_true_only_when_every_node_omits_ev() {
+    // The committed synthetic_v2 fixture carries EV data on at least one node (utg_rfi's KK
+    // cell, per `synthetic_v2_node_map_matches_expected_shape` above).
+    let info: core_preflop::BundleInfo = serde_json::from_slice(MANIFEST_JSON).unwrap();
+    let envelope = core_preflop::checked_envelope(&info, NODES_JSON).unwrap();
+    let map = core_preflop::build_node_map(&info, &envelope).unwrap();
+    assert!(map.values().any(|n| n.ev_source_sb.is_some()), "sanity: this map does carry EV data");
+    let with_ev = core_preflop::PokerDataJson { info, nodes: map };
+    assert!(!with_ev.nodes_have_no_ev(), "a PokerDataJson bundle with EV data on some node must report false");
+
+    // An otherwise-identical PokerDataJson bundle whose nodes carry no EV data anywhere.
+    let bundle_id = "poker_data_no_ev";
+    let nodes_text = baseline_nodes_json_text(bundle_id);
+    let hash = sha256_hex(nodes_text.as_bytes());
+    let manifest_text = minimal_manifest_json(bundle_id, "PokerDataJson", "[0.5,1.0]", &hash);
+    let manifest: core_preflop::BundleInfo = serde_json::from_str(&manifest_text).unwrap();
+    let envelope = core_preflop::checked_envelope(&manifest, nodes_text.as_bytes()).unwrap();
+    let map = core_preflop::build_node_map(&manifest, &envelope).unwrap();
+    let without_ev = core_preflop::PokerDataJson { info: manifest, nodes: map };
+    assert!(without_ev.nodes_have_no_ev(), "a PokerDataJson bundle with no evs anywhere must report true");
+}
+
+#[test]
+fn chart_transcription_nodes_have_no_ev_true_only_when_every_node_omits_ev() {
+    // R3's guarantee (store.rs) is that `lookup` always clears EV; `nodes_have_no_ev` is a
+    // separate, read-only view directly over the stored map, so it must report false here even
+    // though the same map's `lookup` would already hide the EV from a caller.
+    let info: core_preflop::BundleInfo = serde_json::from_slice(MANIFEST_JSON).unwrap();
+    let envelope = core_preflop::checked_envelope(&info, NODES_JSON).unwrap();
+    let map = core_preflop::build_node_map(&info, &envelope).unwrap();
+    assert!(map.values().any(|n| n.ev_source_sb.is_some()), "sanity: this map does carry EV data");
+    let with_ev = core_preflop::ChartTranscription { info, nodes: map };
+    assert!(!with_ev.nodes_have_no_ev(), "a ChartTranscription wrapping a map with EV data must report false");
+
+    // A committed-shape chart bundle whose nodes never carry EV (checked_envelope's R3
+    // load-time rejection already forces this for anything reached through `load_bundle`).
+    let bundle_id = "chart_ok_no_ev";
+    let nodes_text = baseline_nodes_json_text(bundle_id);
+    let hash = sha256_hex(nodes_text.as_bytes());
+    let manifest_text = minimal_manifest_json(bundle_id, "ChartTranscription", "[0.5,1.0]", &hash);
+    let manifest: core_preflop::BundleInfo = serde_json::from_str(&manifest_text).unwrap();
+    let envelope = core_preflop::checked_envelope(&manifest, nodes_text.as_bytes()).unwrap();
+    let map = core_preflop::build_node_map(&manifest, &envelope).unwrap();
+    let without_ev = core_preflop::ChartTranscription { info: manifest, nodes: map };
+    assert!(without_ev.nodes_have_no_ev(), "a ChartTranscription bundle with no evs anywhere must report true");
+}
+
 /// N1 (P3.T2 re-review, minor): `checked_envelope` now enforces the exact `[0.5, 1.0]`
 /// source-blind contract itself, not only `load_bundle`'s earlier wide-`f64` pre-check
 /// (`check_exact_source_blinds`, private to `store.rs`) -- a `pub` caller who builds a
