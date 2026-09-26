@@ -37,6 +37,26 @@ pub struct PreflopNode {
     pub ev_source_sb: Option<Vec<Vec<Option<f32>>>>,
     pub unreachable: [bool; 169],
     pub committed_by_actor_sb: f32,
+    /// Whether this node's fold EV already passed the load-time wide (`f64`) admission gate
+    /// (`crate::store::check_fold_consistency_wide`, run inside `checked_envelope` on the
+    /// ORIGINAL wire-precision bytes) -- P3.T9 fix round 2, N1.
+    ///
+    /// `crate::store::build_node_map` sets this `true` on every node it produces, because it is
+    /// only ever called on an envelope that has already passed that gate. A `PreflopNode` built
+    /// any other way (this struct is `pub` and every field is constructible directly, and
+    /// `PreflopStore::from_sources` accepts a source without ever running the loader) must set
+    /// this `false`: no wide check ran, so [`crate::ev::expand_node`]'s own boundary assertion
+    /// still re-derives the narrow (`f32`) cross-check as the only safety net available for that
+    /// data.
+    ///
+    /// [`crate::ev::expand_node`] never re-derives a narrow residual for a node with this `true`:
+    /// narrowing an already-wide-admitted EV to `f32` before re-checking it can shift a residual
+    /// by less than a part in `1e7`, right across the spec's `1e-3` tolerance boundary, and
+    /// disagree with the wide gate that already admitted it (the exact defect this field fixes --
+    /// see the re-review's `195.0009999`-under-`AbsoluteStackVerified` repro). The wide gate is
+    /// the one admission decision; this field carries that decision forward instead of asking the
+    /// question a second time on narrower data.
+    pub fold_wide_verified: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
