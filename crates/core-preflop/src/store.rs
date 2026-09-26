@@ -269,6 +269,11 @@ fn committed_before(history: &[(Position, PreflopStep)], actor: Position, depth_
 /// fold checks, the declared-actor-matches-the-next-eligible-actor check (R2), and
 /// `committed_by_actor_sb` for each node's actor. A duplicate `node_key` (two nodes with the
 /// same `(depth_bb, rake_profile, straddle, history)`) is rejected.
+///
+/// P3.T9: also runs [`crate::ev::check_fold_consistency`] on every constructed node -- a present,
+/// verified fold EV that fails its reference's `1e-3` cross-check makes the node, and so the whole
+/// bundle, unloadable (spec section 8.3), reaching the store's existing quarantine-and-banner path
+/// exactly like any other content failure while every sibling bundle stays active.
 pub fn build_node_map(info: &BundleInfo, e: &Envelope) -> Result<BTreeMap<String, PreflopNode>, BundleError> {
     let mut map = BTreeMap::new();
     for n in &e.nodes {
@@ -292,6 +297,7 @@ pub fn build_node_map(info: &BundleInfo, e: &Envelope) -> Result<BTreeMap<String
             unreachable,
             committed_by_actor_sb: committed_before(&history, actor, info.depth_bb),
         };
+        crate::ev::check_fold_consistency(&node, info).map_err(BundleError::Content)?;
         let key = node_key(&PreflopNodeKey {
             depth_bb: info.depth_bb,
             rake_profile: info.rake_profile.clone(),

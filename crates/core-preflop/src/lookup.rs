@@ -12,6 +12,7 @@
 
 use crate::depth::{asymmetric, bucket, depth_for, prominent_depth, rake_reason, rank_key, start_stack};
 use crate::envelope::{BundleInfo, PreflopNode, PreflopNodeKey, PreflopSource, PreflopStep};
+use crate::ev::{expand_node, ExpandedNode};
 use crate::store::{node_key, PreflopStore};
 use crate::straddle::{check_straddle, normalized_posts, physical_positions, short_handed_prefix, source_unit, virtual_position};
 use core_model::RulesError;
@@ -22,8 +23,9 @@ use std::collections::HashMap;
 /// selected source has it, the selected bundle, the source unit in chips, the mapping reasons that
 /// accumulated on the way and the `Unsupported` reason if there is one.
 ///
-/// Plan-3 owned (spec section 8.1 defines the store, not the answer). It gains
-/// `expanded: Option<ExpandedNode>` in Task 9; until then a caller that finds `node: None` and
+/// Plan-3 owned (spec section 8.1 defines the store, not the answer). `expanded` is `Some` exactly
+/// when `node` is: the same source node, expanded from 169 classes to 1326 combos and from source
+/// SB to chips (P3.T9, [`crate::ev::expand_node`]). A caller that finds `node: None` and
 /// `unsupported: Some(MissingPreflopNode)` has the truth, and no `NodeStrategy` with zero EVs is
 /// ever fabricated to fill the gap.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,6 +33,7 @@ pub struct PreflopAnswer {
     pub key: String,
     pub actor: Option<Seat>,
     pub node: Option<PreflopNode>,
+    pub expanded: Option<ExpandedNode>,
     pub bundle: Option<BundleInfo>,
     pub unit: u32,
     pub reasons: Vec<ApproxReason>,
@@ -44,6 +47,7 @@ impl PreflopAnswer {
             key: String::new(),
             actor: None,
             node: None,
+            expanded: None,
             bundle: None,
             unit: 0,
             reasons: vec![],
@@ -398,7 +402,18 @@ impl PreflopStore {
         // A miss in the selected source is final: a lower-ranked bundle is never searched to hide
         // it (section 8.3, "Missing nodes stay missing").
         match candidate.lookup(&key) {
-            Some(node) => answer.node = Some(node),
+            Some(node) => {
+                // The actor's actual chip maximum (P3.T9): committed-this-street plus what
+                // remains, never the source's own declared depth -- a live stack shallower or
+                // deeper than the source's acquired depth still expands `AllIn` to what this
+                // actor can actually put in.
+                let seat_i = actor.0 as usize;
+                let actor_max_to = prefix.derived.committed_this_street[seat_i]
+                    .checked_add(prefix.derived.stacks_remaining[seat_i])
+                    .expect("a seat never holds more than its starting stack");
+                answer.expanded = Some(expand_node(&node, info, actor, unit, actor_max_to));
+                answer.node = Some(node);
+            }
             None => answer.unsupported = Some(UnsupportedReason::MissingPreflopNode { key: answer.key.clone() }),
         }
         answer
