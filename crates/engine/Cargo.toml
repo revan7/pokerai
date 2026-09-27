@@ -19,8 +19,10 @@ hex.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# The crate's own tests and examples link it with the fake clock, fake worker and recording sink (Task 19);
-# dev-dependency features apply only to those test builds, so release consumers never see `testing`.
+# Enables `testing` (fake clock, fake worker, recording sink: Task 19) for this crate's own test and example builds.
+# Cargo unifies features within one build, so in a workspace test run (`cargo test --workspace`, debug or release) the
+# other members' test binaries link this same `testing`-enabled engine; ordinary non-test builds (`cargo build`, with
+# or without `--release`) never enable `testing` through this edge.
 engine = { path = ".", features = ["testing"] }
 
 [features]
