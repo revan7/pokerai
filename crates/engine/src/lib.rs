@@ -7,6 +7,8 @@ pub mod clock;
 pub mod equity;
 pub mod identity;
 pub mod log;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod tree;
 pub mod worker;
 
