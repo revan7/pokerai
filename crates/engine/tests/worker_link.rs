@@ -82,8 +82,9 @@ fn process_worker_spawns_validates_ready_and_restarts() {
 #[test]
 fn river_check_only_terminal_oracle() {
     // §13.2 (spec S8: this test lives here because its oracle is `core-eval`, which `solver-worker` may not depend on).
-    // Check-check only, pot 100, stacks 100, no all-in: EV(check) per combo equals equity_actual_combo * 100 within 1e-3;
-    // swapping seats leaves every value unchanged.
+    // Check-check only, pot 100, stacks 100, no all-in: EV(check) per combo equals equity_actual_combo * 100 within 1e-3
+    // at both nodes (OOP's root and IP's node) of both solutions; swapping seats leaves every value unchanged, checked
+    // in both directions.
     use core_eval::{equity, exact_cost, EquityMode, EquityRequest, EquityStatus, PlayerRange};
     use proto::{combo_cards, combo_index, Action, Card, EffectiveTree, MaterializedNode, PlayerMenus, Range1326, Seat, SideMenu, Street};
     use proto::worker::SolveRequest;
@@ -127,16 +128,33 @@ fn river_check_only_terminal_oracle() {
     };
     let a = run("1", &oop, &ip);
     let b = run("2", &ip, &oop);
-    for (sol, hero, villain) in [(&a, &oop, &ip), (&b, &ip, &oop)] {
-        let node = &sol.nodes[0];
+    // Node 0 is OOP's root, node 1 IP's node after OOP's check (the only line); each carries its actor's combos.
+    for (run_name, sol) in [("a", &a), ("b", &b)] {
+        assert_eq!((sol.nodes[0].path.as_slice(), sol.nodes[0].actor.as_str()), (&[][..], "oop"), "{run_name}: node 0");
+        assert_eq!((sol.nodes[1].path.as_slice(), sol.nodes[1].actor.as_str()), (&[Action::Check][..], "ip"), "{run_name}: node 1");
+    }
+    // Both nodes of both solutions (§13.2: "at the OOP root and at IP's node"): EV(check) of every supported combo of
+    // the node's actor equals its equity against the opposing range, times the pot. In `b` the ranges swapped seats,
+    // so `b`'s OOP node holds the `ip` range's combos and `b`'s IP node the `oop` range's.
+    for (name, node, hero, villain) in [("a.nodes[0] (oop range at OOP)", &a.nodes[0], &oop, &ip), ("a.nodes[1] (ip range at IP)", &a.nodes[1], &ip, &oop),
+                                        ("b.nodes[0] (ip range at OOP)", &b.nodes[0], &ip, &oop), ("b.nodes[1] (oop range at IP)", &b.nodes[1], &oop, &ip)] {
         for i in 0..1326 {
             if hero.0[i] == 0.0 { continue; }
             let eq = hero_equity(i, villain);
-            assert!((node.ev_chips[i][0] - eq * 100.0).abs() <= 1e-3, "combo {i}: ev {} vs equity*100 {}", node.ev_chips[i][0], eq * 100.0);
+            assert!((node.ev_chips[i][0] - eq * 100.0).abs() <= 1e-3, "{name} combo {i}: ev {} vs equity*100 {}", node.ev_chips[i][0], eq * 100.0);
         }
     }
-    // IP's node (after OOP's check) carries the same identity for IP's combos; swapping seats swapped the roles, not the values
-    for i in 0..1326 { if ip.0[i] > 0.0 { assert!((a.nodes[1].ev_chips[i][0] - b.nodes[0].ev_chips[i][0]).abs() <= 1e-3); } }
+    // Swapping seats swapped the roles, not the values: each range's combos carry the same EV in either seat, both ways.
+    for i in 0..1326 {
+        if ip.0[i] > 0.0 {
+            let (x, y) = (a.nodes[1].ev_chips[i][0], b.nodes[0].ev_chips[i][0]);
+            assert!((x - y).abs() <= 1e-3, "ip combo {i}: a.nodes[1] {x} vs b.nodes[0] {y}");
+        }
+        if oop.0[i] > 0.0 {
+            let (x, y) = (a.nodes[0].ev_chips[i][0], b.nodes[1].ev_chips[i][0]);
+            assert!((x - y).abs() <= 1e-3, "oop combo {i}: a.nodes[0] {x} vs b.nodes[1] {y}");
+        }
+    }
 }
 
 // ---- Beyond the brief's three: the standing rulings on the link (spawn bounded and reported, kill idempotent,
