@@ -6,6 +6,7 @@ pub mod assemble;
 pub mod bench_support;
 pub mod clock;
 pub mod core;
+pub mod coverage;
 pub mod deadline;
 pub mod equity;
 pub mod identity;
