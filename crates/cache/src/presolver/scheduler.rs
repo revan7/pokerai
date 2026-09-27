@@ -11,8 +11,8 @@
 //! - `Scheduler` is the thread's body as a synchronous state machine: `apply` takes one
 //!   `PresolverCommand`, `step` runs one iteration. Tests drive it directly with a fake executor
 //!   and a fake clock.
-//! - `Presolver` is the handle the engine owns: it starts the thread and forwards commands. None of
-//!   its methods waits for the thread, the executor or any I/O.
+//! - `Presolver` is the handle the engine owns: it starts the thread and posts notifications to its
+//!   mailbox. None of its methods waits for the thread, the executor or any I/O.
 //!
 //! ## When jobs run
 //!
@@ -20,17 +20,26 @@
 //! live request, hand event or resume has happened for `IDLE_MS` (30 s) on the queue clock. At most
 //! one job runs at a time. A pause lets a running job finish and launches nothing more; a resume
 //! keeps the cursor and waits for the idle gate again. When the queue offers nothing to launch (all
-//! done, terminal, or waiting out a backoff), it is scanned again only once it changes or after
-//! `RESCAN_MS`: with every slot bound, a scan that finds nothing reads all 42,120 slots.
+//! done, terminal, waiting out a backoff or cooling down), it is scanned again only once it changes
+//! or after `RESCAN_MS`: with every slot bound, a scan that finds nothing reads all 42,120 slots.
 //!
-//! ## The thread
+//! ## The thread and its mailbox (fix round 1, R2)
 //!
-//! The `presolver` thread waits up to `TICK_MS` for commands, applies every command waiting, runs
-//! one iteration, and publishes the status. After an iteration that resolved a slot without starting
-//! a solve, or while a reconciliation sweep runs with nothing else to do, it does not wait
-//! (`wait_hint` is zero) and publishes at most once per `BUSY_PUBLISH_MS`, since a publication after
-//! a change recounts every slot. Commands are applied between iterations, never lost: the channel is
-//! unbounded.
+//! The handle never queues one message per call. Its notifications land in a mailbox of at most
+//! `MAILBOX_CAPACITY` entries: the latest hand state and the latest pause/resume state (a newer one
+//! replaces an older one the thread has not taken yet), a source-change signal, an activity signal
+//! (a live request) and the shutdown latch. So a flood of calls costs no memory beyond those
+//! entries, and the state the thread applies is always the latest; nothing is refused because the
+//! mailbox is full. Live pre-emption does not go through the mailbox at all (below).
+//!
+//! The `presolver` thread waits up to `TICK_MS` for a notification, takes everything in the mailbox
+//! at once -- a batch of at most `MAILBOX_CAPACITY` commands, applied as hand, pause/resume, source
+//! change, live request, then shutdown, so the final states reach the queue before a shutdown saves
+//! it -- runs one iteration, and publishes the status. After an iteration that resolved a slot
+//! without starting a solve, or while a reconciliation sweep runs with nothing else to do, it does
+//! not wait (`wait_hint` is zero) and publishes at most once per `BUSY_PUBLISH_MS`, since a
+//! publication after a change recounts every slot. Once shutdown is requested no job is submitted
+//! any more, so the thread stops as soon as an executor call it is blocked in returns.
 //!
 //! ## Live pre-emption
 //!
@@ -38,7 +47,7 @@
 //! `submit`; the executor's worker owner observes it. `LiveSignal::raise` -- called by
 //! `Presolver::notify_live_request` and `notify_hand(true)` on the engine's admitting thread --
 //! sets the running job's flag at once, so the worker hears about live work without waiting for
-//! this thread, its channel or the executor. The scheduler then cancels the job in its next
+//! this thread, its mailbox or the executor. The scheduler then cancels the job in its next
 //! iteration: the queue records the cancel first (refunding the attempt, `Queue::record_cancel`),
 //! then the executor is told (`cancel`), and the scheduler moves on without waiting for the job to
 //! wind down -- the work is lost, as section 10.5 accepts. A live request that arrives while a job
@@ -53,8 +62,11 @@
 //! the slot is the job submitted, and then `record_launch` charges the attempt. A preparation
 //! failure (including a prepared key that is not a flop root on the slot's canonical flop) is a
 //! failure of the slot itself; a refused submission is a failure of the bound game. A completed job
-//! is `Done` only if `store_and_verify` reads its entry back durably at target; otherwise it is a
-//! failed attempt, retried after the backoff.
+//! is `Done` only if `store_and_verify` reads its entry back durably at target. Otherwise (fix
+//! round 1, R4) the solve did not fail -- the cache could not keep its result -- so the attempt is
+//! refunded and the game is `Pending` again (a retry returns to its `Failed{n}`, still due), the
+//! outcome is logged, and the slot cools down in memory for `NOT_DURABLE_COOLDOWN_MS` before
+//! `next_pending` may offer it again, so a solve that never verifies cannot hot-loop.
 //!
 //! ## Clocks (ruling S1)
 //!
@@ -72,34 +84,42 @@
 //! a solve is followed at once by the next (`wait_hint` is zero), so rebinding costs preparations,
 //! not idle ticks.
 //!
-//! ## Saves (ruling S8)
+//! ## Saves (ruling S8, refined by ruling 15-R3)
 //!
 //! `queue.json` is rewritten whole (about 32 MB once every slot is bound), so it is saved only when
-//! the queue changed: at once for a pause, a resume, a generation change and shutdown, and otherwise
-//! at most once per `CHECKPOINT_MS`. A launch is never saved on its own: opening the queue refunds
-//! an in-flight attempt, so a saved launch and an unsaved one reopen identically, and what a crash
-//! can lose -- completions, bindings, the cursor -- is re-derived from the cache by the launch path
-//! and reconciliation (at most a few failure counts are lost). A failed save is counted
-//! (`SaveStats::failures`), reported on stderr once per distinct error, kept dirty, and retried at
-//! the next checkpoint.
+//! the queue changed. An outcome the cache cannot reconstruct -- a failure with its attempt count
+//! and absolute retry deadline, whether the worker, the preparation or the submission failed -- is
+//! saved at once, before the scheduler goes on; if that save fails, nothing new is launched until
+//! it succeeds, tried again every `SAVE_RETRY_MS`. A pause, a resume, a generation change and
+//! shutdown are saved at once too. Everything else -- a launch, a completion proven by a verified
+//! entry, a cancellation, reconciliation's verdicts, the cursor -- waits for the next checkpoint,
+//! at most `CHECKPOINT_MS` later: opening the queue refunds an in-flight attempt, so a saved launch
+//! and an unsaved one reopen identically, and what a crash can lose there is re-derived from the
+//! cache by the launch path and reconciliation. A failed save is counted (`SaveStats::failures`),
+//! reported on stderr once per distinct error, kept dirty, and retried.
 //!
-//! ## Reconciliation
+//! ## Reconciliation (fix round 1, R1)
 //!
 //! A sweep over every slot bound under the current generation (`reconcile_item` per game, in
 //! `Queue::sweep_order`) starts with the scheduler and again every `RECONCILE_PERIOD_MS`. It runs
 //! only while idle-eligible, at most `RECONCILE_CHUNK` games per iteration, so commands are handled
 //! between chunks; it skips the running game, and a game the launch path already decided in this
-//! sweep.
+//! sweep. Each iteration reconciles its chunk before it chooses work, and while a sweep is under
+//! way no candidate is launched that lies later in sweep order than a `Done` game the sweep has
+//! not verified yet: the launch waits until the sweep has passed the last such game before the
+//! candidate, so an entry that went missing (evicted, corrupt) is found and solved again before any
+//! later work -- tier 1 before tier 2. Until the startup sweep ends, the published `done` and
+//! `tier_done` count only completions verified in this process (by the sweep, the launch path or a
+//! job's own read-back); a persisted `Done` not yet verified counts as pending.
 
-use super::queue::{self, Queue, QueueClock, QueueItem};
+use super::queue::{self, Queue, QueueClock, QueueItem, RETRY_BACKOFF_MS};
 use crate::entry::CacheEntry;
 use crate::key::{KeyFields, Rational};
 use crate::CacheError;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 /// Section 10.5: no request (and no hand) for this long, in milliseconds, before a job may start.
@@ -114,8 +134,20 @@ pub const CHECKPOINT_MS: u64 = 300_000;
 pub const RECONCILE_CHUNK: usize = 16;
 /// How often a reconciliation sweep starts again, in queue-clock milliseconds: six hours.
 pub const RECONCILE_PERIOD_MS: u64 = 6 * 60 * 60 * 1_000;
-/// The failure recorded when a completed job's entry does not read back durably at target.
+/// What the scheduler logs when a completed job's entry does not read back durably at target (fix
+/// round 1, R4: the slot stays pending, nothing is recorded as a failure).
 pub const NOT_DURABLE: &str = "entry not durable at target";
+/// How long a slot whose completed entry did not read back durably is held back before
+/// `next_pending` may offer it again, in queue-clock milliseconds: the standard retry backoff, kept
+/// in memory only (fix round 1, R4).
+pub const NOT_DURABLE_COOLDOWN_MS: u64 = RETRY_BACKOFF_MS;
+/// After the save of an outcome the cache cannot reconstruct failed, how often it is tried again,
+/// in queue-clock milliseconds; nothing new is launched meanwhile (module doc, "Saves").
+pub const SAVE_RETRY_MS: u64 = 30_000;
+/// The most notifications the handle's mailbox holds: the latest hand state, the latest
+/// pause/resume state, the source-change and activity signals and the shutdown latch (module doc,
+/// "The thread and its mailbox").
+pub const MAILBOX_CAPACITY: usize = 5;
 /// When the queue offers nothing to launch, how long the scheduler waits before scanning it again
 /// unless it changes first, in queue-clock milliseconds: with every slot bound, a scan that finds
 /// nothing reads all 42,120 slots (measured about 36 ms in a release build), and only a retry
@@ -275,9 +307,22 @@ pub enum PresolverCommand {
 pub struct LiveSignal {
     live: Arc<AtomicBool>,
     job: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    /// Set once shutdown is requested (`Presolver::shutdown`, or the handle dropped): no job is
+    /// submitted after it.
+    stopping: Arc<AtomicBool>,
 }
 
 impl LiveSignal {
+    /// Shutdown was requested: sets the running job's cancel flag and stops any further submission.
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        self.cancel_job();
+    }
+
+    fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
     /// Live admission or a hand start: marks live work for the scheduler and sets the running job's
     /// cancel flag, if a job is running, before returning. Never blocks beyond a lock held only for
     /// a pointer swap.
@@ -340,8 +385,16 @@ struct Active {
 struct Sweep {
     /// The next index into `Queue::sweep_order`.
     next: usize,
-    /// The games already decided in this sweep.
+    /// The games already decided in this sweep, or completed and read back by a job during it:
+    /// verified by this process.
     seen: BTreeSet<[u8; 32]>,
+    /// The sweep that starts with the scheduler: until it ends, only verified completions are
+    /// published (module doc, "Reconciliation").
+    startup: bool,
+    /// Launches wait until `next` reaches this sweep position: one past the last `Done` game the
+    /// sweep has not verified before the candidate the last scan chose. Zero: no wait. Reset by
+    /// any change to the queue, which may change the candidate.
+    gate: usize,
 }
 
 /// The presolver thread's body as a synchronous state machine (module doc).
@@ -372,12 +425,19 @@ pub struct Scheduler {
     exhausted_at: Option<u64>,
     /// When a status was last published.
     published: Option<u64>,
+    /// Slots held back after a completion whose entry did not read back durably, each until the
+    /// queue-clock reading given (fix round 1, R4). Runtime-only.
+    cooldown: BTreeMap<String, u64>,
+    /// An outcome the cache cannot reconstruct is not on disk yet: its save failed. Nothing new is
+    /// launched until a save succeeds (fix round 1, R3).
+    outcome_unsaved: bool,
 }
 
 impl Scheduler {
     /// Opens the queue in `cache_root` on the executor's clock and declares the executor's
     /// generation before anything reconciles (rulings S1, S2). The idle gate starts now, and so
-    /// does the startup reconciliation sweep.
+    /// does the startup reconciliation sweep, which verifies the persisted completions before any
+    /// later work is launched and before they are published (fix round 1, R1).
     ///
     /// # Errors
     /// Whatever `Queue::open_with_clock` returns (today it rebuilds every unusable file instead).
@@ -396,7 +456,7 @@ impl Scheduler {
             last_activity: now,
             now,
             active: None,
-            sweep: Some(Sweep::default()),
+            sweep: Some(Sweep { startup: true, ..Sweep::default() }),
             last_sweep_start: now,
             dirty: changed,
             last_save: now,
@@ -408,6 +468,8 @@ impl Scheduler {
             scans: 0,
             exhausted_at: None,
             published: None,
+            cooldown: BTreeMap::new(),
+            outcome_unsaved: false,
         })
     }
 
@@ -449,15 +511,20 @@ impl Scheduler {
         true
     }
 
-    /// One iteration: at most one scheduling decision (cancel for live work, or launch when idle),
-    /// progress of the running job, a reconciliation chunk while idle, and a checkpoint save.
+    /// One iteration: a reconciliation chunk while idle, then at most one scheduling decision
+    /// (cancel for live work, or launch when idle), progress of the running job, and a checkpoint
+    /// save. The chunk comes first so that the launch sees its verdicts (fix round 1, R1).
     pub fn step(&mut self) {
         let now = self.refresh_now();
         let live = self.live.take() || self.hand_in_progress;
         if live {
             self.last_activity = now;
         }
-        let can_start = eligible(self.hand_in_progress, self.queue.paused(), now, self.last_activity);
+        let can_start = !self.live.stopping() && eligible(self.hand_in_progress, self.queue.paused(), now, self.last_activity);
+        let idle = can_start && !self.live.pending();
+        if idle {
+            self.sweep_chunk();
+        }
         let mut progressed = false;
         match next_action(self.active.as_ref().map(|a| a.job), live, can_start) {
             ScheduleAction::Cancel(_) => self.cancel_active(),
@@ -465,10 +532,6 @@ impl Scheduler {
             ScheduleAction::Wait => {}
         }
         progressed |= self.progress();
-        let idle = can_start && !self.live.pending();
-        if idle {
-            self.sweep_chunk();
-        }
         if self.sweep.is_none() && now.saturating_sub(self.last_sweep_start) >= RECONCILE_PERIOD_MS {
             self.sweep = Some(Sweep::default());
             self.last_sweep_start = now;
@@ -484,10 +547,15 @@ impl Scheduler {
         self.flush(true);
     }
 
-    /// The status to publish. Recounts the queue only after it changed.
+    /// The status to publish. Recounts the queue only after it changed. Until the startup sweep
+    /// ends, `done` and `tier_done` count only the completions verified in this process, and a
+    /// persisted `Done` not yet verified counts as pending (fix round 1, R1).
     pub fn status(&mut self) -> PresolverStatus {
         if self.counts_stale {
-            self.counts = (self.queue.status_counts(), self.queue.tier_counts());
+            self.counts = match self.sweep.as_ref().filter(|sweep| sweep.startup) {
+                Some(sweep) => self.queue.counts_verified(&|game| sweep.seen.contains(game)),
+                None => (self.queue.status_counts(), self.queue.tier_counts()),
+            };
             self.counts_stale = false;
         }
         let ((pending, done, failed), (tier_done, tier_total)) = self.counts;
@@ -561,20 +629,47 @@ impl Scheduler {
         self.dirty = true;
         self.counts_stale = true;
         self.exhausted_at = None;
+        if let Some(sweep) = self.sweep.as_mut() {
+            sweep.gate = 0;
+        }
     }
 
     /// The launch path (module doc; ruling S3). Returns whether a slot was taken from the queue.
+    /// Nothing is launched while a failure outcome is not on disk (its save is retried here every
+    /// `SAVE_RETRY_MS`), nor while a sweep has yet to verify a `Done` game before the candidate.
     /// After a scan that found nothing, the queue is scanned again only once it changed or
     /// `RESCAN_MS` has passed.
     fn launch(&mut self) -> bool {
+        if self.outcome_unsaved {
+            self.flush(false);
+            if self.outcome_unsaved {
+                return false;
+            }
+        }
+        if self.sweep.as_ref().is_some_and(|sweep| sweep.next < sweep.gate) {
+            return false;
+        }
         if self.exhausted_at.is_some_and(|at| self.now.saturating_sub(at) < RESCAN_MS) {
             return false;
         }
         self.scans += 1;
-        let Some(item) = self.queue.next_pending(self.now) else {
-            self.exhausted_at = Some(self.now);
+        let now = self.now;
+        self.cooldown.retain(|_, until| *until > now);
+        let cooling = &self.cooldown;
+        let Some((at, item)) = self.queue.next_pending_at(now, &|slot| cooling.contains_key(slot)) else {
+            self.exhausted_at = Some(now);
             return false;
         };
+        if let Some(sweep) = self.sweep.as_mut() {
+            // Ruling 15-R1: no candidate later in sweep order than a completion the sweep has not
+            // verified yet; wait until the sweep has passed the last one before the candidate.
+            let seen = &sweep.seen;
+            let unverified = self.queue.done_bindings(sweep.next..at).filter(|(_, game)| !seen.contains(game)).last();
+            if let Some((last, _)) = unverified {
+                sweep.gate = last + 1;
+                return false;
+            }
+        }
         let id = item.identity_hex();
         self.touched();
         let prepared = self.executor.prepare(&item).and_then(|job| checked(&item, job));
@@ -585,6 +680,7 @@ impl Scheduler {
                 self.queue.record_launch(&id);
                 self.queue.record_failure(&id, now, error);
                 self.queue.advance_cursor();
+                self.persist_outcome();
                 return true;
             }
         };
@@ -596,11 +692,14 @@ impl Scheduler {
             sweep.seen.insert(game);
         }
         let now = self.refresh_now();
-        if self.queue.next_pending(now).is_some_and(|next| next.identity == item.identity) {
+        let cooling = &self.cooldown;
+        let mut refused = false;
+        if self.queue.next_pending_at(now, &|slot| cooling.contains_key(slot)).is_some_and(|(_, next)| next.identity == item.identity) {
             let cancel = Arc::new(AtomicBool::new(false));
             self.live.install(Arc::clone(&cancel));
-            if self.live.pending() {
-                // Live work arrived while the job was being prepared: leave the slot unlaunched.
+            if self.live.pending() || self.live.stopping() {
+                // Live work (or shutdown) arrived while the job was being prepared: leave the slot
+                // unlaunched.
                 self.live.clear();
             } else {
                 let label = format!("{} {}", item.scenario.id(), cards(&item.board));
@@ -614,11 +713,15 @@ impl Scheduler {
                         let now = self.refresh_now();
                         self.queue.record_launch(&id);
                         self.queue.record_failure(&id, now, error);
+                        refused = true;
                     }
                 }
             }
         }
         self.queue.advance_cursor();
+        if refused {
+            self.persist_outcome();
+        }
         true
     }
 
@@ -640,14 +743,26 @@ impl Scheduler {
                 let now = self.refresh_now();
                 if verified {
                     self.queue.record_done(&active.slot);
+                    if let Some(sweep) = self.sweep.as_mut() {
+                        sweep.seen.insert(active.game);
+                    }
                 } else {
-                    self.queue.record_failure(&active.slot, now, NOT_DURABLE.into());
+                    // Ruling 15-R4: the cache could not keep a solve that did not fail. The attempt
+                    // is refunded (the game is pending again, its retry budget untouched), and the
+                    // slot cools down in memory so a solve that never verifies cannot hot-loop.
+                    self.queue.record_cancel(&active.slot);
+                    self.cooldown.insert(active.slot.clone(), now.saturating_add(NOT_DURABLE_COOLDOWN_MS));
+                    eprintln!(
+                        "presolver: {} completed, but its {NOT_DURABLE}; the slot stays pending with its attempt refunded and is held back for {NOT_DURABLE_COOLDOWN_MS} ms",
+                        active.label
+                    );
                 }
             }
             JobPoll::Cancelled => self.queue.record_cancel(&active.slot),
             JobPoll::Failed(error) => {
                 let now = self.refresh_now();
                 self.queue.record_failure(&active.slot, now, error);
+                self.persist_outcome();
             }
         }
         true
@@ -682,19 +797,38 @@ impl Scheduler {
             let valid = self.executor.entry_exists_at_target(&view);
             self.queue.reconcile_item(id, valid);
             if self.queue.item(id).map(|after| after.status) != Some(view.status) {
-                self.touched();
+                self.touched(); // the sweep is out of `self.sweep` here: reset its gate below
+                sweep.gate = 0;
             }
             decided += 1;
         }
+        if sweep.startup && decided > 0 {
+            self.counts_stale = true; // more completions are verified, so more are published
+        }
         if sweep.next < order.len() {
             self.sweep = Some(sweep);
+        } else if sweep.startup {
+            self.counts_stale = true;
         }
     }
 
-    /// Saves the queue if it changed: now if `force`, else once `CHECKPOINT_MS` has passed since
-    /// the last attempt. A failure is counted, reported once per distinct error, and left dirty.
+    /// Saves at once an outcome the cache cannot reconstruct (ruling 15-R3). If the save fails,
+    /// nothing new is launched until a save succeeds (`launch` retries it every `SAVE_RETRY_MS`).
+    fn persist_outcome(&mut self) {
+        self.outcome_unsaved = true;
+        self.flush(true);
+    }
+
+    /// Saves the queue if it changed: now if `force`, else once `CHECKPOINT_MS` -- or, while an
+    /// outcome is not on disk, `SAVE_RETRY_MS` -- has passed since the last attempt. A failure is
+    /// counted, reported once per distinct error, and left dirty.
     fn flush(&mut self, force: bool) {
-        if !self.dirty || (!force && self.now.saturating_sub(self.last_save) < CHECKPOINT_MS) {
+        if !self.dirty {
+            self.outcome_unsaved = false;
+            return;
+        }
+        let interval = if self.outcome_unsaved { SAVE_RETRY_MS } else { CHECKPOINT_MS };
+        if !force && self.now.saturating_sub(self.last_save) < interval {
             return;
         }
         self.last_save = self.now;
@@ -702,6 +836,7 @@ impl Scheduler {
         match self.queue.save() {
             Ok(()) => {
                 self.dirty = false;
+                self.outcome_unsaved = false;
                 self.stats.saves += 1;
                 self.stats.bytes += std::fs::metadata(&path).map_or(0, |m| m.len());
                 if self.save_error.take().is_some() {
@@ -712,10 +847,17 @@ impl Scheduler {
                 self.stats.failures += 1;
                 let message = error.to_string();
                 if self.save_error.as_deref() != Some(message.as_str()) {
-                    eprintln!(
-                        "presolver queue: saving {} failed ({message}); the queue keeps its progress in memory and retries at the next checkpoint",
-                        path.display()
-                    );
+                    if self.outcome_unsaved {
+                        eprintln!(
+                            "presolver queue: saving {} failed ({message}); a failure outcome is not on disk yet, so nothing new is launched until the save succeeds (retried every {SAVE_RETRY_MS} ms)",
+                            path.display()
+                        );
+                    } else {
+                        eprintln!(
+                            "presolver queue: saving {} failed ({message}); the queue keeps its progress in memory and retries at the next checkpoint",
+                            path.display()
+                        );
+                    }
                 }
                 self.save_error = Some(message);
             }
@@ -746,15 +888,92 @@ fn cards(board: &[proto::Card]) -> String {
     board.iter().map(ToString::to_string).collect()
 }
 
+/// What the handle has told the thread and the thread has not taken yet (module doc, "The thread
+/// and its mailbox"): a newer state replaces an older one, the signals are flags, and shutdown is
+/// a latch. At most `MAILBOX_CAPACITY` entries, however many calls were made.
+#[derive(Debug, Default)]
+struct Inbox {
+    /// The latest `notify_hand` state.
+    hand: Option<bool>,
+    /// The latest `pause` (`true`) or `resume` (`false`).
+    pause: Option<bool>,
+    source_changed: bool,
+    /// A live request: activity that restarts the idle gate.
+    activity: bool,
+    /// Latched: never cleared once set.
+    shutdown: bool,
+}
+
+impl Inbox {
+    fn len(&self) -> usize {
+        usize::from(self.hand.is_some())
+            + usize::from(self.pause.is_some())
+            + usize::from(self.source_changed)
+            + usize::from(self.activity)
+            + usize::from(self.shutdown)
+    }
+
+    /// The batch as the commands the scheduler applies, in this order: the hand state, the pause
+    /// state, the source change, the live request, and shutdown last, so the final states reach the
+    /// queue before a shutdown saves it.
+    fn commands(&self) -> impl Iterator<Item = PresolverCommand> {
+        [
+            self.hand.map(PresolverCommand::HandInProgress),
+            self.pause.map(|paused| if paused { PresolverCommand::Pause } else { PresolverCommand::Resume }),
+            self.source_changed.then_some(PresolverCommand::SourceChanged),
+            self.activity.then_some(PresolverCommand::LiveRequest),
+            self.shutdown.then_some(PresolverCommand::Shutdown),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+/// The bounded, coalescing mailbox between the handle and the thread (ruling 15-R2). Its lock is
+/// held only to update or take the `Inbox`, never across I/O or an executor call.
+#[derive(Default)]
+struct Mailbox {
+    inbox: Mutex<Inbox>,
+    wake: Condvar,
+}
+
+impl Mailbox {
+    /// Records a notification and wakes the thread. Never blocks beyond the lock.
+    fn post(&self, note: impl FnOnce(&mut Inbox)) {
+        note(&mut self.lock());
+        self.wake.notify_one();
+    }
+
+    /// Waits up to `timeout` for a notification, then takes everything waiting as one batch. The
+    /// shutdown latch stays set.
+    fn take(&self, timeout: Duration) -> Inbox {
+        let inbox = self.lock();
+        let (mut inbox, _) = self.wake.wait_timeout_while(inbox, timeout, |inbox| inbox.len() == 0).unwrap_or_else(PoisonError::into_inner);
+        let batch = std::mem::take(&mut *inbox);
+        inbox.shutdown = batch.shutdown;
+        batch
+    }
+
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inbox> {
+        self.inbox.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// The handle the engine owns (task 16: `Engine.presolver: Option<Arc<Presolver>>`). No method
-/// waits for the presolver thread, the executor or any I/O; commands travel on an unbounded channel,
-/// so none is ever dropped.
+/// waits for the presolver thread, the executor or any I/O. Notifications go to a bounded,
+/// coalescing mailbox (module doc, "The thread and its mailbox"): the thread always applies the
+/// latest hand and pause states, nothing is refused, and nothing piles up. Dropping the handle
+/// shuts the thread down, as `shutdown` does, without waiting for it.
 pub struct Presolver {
-    commands: mpsc::Sender<PresolverCommand>,
+    mailbox: Arc<Mailbox>,
     status: Arc<RwLock<PresolverStatus>>,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Set synchronously by `notify_live_request` and `notify_hand(true)` at engine admission, so a
-    /// live job is protected even before the presolver thread drains its channel (section 7).
+    /// live job is protected even before the presolver thread takes its mailbox (section 7).
     live: LiveSignal,
 }
 
@@ -762,24 +981,24 @@ impl Presolver {
     /// Starts the `presolver` thread over the cache root `dir`. The queue is opened on the thread,
     /// so this returns at once; until it is open, `status` is the default.
     pub fn start(dir: PathBuf, executor: Box<dyn PresolveExecutor>) -> Presolver {
-        let (commands, inbox) = mpsc::channel();
+        let mailbox = Arc::new(Mailbox::default());
         let status = Arc::new(RwLock::new(PresolverStatus::default()));
         let live = LiveSignal::default();
-        let (thread_status, thread_live) = (Arc::clone(&status), live.clone());
+        let (thread_mailbox, thread_status, thread_live) = (Arc::clone(&mailbox), Arc::clone(&status), live.clone());
         let handle = std::thread::Builder::new()
             .name("presolver".into())
-            .spawn(move || run(dir, executor, &inbox, &thread_status, thread_live))
+            .spawn(move || run(dir, executor, &thread_mailbox, &thread_status, thread_live))
             .map_err(|error| eprintln!("presolver: the thread did not start ({error}); background presolving is off"))
             .ok();
-        Presolver { commands, status, handle: Mutex::new(handle), live }
+        Presolver { mailbox, status, handle: Mutex::new(handle), live }
     }
 
     pub fn pause(&self) {
-        self.send(PresolverCommand::Pause);
+        self.mailbox.post(|inbox| inbox.pause = Some(true));
     }
 
     pub fn resume(&self) {
-        self.send(PresolverCommand::Resume);
+        self.mailbox.post(|inbox| inbox.pause = Some(false));
     }
 
     pub fn status(&self) -> PresolverStatus {
@@ -790,27 +1009,28 @@ impl Presolver {
         if in_progress {
             self.live.raise();
         }
-        self.send(PresolverCommand::HandInProgress(in_progress));
+        self.mailbox.post(|inbox| inbox.hand = Some(in_progress));
     }
 
-    /// Synchronous flag plus an asynchronous event: admission never waits for the channel.
+    /// Synchronous flag plus an asynchronous signal: admission never waits for the thread.
     pub fn notify_live_request(&self) {
         self.live.raise();
-        self.send(PresolverCommand::LiveRequest);
+        self.mailbox.post(|inbox| inbox.activity = true);
     }
 
     /// The executor's source/config snapshot changed (ruling S5); call after the executor's
     /// `generation` already describes the new snapshot.
     pub fn notify_source_changed(&self) {
-        self.send(PresolverCommand::SourceChanged);
+        self.mailbox.post(|inbox| inbox.source_changed = true);
     }
 
-    /// Signals the running job's cancellation, then asks the thread to record it, save the queue
-    /// and stop. The UI command path never joins the thread; `join_for_shutdown` is called only
-    /// from `Engine::shutdown`. Repeating it is harmless.
+    /// Signals the running job's cancellation and stops any further submission, then asks the
+    /// thread to apply the latest states, record the cancel, save the queue and stop. The UI
+    /// command path never joins the thread; `join_for_shutdown` is called only from
+    /// `Engine::shutdown`. Repeating it is harmless.
     pub fn shutdown(&self) {
-        self.live.cancel_job();
-        self.send(PresolverCommand::Shutdown);
+        self.live.stop();
+        self.mailbox.post(|inbox| inbox.shutdown = true);
     }
 
     /// Waits for the thread to stop; a second call returns at once.
@@ -823,23 +1043,23 @@ impl Presolver {
         }
     }
 
-    fn send(&self, command: PresolverCommand) {
-        // A send fails only once the thread has stopped (after `Shutdown`, or a panic that
-        // `join_for_shutdown` reports); there is nothing left to tell it.
-        let _ = self.commands.send(command);
+    /// How many notifications the thread has not taken yet: never more than `MAILBOX_CAPACITY`.
+    pub fn pending_notifications(&self) -> usize {
+        self.mailbox.len()
     }
 }
 
-/// The `presolver` thread: opens the scheduler, then alternates between draining commands and one
-/// iteration, publishing the status after each. The status lock is held only to swap the value in,
-/// never across I/O or an executor call.
-fn run(
-    dir: PathBuf,
-    executor: Box<dyn PresolveExecutor>,
-    inbox: &mpsc::Receiver<PresolverCommand>,
-    status: &RwLock<PresolverStatus>,
-    live: LiveSignal,
-) {
+impl Drop for Presolver {
+    /// The engine let go of the handle: the thread stops as after `shutdown` (it is not joined).
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// The `presolver` thread: opens the scheduler, then alternates between taking the mailbox (one
+/// bounded batch) and one iteration, publishing the status after each. The status lock is held
+/// only to swap the value in, never across I/O or an executor call.
+fn run(dir: PathBuf, executor: Box<dyn PresolveExecutor>, mailbox: &Mailbox, status: &RwLock<PresolverStatus>, live: LiveSignal) {
     let mut scheduler = match Scheduler::open(dir, executor, live) {
         Ok(scheduler) => scheduler,
         Err(error) => {
@@ -851,28 +1071,10 @@ fn run(
         publish(status, scheduler.status());
     }
     loop {
-        let mut commands = Vec::new();
+        let batch = mailbox.take(scheduler.wait_hint());
         let mut stop = false;
-        match inbox.recv_timeout(scheduler.wait_hint()) {
-            Ok(command) => commands.push(command),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => stop = true,
-        }
-        loop {
-            match inbox.try_recv() {
-                Ok(command) => commands.push(command),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    stop = true;
-                    break;
-                }
-            }
-        }
-        for command in commands {
-            if !scheduler.apply(command) {
-                stop = true;
-                break;
-            }
+        for command in batch.commands() {
+            stop |= !scheduler.apply(command);
         }
         if stop {
             scheduler.shutdown();

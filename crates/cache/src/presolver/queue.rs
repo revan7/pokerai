@@ -1031,6 +1031,28 @@ impl Queue {
         frozen().keys.iter().find(|key| self.ready(key, now_ms)).map(|key| self.view(key))
     }
 
+    /// `next_pending`, passing over every slot `skip` names by `identity_hex`, with the chosen
+    /// slot's sweep position. The scheduler (task 15, fix round 1 R4) skips the slots it holds back
+    /// in memory after a completion whose entry did not read back durably.
+    pub fn next_pending_at(&self, now_ms: u64, skip: &dyn Fn(&str) -> bool) -> Option<(usize, QueueItem)> {
+        frozen().keys.iter().enumerate().find(|(_, key)| self.ready(key, now_ms) && !skip(key)).map(|(at, key)| (at, self.view(key)))
+    }
+
+    /// The completions at sweep positions `range` (clamped to the enumeration; empty when it is
+    /// reversed), in sweep order: each position whose slot is `Done` under a binding of the current
+    /// generation, with that game's normalized identity. The scheduler (task 15, fix round 1 R1)
+    /// launches no candidate later in sweep order than a completion its reconciliation sweep has
+    /// not verified yet.
+    pub fn done_bindings(&self, range: std::ops::Range<usize>) -> impl Iterator<Item = (usize, [u8; 32])> + '_ {
+        let keys = &frozen().keys;
+        let end = range.end.min(keys.len());
+        let start = range.start.min(end);
+        keys[start..end].iter().enumerate().filter_map(move |(offset, key)| {
+            let binding = self.current(&self.file.items[key.as_str()])?;
+            (self.file.games[&binding.identity_hex()].status == TaskStatus::Done).then_some((start + offset, binding.identity))
+        })
+    }
+
     /// Steps the cursor over every slot whose progress is no longer fresh -- launched, failed or
     /// done -- so it rests on the next slot the sweep has not started, or on `CURSOR_END`. After a
     /// launch at the cursor it moves past that slot; after a revisit launch it stays.
@@ -1094,6 +1116,8 @@ impl Queue {
 
     /// A live-work cancellation refunds the in-flight attempt and returns its record to the
     /// pre-launch state: `Pending`, or `Failed{n}` still due for its retry. It never burns a retry.
+    /// The scheduler (task 15, fix round 1 R4) refunds a completed job whose entry did not read back
+    /// durably the same way: the solve did not fail, so it consumes no attempt.
     ///
     /// # Panics
     /// If `id` is not the job in flight (always-on).
@@ -1197,6 +1221,27 @@ impl Queue {
             }
         }
         (done, total)
+    }
+
+    /// `status_counts` and `tier_counts` in one pass, except that a `Done` slot counts as done only
+    /// when it is bound under the current generation and `verified` accepts its game's normalized
+    /// identity, and as pending otherwise. The scheduler (task 15, fix round 1 R1) publishes a
+    /// completion restored from the file only once its startup sweep has read the entry back.
+    pub fn counts_verified(&self, verified: &dyn Fn(&[u8; 32]) -> bool) -> ((u32, u32, u32), ([u32; 3], [u32; 3])) {
+        let (mut counts, mut done, mut total) = ((0, 0, 0), [0; 3], [0; 3]);
+        for item in self.file.items.values() {
+            let t = usize::from(item.scenario.tier) - 1; // validated 1..=3
+            total[t] += 1;
+            match *self.effective(item).status {
+                TaskStatus::Done if self.current(item).is_some_and(|binding| verified(&binding.identity)) => {
+                    counts.1 += 1;
+                    done[t] += 1;
+                }
+                TaskStatus::Done | TaskStatus::Pending => counts.0 += 1,
+                TaskStatus::Failed { .. } => counts.2 += 1,
+            }
+        }
+        (counts, (done, total))
     }
 
     fn slot(&self, id: &str, op: &str) -> &QueueItem {
