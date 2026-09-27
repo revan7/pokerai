@@ -10,8 +10,16 @@
 //! action** at replay time -- section 9.2's off-menu branch), and [`destination_map`]/
 //! [`legalize_row`] (section 8.4's legality-after-mapping rule, used once per **node**: the
 //! destination map is built a single time and then walked, unchanged, for all 1326 combo rows).
+//!
+//! The last section (P3.T16) assembles hero's current decision from those mapped nodes over the
+//! shared history branches: [`mix_action`] is section 8.4's per-action kernel (known frequency,
+//! EV only over complete branch support) and [`mix_nodes`] builds the whole [`MixedNode`] --
+//! per-combo advice, the unresolved posterior mass, the range-level mix and the reasons.
 
-use proto::{Action, LegalAction, Unavailable, UnsupportedReason};
+use crate::branches::{posterior, HistoryBranch, MASS_TOLERANCE};
+use crate::envelope::{EvReference, SourceKind};
+use crate::ev::ExpandedNode;
+use proto::{Action, ActionAdvice, ApproxReason, LegalAction, Seat, Unavailable, UnsupportedReason, COMBOS};
 
 // ---------------------------------------------------------------------------------------------
 // Likelihood interpolation (spec section 8.4).
@@ -265,21 +273,25 @@ fn allin_action(legal: &[LegalAction]) -> Option<Action> {
     allin_to(legal).map(|to| Action::AllIn { to })
 }
 
-/// Sorts `menu` into the canonical order (`Fold`, `Check`, `Call`, wagers ascending by `to`,
-/// `AllIn`) and rewrites `created`/`mapped` to the same permutation, so every row of a node sees
-/// an identical menu order regardless of the order source actions happened to arrive in.
-fn order_menu(menu: &mut Vec<Action>, created: &mut Vec<bool>, mapped: &mut [Option<usize>]) {
-    fn rank(a: &Action) -> (u8, u32) {
-        match a {
-            Action::Fold => (0, 0),
-            Action::Check => (1, 0),
-            Action::Call => (2, 0),
-            Action::Bet { to } | Action::Raise { to } => (3, *to),
-            Action::AllIn { to } => (4, *to),
-        }
+/// The canonical menu order of spec section 8.4 (`Fold`, `Check`, `Call`, wagers ascending by
+/// `to`, `AllIn`), shared by [`destination_map`]'s per-node menu and [`mix_nodes`]'s union menu so
+/// the two can never disagree.
+fn menu_rank(a: &Action) -> (u8, u32) {
+    match a {
+        Action::Fold => (0, 0),
+        Action::Check => (1, 0),
+        Action::Call => (2, 0),
+        Action::Bet { to } | Action::Raise { to } => (3, *to),
+        Action::AllIn { to } => (4, *to),
     }
+}
+
+/// Sorts `menu` into the canonical order ([`menu_rank`]) and rewrites `created`/`mapped` to the
+/// same permutation, so every row of a node sees an identical menu order regardless of the order
+/// source actions happened to arrive in.
+fn order_menu(menu: &mut Vec<Action>, created: &mut Vec<bool>, mapped: &mut [Option<usize>]) {
     let mut order: Vec<usize> = (0..menu.len()).collect();
-    order.sort_by_key(|&i| rank(&menu[i]));
+    order.sort_by_key(|&i| menu_rank(&menu[i]));
     let mut old_to_new = vec![0usize; menu.len()];
     for (new_i, &old_i) in order.iter().enumerate() {
         old_to_new[old_i] = new_i;
@@ -504,4 +516,500 @@ pub fn merge_probability(destination: &mut MappedAction, from: &Action, probabil
         }
     }
     notes.push(format!("Moved {from:?} probability {probability} to {:?}", destination.action));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Branch-supported assembly (spec section 8.4's node translation and assembly; sections 6, 8.3).
+// ---------------------------------------------------------------------------------------------
+
+/// Hero's current preflop node in one history branch, as the current decision's lookup in that
+/// branch found it (spec section 8.4).
+///
+/// - `branch_id`: the [`HistoryBranch::id`] this entry belongs to.
+/// - `node`: the source node expanded to chips (P3.T9) and already mapped onto the live legal menu
+///   ([`destination_map`]/[`legalize_row`], P3.T10), so every action is a live chip action and no
+///   action appears twice; `None` when the branch's key has no node.
+/// - `key`: the key the lookup used, retained for diagnostics whether or not a node was found; it
+///   names the missing node in `MissingPreflopNode` and in `BranchResidual`'s cause.
+/// - `created`: the destinations on `node`'s menu that the legality-after-mapping rule **created**
+///   (no legal source action owns them), each with the ORIGINAL source action whose probability
+///   was moved there first -- `(destination, from)`, exactly the `MovedProbability { from }` that
+///   [`legalize_row`] records on that destination. An [`ExpandedNode`] carries no per-action
+///   `unavailable`, so without this list the assembly could not tell a created destination's
+///   missing EV from an unnormalizable one. Empty when nothing was created. (Plan-3 deviation:
+///   the brief's `BranchNode` has only the first three fields; `Default` lets a caller write
+///   `BranchNode { branch_id, node, key, ..Default::default() }`.)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BranchNode {
+    pub branch_id: u8,
+    pub node: Option<ExpandedNode>,
+    pub key: String,
+    pub created: Vec<(Action, Action)>,
+}
+
+/// Hero's current preflop decision assembled over the shared history branches (spec sections 4.4
+/// and 8.4).
+///
+/// - `actions`: one entry per action of the union of the mapped menus, in the canonical order
+///   (Fold, Check, Call, wagers ascending, AllIn). `frequency` is the known mass
+///   `sum_{k has a} pi_{H,k}[c] * P_k(a | c)`; `ev_bb` is the posterior-averaged EV only over
+///   complete branch support, converted from chips to bb once; `headline` is always `false` (the
+///   headline is Plan 2's `assemble::headline`, which reads `unresolved_mass`).
+/// - `unresolved_mass`: hero's combo posterior mass on branches with no node (the residual, a
+///   stopped branch, or a missing key) -- reported, never renormalized away, so
+///   `sum(frequency) + unresolved_mass = 1` whenever frequencies exist.
+/// - `range_mix`: the mass-weighted action frequencies over hero's public range at the node,
+///   over the node-covered branches only (the excluded share is disclosed in `notes`); present
+///   whenever a node strategy exists, and the only strategy output under `HeroComboOutOfSupport`.
+/// - `reasons`: `ChartRounded` / `EvReferenceUnverified` for the sources that contributed, and
+///   `BranchResidual { cause: "missing node <key>" }` whenever `unresolved_mass > 0`; no
+///   duplicates.
+/// - `notes`: `"x% of the posterior has no strategy"` whenever `unresolved_mass > 0`, and the
+///   range mix's excluded share.
+/// - `unsupported`: `MissingPreflopNode { key }` when hero has a node in no positive-posterior
+///   branch; `HeroComboOutOfSupport` when hero's combo has zero public mass or a node marks its
+///   class explicitly unreachable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MixedNode {
+    pub actions: Vec<ActionAdvice>,
+    pub unresolved_mass: f32,
+    pub range_mix: Option<Vec<(Action, f32)>>,
+    pub reasons: Vec<ApproxReason>,
+    pub notes: Vec<String>,
+    pub unsupported: Option<UnsupportedReason>,
+}
+
+/// Section 8.4's per-action assembly kernel for hero's combo `c`, over the history branches `k`.
+///
+/// `posterior[k]` is hero's branch posterior `pi_{H,k}[c]` (a distribution: it sums to 1, or is
+/// all zeros when the combo has no public mass); `probs[k]` is `P_k(a | c)` when branch `k`'s node
+/// lists this action (identical kind and identical mapped chip amount), `None` when the branch has
+/// no node or its menu lacks the action; `evs[k]` is branch `k`'s normalized chip EV for the
+/// action, `None` when it has none; `same_reference` says every contributing node carries the same
+/// `EvReference` (compared before any averaging).
+///
+/// Returns `(frequency, ev, unavailable)`:
+/// - `frequency = sum_k pi_k * P_k(a | c)`, the known mass of the action: a branch without the
+///   action (or without a node) contributes nothing, and nothing is renormalized.
+/// - With `B+ = {k : pi_k > 0}`: `ev = sum_{k in B+} pi_k * EV_k` -- a plain posterior average,
+///   never weighted by action frequency and never divided by the covered posterior -- defined only
+///   when every branch of `B+` has the action with an EV and `same_reference` holds.
+/// - Otherwise `ev = None` and, in this order: `NotInMenu` when no branch of `B+` has the action;
+///   `BranchSupportIncomplete { covered_posterior }` (the `B+` posterior whose branch has the
+///   action with an EV, possibly 0) when some branch of `B+` lacks the action or a node;
+///   `NoEvReference` when every branch has the action but some EV is missing or the references
+///   differ. [`mix_nodes`] refines `NoEvReference` into `ChartNoEv` or `MovedProbability` where
+///   that is the actual cause.
+///
+/// # Panics
+/// Always (not only in debug builds), naming the offending index, if the three slices differ in
+/// length, a posterior entry is not a finite value in `[0, 1]`, the posterior neither sums to 1
+/// (within [`MASS_TOLERANCE`]) nor is all zero, a probability is not a finite value in `[0, 1]`,
+/// an EV is not finite, or an EV is given for an action absent from its branch.
+pub fn mix_action(posterior: &[f64], probs: &[Option<f64>], evs: &[Option<f64>], same_reference: bool) -> (f64, Option<f64>, Option<Unavailable>) {
+    check_mix_inputs(posterior, probs, evs);
+    let pi = posterior;
+    let freq: f64 = pi.iter().zip(probs).map(|(w, p)| w * p.unwrap_or(0.0)).sum();
+    let active: Vec<usize> = (0..pi.len()).filter(|&k| pi[k] > 0.0).collect();
+    let present = active.iter().filter(|&&k| probs[k].is_some()).count();
+    if present == 0 {
+        return (freq, None, Some(Unavailable::NotInMenu));
+    }
+    let with_ev = |k: usize| probs[k].is_some() && evs[k].is_some();
+    let covered: f64 = active.iter().filter(|&&k| with_ev(k)).map(|&k| pi[k]).sum();
+    let complete = active.iter().all(|&k| with_ev(k));
+    if complete && same_reference {
+        let ev: f64 = active.iter().map(|&k| pi[k] * evs[k].expect("complete support: every active branch has an EV")).sum();
+        return (freq, Some(ev), None);
+    }
+    if present != active.len() {
+        let covered_posterior = narrow_share(covered, "mix_action: covered posterior");
+        return (freq, None, Some(Unavailable::BranchSupportIncomplete { covered_posterior }));
+    }
+    (freq, None, Some(Unavailable::NoEvReference))
+}
+
+/// [`mix_action`]'s always-on input checks: shape first, then the value domains.
+fn check_mix_inputs(pi: &[f64], probs: &[Option<f64>], evs: &[Option<f64>]) {
+    assert!(probs.len() == pi.len(), "mix_action: posterior has {} entries but probs has {}", pi.len(), probs.len());
+    assert!(evs.len() == pi.len(), "mix_action: posterior has {} entries but evs has {}", pi.len(), evs.len());
+    for (k, w) in pi.iter().enumerate() {
+        assert!(w.is_finite() && (0.0..=1.0).contains(w), "mix_action: posterior[{k}] = {w} is not a probability in [0, 1]");
+    }
+    let total: f64 = pi.iter().sum();
+    assert!(total == 0.0 || (total - 1.0).abs() <= MASS_TOLERANCE, "mix_action: posterior sums to {total}, not 1");
+    for (k, p) in probs.iter().enumerate() {
+        if let Some(p) = p {
+            assert!(p.is_finite() && (0.0..=1.0).contains(p), "mix_action: probs[{k}] = {p} is not a probability in [0, 1]");
+        }
+    }
+    for (k, ev) in evs.iter().enumerate() {
+        if let Some(v) = ev {
+            assert!(v.is_finite(), "mix_action: evs[{k}] = {v} is not finite");
+            assert!(probs[k].is_some(), "mix_action: evs[{k}] is present for an action absent from branch {k}");
+        }
+    }
+}
+
+/// Hero's current preflop decision over the shared history branches (spec section 8.4's node
+/// translation and assembly, section 6's coverage rows, section 4.4's `unresolved_mass` and
+/// `range_mix`). `nodes` holds at most one [`BranchNode`] per branch (a branch with no entry has
+/// no node); `hero_combo` only selects hero's posterior -- hero's cards never enter any public
+/// quantity -- and `bb_chips` converts the final chip EV to bb once.
+///
+/// With `pi = posterior(branches, hero, hero_combo)` and `B+ = {k : pi_k > 0}`:
+///
+/// 1. A branch **has a node** only when it is neither the residual nor stopped (spec section 9.3:
+///    a stopped branch never resumes at a later present node, and for lookups behaves like the
+///    residual) and its entry carries a node. `unresolved_mass = sum_{k without node} pi_k`.
+/// 2. No node in any branch of `B+` (or in any branch at all): `Unsupported { MissingPreflopNode {
+///    key } }`, with no advice and no range mix; `key` is the retained key of the heaviest (`q`,
+///    ties by creation order) positive-posterior branch -- the residual has no source key, so it
+///    falls back to the heaviest known stopped/live key, never an empty invented node.
+/// 3. Hero's combo has zero public mass (`B+` empty), or a node of some branch in `B+` marks its
+///    class explicitly unreachable: `Unsupported { HeroComboOutOfSupport }`; every union action
+///    is listed with no frequency and no EV (`HeroOutOfSupport`), and the range-level mix is the
+///    only strategy output. It is never replaced by a nearby hand's strategy.
+/// 4. Otherwise every action of the union of the mapped menus goes through [`mix_action`] (an
+///    action is present in a branch only under identical kind and identical chip amount), with
+///    `same_reference` over the nodes of `B+`. A `NoEvReference` (complete action support, EV
+///    missing) is refined: `ChartNoEv` when every contributing node is a chart; `MovedProbability
+///    { from }` when every contributing node is a verified PokerData node under one reference and
+///    every missing EV belongs to a legality-created destination ([`BranchNode::created`]; `from`
+///    of the first such branch); otherwise it stays `NoEvReference`. `BranchSupportIncomplete`
+///    and `NotInMenu` are never refined.
+///
+/// `range_mix` weights each combo by `sum_{k has node} q_k * w_{H,k}[c]`, independently of hero's
+/// combo, and divides by that covered mass (the excluded share is disclosed in `notes`).
+/// Whenever `unresolved_mass > 0`, `BranchResidual { seat: hero, residual_mass_pct: 100 *
+/// unresolved_mass, cause: "missing node <key>" }` is added (the heaviest positive no-node branch's
+/// key, or the heaviest known stopped/live key when only the residual lacks a node) together with
+/// the note `"x% of the posterior has no strategy"`. Contributing chart nodes add `ChartRounded`
+/// and unverified PokerData nodes add `EvReferenceUnverified`. Branches are read, never mutated:
+/// stopping a branch belongs to the replay walk, and nothing is renormalized.
+///
+/// # Panics
+/// Always (not only in debug builds), naming the offending branch, action or combo, if `bb_chips`
+/// is 0, `hero_combo` is not a combo index, two branches share an id, a node entry names no branch
+/// or a branch twice, a node is not hero's, lists an action twice, has other than 1326 rows of its
+/// menu's length, holds a probability outside `[0, 1]` or a non-finite EV, a created destination
+/// is off its menu, names itself or carries an EV, or through [`posterior`]'s own checks.
+pub fn mix_nodes(branches: &[HistoryBranch], nodes: &[BranchNode], hero: Seat, hero_combo: usize, bb_chips: u32) -> MixedNode {
+    assert!(bb_chips > 0, "mix_nodes: bb_chips is 0");
+    assert!(hero_combo < COMBOS, "mix_nodes: hero combo {hero_combo} is out of range 0..{COMBOS}");
+    let entry = branch_entries(branches, nodes, hero);
+    let pi = posterior(branches, hero, hero_combo);
+    let all: Vec<usize> = (0..branches.len()).collect();
+    let unresolved: f64 = all.iter().filter(|&&k| entry[k].is_none()).map(|&k| pi[k]).sum();
+    let positive: Vec<usize> = all.iter().copied().filter(|&k| pi[k] > 0.0).collect();
+    if !entry.iter().any(Option::is_some) || (!positive.is_empty() && positive.iter().all(|&k| entry[k].is_none())) {
+        let candidates = if positive.is_empty() { &all } else { &positive };
+        return MixedNode {
+            actions: vec![],
+            unresolved_mass: narrow_share(unresolved, "mix_nodes: unresolved mass"),
+            range_mix: None,
+            reasons: vec![],
+            notes: vec![],
+            unsupported: Some(UnsupportedReason::MissingPreflopNode { key: retained_key(branches, nodes, candidates) }),
+        };
+    }
+    let menu = union_menu(&entry);
+    let covered_nodes: Vec<&ExpandedNode> = entry.iter().flatten().map(|e| expanded(e)).collect();
+    let (range_mix, excluded) = range_mix(branches, &entry, hero, &menu);
+    let mut out = MixedNode {
+        actions: vec![],
+        unresolved_mass: narrow_share(unresolved, "mix_nodes: unresolved mass"),
+        range_mix,
+        reasons: source_reasons(&covered_nodes),
+        notes: vec![],
+        unsupported: None,
+    };
+    if excluded > 0.0 {
+        out.notes.push(format!("range mix excludes {:.1}% of hero's public range mass (no strategy)", 100.0 * excluded));
+    }
+    let out_of_support = positive.is_empty() || positive.iter().any(|&k| entry[k].is_some_and(|e| !expanded(e).available[hero_combo]));
+    if out_of_support {
+        out.actions = menu
+            .iter()
+            .map(|&action| ActionAdvice { action, frequency: None, ev_bb: None, unavailable: Some(Unavailable::HeroOutOfSupport), headline: false })
+            .collect();
+        out.unsupported = Some(UnsupportedReason::HeroComboOutOfSupport);
+    } else {
+        let contributing: Vec<&BranchNode> = positive.iter().filter_map(|&k| entry[k]).collect();
+        let same = contributing.windows(2).all(|w| expanded(w[0]).ev_reference == expanded(w[1]).ev_reference);
+        for action in menu {
+            let probs: Vec<Option<f64>> = entry.iter().map(|e| e.and_then(|e| node_prob(e, &action, hero_combo))).collect();
+            let evs: Vec<Option<f64>> = entry.iter().map(|e| e.and_then(|e| node_ev(e, &action, hero_combo))).collect();
+            let (freq, ev, why) = mix_action(&pi, &probs, &evs, same);
+            let unavailable = refine_no_ev(why, &action, &contributing, hero_combo, same);
+            out.actions.push(ActionAdvice {
+                action,
+                frequency: Some(narrow_share(freq, "mix_nodes: frequency")),
+                ev_bb: ev.map(|v| to_bb(v, bb_chips)),
+                unavailable,
+                headline: false,
+            });
+        }
+    }
+    if unresolved > 0.0 {
+        let missing: Vec<usize> = positive.iter().copied().filter(|&k| entry[k].is_none()).collect();
+        let pct = 100.0 * unresolved;
+        assert!(pct.is_finite() && pct <= 100.0 * (1.0 + MASS_TOLERANCE), "mix_nodes: unresolved share {pct}% is not a percentage");
+        push_unique(
+            &mut out.reasons,
+            ApproxReason::BranchResidual {
+                seat: hero,
+                // Positive stays positive at the f32 boundary; `pct <= 100 * (1 + MASS_TOLERANCE)`
+                // narrows to at most exactly 100.
+                residual_mass_pct: pct.max(f64::from(f32::MIN_POSITIVE)) as f32,
+                cause: format!("missing node {}", retained_key(branches, nodes, &missing)),
+            },
+        );
+        out.notes.push(format!("{pct:.1}% of the posterior has no strategy"));
+    }
+    out
+}
+
+/// The covered-mass weight of combo `c` in hero's range mix: `sum_{k in covered} q_k *
+/// w_{H,k}[c]` over the branches whose ids are in `covered` (spec section 8.4: "the range mix uses
+/// `sum_{k has node} q_k * w_{H,k}[c]` as the mass over the branches with nodes"). Independent of
+/// hero's actual combo.
+///
+/// # Panics
+/// Always, if `c` is not a combo index or a covered branch lacks hero's seat.
+pub fn range_mix_weight(branches: &[HistoryBranch], hero: Seat, c: usize, covered: &[u8]) -> f64 {
+    assert!(c < COMBOS, "range_mix_weight: combo {c} is out of range 0..{COMBOS}");
+    branches
+        .iter()
+        .filter(|b| covered.contains(&b.id))
+        .map(|b| b.q * b.seats.iter().find(|s| s.seat == hero).unwrap_or_else(|| panic!("range_mix_weight: branch {} has no seat {hero:?}", b.id)).mass[c])
+        .sum()
+}
+
+/// One entry per branch: the branch's [`BranchNode`] when the branch **has a node** (it is neither
+/// the residual nor stopped, and its entry carries a node), else `None`. Validates every entry --
+/// including a node supplied for a frozen branch, which is ignored rather than resumed.
+fn branch_entries<'a>(branches: &[HistoryBranch], nodes: &'a [BranchNode], hero: Seat) -> Vec<Option<&'a BranchNode>> {
+    for (k, b) in branches.iter().enumerate() {
+        assert!(branches[..k].iter().all(|x| x.id != b.id), "mix_nodes: branch id {} appears more than once", b.id);
+    }
+    let mut entry: Vec<Option<&BranchNode>> = vec![None; branches.len()];
+    let mut seen = vec![false; branches.len()];
+    for n in nodes {
+        let k = branches
+            .iter()
+            .position(|b| b.id == n.branch_id)
+            .unwrap_or_else(|| panic!("mix_nodes: node for branch {} names no branch in the list", n.branch_id));
+        assert!(!seen[k], "mix_nodes: branch {} has more than one node entry", n.branch_id);
+        seen[k] = true;
+        match &n.node {
+            Some(node) => {
+                check_node(n.branch_id, node, &n.created, hero);
+                if !branches[k].residual && branches[k].stopped.is_none() {
+                    entry[k] = Some(n);
+                }
+            }
+            None => assert!(n.created.is_empty(), "mix_nodes: branch {} lists created destinations but has no node", n.branch_id),
+        }
+    }
+    entry
+}
+
+/// [`mix_nodes`]'s always-on checks of one mapped node and its created destinations.
+fn check_node(id: u8, n: &ExpandedNode, created: &[(Action, Action)], hero: Seat) {
+    assert!(n.actor == hero, "mix_nodes: branch {id}'s node is seat {:?}'s, not hero {hero:?}'s", n.actor);
+    for (i, a) in n.actions.iter().enumerate() {
+        if let Some(j) = (i + 1..n.actions.len()).find(|&j| n.actions[j] == *a) {
+            panic!("mix_nodes: branch {id}'s node lists {a:?} twice (actions {i} and {j})");
+        }
+    }
+    for (what, len) in [("probability", n.probs.len()), ("EV", n.ev_chips.len()), ("availability", n.available.len())] {
+        assert!(len == COMBOS, "mix_nodes: branch {id}'s node has {len} {what} rows, expected {COMBOS}");
+    }
+    for c in 0..COMBOS {
+        let (probs, evs) = (&n.probs[c], &n.ev_chips[c]);
+        assert!(
+            probs.len() == n.actions.len() && evs.len() == n.actions.len(),
+            "mix_nodes: branch {id}'s node combo {c} has {} probabilities and {} EVs for {} actions",
+            probs.len(),
+            evs.len(),
+            n.actions.len()
+        );
+        for (i, p) in probs.iter().enumerate() {
+            assert!(p.is_finite() && (0.0..=1.0).contains(p), "mix_nodes: branch {id}'s node combo {c} action {i} probability {p} is not in [0, 1]");
+        }
+        for (i, ev) in evs.iter().enumerate() {
+            if let Some(v) = ev {
+                assert!(v.is_finite(), "mix_nodes: branch {id}'s node combo {c} action {i} EV {v} is not finite");
+            }
+        }
+    }
+    for (j, (dest, from)) in created.iter().enumerate() {
+        let i = n
+            .actions
+            .iter()
+            .position(|a| a == dest)
+            .unwrap_or_else(|| panic!("mix_nodes: branch {id}'s created destination {dest:?} is not on its menu"));
+        assert!(dest != from, "mix_nodes: branch {id}'s created destination {dest:?} names itself as its source");
+        assert!(created[..j].iter().all(|(d, _)| d != dest), "mix_nodes: branch {id} lists created destination {dest:?} twice");
+        assert!(
+            n.ev_chips.iter().all(|row| row[i].is_none()),
+            "mix_nodes: branch {id}'s created destination {dest:?} carries an EV (a created destination owns none)"
+        );
+    }
+}
+
+/// The node of an entry [`branch_entries`] kept.
+fn expanded(e: &BranchNode) -> &ExpandedNode {
+    e.node.as_ref().expect("branch_entries keeps only entries with a node")
+}
+
+/// The union of the mapped menus in the canonical order ([`menu_rank`]); actions are identified by
+/// kind and chip amount, so a raise to 12 and a raise to 13 stay two actions.
+fn union_menu(entry: &[Option<&BranchNode>]) -> Vec<Action> {
+    let mut menu: Vec<Action> = Vec::new();
+    for e in entry.iter().flatten() {
+        for a in &expanded(e).actions {
+            if !menu.contains(a) {
+                menu.push(*a);
+            }
+        }
+    }
+    menu.sort_by_key(menu_rank);
+    menu
+}
+
+/// `P_k(a | c)` when the branch's node lists `action` (identical kind and chip amount).
+fn node_prob(e: &BranchNode, action: &Action, c: usize) -> Option<f64> {
+    let n = expanded(e);
+    n.actions.iter().position(|a| a == action).map(|i| f64::from(n.probs[c][i]))
+}
+
+/// Branch `k`'s normalized chip EV for `action` and combo `c`, when its node lists the action and
+/// carries one.
+fn node_ev(e: &BranchNode, action: &Action, c: usize) -> Option<f64> {
+    let n = expanded(e);
+    n.actions.iter().position(|a| a == action).and_then(|i| n.ev_chips[c][i]).map(f64::from)
+}
+
+/// The source action whose probability created `action` on this branch's menu, if it was created.
+fn created_from(e: &BranchNode, action: &Action) -> Option<Action> {
+    e.created.iter().find(|(d, _)| d == action).map(|(_, from)| *from)
+}
+
+/// Refines [`mix_action`]'s `NoEvReference` (complete action support, some EV missing or the
+/// references differ) into the actual cause: `ChartNoEv` when every contributing node is a chart;
+/// `MovedProbability { from }` when every contributing node is a verified PokerData node under one
+/// reference and each missing EV belongs to a legality-created destination; else unchanged.
+fn refine_no_ev(why: Option<Unavailable>, action: &Action, contributing: &[&BranchNode], c: usize, same: bool) -> Option<Unavailable> {
+    if why != Some(Unavailable::NoEvReference) {
+        return why;
+    }
+    if contributing.iter().all(|e| expanded(e).source == SourceKind::ChartTranscription) {
+        return Some(Unavailable::ChartNoEv);
+    }
+    let verified = contributing.iter().all(|e| expanded(e).source == SourceKind::PokerDataJson && expanded(e).ev_reference != EvReference::Unverified);
+    if same && verified {
+        let missing: Vec<&&BranchNode> = contributing.iter().filter(|e| node_ev(e, action, c).is_none()).collect();
+        if let Some(first) = missing.first() {
+            if missing.iter().all(|e| created_from(e, action).is_some()) {
+                return Some(Unavailable::MovedProbability { from: created_from(first, action).expect("checked just above") });
+            }
+        }
+    }
+    why
+}
+
+/// The range-level mix over the node-covered branches (spec section 8.4) and the share of hero's
+/// public range mass it excludes (branches with no node). `None` when the covered mass is zero.
+fn range_mix(branches: &[HistoryBranch], entry: &[Option<&BranchNode>], hero: Seat, menu: &[Action]) -> (Option<Vec<(Action, f32)>>, f64) {
+    let covered_ids: Vec<u8> = branches.iter().zip(entry).filter(|(_, e)| e.is_some()).map(|(b, _)| b.id).collect();
+    let uncovered_ids: Vec<u8> = branches.iter().zip(entry).filter(|(_, e)| e.is_none()).map(|(b, _)| b.id).collect();
+    let covered: f64 = (0..COMBOS).map(|c| range_mix_weight(branches, hero, c, &covered_ids)).sum();
+    let uncovered: f64 = (0..COMBOS).map(|c| range_mix_weight(branches, hero, c, &uncovered_ids)).sum();
+    let total = covered + uncovered;
+    let excluded = if total > 0.0 { uncovered / total } else { 0.0 };
+    if !(covered > 0.0) {
+        return (None, excluded);
+    }
+    let mut numerators = vec![0.0_f64; menu.len()];
+    for (b, e) in branches.iter().zip(entry) {
+        let Some(e) = e else { continue };
+        let n = expanded(e);
+        let w = &b.seats.iter().find(|s| s.seat == hero).expect("range_mix_weight checked hero's seat").mass;
+        for (j, a) in menu.iter().enumerate() {
+            if let Some(i) = n.actions.iter().position(|x| x == a) {
+                numerators[j] += (0..COMBOS).map(|c| b.q * w[c] * f64::from(n.probs[c][i])).sum::<f64>();
+            }
+        }
+    }
+    let mix = menu.iter().zip(numerators).map(|(a, x)| (*a, narrow_share(x / covered, "mix_nodes: range mix"))).collect();
+    (Some(mix), excluded)
+}
+
+/// `ChartRounded` for any contributing chart node and `EvReferenceUnverified` for any contributing
+/// PokerData node with an unverified reference (spec sections 6 and 8.3), each at most once.
+fn source_reasons(nodes: &[&ExpandedNode]) -> Vec<ApproxReason> {
+    let mut reasons = Vec::new();
+    if nodes.iter().any(|n| n.source == SourceKind::ChartTranscription) {
+        push_unique(&mut reasons, ApproxReason::ChartRounded);
+    }
+    if nodes.iter().any(|n| n.source == SourceKind::PokerDataJson && n.ev_reference == EvReference::Unverified) {
+        push_unique(&mut reasons, ApproxReason::EvReferenceUnverified);
+    }
+    reasons
+}
+
+/// Reasons accumulate without duplicates.
+fn push_unique(reasons: &mut Vec<ApproxReason>, reason: ApproxReason) {
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
+
+/// The retained key naming a missing node: the key of the heaviest (`q`, ties by creation order)
+/// non-residual branch among `candidates` that has one; else the heaviest known stopped/live key of
+/// any branch (the residual has no source key); else a descriptive label -- never an empty key.
+fn retained_key(branches: &[HistoryBranch], nodes: &[BranchNode], candidates: &[usize]) -> String {
+    let key_of = |k: usize| nodes.iter().find(|n| n.branch_id == branches[k].id).map(|n| n.key.as_str()).filter(|s| !s.is_empty());
+    let heaviest = |ks: &mut dyn Iterator<Item = usize>| {
+        ks.filter(|&k| !branches[k].residual)
+            .filter_map(|k| key_of(k).map(|key| (k, key)))
+            .max_by(|(a, _), (b, _)| branches[*a].q.total_cmp(&branches[*b].q).then(branches[*b].id.cmp(&branches[*a].id)))
+            .map(|(_, key)| key.to_string())
+    };
+    heaviest(&mut candidates.iter().copied())
+        .or_else(|| heaviest(&mut (0..branches.len())))
+        .unwrap_or_else(|| "no retained key".into())
+}
+
+/// Narrows a probability share (a frequency, a posterior mass, a range-mix weight) from `f64` to
+/// the `f32` wire type -- the assembly's only narrowing of shares, after validation. Zero stays
+/// zero; a positive share below `f32::MIN_POSITIVE` becomes `f32::MIN_POSITIVE`, so a positive
+/// unresolved mass can never narrow to the zero that would allow a headline (spec section 9.2's
+/// output-boundary rule).
+///
+/// # Panics
+/// Always, naming `what`, if `x` is not a finite value in `[0, 1 + MASS_TOLERANCE]`: out-of-domain
+/// input is an error, never clamped.
+fn narrow_share(x: f64, what: &str) -> f32 {
+    assert!(x.is_finite() && (0.0..=1.0 + MASS_TOLERANCE).contains(&x), "{what} = {x} is not a share in [0, 1]");
+    // `x <= 1 + MASS_TOLERANCE` lies within half an `f32` ulp of 1, so the narrowed share is at
+    // most exactly `1.0_f32`: nothing is clamped from above.
+    if x == 0.0 {
+        0.0
+    } else {
+        x.max(f64::from(f32::MIN_POSITIVE)) as f32
+    }
+}
+
+/// A mixed chip EV in bb (spec section 8.3: `ev_chips / bb_chips`), converted once, in `f64`, and
+/// narrowed to `f32` at the boundary.
+///
+/// # Panics
+/// Always, if the narrowed value is not finite.
+fn to_bb(ev_chips: f64, bb_chips: u32) -> f32 {
+    let out = (ev_chips / f64::from(bb_chips)) as f32;
+    assert!(out.is_finite(), "mix_nodes: EV {ev_chips} chips at {bb_chips} chips per bb is not a finite f32");
+    out
 }
