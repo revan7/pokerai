@@ -30,24 +30,37 @@ pub struct Shared { pub proto: Mutex<Proto>, pub out: SyncSender<Out>, pub jobs:
 impl Proto { pub fn new() -> Self { Self { state: WorkerState::Idle, live: None, finished: VecDeque::new(), staged: None, stopping: false } } }
 impl Default for Proto { fn default() -> Self { Self::new() } }
 
-pub enum Incoming { Line(String), TooLong, Eof }
+/// One read from stdin: a complete line (its terminator removed), a line over the limit or a line that is not
+/// UTF-8 (each consumed whole and discarded unparsed, so neither carries a readable id), or the end of input.
+pub enum Incoming { Line(String), TooLong, InvalidUtf8, Eof }
 
 /// Bounded line read: a line over `MAX_REQUEST_LINE` is consumed to its newline and reported as `TooLong`.
 /// The limit counts the line's bytes with its terminator (LF, and the CR of a CRLF), the convention
 /// `extract::result_line_len` uses for the result line; at most `MAX_REQUEST_LINE` plus one read chunk is
-/// ever buffered. An `Interrupted` read is retried, as `std`'s line readers do: `main` answers any other
-/// read error like EOF, by stopping the worker.
+/// ever buffered. A line within the limit is decoded as checked UTF-8 once it is complete (§4.5's lines are
+/// UTF-8): one that is not is `InvalidUtf8`, never repaired into a different request. An `Interrupted` read is
+/// retried, as `std`'s line readers do: `main` answers any other read error like EOF, by stopping the worker.
 pub fn read_line(reader: &mut impl BufRead) -> io::Result<Incoming> {
     let mut buf: Vec<u8> = Vec::new();
     let mut too_long = false;
     loop {
         let chunk = match reader.fill_buf() { Ok(c) => c, Err(e) if e.kind() == io::ErrorKind::Interrupted => continue, Err(e) => return Err(e) };
-        if chunk.is_empty() { return Ok(if buf.is_empty() && !too_long { Incoming::Eof } else if too_long { Incoming::TooLong } else { Incoming::Line(String::from_utf8_lossy(&buf).into_owned()) }); }
+        if chunk.is_empty() { return Ok(if buf.is_empty() && !too_long { Incoming::Eof } else if too_long { Incoming::TooLong } else { decoded(buf) }); }
         let (take, done) = match chunk.iter().position(|b| *b == b'\n') { Some(i) => (i + 1, true), None => (chunk.len(), false) };
         if !too_long { buf.extend_from_slice(&chunk[..take]); if buf.len() > MAX_REQUEST_LINE { too_long = true; buf.clear(); } }
         reader.consume(take);
-        if done { return Ok(if too_long { Incoming::TooLong } else { Incoming::Line(String::from_utf8_lossy(&buf).trim_end_matches(['\n', '\r']).to_string()) }); }
+        if done {
+            if too_long { return Ok(Incoming::TooLong); }
+            while matches!(buf.last(), Some(b'\n' | b'\r')) { buf.pop(); }   // ASCII, so never part of a multi-byte sequence
+            return Ok(decoded(buf));
+        }
     }
+}
+
+/// A complete line's bytes as text, by checked UTF-8 decoding only: a lossy decode would turn an invalid byte
+/// inside, say, a quoted `id` into U+FFFD and hand the parser a different, well-formed request.
+fn decoded(line: Vec<u8>) -> Incoming {
+    match String::from_utf8(line) { Ok(text) => Incoming::Line(text), Err(_) => Incoming::InvalidUtf8 }
 }
 
 fn send(shared: &Shared, m: WorkerMessage) { let _ = shared.out.send(Out::Msg(m)); }
@@ -66,19 +79,32 @@ pub fn handle_line(shared: &Shared, line: &str) {
 /// stdin EOF: exit 0 without an ack (§4.5). Task 13 replaces this with `begin_stop`.
 pub fn handle_eof(shared: &Shared) { let _ = shared.out.send(Out::Exit(0)); }
 
-/// A job's single terminal (§4.5): the `result` is queued first, then the job is retired (its id joins the
-/// remembered finished ids) and the worker returns to `Idle`, or, when stopping, queues `Exit(0)` behind it.
+/// A job's single terminal (§4.5): under the protocol lock the job is retired (its id joins the remembered
+/// finished ids) and the worker returns to `Idle` (or stays `Stopping`); only then, still under the lock, is
+/// the `result` queued, followed by `Exit(0)` when stopping.
 fn terminal(shared: &Shared, id: &str, outcome: JobOutcome, elapsed_ms: u32) {
+    terminal_via(shared, id, outcome, elapsed_ms, |o| { let _ = shared.out.send(o); });
+}
+
+/// `terminal` with its publication step passed in: `publish` is `shared.out` in production, and a test's
+/// probe that observes the protocol lock and state at the instant each item is published.
+fn terminal_via(shared: &Shared, id: &str, outcome: JobOutcome, elapsed_ms: u32, mut publish: impl FnMut(Out)) {
     let (status, solution, error) = match outcome {
         JobOutcome::Ok(s) => (ResultStatus::Ok, Some(s), None), JobOutcome::BestSoFar(s) => (ResultStatus::BestSoFar, Some(s), None),
         JobOutcome::Cancelled => (ResultStatus::Cancelled, None, None), JobOutcome::Error(e) => (ResultStatus::Error, None, Some(e)),
     };
-    send(shared, WorkerMessage::Result { id: id.to_string(), status, elapsed_ms, solution, error });
+    let result = WorkerMessage::Result { id: id.to_string(), status, elapsed_ms, solution, error };
     let mut p = shared.proto.lock().unwrap();
     p.live = None;
     p.finished.push_back(id.to_string());
     if p.finished.len() > FINISHED_IDS { p.finished.pop_front(); }
-    if p.stopping { p.state = WorkerState::Stopping; let _ = shared.out.send(Out::Exit(0)); } else { p.state = WorkerState::Idle; }
+    p.state = if p.stopping { WorkerState::Stopping } else { WorkerState::Idle };
+    // The result is the last effect of retirement and is published under the same lock: once the engine has seen
+    // it, control cannot find the job still live or the worker not yet `Idle` (and answer the engine's next
+    // `solve` "busy"), nor queue an `already_finished` ack ahead of it. The writer never takes this lock, so a
+    // full `out` still drains. `Exit(0)` follows the result, in queue order.
+    publish(Out::Msg(result));
+    if p.stopping { publish(Out::Exit(0)); }
 }
 
 /// The executor's panic boundary (§4.5 `internal`, retryable): a job that panics becomes an error carrying
@@ -125,6 +151,7 @@ mod tests {
             match read_line(&mut r).unwrap() {
                 Incoming::Line(l) => out.push(l),
                 Incoming::TooLong => out.push("<too long>".into()),
+                Incoming::InvalidUtf8 => out.push("<not utf-8>".into()),
                 Incoming::Eof => return out,
             }
         }
@@ -164,6 +191,23 @@ mod tests {
         let long = "w".repeat(2 * MAX_REQUEST_LINE + 7);
         assert_eq!(read_all(format!("{long}\nz\n").as_bytes()), vec!["<too long>", "z"]);
         assert_eq!(read_all(format!("{long}\r\n{long}").as_bytes()), vec!["<too long>", "<too long>"]);
+    }
+
+    /// Review I2: §4.5's lines are UTF-8. A line that is not is reported as exactly that, consumed whole,
+    /// terminated or not, and never repaired with U+FFFD into a different request; the lines around it are
+    /// unaffected.
+    #[test]
+    fn a_line_that_is_not_utf8_is_reported_as_such_never_repaired() {
+        // 0xFF inside the quoted id: a lossy decoder would hand the parser the valid request {"id":"\u{FFFD}"}
+        assert_eq!(read_all(b"{\"id\":\"\xff\"}\n{\"b\":2}\n"), vec!["<not utf-8>", "{\"b\":2}"]);
+        assert_eq!(read_all(b"{\"id\":\"\xff\"}\r\n{\"b\":2}\r\n"), vec!["<not utf-8>", "{\"b\":2}"]);
+        // a final line without a terminator: a truncated two-byte sequence
+        assert_eq!(read_all(b"{\"b\":2}\n{\"id\":\"\xc3\"}"), vec!["{\"b\":2}", "<not utf-8>"]);
+        // an overlong encoding and a UTF-16 surrogate are not UTF-8 either
+        assert_eq!(read_all(b"\xc0\xaf\n\xed\xa0\x80\n"), vec!["<not utf-8>", "<not utf-8>"]);
+        // valid multi-byte text that straddles two read chunks (the reader's buffer is 64 bytes) decodes whole
+        let split = format!("{}\u{e9}\u{1F0A1}", "x".repeat(63));
+        assert_eq!(read_all(format!("{split}\n").as_bytes()), vec![split]);
     }
 
     /// A reader that fails its first `fill_buf` with `Interrupted`, as a signal-interrupted read does.
@@ -302,5 +346,79 @@ mod tests {
         // a job that returns is passed through with its own elapsed time
         let r = caught(std::time::Instant::now(), || job::JobResult { outcome: JobOutcome::Cancelled, elapsed_ms: 17 });
         assert!(matches!(r, (JobOutcome::Cancelled, 17)));
+    }
+
+    // ---- Fix round 1 (review I3): no terminal is visible before the retirement that makes it true ----
+
+    use std::sync::TryLockError;
+
+    /// What another thread (control) could observe right now: the protocol lock held, so it can act on nothing
+    /// yet, or free with the state it would act on: (state, a live job, the id remembered as finished). It never
+    /// blocks: `try_lock` reports a held lock as `WouldBlock` whoever holds it, including the calling thread.
+    #[derive(Debug, PartialEq)]
+    enum Seen { LockHeld, Free(WorkerState, bool, bool) }
+    fn seen_now(shared: &Shared, id: &str) -> Seen {
+        match shared.proto.try_lock() {
+            Ok(p) => Seen::Free(p.state, p.live.is_some(), p.finished.iter().any(|f| f == id)),
+            Err(TryLockError::WouldBlock) => Seen::LockHeld,
+            Err(TryLockError::Poisoned(e)) => panic!("poisoned: {e}"),
+        }
+    }
+    fn published(o: &Out) -> String {
+        match o { Out::Msg(WorkerMessage::Result { id, status, .. }) => format!("result {id} {status:?}"), Out::Msg(m) => format!("{m:?}"), Out::Exit(c) => format!("exit {c}") }
+    }
+    /// The state the executor finds at its terminal: job `id` live, the worker extracting, or stopping.
+    fn live_job(id: &str, stopping: bool, out: SyncSender<Out>) -> Arc<Shared> {
+        let (unused_jobs, _) = channel::<Job>();
+        let shared = Arc::new(Shared { proto: Mutex::new(Proto::new()), out, jobs: unused_jobs });
+        {
+            let mut p = shared.proto.lock().unwrap();
+            p.state = if stopping { WorkerState::Stopping } else { WorkerState::Extracting };
+            p.live = Some(LiveJob { id: id.into(), cancel: Arc::new(AtomicBool::new(false)) });
+            p.stopping = stopping;
+        }
+        shared
+    }
+
+    /// Deterministic: the probe runs at the instant each item is published. The result (and, when stopping, the
+    /// `Exit(0)` behind it) is published only under the protocol lock and after the job is retired, so once the
+    /// engine has seen the result, control can never find the job still live, the worker not yet back to `Idle`,
+    /// or the id not yet finished (which would answer the engine's next `solve` "busy", §4.5).
+    #[test]
+    fn the_terminal_is_published_under_the_lock_after_the_job_is_retired() {
+        for stopping in [false, true] {
+            let (out_tx, _out_rx) = sync_channel::<Out>(1);
+            let shared = live_job("31", stopping, out_tx);
+            let mut log = Vec::new();
+            terminal_via(&shared, "31", JobOutcome::Cancelled, 5, |o| log.push((seen_now(&shared, "31"), published(&o))));
+            let mut want = vec![(Seen::LockHeld, "result 31 Cancelled".to_string())];
+            if stopping { want.push((Seen::LockHeld, "exit 0".to_string())); }
+            assert_eq!(log, want, "stopping: {stopping}");
+            let end = if stopping { WorkerState::Stopping } else { WorkerState::Idle };
+            assert_eq!(seen_now(&shared, "31"), Seen::Free(end, false, true), "the lock is released with the job retired");
+        }
+    }
+
+    /// The same through the real `terminal` and `out` (a rendezvous channel; this test is the writer and then
+    /// control). Once the result is taken off the channel, control's next admission finds the job retired; when
+    /// stopping, the executor still holds the lock until its `Exit(0)` is taken as well.
+    #[test]
+    fn control_never_finds_the_job_live_once_its_result_is_out() {
+        for stopping in [false, true] {
+            let (out_tx, out_rx) = sync_channel::<Out>(0);
+            let shared = live_job("32", stopping, out_tx);
+            let sh = shared.clone();
+            let executor = std::thread::spawn(move || terminal(&sh, "32", JobOutcome::Cancelled, 5));
+            assert_eq!(published(&out_rx.recv().unwrap()), "result 32 Cancelled");
+            if stopping {
+                assert_eq!(seen_now(&shared, "32"), Seen::LockHeld, "the executor holds the lock from its result to its exit");
+                assert_eq!(published(&out_rx.recv().unwrap()), "exit 0");
+            }
+            let p = shared.proto.lock().unwrap();   // control's admission, right after the engine saw the result
+            let end = if stopping { WorkerState::Stopping } else { WorkerState::Idle };
+            assert_eq!((p.state, p.live.is_some(), p.finished.iter().any(|f| f == "32")), (end, false, true), "stopping: {stopping}");
+            drop(p);
+            executor.join().expect("executor thread");
+        }
     }
 }

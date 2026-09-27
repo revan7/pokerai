@@ -1,9 +1,16 @@
+use proto::worker::{AckStatus, WorkerMessage};
 use solver_worker::protocol::{executor_loop, handle_eof, handle_line, read_line, Incoming, Proto, Shared};
 use solver_worker::writer::{spawn_writer, Out};
-use std::sync::{mpsc::channel, Arc, Mutex};
+use std::sync::mpsc::{channel, SyncSender};
+use std::sync::{Arc, Mutex};
 
 fn parse_threads(args: &[String]) -> u8 {
     args.iter().position(|a| a == "--threads").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u8>().ok()).filter(|n| *n >= 1).unwrap_or(16)
+}
+
+/// A line rejected before it is parsed has no id that can be read, so its ack carries "unknown".
+fn reject_unparsed(out: &SyncSender<Out>, reason: &str) {
+    let _ = out.send(Out::Msg(WorkerMessage::Ack { id: "unknown".into(), status: AckStatus::Rejected, reason: Some(reason.into()), replaced: None }));
 }
 
 fn main() {
@@ -22,7 +29,8 @@ fn main() {
     loop {
         match read_line(&mut reader) {
             Ok(Incoming::Line(l)) => handle_line(&shared, &l),
-            Ok(Incoming::TooLong) => { let _ = out.send(Out::Msg(proto::worker::WorkerMessage::Ack { id: "unknown".into(), status: proto::worker::AckStatus::Rejected, reason: Some("line exceeds 1 MiB".into()), replaced: None })); }
+            Ok(Incoming::TooLong) => reject_unparsed(&out, "line exceeds 1 MiB"),
+            Ok(Incoming::InvalidUtf8) => reject_unparsed(&out, "line is not valid UTF-8"),
             Ok(Incoming::Eof) | Err(_) => { handle_eof(&shared); break; }
         }
     }
