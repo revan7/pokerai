@@ -28,6 +28,15 @@ fn fits(deadline_ms: f64, elapsed_ms: f64, margin_ms: f64, iter_cost_ms: f64) ->
     if iter_cost_ms > 0.0 { (deadline_ms - elapsed_ms - margin_ms) / iter_cost_ms } else { f64::INFINITY }
 }
 
+/// Where the loop is, as `run` reports it to its caller immediately before it happens (the job's hooks seam,
+/// `job::Hooks::loop_site`), each with the number of iterations completed so far. Its three cancel polls:
+/// `Boundary` at the top of every pass, before the first iteration and between two (§4.5's "next iteration
+/// boundary"); `Stepped` right after a solve step, before any measurement; `Measured` right after a measurement,
+/// before its outcome is published. The work between them: `Iteration(n)`, the n-th solve step, about to run;
+/// `Measurement(n)`, an exploitability measurement after n iterations, about to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopSite { Boundary(u32), Stepped(u32), Measured(u32), Iteration(u32), Measurement(u32) }
+
 /// The operations and clock the scheduling loop drives, factored out of `run` so the deadline and
 /// cancellation policy in `run_loop` -- the part under test for R1/R2 -- can be exercised
 /// deterministically against scripted costs and a fake clock (`testutil::FakeOps`), never a real
@@ -36,10 +45,14 @@ trait LoopOps {
     fn elapsed_ms(&self) -> f64;
     fn run_iteration(&mut self, iteration: u32) -> f64;
     fn measure_exploitability(&mut self) -> (f32, f64);
+    /// Called immediately before each poll and each operation (`LoopSite`); it neither polls nor decides
+    /// anything. `RealOps` hands it to `run`'s caller; the fakes keep this no-op.
+    fn at_site(&mut self, _at: LoopSite) {}
 }
 
-struct RealOps<'g> { game: &'g PostFlopGame, started: Instant }
-impl LoopOps for RealOps<'_> {
+struct RealOps<'g, 'h> { game: &'g PostFlopGame, started: Instant, at_site: &'h mut dyn FnMut(LoopSite) }
+impl LoopOps for RealOps<'_, '_> {
+    fn at_site(&mut self, at: LoopSite) { (self.at_site)(at) }
     fn elapsed_ms(&self) -> f64 { self.started.elapsed().as_secs_f64() * 1000.0 }
     fn run_iteration(&mut self, iteration: u32) -> f64 {
         let t = Instant::now();
@@ -53,8 +66,10 @@ impl LoopOps for RealOps<'_> {
     }
 }
 
-pub fn run(game: &PostFlopGame, p: &LoopParams, cancel: &AtomicBool, progress: impl FnMut(u32, Option<f32>)) -> LoopOutcome {
-    let mut ops = RealOps { game, started: p.started };
+/// The §7 loop on `game`. `at_site` is called immediately before each of its cancel polls and each of its
+/// operations (`LoopSite`); the job passes its hooks' `loop_site`, a no-op in production.
+pub fn run(game: &PostFlopGame, p: &LoopParams, cancel: &AtomicBool, progress: impl FnMut(u32, Option<f32>), at_site: &mut dyn FnMut(LoopSite)) -> LoopOutcome {
+    let mut ops = RealOps { game, started: p.started, at_site };
     run_loop(&mut ops, p.deadline_ms as f64, p.extraction_margin_ms as f64, p.target_chips, cancel, progress)
 }
 
@@ -75,6 +90,7 @@ fn run_loop<O: LoopOps>(
     let mut last_progress_ms = 0.0f64;
     loop {
         // Checkpoint: nothing further starts once cancellation is observed (§4.5).
+        ops.at_site(LoopSite::Boundary(iters));
         if cancel.load(Ordering::SeqCst) {
             return LoopOutcome { iterations: iters, exploitability: expl, reached_target: false, cancelled: true };
         }
@@ -85,12 +101,14 @@ fn run_loop<O: LoopOps>(
         let due_guess = expl_due(iters + 1, fits(deadline_ms, elapsed, margin_ms, next_cost_bound));
         if should_stop(elapsed, next_cost_bound, due_guess, margin_ms, deadline_ms) { break; }
 
+        ops.at_site(LoopSite::Iteration(iters + 1));
         let step_cost = ops.run_iteration(iters);
         iters += 1;
         max_iter_ms = max_iter_ms.max(step_cost);
 
         // R2: poll cancellation immediately after the (expensive, non-interruptible) solve step,
         // before starting a measurement.
+        ops.at_site(LoopSite::Stepped(iters));
         if cancel.load(Ordering::SeqCst) {
             return LoopOutcome { iterations: iters, exploitability: expl, reached_target: false, cancelled: true };
         }
@@ -104,11 +122,13 @@ fn run_loop<O: LoopOps>(
             // on the next pass if nothing changes.
             let remaining_after_margin = deadline_ms - elapsed - margin_ms;
             if remaining_after_margin >= max_iter_ms {
+                ops.at_site(LoopSite::Measurement(iters));
                 let (value, _measure_cost) = ops.measure_exploitability();
                 expl = Some(value);
 
                 // R2: poll cancellation immediately after the measurement and before publishing
                 // a target-reached outcome -- an early return here must not bypass this checkpoint.
+                ops.at_site(LoopSite::Measured(iters));
                 if cancel.load(Ordering::SeqCst) {
                     return LoopOutcome { iterations: iters, exploitability: expl, reached_target: false, cancelled: true };
                 }
