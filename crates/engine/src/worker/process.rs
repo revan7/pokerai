@@ -1,0 +1,592 @@
+//! The production `WorkerLink`: the `solver-worker` binary as a child process (§3.1, §3.4, §4.5, §10.3, §12).
+//!
+//! One live process at a time, with three threads of its own (§3.4):
+//! - `worker-stdin` writes the queued request lines in order, so `send` never blocks on a worker that stopped
+//!   reading; a failed write ends the thread and the next `send` reports the process's state.
+//! - `worker-stdout` reads bounded lines (`read_line`: at most `MAX_RESULT_LINE` bytes counting the LF, the worker's
+//!   own convention for both of its limits), decodes each into a `WorkerMessage` and queues it for `recv`. A line that
+//!   is too long, not UTF-8 or not a message is queued as an error and reading goes on at the next line: a fault is
+//!   reported (the caller restarts the worker, §12), never a panic, and never repaired into a different message.
+//! - `worker-stderr` drains diagnostics into a ring of the last `STDERR_RING` bytes (`stderr_tail`).
+//!
+//! Start (`spawn`, `restart`): launch with `--threads N`, place the child in the job object (`job_object`; a failed
+//! assignment fails the launch), and wait up to `STARTUP_TIMEOUT` for the first line, which must be a `ready` that
+//! `validate_ready` accepts. A launch that fails otherwise (the binary does not start, exits, stays silent, or writes
+//! something else first) is killed and retried once, then `Spawn` (§4.5). A `ready` that fails validation is refused
+//! at once, without the retry: the same binary reports the same values (§12, "until rebuilt"). So every `spawn` and
+//! every `restart` launches at most twice, each launch bounded by the startup timeout, and a failure is returned as
+//! `Spawn` with every attempt's reason; `restarts()` counts the restarts.
+//!
+//! End: `recv` reports the end of stdout only after every line before it, as `Exit{code}` once the exit is confirmed
+//! (within `EXIT_CONFIRM`, a liveness bound: a process whose stdout closed is exiting) or `Eof` if it is not, and
+//! keeps giving that answer. A line cut off by the end of stdout (a process that died mid-write) is dropped: the
+//! death itself is what gets reported. A second `ready` is a protocol error (`ready` is written once, §4.5). `kill` is
+//! idempotent: it ends the stdin writer, terminates and reaps the child (bounded), closes the job and waits (bounded)
+//! for the stderr drain, so the ring is complete afterwards. Dropping a `ProcessWorker` kills its worker.
+//!
+//! Win32 here (kernel32): `WaitForSingleObject` on the child's process handle (the bounded exit confirmation and
+//! reap) and `K32GetProcessMemoryInfo` (`PeakWorkingSetSize`, measured from the engine, which is why the worker has
+//! no memory query of its own); `CREATE_NO_WINDOW` as the creation flag, so the console worker never opens a console
+//! window under the GUI app. The job object's calls are all in `job_object`.
+use super::job_object::{self, JobHandle};
+use super::link::{WorkerLink, WorkerLinkError};
+use super::ready::validate_ready;
+use proto::worker::{EngineMessage, Ready, WorkerMessage, REQUEST_LINE_MAX};
+use std::collections::VecDeque;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+/// §4.5's result-line limit, owned by `proto::worker`; re-exported, never redefined. It counts the line's bytes
+/// with its LF terminator (the worker's `extract::result_line_len` convention).
+pub use proto::worker::RESULT_LINE_MAX as MAX_RESULT_LINE;
+/// §4.5: the worker's stderr is drained into a 64 KiB ring.
+pub const STDERR_RING: usize = 64 << 10;
+/// §4.5: `ready` within 5 s of the launch.
+pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// §4.5: a launch that does not reach a valid `ready` is retried once.
+pub const START_ATTEMPTS: u32 = 2;
+/// Liveness bound on confirming the exit of a process whose stdout has closed (§4.5's own exit bound is 2 s).
+const EXIT_CONFIRM: Duration = Duration::from_secs(2);
+/// Liveness bound on reaping a terminated child; termination is immediate, the bound only keeps `kill` from blocking.
+const REAP: Duration = Duration::from_secs(10);
+/// Liveness bound on the stderr drain after the child is gone (the pipe is at EOF by then).
+const STDERR_DRAIN: Duration = Duration::from_secs(2);
+/// How much of an undecodable line a `Protocol` error quotes.
+const EXCERPT: usize = 200;
+
+type Incoming = Result<WorkerMessage, WorkerLinkError>;
+
+/// The live process and the ends of its three threads' channels.
+struct Live {
+    child: Child,
+    stdin: Sender<Vec<u8>>,
+    lines: Receiver<Incoming>,
+    /// Disconnects when the stderr drain has ended (its sender is dropped with the thread).
+    stderr_done: Receiver<()>,
+    /// Held for its `Drop`: closing it kills whatever is still in the job.
+    _job: JobHandle,
+    /// The confirmed end of stdout (`Exit` or `Eof`), once `recv` has observed it.
+    gone: Option<WorkerLinkError>,
+}
+
+pub struct ProcessWorker {
+    exe: PathBuf,
+    threads: u8,
+    startup: Duration,
+    live: Option<Live>,
+    ready: Option<Ready>,
+    stderr: Arc<Mutex<VecDeque<u8>>>,
+    restarts: u32,
+}
+
+/// Why one launch failed: `Refused` (a `ready` that fails validation) is final, `Failed` is retried once.
+enum Launch { Refused(String), Failed(WorkerLinkError) }
+
+impl ProcessWorker {
+    /// Spawns with `--threads N`, assigns the job object, validates `ready` within 5 s; one retry, then `Spawn`.
+    pub fn spawn(exe: &Path, threads: u8) -> Result<ProcessWorker, WorkerLinkError> { Self::spawn_with(exe, threads, STARTUP_TIMEOUT) }
+
+    /// `spawn` with another startup timeout: the seam the startup-timeout test uses (a stand-in that never writes
+    /// `ready` fails either way; the seam only keeps the test from waiting 2 x 5 s).
+    pub(crate) fn spawn_with(exe: &Path, threads: u8, startup: Duration) -> Result<ProcessWorker, WorkerLinkError> {
+        let mut w = ProcessWorker { exe: exe.to_path_buf(), threads, startup, live: None, ready: None, stderr: Arc::new(Mutex::new(VecDeque::new())), restarts: 0 };
+        w.start()?;
+        Ok(w)
+    }
+
+    /// The last `STDERR_RING` bytes the worker wrote to stderr, across launches (lossy UTF-8).
+    pub fn stderr_tail(&self) -> String {
+        let ring = lock(&self.stderr);
+        let (a, b) = ring.as_slices();
+        String::from_utf8_lossy(&[a, b].concat()).into_owned()
+    }
+
+    /// How many times `restart` has been called on this link (each call launches at most `START_ATTEMPTS` times).
+    pub fn restarts(&self) -> u32 { self.restarts }
+
+    /// At most `START_ATTEMPTS` launches; a refused `ready` ends it at once.
+    fn start(&mut self) -> Result<(), WorkerLinkError> {
+        let mut failures = Vec::new();
+        for attempt in 1..=START_ATTEMPTS {
+            match self.launch() {
+                Ok(()) => return Ok(()),
+                Err(Launch::Refused(reason)) => {
+                    self.kill();
+                    return Err(WorkerLinkError::Spawn(format!("{}: ready refused: {reason}", self.exe.display())));
+                }
+                Err(Launch::Failed(e)) => { self.kill(); failures.push(format!("attempt {attempt}: {e}")); }
+            }
+        }
+        Err(WorkerLinkError::Spawn(format!("{} did not become ready after {START_ATTEMPTS} attempts ({})", self.exe.display(), failures.join("; "))))
+    }
+
+    fn launch(&mut self) -> Result<(), Launch> {
+        assert!(self.live.is_none() && self.ready.is_none(), "launch: the previous worker was not killed first");
+        let failed = |what: String| Launch::Failed(WorkerLinkError::Spawn(what));
+        let mut cmd = Command::new(&self.exe);
+        cmd.args(["--threads", &self.threads.to_string()]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        no_console_window(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| failed(format!("{}: {e}", self.exe.display())))?;
+        let job = match job_object::assign(&child) {
+            Ok(job) => job,
+            Err(e) => { terminate(&mut child); return Err(failed(format!("job object: {e}"))); }
+        };
+        let stdin = child.stdin.take().expect("stdin is piped");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let pipes = start_threads(stdin, stdout, stderr, self.stderr.clone());
+        let (stdin, lines, stderr_done) = match pipes {
+            Ok(p) => p,
+            Err(e) => { terminate(&mut child); return Err(failed(format!("worker threads: {e}"))); }
+        };
+        self.live = Some(Live { child, stdin, lines, stderr_done, _job: job, gone: None });
+        match self.recv_any(self.startup) {
+            Ok(Some(WorkerMessage::Ready(r))) => {
+                validate_ready(&r, self.threads).map_err(Launch::Refused)?;
+                self.ready = Some(r);
+                Ok(())
+            }
+            Ok(Some(other)) => Err(Launch::Failed(WorkerLinkError::Protocol(format!("expected ready, got {}", kind(&other))))),
+            Ok(None) => Err(Launch::Failed(WorkerLinkError::Protocol(format!("no ready within {} ms", self.startup.as_millis())))),
+            Err(e) => Err(Launch::Failed(e)),
+        }
+    }
+
+    /// The next message of any kind (`ready` included, for `launch`).
+    fn recv_any(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> {
+        let Some(live) = self.live.as_mut() else { return Err(WorkerLinkError::Eof) };
+        if let Some(gone) = &live.gone { return Err(gone.clone()); }
+        match live.lines.recv_timeout(timeout) {
+            Ok(item) => item.map(Some),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => {
+                let gone = match wait_for_exit(&mut live.child, EXIT_CONFIRM) { Some(st) => WorkerLinkError::Exit { code: exit_code(st) }, None => WorkerLinkError::Eof };
+                live.gone = Some(gone.clone());
+                Err(gone)
+            }
+        }
+    }
+}
+
+impl WorkerLink for ProcessWorker {
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError> {
+        let line = encode_request(msg)?;
+        let Some(live) = self.live.as_mut() else { return Err(WorkerLinkError::Eof) };
+        if let Some(gone) = &live.gone { return Err(gone.clone()); }
+        if let Ok(Some(st)) = live.child.try_wait() { return Err(WorkerLinkError::Exit { code: exit_code(st) }); }
+        // The writer thread only ends at a failed write: the process is gone or going. Not recorded in `gone`, which
+        // `recv` sets only once it has read every line the process wrote.
+        live.stdin.send(line).map_err(|_| match wait_for_exit(&mut live.child, EXIT_CONFIRM) { Some(st) => WorkerLinkError::Exit { code: exit_code(st) }, None => WorkerLinkError::Eof })
+    }
+    fn recv(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> {
+        match self.recv_any(timeout)? {
+            Some(WorkerMessage::Ready(_)) => Err(WorkerLinkError::Protocol("a second ready (ready is written once, §4.5)".into())),
+            other => Ok(other),
+        }
+    }
+    fn restart(&mut self) -> Result<(), WorkerLinkError> {
+        self.kill();
+        self.restarts += 1;
+        self.start()
+    }
+    fn kill(&mut self) {
+        self.ready = None;
+        let Some(Live { mut child, stdin, lines, stderr_done, _job: job, .. }) = self.live.take() else { return };
+        drop(stdin);           // the writer thread ends at its next receive (or at its failed write, below)
+        terminate(&mut child); // TerminateProcess and a bounded reap
+        drop(job);             // the last handle to the job: anything still in it is killed
+        drop(lines);           // the reader thread ends at the pipe's EOF, or at its next send
+        let _ = stderr_done.recv_timeout(STDERR_DRAIN);
+    }
+    fn ready(&self) -> Option<&Ready> { self.ready.as_ref() }
+    fn peak_working_set_bytes(&self) -> u64 { self.live.as_ref().map_or(0, |l| peak_ws(&l.child)) }
+}
+
+impl Drop for ProcessWorker {
+    fn drop(&mut self) { self.kill(); }
+}
+
+/// A request as the exact bytes of its line: the JSON object and its LF, within §4.5's 1 MiB request-line limit
+/// counted with the LF (the worker's reader counts the same way, and answers an over-limit line with an ack it can
+/// only address to "unknown", so the engine never sends one).
+pub(crate) fn encode_request(msg: &EngineMessage) -> Result<Vec<u8>, WorkerLinkError> {
+    let mut line = serde_json::to_vec(msg).map_err(|e| WorkerLinkError::Protocol(format!("the request does not serialize: {e}")))?;
+    assert!(!line.contains(&b'\n'), "serde_json escapes every newline inside a JSON value");
+    line.push(b'\n');
+    if line.len() > REQUEST_LINE_MAX { return Err(WorkerLinkError::LineTooLong(line.len())); }
+    Ok(line)
+}
+
+type Pipes = (Sender<Vec<u8>>, Receiver<Incoming>, Receiver<()>);
+
+fn start_threads(stdin: impl Write + Send + 'static, stdout: impl Read + Send + 'static, stderr: impl Read + Send + 'static, ring: Arc<Mutex<VecDeque<u8>>>) -> io::Result<Pipes> {
+    let (req_tx, req_rx) = channel::<Vec<u8>>();
+    let (line_tx, line_rx) = channel::<Incoming>();
+    let (done_tx, done_rx) = channel::<()>();
+    std::thread::Builder::new().name("worker-stdin".into()).spawn(move || pump_stdin(stdin, req_rx))?;
+    std::thread::Builder::new().name("worker-stdout".into()).spawn(move || pump_stdout(stdout, MAX_RESULT_LINE, line_tx))?;
+    std::thread::Builder::new().name("worker-stderr".into()).spawn(move || drain_stderr(stderr, &ring, done_tx))?;
+    Ok((req_tx, line_rx, done_rx))
+}
+
+fn pump_stdin(mut stdin: impl Write, requests: Receiver<Vec<u8>>) {
+    for line in requests {
+        if stdin.write_all(&line).and_then(|()| stdin.flush()).is_err() { return; }
+    }
+}
+
+/// Reads `stdout` line by line until its end (or until `recv`'s side is gone), queuing each line decoded.
+fn pump_stdout(stdout: impl Read, max: usize, lines: Sender<Incoming>) {
+    let mut reader = BufReader::with_capacity(1 << 16, stdout);
+    loop {
+        let item = match read_line(&mut reader, max) {
+            Ok(Some(line)) => decode(line),
+            // The end of stdout; a read error on the pipe is its end too. Either way `recv` then confirms the exit.
+            Ok(None) | Err(_) => return,
+        };
+        if lines.send(item).is_err() { return; }
+    }
+}
+
+/// Keeps the last `STDERR_RING` bytes; `_done` is dropped when the pipe ends, which is what `kill` waits for.
+fn drain_stderr(mut stderr: impl Read, ring: &Mutex<VecDeque<u8>>, _done: Sender<()>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match stderr.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => push_ring(&mut lock(ring), &buf[..n], STDERR_RING),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
+}
+
+fn push_ring(ring: &mut VecDeque<u8>, bytes: &[u8], cap: usize) {
+    ring.extend(&bytes[bytes.len().saturating_sub(cap)..]);
+    let excess = ring.len().saturating_sub(cap);
+    ring.drain(..excess);
+}
+
+/// One complete stdout line, classified. The lengths count the terminator.
+#[derive(Debug, PartialEq)]
+enum Line { Text(String), TooLong(usize), NotUtf8(usize) }
+
+/// Bounded line read: at most `max` bytes counting the LF are buffered; a longer line is consumed to its LF and
+/// reported with its full length. A complete line is decoded as checked UTF-8, never repaired. `None` at the end
+/// of input, including after an unterminated tail (see the module doc). `Interrupted` reads are retried.
+fn read_line(reader: &mut impl BufRead, max: usize) -> io::Result<Option<Line>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut len = 0usize;
+    loop {
+        let chunk = match reader.fill_buf() { Ok(c) => c, Err(e) if e.kind() == io::ErrorKind::Interrupted => continue, Err(e) => return Err(e) };
+        if chunk.is_empty() { return Ok(None); }
+        let (take, done) = match chunk.iter().position(|b| *b == b'\n') { Some(i) => (i + 1, true), None => (chunk.len(), false) };
+        len = len.saturating_add(take);
+        if len <= max { buf.extend_from_slice(&chunk[..take]); } else if buf.capacity() > 0 { buf = Vec::new(); }
+        reader.consume(take);
+        if done {
+            if len > max { return Ok(Some(Line::TooLong(len))); }
+            buf.pop();                                   // the LF
+            if buf.last() == Some(&b'\r') { buf.pop(); } // a CRLF's CR (ASCII, so never part of a multi-byte sequence)
+            return Ok(Some(match String::from_utf8(buf) { Ok(text) => Line::Text(text), Err(_) => Line::NotUtf8(len) }));
+        }
+    }
+}
+
+fn decode(line: Line) -> Incoming {
+    match line {
+        Line::Text(text) => serde_json::from_str::<WorkerMessage>(&text).map_err(|e| WorkerLinkError::Protocol(format!("{e}: {}", excerpt(&text)))),
+        Line::TooLong(len) => Err(WorkerLinkError::LineTooLong(len)),
+        Line::NotUtf8(len) => Err(WorkerLinkError::Protocol(format!("a {len}-byte line is not valid UTF-8"))),
+    }
+}
+
+/// At most `EXCERPT` bytes of `text`, cut at a character boundary.
+fn excerpt(text: &str) -> &str {
+    let mut end = text.len().min(EXCERPT);
+    while !text.is_char_boundary(end) { end -= 1; }
+    &text[..end]
+}
+
+fn kind(m: &WorkerMessage) -> &'static str {
+    match m { WorkerMessage::Ready(_) => "ready", WorkerMessage::Ack { .. } => "ack", WorkerMessage::Progress { .. } => "progress", WorkerMessage::Result { .. } => "result" }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> { m.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) }
+
+fn exit_code(st: ExitStatus) -> i32 { st.code().unwrap_or(-1) }
+
+/// Terminates the child (a no-op if it has exited) and reaps it within `REAP`.
+fn terminate(child: &mut Child) {
+    let _ = child.kill();
+    let _ = wait_for_exit(child, REAP);
+}
+
+#[cfg(windows)]
+fn no_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+#[cfg(not(windows))]
+fn no_console_window(_cmd: &mut Command) {}
+
+/// The child's exit status if it has exited or exits within `bound`.
+#[cfg(windows)]
+fn wait_for_exit(child: &mut Child, bound: Duration) -> Option<ExitStatus> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    extern "system" { fn WaitForSingleObject(handle: isize, ms: u32) -> u32; }
+    // u32::MAX is INFINITE: a bound never asks for it.
+    let ms = u32::try_from(bound.as_millis()).unwrap_or(u32::MAX).min(u32::MAX - 1);
+    // SAFETY: the child's process handle is open for as long as `child` lives; the call only waits on it.
+    unsafe { WaitForSingleObject(child.as_raw_handle() as isize, ms); }
+    child.try_wait().ok().flatten()
+}
+#[cfg(not(windows))]
+fn wait_for_exit(child: &mut Child, bound: Duration) -> Option<ExitStatus> {
+    let end = std::time::Instant::now() + bound;
+    loop {
+        if let Ok(Some(st)) = child.try_wait() { return Some(st); }
+        if std::time::Instant::now() >= end { return None; }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(windows)]
+fn peak_ws(child: &Child) -> u64 {
+    use std::os::windows::io::AsRawHandle;
+    /// `PROCESS_MEMORY_COUNTERS` (psapi.h).
+    #[repr(C)]
+    struct Counters { cb: u32, page_fault_count: u32, peak_working_set_size: usize, rest: [usize; 7] }
+    #[link(name = "kernel32")]
+    extern "system" { fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, cb: u32) -> i32; }
+    let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, page_fault_count: 0, peak_working_set_size: 0, rest: [0; 7] };
+    // SAFETY: the process handle is open while `child` lives; `c` is a writable PROCESS_MEMORY_COUNTERS of `cb` bytes.
+    if unsafe { K32GetProcessMemoryInfo(child.as_raw_handle() as isize, &mut c, c.cb) } == 0 { 0 } else { c.peak_working_set_size as u64 }
+}
+#[cfg(not(windows))]
+fn peak_ws(_child: &Child) -> u64 { 0 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto::worker::{AckStatus, NodeLock, ADAPTER_VERSION, PROTO_VERSION, SOLVER_COMMIT};
+    use std::io::Cursor;
+
+    fn lines(bytes: &[u8], chunk: usize, max: usize) -> Vec<Line> {
+        let mut r = BufReader::with_capacity(chunk, Cursor::new(bytes.to_vec()));
+        let mut out = Vec::new();
+        while let Some(l) = read_line(&mut r, max).unwrap() { out.push(l); }
+        out
+    }
+
+    /// The limit counts the LF: a line of exactly `max` bytes with it is read, one byte more is refused with its full
+    /// length, and reading resumes at the next line. Small reader chunks put every boundary inside a chunk.
+    #[test]
+    fn read_line_counts_the_terminator_and_resumes_after_an_over_long_line() {
+        let long = format!("{}\n", "x".repeat(100));
+        let input = format!("1234567\n12345678\n{long}ok\n");
+        for chunk in [1, 3, 8, 64] {
+            assert_eq!(lines(input.as_bytes(), chunk, 8), vec![Line::Text("1234567".into()), Line::TooLong(9), Line::TooLong(101), Line::Text("ok".into())], "chunk {chunk}");
+        }
+    }
+
+    /// A line that is not UTF-8 is classified, not repaired; CRLF is accepted; an unterminated tail at the end of
+    /// input is dropped (the process died mid-write, which the exit reports).
+    #[test]
+    fn read_line_classifies_utf8_crlf_and_the_torn_tail() {
+        let input: &[u8] = b"a\xff\"b\n\xc3\xa9\r\nnext\ntorn";
+        assert_eq!(lines(input, 2, 64), vec![Line::NotUtf8(5), Line::Text("\u{e9}".into()), Line::Text("next".into())]);
+    }
+
+    fn ready_line() -> String {
+        serde_json::to_string(&WorkerMessage::Ready(Ready { proto_version: PROTO_VERSION, solver_commit: SOLVER_COMMIT.into(), adapter_version: ADAPTER_VERSION, threads: 4,
+            build_features: vec!["avx2".into()], cpu_features: vec!["avx2".into()], capabilities: vec!["solve".into()] })).unwrap()
+    }
+
+    /// The stdout pump turns every fault into a queued error and keeps reading: over-long, not UTF-8, not JSON, not a
+    /// message; the messages around them arrive intact and in order, and the queue ends with the input.
+    #[test]
+    fn stdout_faults_are_errors_in_order_never_panics() {
+        let mut input = Vec::new();
+        input.extend_from_slice(format!("{}\n", ready_line()).as_bytes());
+        input.extend_from_slice(format!("{}\n", "y".repeat(2_000)).as_bytes());
+        input.extend_from_slice(b"\xfe\xff\n");
+        input.extend_from_slice(format!("{}{{not json\n", "\u{e9}".repeat(150)).as_bytes());
+        input.extend_from_slice(b"{\"type\":\"ack\",\"id\":\"7\",\"status\":\"accepted\",\"extra\":1}\n");
+        input.extend_from_slice(b"{\"type\":\"ack\",\"id\":\"8\",\"status\":\"accepted\"}\n");
+        let (tx, rx) = channel();
+        pump_stdout(Cursor::new(input), 1_024, tx);
+        let got: Vec<Incoming> = rx.try_iter().collect();
+        assert_eq!(got.len(), 6, "{got:?}");
+        assert!(matches!(&got[0], Ok(WorkerMessage::Ready(r)) if r.threads == 4));
+        assert!(matches!(&got[1], Err(WorkerLinkError::LineTooLong(2_001))));
+        assert!(matches!(&got[2], Err(WorkerLinkError::Protocol(m)) if m.contains("not valid UTF-8")));
+        // 150 two-byte characters: the 200-byte excerpt limit falls on a boundary check, never inside a character
+        assert!(matches!(&got[3], Err(WorkerLinkError::Protocol(m)) if m.contains('\u{e9}')));
+        assert!(matches!(&got[4], Err(WorkerLinkError::Protocol(m)) if m.contains("extra")), "unknown fields are refused: {:?}", got[4]);
+        assert!(matches!(&got[5], Ok(WorkerMessage::Ack { id, status: AckStatus::Accepted, .. }) if id == "8"));
+        assert!(rx.try_recv().is_err(), "the pump ended with its input and dropped its sender");
+    }
+
+    #[test]
+    fn excerpt_cuts_at_a_character_boundary() {
+        let s = format!("{}\u{e9}tail", "a".repeat(199));   // the two-byte character spans bytes 199..201
+        assert_eq!(excerpt(&s), "a".repeat(199));
+        assert_eq!(excerpt("short"), "short");
+    }
+
+    /// §4.5's 1 MiB request limit counts the LF: a line of exactly the limit is sent, one byte more is refused.
+    #[test]
+    fn request_lines_are_bounded_by_the_request_limit_with_their_terminator() {
+        let base = encode_request(&EngineMessage::Shutdown { id: String::new() }).unwrap();
+        assert_eq!(base.last(), Some(&b'\n'));
+        assert_eq!(base.iter().filter(|b| **b == b'\n').count(), 1);
+        let fits = EngineMessage::Shutdown { id: "1".repeat(REQUEST_LINE_MAX - base.len()) };
+        assert_eq!(encode_request(&fits).unwrap().len(), REQUEST_LINE_MAX);
+        let over = EngineMessage::Shutdown { id: "1".repeat(REQUEST_LINE_MAX - base.len() + 1) };
+        assert!(matches!(encode_request(&over), Err(WorkerLinkError::LineTooLong(n)) if n == REQUEST_LINE_MAX + 1));
+        // a request the checked wire codecs refuse is a protocol error, never a partial line
+        let bad = EngineMessage::Lock { id: "1".into(), spot: "s".into(), locks: vec![NodeLock { path: vec![], actor: "oop".into(), probs: vec![vec![f32::NAN]] }] };
+        assert!(matches!(encode_request(&bad), Err(WorkerLinkError::Protocol(_))));
+    }
+
+    #[test]
+    fn the_stderr_ring_keeps_the_last_bytes() {
+        let mut ring = VecDeque::new();
+        push_ring(&mut ring, b"abcdef", 4);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"cdef");
+        push_ring(&mut ring, b"gh", 4);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"efgh");
+        push_ring(&mut ring, &[b'z'; 10], 4);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"zzzz");
+    }
+}
+
+/// The launch, validation and exit paths against stand-in workers: batch files run by `cmd.exe` (std's `Command`
+/// runs a `.cmd` file through it). Each launch appends a line to `launches.txt` next to the script before anything
+/// else, so a test counts launches exactly; `set /p` blocks on stdin, so a stand-in that reaches it lives until it is
+/// killed or sent a line. Every outcome here is decided by what the stand-in writes, never by timing.
+#[cfg(all(test, windows))]
+mod stand_in_tests {
+    use super::*;
+    use proto::worker::{ADAPTER_VERSION, PROTO_VERSION, SOLVER_COMMIT};
+
+    struct StandIn { dir: PathBuf, script: PathBuf }
+    impl StandIn {
+        fn new(tag: &str, body: &[String]) -> StandIn {
+            let dir = std::env::temp_dir().join(format!("pokerai-stand-in-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("worker.cmd");
+            let mut text = String::from("@echo off\r\necho x>>\"%~dp0launches.txt\"\r\n");
+            for line in body { text.push_str(line); text.push_str("\r\n"); }
+            std::fs::write(&script, text).unwrap();
+            StandIn { dir, script }
+        }
+        fn launches(&self) -> usize { std::fs::read_to_string(self.dir.join("launches.txt")).map(|s| s.lines().count()).unwrap_or(0) }
+    }
+    impl Drop for StandIn { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); } }
+
+    fn valid() -> Ready {
+        Ready { proto_version: PROTO_VERSION, solver_commit: SOLVER_COMMIT.into(), adapter_version: ADAPTER_VERSION, threads: 4,
+            build_features: vec!["avx2".into()], cpu_features: vec!["avx2".into()], capabilities: vec!["solve".into()] }
+    }
+    fn echo_ready(r: Ready) -> String { format!("echo {}", serde_json::to_string(&WorkerMessage::Ready(r)).unwrap()) }
+    const WAIT: &str = "set /p _=";
+
+    fn spawn_err(s: &StandIn, startup: Duration) -> String {
+        match ProcessWorker::spawn_with(&s.script, 4, startup) {
+            Err(WorkerLinkError::Spawn(msg)) => msg,
+            Err(other) => panic!("expected a spawn error, got {other:?}"),
+            Ok(_) => panic!("the stand-in was accepted"),
+        }
+    }
+
+    /// The engine never trusts a `ready` that fails any §4.5 rule, and does not retry it: one launch, refused.
+    #[test]
+    fn a_ready_failing_any_rule_is_refused_without_a_retry() {
+        let cases: [(&str, fn(&mut Ready), &str); 5] = [
+            ("proto", |r| r.proto_version = PROTO_VERSION + 1, "proto_version"),
+            ("commit", |r| r.solver_commit = "deadbeef".into(), "solver commit"),
+            ("adapter", |r| r.adapter_version = ADAPTER_VERSION + 1, "adapter_version"),
+            ("threads", |r| r.threads = 8, "threads 8 != requested 4"),
+            ("avx2", |r| r.build_features = vec!["fma".into()], "worker built without AVX2"),
+        ];
+        for (tag, edit, expected) in cases {
+            let mut r = valid();
+            edit(&mut r);
+            let s = StandIn::new(&format!("refused-{tag}"), &[echo_ready(r), WAIT.into()]);
+            let msg = spawn_err(&s, STARTUP_TIMEOUT);
+            assert!(msg.contains("ready refused") && msg.contains(expected), "{tag}: {msg}");
+            assert_eq!(s.launches(), 1, "{tag}: a refused ready is not retried");
+        }
+    }
+
+    /// A process that exits before `ready` is retried once, then reported with its confirmed exit code.
+    #[test]
+    fn an_exit_before_ready_is_retried_once_and_reports_its_code() {
+        let s = StandIn::new("exit-early", &["exit /b 7".into()]);
+        let msg = spawn_err(&s, STARTUP_TIMEOUT);
+        assert!(msg.contains("after 2 attempts") && msg.contains("worker exited with code 7"), "{msg}");
+        assert_eq!(s.launches(), 2);
+    }
+
+    /// A first line that is not a message, or a message that is not `ready`, is a protocol error: retried once.
+    #[test]
+    fn a_first_line_other_than_ready_is_retried_once() {
+        for (tag, first, expected) in [("garbage", "echo this is not json", "protocol: "), ("ack", r#"echo {"type":"ack","id":"1","status":"accepted"}"#, "expected ready, got ack")] {
+            let s = StandIn::new(&format!("first-{tag}"), &[first.into(), WAIT.into()]);
+            let msg = spawn_err(&s, STARTUP_TIMEOUT);
+            assert!(msg.contains("after 2 attempts") && msg.contains(expected), "{tag}: {msg}");
+            assert_eq!(s.launches(), 2, "{tag}");
+        }
+    }
+
+    /// A silent process is killed at the startup timeout and retried once (the stand-in never writes, so the outcome
+    /// does not depend on the timeout's length; the seam only shortens the test).
+    #[test]
+    fn a_silent_process_times_out_twice() {
+        let s = StandIn::new("silent", &[WAIT.into()]);
+        let msg = spawn_err(&s, Duration::from_millis(300));
+        assert!(msg.contains("after 2 attempts") && msg.contains("no ready within 300 ms"), "{msg}");
+        assert_eq!(s.launches(), 2);
+    }
+
+    /// A live link: the child is in the engine's job; stderr reaches the ring (complete once `kill` returns); a second
+    /// `ready` is a protocol error; the link stays usable after it.
+    #[test]
+    fn a_live_stand_in_is_jobbed_drains_stderr_and_refuses_a_second_ready() {
+        let s = StandIn::new("live", &["echo diag-marker-1 1>&2".into(), echo_ready(valid()), echo_ready(valid()), WAIT.into()]);
+        let mut w = ProcessWorker::spawn_with(&s.script, 4, STARTUP_TIMEOUT).expect("the stand-in's ready is valid");
+        {
+            let live = w.live.as_ref().unwrap();
+            assert!(live._job.contains(&live.child), "the worker runs in the engine's job");
+        }
+        match w.recv(STARTUP_TIMEOUT) { Err(WorkerLinkError::Protocol(m)) => assert!(m.contains("second ready"), "{m}"), other => panic!("{other:?}") }
+        // the protocol error did not end the link: it still sends (the stand-in is blocked on stdin, so alive)
+        w.send(&EngineMessage::Shutdown { id: "1".into() }).unwrap();
+        w.kill();
+        let tail = w.stderr_tail();
+        assert!(tail.contains("diag-marker-1"), "{tail:?}");
+        assert_eq!(s.launches(), 1);
+    }
+
+    /// A worker that exits with a non-zero code mid-session (the writer-fault code 3, say) is reported as
+    /// `Exit{code}` by `recv` and then by `send`; a restart relaunches it.
+    #[test]
+    fn a_non_zero_exit_is_reported_with_its_code_and_restart_relaunches() {
+        let s = StandIn::new("exit-3", &[echo_ready(valid()), WAIT.into(), "exit /b 3".into()]);
+        let mut w = ProcessWorker::spawn_with(&s.script, 4, STARTUP_TIMEOUT).unwrap();
+        w.send(&EngineMessage::Shutdown { id: "1".into() }).unwrap();   // releases `set /p`; the stand-in exits 3
+        match w.recv(Duration::from_secs(10)) { Err(WorkerLinkError::Exit { code: 3 }) => {}, other => panic!("expected exit 3, got {other:?}") }
+        assert!(matches!(w.send(&EngineMessage::Shutdown { id: "2".into() }), Err(WorkerLinkError::Exit { code: 3 })));
+        w.restart().unwrap();
+        assert_eq!((w.restarts(), s.launches(), w.ready().map(|r| r.threads)), (1, 2, Some(4)));
+    }
+}
