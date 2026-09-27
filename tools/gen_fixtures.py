@@ -118,32 +118,175 @@ def _board_cards_from_events(events: list) -> list[str]:
     return [final[i:i + 2] for i in range(0, len(final), 2)]
 
 
+class Ledger:
+    """Independent chip-and-board accounting for one e2e record (Task 19 fix round 1, I4), kept by
+    player index in PokerKit's order (`ring`: SB first, button last). It reads only the record
+    and hold'em's rules, never PokerKit's state; `replay_record` asserts that `view()` equals
+    PokerKit's state after the posts and after every event.
+
+    Rules: SB and BB post, and a configured straddle is posted by the next seat (a short stack
+    posts what it has). A check pays nothing, a call pays min(owed, stack) -- a short all-in call
+    included -- a bet or raise to `to` pays `to` minus the seat's street commitment, and an
+    all-in pays the whole stack. A seat needs to act while it is live, has chips behind, and
+    either owes chips or has not acted this street (posts are not actions) and still faces an
+    opponent who could put in more than it has. When no seat needs to act the street closes: the
+    wager above the second-largest street commitment (folded seats' dead chips count) goes back
+    to its owner and every other street commitment is collected into the pot. A board event must
+    add cards not already dealt (hero's hole cards or the board) and opens the next street,
+    first to act the first seat after the button. A fold that leaves one live seat ends the hand,
+    which an e2e history -- played to a decision -- never does, so it is rejected."""
+
+    def __init__(self, record: dict, ring: list[int]) -> None:
+        cfg = record["config"]
+        n = len(ring)
+        assert n >= 3, f"record {record['id']}: the ledger covers 3-6 dealt seats, not {n}"
+        self.ring = ring
+        self.stacks = [record["stacks"][s] for s in ring]
+        self.bets = [0] * n          # street commitments, uncollected
+        self.committed = [0] * n     # hand commitments, net of returned wagers
+        self.live = [True] * n
+        self.acted = [False] * n
+        self.collected = 0
+        self.board = ""
+        self.dealt = {record["hero_cards"][:2], record["hero_cards"][2:]}
+        posts = [cfg["sb_chips"], cfg["bb_chips"]] + ([cfg["straddle"]] if cfg["straddle"] else [])
+        for j, amount in enumerate(posts):
+            self._pay(j, min(amount, self.stacks[j]))
+        self.actor = self._next_after(len(posts) - 1)
+
+    def _pay(self, j: int, amount: int) -> None:
+        self.stacks[j] -= amount
+        self.bets[j] += amount
+        self.committed[j] += amount
+
+    def _needs_to_act(self, j: int) -> bool:
+        if not self.live[j] or self.stacks[j] == 0:
+            return False
+        if self.bets[j] < max(self.bets):
+            return True
+        return not self.acted[j] and any(
+            self.live[k] and self.bets[k] + self.stacks[k] > self.bets[j] for k in range(len(self.ring)) if k != j)
+
+    def _next_after(self, j: int) -> int | None:
+        n = len(self.ring)
+        return next((k % n for k in range(j + 1, j + 1 + n) if self._needs_to_act(k % n)), None)
+
+    def _collect(self) -> None:
+        cutoff = sorted(self.bets)[-2]
+        for j, bet in enumerate(self.bets):
+            if bet > cutoff:
+                self.stacks[j] += bet - cutoff
+                self.committed[j] -= bet - cutoff
+                self.bets[j] = cutoff
+        self.collected += sum(self.bets)
+        self.bets = [0] * len(self.ring)
+
+    def apply(self, e: dict, where: str) -> None:
+        """Apply one record event (`where` names the record and event in any rejection)."""
+        if e["type"] == "board":
+            for card in (e["cards"][i:i + 2] for i in range(len(self.board), len(e["cards"]), 2)):
+                assert card not in self.dealt, f"{where}: board card {card} is already dealt (hero's hole cards or the board)"
+                self.dealt.add(card)
+            self.board = e["cards"]
+            self.acted = [False] * len(self.ring)
+            self.actor = self._next_after(len(self.ring) - 1)
+            return
+        j = self.ring.index(e["seat"])
+        kind, to = e["action"]["kind"], e["action"].get("to")
+        if kind == "fold":
+            self.live[j] = False
+            assert sum(self.live) > 1, f"{where}: a fold-out ends the hand, but an e2e history is played to a decision"
+        elif kind == "call":
+            self._pay(j, min(max(self.bets) - self.bets[j], self.stacks[j]))
+        elif kind in ("bet", "raise"):
+            self._pay(j, to - self.bets[j])
+        elif kind == "allin":
+            self._pay(j, self.stacks[j])
+        self.acted[j] = True
+        self.actor = self._next_after(j)
+        if self.actor is None:
+            self._collect()
+
+    def view(self) -> dict:
+        """What `replay_record` compares with PokerKit, per-seat values keyed by seat."""
+        return _view(
+            actor=None if self.actor is None else self.ring[self.actor],
+            ring=self.ring, live=self.live, stacks=self.stacks, bets=self.bets, committed=self.committed,
+            collected=self.collected, board=self.board)
+
+
+def _view(*, actor, ring, live, stacks, bets, committed, collected, board) -> dict:
+    def by_seat(values) -> dict:
+        return dict(zip(ring, values))
+
+    return {
+        "actor": actor,
+        "live": by_seat(bool(v) for v in live),
+        "stacks": by_seat(stacks),
+        "street commitments": by_seat(bets),
+        "hand commitments": by_seat(committed),
+        "collected pot": collected,
+        "total pot": collected + sum(bets),
+        "board": board,
+    }
+
+
+def _pokerkit_view(state, ring: list[int]) -> dict:
+    """PokerKit's side of the comparison: `bets` are the uncollected street commitments, the
+    negated `payoffs` are what each player has put in net of returned wagers (no chips are pushed
+    before a decision), `pot_amounts` are the collected pots, `total_pot_amount` adds the
+    uncollected wagers, and board index 0 is the board."""
+    view = _view(
+        actor=None if state.actor_index is None else ring[state.actor_index],
+        ring=ring, live=state.statuses, stacks=state.stacks, bets=state.bets,
+        committed=[-p for p in state.payoffs], collected=sum(state.pot_amounts),
+        board="".join(repr(c) for c in state.get_board_cards(0)))
+    view["total pot"] = state.total_pot_amount
+    return view
+
+
+def _compare(state, ledger: Ledger, where: str) -> int:
+    """Assert the ledger equals PokerKit's state, naming `where` and the first differing field;
+    returns 1, the number of states compared."""
+    actual = _pokerkit_view(state, ledger.ring)
+    for field, value in ledger.view().items():
+        assert actual[field] == value, f"{where}: {field} differ -- PokerKit {actual[field]!r}, model {value!r}"
+    return 1
+
+
 @dataclass
 class Trace:
     """The result of replaying one e2e record's complete event history through PokerKit: the
     final `pokerkit` state, its seating ring (SB first, button last, the same order PokerKit's
-    `actor_index` indexes into), whether every step compared legal (see `replay_record`), and the
-    seat to act when the replay stops (`None` at a terminal street -- a fold-out, an all-in
-    runout, or showdown)."""
+    `actor_index` indexes into), whether every step compared legal (see `replay_record`), the
+    seat to act when the replay stops (`None` at a terminal street -- an all-in runout or
+    showdown), the independent `Ledger` at that point, and how many states were compared with
+    PokerKit (the posts plus one per event)."""
 
     state: object
     ring: list[int]
     legal_at_every_step: bool
     final_actor: int | None
+    ledger: Ledger
+    states_compared: int
 
 
 def replay_record(record: dict) -> Trace:
     """Plan 1's PokerKit adapter, extended by Task 19: replays one `e2e_hands.records()` row's
     complete event history through PokerKit (the plan-1 oracle for legal actions, pots, stacks and
-    refunds), comparing the legal actor, pot, committed amounts, stacks and board at every step.
-    Straddle and projection records are replayed as real, legal sequences first -- no record gets
-    a pass because it is "just a projection" or "just a straddle" case.
+    refunds) and, alongside it, through the independent `Ledger`, asserting after the posts and
+    after every event that both agree on the actor, live seats, stacks, street and hand
+    commitments, collected and total pot, and dealt board (fix round 1, I4). Straddle and
+    projection records are replayed as real, legal sequences first -- no record gets a pass
+    because it is "just a projection" or "just a straddle" case.
 
-    Fails loudly (`AssertionError`, naming the record id and event) on any illegal action (a wager
-    outside PokerKit's `[min_to, max_to)`, a check facing a bet, an all-in that is not the whole
-    stack, a fold with nothing owed, the wrong actor or street, a board dealt mid-street) and on
-    any PokerKit/spec-4.3 reopening divergence -- so `legal_at_every_step` is `True` on every
-    `Trace` this function actually returns; it never returns a `Trace` for an illegal replay.
+    Fails loudly (`AssertionError`, naming the record id and the event index, or "posts" before
+    event 0) on any illegal action (a wager outside PokerKit's `[min_to, max_to)`, a check facing
+    a bet, an all-in that is not the whole stack, a fold with nothing owed, the wrong actor or
+    street, a board dealt mid-street or repeating a dealt card), on a fold-out, on any
+    PokerKit/spec-4.3 reopening divergence and on any ledger/PokerKit difference -- so
+    `legal_at_every_step` is `True` on every `Trace` this function actually returns; it never
+    returns a `Trace` for an illegal replay.
     """
     cfg = record["config"]
     button = record["button"]
@@ -165,6 +308,8 @@ def replay_record(record: dict) -> Trace:
         # the first full raise over a straddle is one straddle (min open 2S), as in generate_hand
         state.completion_betting_or_raising_amount = straddle
     reopen = SpecReopen(n, straddle or cfg["bb_chips"], max(state.bets))
+    ledger = Ledger(record, ring)
+    compared = _compare(state, ledger, f"record {record['id']} posts (before event 0)")
     board_so_far = ""
     for k, e in enumerate(record["events"]):
         where = f"record {record['id']} event {k} {e}"
@@ -173,9 +318,11 @@ def replay_record(record: dict) -> Trace:
             assert e["cards"].startswith(board_so_far), where
             new = e["cards"][len(board_so_far):]
             assert len(new) == (6 if not board_so_far else 2), where
+            ledger.apply(e, where)  # before PokerKit, which would silently deal a repeated card
             _deal(state.deal_board, new)
             reopen.start_street(cfg["bb_chips"], 0)
             board_so_far = e["cards"]
+            compared += _compare(state, ledger, where)
             continue
         i = state.actor_index
         assert i is not None and ring[i] == e["seat"], where
@@ -214,8 +361,11 @@ def replay_record(record: dict) -> Trace:
         else:
             raise AssertionError(f"unknown action kind at {where}")
         reopen.acted(i, aggression)
+        ledger.apply(e, where)  # after the legality checks above, so theirs is the first failure
+        compared += _compare(state, ledger, where)
     final_actor = ring[state.actor_index] if state.actor_index is not None else None
-    return Trace(state=state, ring=ring, legal_at_every_step=True, final_actor=final_actor)
+    return Trace(state=state, ring=ring, legal_at_every_step=True, final_actor=final_actor,
+                 ledger=ledger, states_compared=compared)
 
 
 def normalize_pots(state, ring) -> list[dict]:

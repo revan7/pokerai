@@ -413,42 +413,115 @@ def records() -> list:
 _SUPPORTED_IDS = [f"{n:03}" for n in range(1, 23)]
 
 
-def write_e2e(root: Path) -> None:
-    """Writes `fixtures/hands/e2e/001.json`..`050.json` and `manifest.json` from `records()`.
-    Byte-stable across calls: fixed key order (`sort_keys=True`), fixed separators (`json.dumps`'
-    default `", "`/`": "` under `indent=2`), trailing newline. Regenerating and rewriting is the
-    only way these files change -- never hand-edited."""
-    root.mkdir(parents=True, exist_ok=True)
+MANIFEST = "manifest.json"
+
+
+def canonical_json_bytes(value) -> bytes:
+    """The one serializer of every frozen e2e file, manifest included (fix round 1, I1): sorted
+    keys, two-space indent, `json.dumps`' default separators and ASCII escaping, LF line endings
+    and exactly one trailing newline, encoded as UTF-8. Pure: the bytes never depend on the
+    platform, because they are built here and written with `write_bytes` -- never through a
+    text-mode write, which turns every LF into CRLF on Windows."""
+    return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode("utf-8")
+
+
+def e2e_files() -> dict:
+    """In-memory regeneration of the whole freeze, `{"001.json": bytes, ..., "050.json": bytes,
+    "manifest.json": bytes}` in that order: the fifty `records()` rows and the manifest that pins
+    their sha256, every file from `canonical_json_bytes`. Writes nothing; `write_e2e` writes these
+    bytes and `check_e2e` compares against them."""
     rows = records()
     assert len(rows) == 50
-    hashes = {}
+    files = {}
     for i, row in enumerate(rows, 1):
-        row["id"] = f"{i:03}"
-        raw = (json.dumps(row, sort_keys=True, indent=2) + "\n").encode()
-        (root / f"{i:03}.json").write_bytes(raw)
-        hashes[f"{i:03}.json"] = hashlib.sha256(raw).hexdigest()
-    manifest = {
+        assert row["id"] == f"{i:03}", row["id"]
+        files[f"{i:03}.json"] = canonical_json_bytes(row)
+    files[MANIFEST] = canonical_json_bytes({
         "version": 1,
         "synthetic": True,
-        "supported_ids": _SUPPORTED_IDS,
-        "supported_baseline": _SUPPORTED_IDS,
-        "sha256": hashes,
-    }
-    (root / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+        "supported_ids": list(_SUPPORTED_IDS),
+        "supported_baseline": list(_SUPPORTED_IDS),
+        "sha256": {name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()},
+    })
+    return files
+
+
+def write_e2e(root: Path) -> None:
+    """Writes `001.json`..`050.json` and `manifest.json` under `root` (the CLI's root is
+    `fixtures/hands/e2e`) as exactly the bytes of `e2e_files()`. Regenerating and rewriting is the
+    only way these files change -- never hand-edited."""
+    root.mkdir(parents=True, exist_ok=True)
+    for name, raw in e2e_files().items():
+        (root / name).write_bytes(raw)
 
 
 def check_e2e(root: Path) -> None:
-    """Regenerates `records()` in memory and compares bytes against the committed files; a
-    difference is an error, never a silent rewrite (standing ruling: fixtures are committed data,
-    regenerated only by the generator)."""
-    rows = records()
-    for i, row in enumerate(rows, 1):
-        row["id"] = f"{i:03}"
-        expected = (json.dumps(row, sort_keys=True, indent=2) + "\n").encode()
-        actual = (root / f"{i:03}.json").read_bytes()
-        if actual != expected:
-            raise SystemExit(f"fixtures/hands/e2e/{i:03}.json differs from the generator")
-    manifest = json.loads((root / "manifest.json").read_text())
-    for name, digest in manifest["sha256"].items():
-        if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
-            raise SystemExit(f"manifest hash mismatch for {name}")
+    """Compares the directory `root` with `e2e_files()` -- all 51 expected byte strings -- and
+    writes nothing (fix round 1, I3). Every difference is collected and reported in one
+    `SystemExit`, each line naming its file: a missing or unexpected file, a hand file whose bytes
+    differ, and for the manifest a missing or unexpected `sha256` entry, a digest that is not the
+    generator's, changed metadata (`version`, `synthetic`, `supported_ids`,
+    `supported_baseline`), an unexpected key, or -- when its content matches -- byte drift alone
+    (formatting, key order, trailing newline, CRLF)."""
+    expected = e2e_files()
+    if not root.is_dir():
+        raise SystemExit(f"{root} is missing: expected the {len(expected)} frozen e2e files")
+    present = {p.name for p in root.iterdir()}
+    problems = [f"{name} is not part of the freeze" for name in sorted(present - set(expected))]
+    for name, want in expected.items():
+        if name not in present:
+            problems.append(f"{name} is missing")
+            continue
+        got = (root / name).read_bytes()
+        if got == want:
+            continue
+        if name == MANIFEST:
+            problems += _manifest_problems(got, want)
+        else:
+            problems.append(f"{name} differs from the generator{_cr_note(got)}")
+    if problems:
+        raise SystemExit(f"{root} does not match the generator:\n" + "\n".join(f"  {p}" for p in problems))
+
+
+_MANIFEST_METADATA = ("version", "synthetic", "supported_ids", "supported_baseline")
+
+
+def _cr_note(raw: bytes) -> str:
+    return " (it contains CR bytes; the freeze is LF)" if b"\r" in raw else ""
+
+
+def _manifest_problems(got: bytes, want: bytes) -> list:
+    """Why the manifest bytes `got` differ from the generator's `want`, most specific first."""
+    expected = json.loads(want)
+    try:
+        actual = json.loads(got.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        return [f"{MANIFEST} is not UTF-8 JSON ({e})"]
+    if not isinstance(actual, dict):
+        return [f"{MANIFEST} is not a JSON object"]
+    out = []
+    extra_keys = sorted(set(actual) - set(expected))
+    if extra_keys:
+        out.append(f"{MANIFEST}: unexpected keys {extra_keys}")
+    for key in _MANIFEST_METADATA:
+        if key not in actual:
+            out.append(f"{MANIFEST}: {key} is missing, expected {expected[key]!r}")
+        elif canonical_json_bytes(actual[key]) != canonical_json_bytes(expected[key]):  # true != 1
+            out.append(f"{MANIFEST}: {key} is {actual[key]!r}, expected {expected[key]!r}")
+    hashes, want_hashes = actual.get("sha256"), expected["sha256"]
+    if not isinstance(hashes, dict):
+        out.append(f"{MANIFEST}: sha256 is {hashes!r}, expected an object of {len(want_hashes)} file hashes")
+    else:
+        missing = [name for name in want_hashes if name not in hashes]
+        if missing:
+            out.append(f"{MANIFEST}: sha256 lacks {len(missing)} of {len(want_hashes)} entries: {missing}")
+        unexpected = sorted(set(hashes) - set(want_hashes))
+        if unexpected:
+            out.append(f"{MANIFEST}: sha256 has unexpected entries {unexpected}")
+        for name, digest in want_hashes.items():
+            if name in hashes and hashes[name] != digest:
+                out.append(f"{MANIFEST}: sha256[{name!r}] is {hashes[name]!r}, expected {digest} "
+                           f"(the sha256 of the generator's {name})")
+    if not out:
+        out.append(f"{MANIFEST}: bytes differ from the generator although its content matches{_cr_note(got)}")
+    return out
