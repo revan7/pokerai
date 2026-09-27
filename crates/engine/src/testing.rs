@@ -55,8 +55,11 @@
 //! - once its exit is due on the fake clock (whether or not `send` or `recv` has reported it yet), everything scripted
 //!   up to and including that exit, the lines it wrote that the engine has not read included: what an exited process
 //!   wrote goes with it;
-//! - before that, whatever is left of its end, delays included, and nothing else: a scripted reply is never
-//!   discarded unless its process's exit is already due at the kill.
+//! - else, once the closure of its stdin is due (a `StdinClosed`, its writer state), likewise everything up to and
+//!   including that `StdinClosed`, and then whatever is left of its end: the next worker's stdin is open;
+//! - before either, whatever is left of its end, delays included, and nothing else: a scripted reply is never
+//!   discarded unless its process's exit or stdin closure is already due at the kill (a reply after a due closure
+//!   is the next worker's, as is one after any kill point).
 //!
 //! An `InvalidateIdentity` a kill passes stays, in order, at the front of the script: the mutation still arrives, at
 //! the next worker's first `recv`. `restart` is counted, then fails with `Spawn` (no live worker) when a `SpawnFails`
@@ -167,7 +170,8 @@ pub enum FakeReply {
     /// it is due at the engine's first call (see the module doc). The real link's first `send` after its worker closes
     /// its stdin is usually queued and lost (`Ok`, and no reply ever comes), only a later `send` answering `Eof`; a
     /// script says so by placing `StdinClosed` just after that send on the timeline (a `Delay` before it), so that the
-    /// send is `Ok` and recorded (the engine did send it) and no reply to it is scripted.
+    /// send is `Ok` and recorded (the engine did send it) and no reply to it is scripted. Once due, a kill discards it
+    /// with the process, with the lines written before it (see the module doc): the next worker's stdin is open.
     StdinClosed,
     /// Simulates a mutation arriving while the solve is live: the active identity is cancelled.
     /// `recv` consumes it and continues to the next scripted item in the SAME call, so a script that wants the
@@ -226,8 +230,9 @@ enum Proc {
 enum Polled {
     /// The process has exited with this code; the `Exit` is at this index of the script.
     Exited { code: i32, at: usize },
-    /// The process lives on but has closed its stdin.
-    StdinClosed,
+    /// The process lives on but has closed its stdin: at this index of the script (the last `StdinClosed` due), or
+    /// `None` when `recv` has already passed it.
+    StdinClosed { at: Option<usize> },
     /// The process takes requests.
     TakingRequests,
 }
@@ -326,7 +331,7 @@ impl FakeWorker {
     /// How many items at the front of the script are the running process's pending end, which a kill discards before
     /// its exit is due (see the module doc): the `Delay`s, `StdinClosed`s and identity markers leading to its
     /// terminator, the terminator, and after an `Eof` the confirmation of its exit. Zero when the process has something
-    /// else to do first: short of a due exit (`end_process`), a reply is never discarded.
+    /// else to do first: short of a due exit or stdin closure (`end_process`), a reply is never discarded.
     fn pending_end(&self) -> usize {
         match self.proc {
             Proc::Live => {
@@ -343,12 +348,12 @@ impl FakeWorker {
         }
     }
 
-    /// One poll of the process at `now`, as the real `send` makes it: has it exited by then (and where is that `Exit`
-    /// in the script), or closed its stdin? It takes nothing from the script and never moves the clock; the replies due
-    /// by then are written, and stay queued for `recv`.
+    /// One poll of the process at `now`, as the real `send` makes it: has it exited by then, or closed its stdin (and
+    /// where in the script)? It takes nothing from the script and never moves the clock; the replies due by then are
+    /// written, and stay queued for `recv`.
     fn poll(&self, now: u64) -> Polled {
         let mut t = self.anchor();
-        let mut stdin_closed = self.stdin_closed;
+        let mut closed_at = None;
         // The process's own items: the whole script while its stdout is open, only the confirmation of its exit once
         // stdout has ended.
         let mut own = match self.proc {
@@ -362,7 +367,7 @@ impl FakeWorker {
                     t = delay_end(t, *ms);
                     if t > now { break; }
                 }
-                FakeReply::StdinClosed => stdin_closed = true,
+                FakeReply::StdinClosed => closed_at = Some(i),
                 FakeReply::Exit { code } => return Polled::Exited { code: *code, at: i },
                 FakeReply::Eof => own = self.confirmation_end(i + 1).map_or(i + 1, |end| end + 1),
                 FakeReply::Hang | FakeReply::SpawnFails(_) => break,
@@ -372,7 +377,7 @@ impl FakeWorker {
             }
             i += 1;
         }
-        if stdin_closed { Polled::StdinClosed } else { Polled::TakingRequests }
+        if closed_at.is_some() || self.stdin_closed { Polled::StdinClosed { at: closed_at } } else { Polled::TakingRequests }
     }
 
     /// `recv` while stdout is open: the timeline up to the next line, the end of stdout, or the deadline.
@@ -482,20 +487,27 @@ impl FakeWorker {
 
     /// The kill of the running process (see the module doc): once its exit is due, everything scripted through that
     /// exit goes with it, the lines it wrote and the engine has not read included, as the real kill drops the dead
-    /// process's queued output; before that, its pending end. The identity markers among those items are not the
+    /// process's queued output; its stdin closure, once due, likewise (it is that process's writer state), then what
+    /// is left of its end; before either, its pending end. The identity markers among those items are not the
     /// process's: they stay, in order, at the front of the script. No worker is left.
     fn end_process(&mut self) {
-        let end = match self.proc {
-            Proc::Live | Proc::Ended => {
-                self.start_timeline(); // a kill before any other call is the engine's first call on this worker
-                match self.poll(self.clock.now_ms()) {
-                    Polled::Exited { at, .. } => at + 1,
-                    Polled::StdinClosed | Polled::TakingRequests => self.pending_end(),
+        let mut kept = Vec::new();
+        if let Proc::Live | Proc::Ended = self.proc {
+            self.start_timeline(); // a kill before any other call is the engine's first call on this worker
+            match self.poll(self.clock.now_ms()) {
+                Polled::Exited { at, .. } => self.discard(at + 1, &mut kept),
+                Polled::StdinClosed { at: Some(at) } => {
+                    self.discard(at + 1, &mut kept);
+                    // What is left of its end follows the closure (after an `Eof`, the rest of the confirmation).
+                    let end = self.pending_end();
+                    self.discard(end, &mut kept);
+                }
+                Polled::StdinClosed { at: None } | Polled::TakingRequests => {
+                    let end = self.pending_end();
+                    self.discard(end, &mut kept);
                 }
             }
-            Proc::Exited(_) | Proc::Gone => 0, // a confirmed exit has already taken its process's items
-        };
-        let kept: Vec<FakeReply> = self.script.drain(..end).filter(|r| matches!(r, FakeReply::InvalidateIdentity)).collect();
+        } // a confirmed exit has already taken its process's items; a killed worker has none left
         for marker in kept.into_iter().rev() {
             self.script.push_front(marker);
         }
@@ -503,6 +515,12 @@ impl FakeWorker {
         self.anchor = None;
         self.stdin_closed = false;
         self.ready = None;
+    }
+
+    /// Drops the first `n` items of the script with the killed process, keeping the identity markers among them (not
+    /// the process's) in `kept`, in order.
+    fn discard(&mut self, n: usize, kept: &mut Vec<FakeReply>) {
+        kept.extend(self.script.drain(..n).filter(|r| matches!(r, FakeReply::InvalidateIdentity)));
     }
 
     /// Why the link refuses to send `msg` now, if it does: the error `send` answers, and what happened, for the panic
@@ -524,7 +542,7 @@ impl FakeWorker {
         let (err, end) = match self.poll(now) {
             Polled::Exited { code, .. } => (WorkerLinkError::Exit { code }, format!("`Exit {{ code: {code} }}`")),
             // It no longer takes requests and the poll found no exit: unconfirmed, and never recorded as an exit.
-            Polled::StdinClosed => (WorkerLinkError::Eof, "`StdinClosed`".to_string()),
+            Polled::StdinClosed { .. } => (WorkerLinkError::Eof, "`StdinClosed`".to_string()),
             Polled::TakingRequests => return None,
         };
         Some((err, format!("the worker's scripted {end} was already due at {now} ms when the engine sent request {id:?}, so `send` reported it and the \
@@ -1212,6 +1230,50 @@ mod tests {
         w.restart().unwrap();
         assert_eq!(acked(w.recv(ms(10))), "r");
         assert!(!identity.lock().unwrap().is_active(&decision));
+    }
+
+    /// Ruling 19-R2-1 (the round-2 probe Y1): the closure of its stdin is the process's writer state, so a kill or
+    /// restart discards a due `StdinClosed` as it discards a due exit, with the lines written before it, and then what
+    /// is left of that process's end: the replacement starts with an open stdin, takes requests, and is served its own
+    /// script (what follows the closure, as after any kill point before the exit is due).
+    #[test]
+    fn a_restart_discards_the_dead_process_due_stdin_closure_so_the_replacement_takes_requests() {
+        let shutdown = |id: &str| EngineMessage::Shutdown { id: id.into() };
+        // Y1: `send` reports the closed stdin, and the engine restarts.
+        let (clock, _identity, mut w, state) = rig(vec![ack("a"), FakeReply::Delay { ms: 10 }, FakeReply::StdinClosed, ack("b"), FakeReply::Delay { ms: 100 },
+            FakeReply::Exit { code: 3 }, ack("next")]);
+        assert_eq!(acked(w.recv(ms(0))), "a");
+        clock.set_ms(50);
+        assert!(matches!(w.send(&shutdown("1")), Err(WorkerLinkError::Eof)), "the dead process closed its stdin at 10");
+        w.restart().unwrap();
+        w.send(&shutdown("2")).unwrap();
+        clock.set_ms(100);
+        let later = w.send(&shutdown("3"));
+        assert!(later.is_ok(), "the dead process's stdin closure reached its successor: {later:?}");
+        assert_eq!(acked(w.recv(ms(100))), "b", "the replacement's script, from the item after the closure");
+        assert!(matches!(w.recv(ms(100)), Err(WorkerLinkError::Exit { code: 3 })));
+        assert_eq!(clock.now_ms(), 150, "the replacement's own delay, from its launch at 50");
+        assert_eq!(sent_ids(&state), ["2", "3"]);
+        // Through `kill`, with lines written before the closure unread: they go with it, and so does the end behind it.
+        let (clock, _identity, mut w, state) = rig(vec![ack("a"), ack("b"), FakeReply::Delay { ms: 10 }, FakeReply::StdinClosed, FakeReply::Delay { ms: 100 },
+            FakeReply::Exit { code: 3 }, ack("next")]);
+        w.send(&shutdown("1")).unwrap();
+        clock.set_ms(50);
+        w.kill();
+        w.restart().unwrap();
+        w.send(&shutdown("2")).unwrap();
+        let got = w.recv(ms(10));
+        assert!(matches!(&got, Ok(Some(WorkerMessage::Ack { id, .. })) if id == "next"), "the dead worker's lines or end reached its successor: {got:?}");
+        assert_eq!(sent_ids(&state), ["1", "2"]);
+        // After the end of stdout, a closure within the confirmation of the exit: the rest of the confirmation goes too.
+        let (clock, _identity, mut w, _state) = rig(vec![ack("a"), FakeReply::Eof, FakeReply::Delay { ms: 10 }, FakeReply::StdinClosed, FakeReply::Delay { ms: 100 },
+            FakeReply::Exit { code: 3 }, ack("next")]);
+        w.send(&shutdown("1")).unwrap();
+        clock.set_ms(50);
+        w.restart().unwrap();
+        w.send(&shutdown("2")).unwrap();
+        let got = w.recv(ms(10));
+        assert!(matches!(&got, Ok(Some(WorkerMessage::Ack { id, .. })) if id == "next"), "the dead worker's end reached its successor: {got:?}");
     }
 
     /// A relaunch that fails leaves no live worker (`Spawn`), and a later restart can succeed; a live worker has nothing
