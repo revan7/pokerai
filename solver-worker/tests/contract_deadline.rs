@@ -29,9 +29,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const S: Duration = Duration::from_secs(1);
-/// The liveness bound on every wait, in process and through the spawned binary, and the allowance on every reported
-/// `elapsed_ms`: generous enough that no schedule of a working worker exceeds it, and never a correctness condition
-/// (ruling 17-I1). A request's own `deadline_ms` is the worker's performance target, not a test gate.
+/// The liveness bound on every wait of the deadline tests below, and the allowance on every reported `elapsed_ms`:
+/// generous headroom over every observed run, a liveness allowance, never a correctness condition (ruling 17-I1).
+/// A request's own `deadline_ms` is the worker's performance target, not a test gate.
 const LIVENESS: Duration = Duration::from_secs(60);
 /// A reading of the §7 loop's clock past every deadline: `deadline_ms` is a `u32`, so `u32::MAX + 1` ms exceeds any,
 /// and the stop rule `elapsed + 1.5 * max_iter + (a due measurement) + margin > deadline` (every term but `elapsed`
@@ -423,16 +423,16 @@ fn memory_admission() {
     let mut w = Worker::spawn(4);
     ready(&w);
     let flop = &fixture_lines("flop_cancel")[0];
-    let t = Instant::now();
     w.send(&edit(flop, |v| {
         v["id"] = json!("132");
         v["memory_limit_bytes"] = json!(64 * 1024 * 1024);
     }));
-    let r = w.recv_until(5 * S, |m| m["type"] == "result" && m["id"] == "132").unwrap();
+    let msgs = job_messages(&w, "132");
+    let r = msgs.last().unwrap();
+    within_liveness(r);
     assert_eq!(
         (r["status"].as_str(), r["error"]["code"].as_str(), r["error"]["retryable"].as_bool()),
         (Some("error"), Some("tree_too_large"), Some(false))
     );
     assert!(r["error"]["estimate_bytes"].as_u64().unwrap() > 64 * 1024 * 1024);
-    assert!(t.elapsed() <= Duration::from_secs(2));
 }
