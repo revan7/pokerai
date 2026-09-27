@@ -1,8 +1,3 @@
-//! §7 watchdog, on the fake clock. `FakeClock` and `RecordingSink` are `engine::testing`, which exists only with the
-//! `testing` feature (lib.rs) and which no workspace member enables, so without it this file compiles to nothing:
-//! run it as `cargo test -p engine --features testing --test watchdog`.
-#![cfg(feature = "testing")]
-
 use engine::deadline::Deadlines;
 use engine::testing::{FakeClock, RecordingSink};
 use engine::watchdog::{Armed, SharedSink, Watchdog};
