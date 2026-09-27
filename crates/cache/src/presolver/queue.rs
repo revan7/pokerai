@@ -1104,16 +1104,21 @@ impl Queue {
     /// keys, no unknown fields (`validate`). A corrupt or absent file is rebuilt deterministically
     /// from `scenarios()` and `canonical_flops_ordered()`; existing valid cache cells still
     /// establish completion through `bind` and `reconcile`. A launch a dead process left in flight
-    /// gets its attempt back. Before any of that, the failure journal's records after the
-    /// snapshot's `journal_seq` are replayed over it (module doc, "The failure journal"). Each
-    /// persisted UTC retry deadline is converted, once, into the backoff that remains -- clamped to
-    /// `0..=RETRY_BACKOFF_MS` -- anchored at `clock`'s monotonic reading now (module doc, "Retry
-    /// deadlines and clocks"). Never fails today: every unusable file is replaced by the rebuild,
-    /// and a damaged journal is replayed up to its last complete, valid record.
+    /// gets its attempt back on the loaded snapshot before anything else -- fix round 3, N2: doing
+    /// this before the failure journal replays keeps a journaled generation change from being
+    /// checked against a game the snapshot still shows launched under the old one, which would
+    /// otherwise fail `validate` and discard the whole journal along with it. Only then are the
+    /// journal's records after the snapshot's `journal_seq` replayed over it (module doc, "The
+    /// failure journal"); records are never in flight (`apply_record` refuses them), so nothing
+    /// needs a refund after replay. Each persisted UTC retry deadline is converted, once, into the
+    /// backoff that remains -- clamped to `0..=RETRY_BACKOFF_MS` -- anchored at `clock`'s monotonic
+    /// reading now (module doc, "Retry deadlines and clocks"). Never fails today: every unusable
+    /// file is replaced by the rebuild, and a damaged journal is replayed up to its last complete,
+    /// valid record.
     pub fn open_with_clock(cache_root: PathBuf, clock: Box<dyn QueueClock>) -> Result<Queue, CacheError> {
         let path = queue_path(&cache_root);
         let journal = journal_path(&cache_root);
-        let file = match load(&path) {
+        let mut file = match load(&path) {
             Ok(Some(file)) => file,
             Ok(None) => Self::rebuild(),
             Err(why) => {
@@ -1121,6 +1126,13 @@ impl Queue {
                 Self::rebuild()
             }
         };
+        let refund = |p: ProgressMut| {
+            if launched(p.get()) {
+                *p.attempts = p.attempts.checked_sub(1).expect("a launched record has an attempt");
+            }
+        };
+        file.items.values_mut().for_each(|item| refund(item.progress_mut()));
+        file.games.values_mut().for_each(|game| refund(game.progress_mut()));
         let (file, valid) = replay_journal(&journal, file);
         let mut queue = Queue {
             path,
@@ -1132,13 +1144,6 @@ impl Queue {
             refs: BTreeMap::new(),
             in_flight: None,
         };
-        let refund = |p: ProgressMut| {
-            if launched(p.get()) {
-                *p.attempts = p.attempts.checked_sub(1).expect("a launched record has an attempt");
-            }
-        };
-        queue.file.items.values_mut().for_each(|item| refund(item.progress_mut()));
-        queue.file.games.values_mut().for_each(|game| refund(game.progress_mut()));
         for binding in queue.file.items.values().filter_map(|item| item.game.as_ref()) {
             *queue.refs.entry(binding.identity_hex()).or_insert(0) += 1;
         }

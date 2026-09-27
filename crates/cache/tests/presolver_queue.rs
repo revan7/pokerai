@@ -1241,6 +1241,62 @@ fn the_largest_possible_queue_file_still_fits_the_bound_and_reopens() {
     assert_eq!((reopened.paused(), reopened.status_counts()), (true, (0, 0, ALL)));
 }
 
+/// Fix round 3 (re-review 1, N2): `Queue::open_with_clock` must refund a dead process's in-flight
+/// attempt on the loaded snapshot before replaying the journal over it, not after. A checkpoint is
+/// usually taken while a job runs, so the snapshot it holds usually has one launched game; slot A
+/// here is launched and the checkpoint saved while it runs (process 1, gone without a further
+/// save). Process 2 opens under a new generation and journals slot B's own preparation failure
+/// before its first checkpoint, then is gone too. Replaying that record declares the new generation
+/// on process 1's snapshot -- whose slot A is still bound under the old one, still `launched` if
+/// nothing refunded it first -- and `validate` then refuses the whole file ("a game in flight
+/// without a current binding"), discarding the journaled failure along with it.
+#[test]
+fn a_journaled_failure_survives_a_checkpoint_with_a_job_in_flight_and_a_later_generation() {
+    let tmp = TempDir::new("queue-inflight-generation");
+    let dir = tmp.path();
+
+    // Process 1: slot A is launched (its game in flight) and the checkpoint saved while it runs.
+    let (a, b) = {
+        let mut q = open_at(dir, &FakeClock::new(0, UNIX));
+        q.set_generation(GEN_A);
+        let mut items = slots(&q, dir).into_values();
+        let a = items.next().unwrap();
+        let b = items.next().unwrap();
+        bind(&mut q, &a);
+        q.record_launch(&a.identity_hex()); // never resolved: the checkpoint below saves it in flight
+        q.save().unwrap();
+        (a, b)
+    };
+    // Process 2 (process 1 is simply gone -- no shutdown, no cancel): declares a new generation
+    // (as `Scheduler::open` does before anything else) and journals slot B's own preparation
+    // failure -- charged to the slot, since it was never bound -- before its first checkpoint.
+    {
+        let mut q = open_at(dir, &FakeClock::new(1_000, UNIX + 1_000));
+        q.set_generation(GEN_B);
+        q.record_launch(&b.identity_hex());
+        q.record_failure(&b.identity_hex(), 1_000, "no chart node".into());
+        assert!(
+            matches!(q.journal_outcome(&b.identity_hex()), Ok(queue::JournalAppend::Appended { .. })),
+            "the journal has room for one small record"
+        );
+        // process 2 is gone too: no save, no shutdown.
+    }
+    // Process 3: N2's fix refunds slot A's in-flight attempt on the loaded snapshot first, so it
+    // is no longer `launched` by the time the journal's generation change is validated against it.
+    let q3 = open_at(dir, &FakeClock::new(2_000, UNIX + 2_000));
+    let (item_a, item_b) = (q3.item(&a.identity_hex()).unwrap(), q3.item(&b.identity_hex()).unwrap());
+    assert_eq!(
+        (item_b.status, item_b.attempts),
+        (TaskStatus::Failed { n: 1 }, 1),
+        "N2: the journaled failure must survive the crash -- a stale in-flight game elsewhere must not invalidate it"
+    );
+    assert_eq!(
+        (item_a.status, item_a.attempts),
+        (TaskStatus::Pending, 0),
+        "slot A's in-flight attempt is refunded either way"
+    );
+}
+
 /// A failure message is stored on one line (control characters become spaces) and within
 /// `LAST_ERROR_MAX_BYTES`, cut on a character boundary and marked as cut.
 #[test]
@@ -1976,6 +2032,24 @@ fn a_completed_job_is_done_only_once_its_entry_reads_back_durably() {
     let done = s.queue().item(&a).unwrap();
     assert_eq!((done.status, done.attempts), (TaskStatus::Done, 1), "Done once the entry reads back at target, on its only charged attempt");
     assert_eq!(s.status().done, 2);
+}
+
+/// Fix round 3 (N3): the not-durable log line must say what the slot actually returns to -- only
+/// `Pending` for a first attempt, and the retained `Failed{n}` wording when a retry returns to its
+/// own `Failed{n}` -- never a fixed "stays pending" regardless of which. This is a pure formatting
+/// function, unit-tested directly: no test in this file captures stderr.
+#[test]
+fn the_not_durable_message_reports_the_status_the_slot_actually_returns_to() {
+    use cache::presolver::queue::TaskStatus;
+    use cache::presolver::scheduler::not_durable_message;
+    let pending = not_durable_message("t1-100bb-Btn-open-Bb-call 2c3d4h", &TaskStatus::Pending);
+    assert!(pending.contains("Pending"), "{pending}");
+    assert!(!pending.contains("Failed"), "a first attempt returns to Pending, not Failed: {pending}");
+    let retried = not_durable_message("t1-100bb-Btn-open-Bb-call 2c3d4h", &TaskStatus::Failed { n: 1 });
+    assert!(
+        retried.contains("Failed { n: 1 }"),
+        "N3: a retry's own Failed{{n}} must be named, not a fixed \"stays pending\": {retried}"
+    );
 }
 
 /// Brief step 5: a pause lets the running job finish and launches nothing more; the cursor, the
@@ -2804,6 +2878,82 @@ fn a_periodic_sweep_that_uncovers_earlier_work_runs_it_before_later_work() {
     assert_eq!(s.queue().item(&order[n]).unwrap().status, TaskStatus::Done, "the running job finished");
     let second = order.iter().position(|o| *o == fake.slots_submitted()[1]).unwrap();
     assert_eq!(second, late, "the uncovered earlier work (sweep position {late}) runs before the cursor (position {}) moves on", n + 1);
+}
+
+/// Fix round 3 (re-review 1, N1): a real generation change must restart a verifying sweep, not
+/// just clear stale bindings, so a generation that becomes current again is re-checked before its
+/// persisted completions count -- the same guarantee ruling 15-R1 already gives the generation a
+/// queue opens under. Twenty slots are persisted `Done` under GEN_A; slots 16-19 straddle the
+/// `RECONCILE_CHUNK` (16) boundary, and slot 19's entry has since been evicted. The startup sweep
+/// verifies slots 0-15, then the source flips to GEN_B -- ending the sweep in one idle iteration,
+/// since nothing is bound under GEN_B yet -- and back to GEN_A before the sweep ever reaches slot
+/// 19. Without a fresh sweep, slot 19 is stuck showing `Done` (only the next `RECONCILE_PERIOD_MS`
+/// sweep, hours later, would catch it) while its stale completion is published at once and slot
+/// 20 -- genuinely new work -- runs right past it; with one, published counts stay conservative
+/// until verified, and slot 19 is found and relaunched before slot 20 runs.
+#[test]
+fn a_generation_flip_back_during_the_startup_sweep_reverifies_before_publishing() {
+    let tmp = TempDir::new("sched-generation-flip");
+    let dir = tmp.path();
+    const DONE: usize = 20;
+    const MISSING: usize = DONE - 1; // slot 19: in the leftover chunk past RECONCILE_CHUNK (16)
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    fake.state().durable = true;
+    let order = {
+        let mut q = open_at(dir, &FakeClock::new(0, UNIX));
+        q.set_generation(GEN_A);
+        let order = q.sweep_order().to_vec();
+        for (i, id) in order[..DONE].iter().enumerate() {
+            let item = q.item(id).unwrap();
+            let (key, spr) = prepared(&item, &hex(&GEN_A));
+            q.bind(id, &key, spr);
+            q.record_launch(id);
+            q.record_done(id);
+            if i != MISSING {
+                fake.state().exists.insert(key.scenario_identity(spr));
+            }
+        }
+        q.save().unwrap();
+        order
+    };
+    let at = |id: &String| order.iter().position(|o| o == id).unwrap();
+    let (mut s, _live) = scheduler(dir, &fake);
+
+    tick(&mut s, &fake, 30_000); // the startup sweep's first chunk verifies slots 0-15
+    assert!(s.reconciling(), "the RECONCILE_CHUNK boundary leaves slots 16-19 unverified");
+    assert!(fake.submitted().is_empty(), "nothing later than the unverified slots runs (ruling 15-R1)");
+
+    fake.state().generation = GEN_B;
+    s.apply(PresolverCommand::SourceChanged);
+    s.step(); // one idle iteration under B: nothing is bound yet, so the sweep ends at once
+    assert!(!s.reconciling(), "the gap fix round 1 left: the sweep ends without ever reaching slot 19");
+
+    fake.state().generation = GEN_A;
+    s.apply(PresolverCommand::SourceChanged);
+    assert!(s.reconciling(), "N1: a real generation change restarts a verifying sweep");
+    assert_eq!(
+        s.status().done,
+        0,
+        "N1: slots 1-19's persisted completions are not published before this fresh sweep verifies them"
+    );
+
+    let mut steps = 0;
+    loop {
+        let submitted: Vec<usize> = fake.slots_submitted().iter().map(at).collect();
+        if submitted.contains(&MISSING) && submitted.contains(&DONE) {
+            break;
+        }
+        step_completing(&mut s, &fake);
+        steps += 1;
+        assert!(
+            steps < 1_000,
+            "N1: slot 19 is stuck (only the next periodic sweep, hours later, would find it) and slot 20 never waits for it"
+        );
+    }
+    let submitted: Vec<usize> = fake.slots_submitted().iter().map(at).collect();
+    let missing_at = submitted.iter().position(|&p| p == MISSING).unwrap();
+    let later_at = submitted.iter().position(|&p| p == DONE).unwrap();
+    assert!(missing_at < later_at, "N1: slot 19's missing completion is relaunched before slot 20 -- genuinely new work -- runs");
 }
 
 /// A queue with nothing to launch is not rescanned every tick -- with every slot bound, a scan that

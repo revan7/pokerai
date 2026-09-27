@@ -79,10 +79,12 @@
 //! `open` declares the executor's source/config fingerprint (`PresolveExecutor::generation`)
 //! before any reconciliation. A runtime change arrives as `PresolverCommand::SourceChanged`: when
 //! the fingerprint really changed, the running job is cancelled and the cancel recorded, then the
-//! new generation is declared and saved. Stale slots count as pending until the launch path
-//! prepares them again, one slot per iteration; an iteration that resolves a slot without starting
-//! a solve is followed at once by the next (`wait_hint` is zero), so rebinding costs preparations,
-//! not idle ticks.
+//! new generation is declared, a fresh startup-style sweep begins (fix round 3, N1: a generation
+//! that becomes current again -- A, then B, then A -- must be re-verified before its persisted
+//! completions count, exactly as `open`'s own generation is), and the change is saved. Stale slots
+//! count as pending until the launch path prepares them again, one slot per iteration; an iteration
+//! that resolves a slot without starting a solve is followed at once by the next (`wait_hint` is
+//! zero), so rebinding costs preparations, not idle ticks.
 //!
 //! ## Saves (ruling S8, refined by rulings 15-R3 and 15-R3b)
 //!
@@ -161,6 +163,15 @@ pub const RESCAN_MS: u64 = 5_000;
 /// queue-clock milliseconds: a publication after a change recounts every slot (measured about
 /// 24 ms in a release build with every slot bound).
 pub const BUSY_PUBLISH_MS: u64 = 1_000;
+
+/// What the scheduler logs when a completed job's entry does not read back durably at target (fix
+/// round 1, R4; fix round 3, N3): the attempt is refunded and the slot -- not the game -- returns
+/// to exactly the record `record_cancel` leaves it in: a fresh `Pending` for a first attempt, its
+/// own `Failed{n}` unchanged for a retry. `status` names which, so the log never claims "pending"
+/// for a retry that is really `Failed{n}`.
+pub fn not_durable_message(label: &str, status: &queue::TaskStatus) -> String {
+    format!("presolver: {label} completed, but its {NOT_DURABLE}; its attempt is refunded (now {status:?}) and the slot is held back for {NOT_DURABLE_COOLDOWN_MS} ms")
+}
 
 /// A job the executor prepared for one queue slot: the slot as the queue showed it, the background
 /// solve input, the rake and blind that input was built with, and -- for `Queue::bind` (ruling S3)
@@ -518,6 +529,13 @@ impl Scheduler {
                 if generation != self.queue.generation() {
                     self.cancel_active();
                     self.queue.set_generation(generation);
+                    // Fix round 3 (re-review 1, N1): a generation that becomes current again must
+                    // be re-verified before its persisted completions count, so a real change
+                    // always restarts a startup-style sweep -- the same gate that already keeps a
+                    // periodic sweep from being overtaken (module doc, "Reconciliation") applies to
+                    // it too, and published counts stay conservative until it clears them.
+                    self.sweep = Some(Sweep { startup: true, ..Sweep::default() });
+                    self.last_sweep_start = now;
                     self.touched();
                     self.flush(true);
                 }
@@ -768,14 +786,13 @@ impl Scheduler {
                     }
                 } else {
                     // Ruling 15-R4: the cache could not keep a solve that did not fail. The attempt
-                    // is refunded (the game is pending again, its retry budget untouched), and the
-                    // slot cools down in memory so a solve that never verifies cannot hot-loop.
+                    // is refunded -- the game is pending again, or (fix round 3, N3) a retry's own
+                    // `Failed{n}` is restored unchanged -- and the slot cools down in memory so a
+                    // solve that never verifies cannot hot-loop.
                     self.queue.record_cancel(&active.slot);
                     self.cooldown.insert(active.slot.clone(), now.saturating_add(NOT_DURABLE_COOLDOWN_MS));
-                    eprintln!(
-                        "presolver: {} completed, but its {NOT_DURABLE}; the slot stays pending with its attempt refunded and is held back for {NOT_DURABLE_COOLDOWN_MS} ms",
-                        active.label
-                    );
+                    let status = self.queue.item(&active.slot).expect("the cancelled slot is a queue slot").status;
+                    eprintln!("{}", not_durable_message(&active.label, &status));
                 }
             }
             JobPoll::Cancelled => self.queue.record_cancel(&active.slot),
