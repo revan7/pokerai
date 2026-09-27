@@ -16,8 +16,9 @@ pub enum WorkerLinkError {
     #[error("line too long: {0} bytes")] LineTooLong(usize),
     /// The worker could not be started and validated (bounded: at most two launches, spec 4.5).
     #[error("spawn: {0}")] Spawn(String),
-    /// The worker process is gone with this confirmed exit code (spec 10.3 `WorkerExit{code}`). Final: once a link
-    /// has reported it, it keeps reporting it.
+    /// The worker process is gone with this confirmed exit code (spec 10.3 `WorkerExit{code}`). Final for the
+    /// process: every later `send` reports it, and `recv` reports it after returning every line the worker wrote
+    /// before exiting (a `send` may report it first, while such lines are still queued), then keeps reporting it.
     #[error("worker exited with code {code}")] Exit { code: i32 },
 }
 
