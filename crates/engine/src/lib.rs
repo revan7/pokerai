@@ -2,6 +2,7 @@
 //! solve-tree templates of spec section 10.1.
 
 pub mod allin;
+pub mod assemble;
 pub mod bench_support;
 pub mod clock;
 pub mod deadline;

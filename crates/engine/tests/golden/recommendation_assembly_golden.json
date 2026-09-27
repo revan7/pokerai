@@ -1,0 +1,165 @@
+{
+  "complete_ev": [
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "ev_bb": 0.0,
+      "frequency": 0.20000000298023224,
+      "headline": false,
+      "unavailable": null
+    },
+    {
+      "action": {
+        "kind": "call"
+      },
+      "ev_bb": 1.25,
+      "frequency": 0.30000001192092896,
+      "headline": false,
+      "unavailable": null
+    },
+    {
+      "action": {
+        "kind": "raise",
+        "to": 150
+      },
+      "ev_bb": 3.0,
+      "frequency": 0.5,
+      "headline": true,
+      "unavailable": null
+    }
+  ],
+  "out_of_support": {
+    "actions": [
+      {
+        "action": {
+          "kind": "fold"
+        },
+        "ev_bb": null,
+        "frequency": null,
+        "headline": false,
+        "unavailable": {
+          "kind": "HeroOutOfSupport"
+        }
+      },
+      {
+        "action": {
+          "kind": "call"
+        },
+        "ev_bb": null,
+        "frequency": null,
+        "headline": false,
+        "unavailable": {
+          "kind": "HeroOutOfSupport"
+        }
+      },
+      {
+        "action": {
+          "kind": "raise",
+          "to": 150
+        },
+        "ev_bb": null,
+        "frequency": null,
+        "headline": false,
+        "unavailable": {
+          "kind": "HeroOutOfSupport"
+        }
+      }
+    ],
+    "assumptions": {
+      "cache": "miss",
+      "elapsed_ms": 0,
+      "mappings": [],
+      "notes": [],
+      "ranges_used": [],
+      "reached_bp": null,
+      "source": "solver-worker",
+      "source_accuracy": "unverified",
+      "source_granularity": "1326 combos",
+      "target_bp": 50,
+      "template_id": "river_std_v1",
+      "translations": [],
+      "tree_signature": ""
+    },
+    "coverage": {
+      "kind": "Unsupported",
+      "partial": [],
+      "reason": {
+        "kind": "HeroComboOutOfSupport"
+      }
+    },
+    "equity": {
+      "hero_combo_vs_each": [
+        [
+          0,
+          {
+            "availability": {
+              "kind": "Pending"
+            },
+            "method": null,
+            "value": null
+          }
+        ]
+      ],
+      "hero_range_vs_each": [
+        [
+          0,
+          {
+            "availability": {
+              "kind": "Pending"
+            },
+            "method": null,
+            "value": null
+          }
+        ]
+      ],
+      "per_pot_shares": []
+    },
+    "experimental": null,
+    "exploit": null,
+    "identity": {
+      "config_revision": 1,
+      "decision_id": 1,
+      "hand_id": 1,
+      "hand_revision": 1,
+      "model_revision": 0
+    },
+    "legal": [
+      {
+        "kind": "fold"
+      },
+      {
+        "cost": 50,
+        "kind": "call"
+      },
+      {
+        "kind": "raise",
+        "max_to": 500,
+        "min_to": 100
+      }
+    ],
+    "phase": "final",
+    "range_mix": [
+      [
+        {
+          "kind": "fold"
+        },
+        0.0
+      ],
+      [
+        {
+          "kind": "call"
+        },
+        1.0
+      ],
+      [
+        {
+          "kind": "raise",
+          "to": 150
+        },
+        0.0
+      ]
+    ],
+    "unresolved_mass": 0.0
+  }
+}
