@@ -7,10 +7,14 @@
 //! NoEvReference, ChartNoEv, EvReferenceUnverified, MovedProbability, mixed references), unequal
 //! menus of the same kind at different chip amounts, the no-node key selection, the frozen
 //! stopped branch, the range-level mix and the always-on input checks.
+//!
+//! Fix round 1: T16-R1's source-rounding policy (rows admitted by spec 8.2's `1 +- 1e-3` are
+//! normalized once at the mapped-node boundary, fed here from real `legalize_row` output; rows
+//! outside it are rejected) and T16-R2's retained key for a heaviest residual.
 
-use core_preflop::branches::{initial, HistoryBranch};
-use core_preflop::{mix_action, mix_nodes, BranchNode, EvReference, ExpandedNode, MixedNode, SourceKind};
-use proto::{Action, ActionAdvice, ApproxReason, Seat, Unavailable, UnsupportedReason, COMBOS};
+use core_preflop::branches::{initial, rescale, HistoryBranch};
+use core_preflop::{destination_map, legalize_row, mix_action, mix_nodes, BranchNode, EvReference, ExpandedNode, MixedNode, SourceKind};
+use proto::{Action, ActionAdvice, ApproxReason, LegalAction, Seat, Unavailable, UnsupportedReason, COMBOS};
 
 const V: Seat = Seat(0);
 const H: Seat = Seat(1);
@@ -407,6 +411,151 @@ fn missing_node_in_every_positive_branch_names_the_heaviest_retained_key() {
     let nodes = vec![at(0, Some(verified(&[(FOLD, 1.0, Some(0.0))])), "k0"), at(1, None, "k1")];
     let m = mix_nodes(&bs, &nodes, H, 0, 2);
     assert_eq!(m.unsupported, Some(UnsupportedReason::MissingPreflopNode { key: "k1".into() }));
+}
+
+#[test]
+fn a_heaviest_residual_names_the_heaviest_known_key_across_all_branches() {
+    // T16-R2, the reviewer's combined case. q = [0.6 residual, 0.1 stopped "positive-key", 0.3 live
+    // with a present node but zero mass for hero's combo 0]. Both positive-posterior branches lack
+    // a node, so the decision is MissingPreflopNode; the heaviest positive-posterior branch is the
+    // residual, which has no source key, so the key is the heaviest known stopped/live key across
+    // ALL branches: branch 2's (q = 0.3), not the lighter positive branch 1's (q = 0.1).
+    let mut bs = branches(&[0.6, 0.1, 0.3]);
+    bs[0].residual = true;
+    bs[1].stopped = Some("missing node positive-key".into());
+    // Equal per-seat branch totals: combo 1 carries the mass combo 0 gives up in branch 2.
+    bs[2].seats[1].mass[0] = 0.0;
+    bs[2].seats[1].mass[1] = 2.0;
+    rescale(&mut bs, &mut [0.0; 2]);
+    let live = verified(&[(FOLD, 0.5, Some(0.0)), (CALL, 0.5, Some(2.0))]);
+    let nodes = vec![at(0, None, ""), at(1, None, "positive-key"), at(2, Some(live.clone()), "heaviest-known-key")];
+    let m = mix_nodes(&bs, &nodes, H, 0, 2);
+    assert_eq!(m.unsupported, Some(UnsupportedReason::MissingPreflopNode { key: "heaviest-known-key".into() }));
+    assert!(m.actions.is_empty());
+    assert_eq!(m.range_mix, None);
+    close(f64::from(m.unresolved_mass), 1.0);
+
+    // Guard (unchanged by the fix): the partial-coverage reason keeps its preference for an actual
+    // missing key. q = [0.5 residual, 0.1 stopped "k-missing", 0.4 live "k-live"]: hero has a node
+    // in branch 2 only, and BranchResidual names the stopped branch's missing key, although the
+    // residual is heavier and the live key is the heaviest known key.
+    let mut bs = branches(&[0.5, 0.1, 0.4]);
+    bs[0].residual = true;
+    bs[1].stopped = Some("missing node k-missing".into());
+    let nodes = vec![at(0, None, ""), at(1, None, "k-missing"), at(2, Some(live), "k-live")];
+    let m = mix_nodes(&bs, &nodes, H, 0, 2);
+    assert_eq!(m.unsupported, None);
+    close(f64::from(m.unresolved_mass), 0.6);
+    assert!(matches!(m.reasons.as_slice(),
+        [ApproxReason::BranchResidual { cause, .. }] if cause == "missing node k-missing"), "{:?}", m.reasons);
+}
+
+/// Hero's node built from real P3.T10 output, one source row repeated on every combo: source
+/// actions `Call` and raises to 10, 11, ... chips, every raise below the live minimum raise (20)
+/// with no legal source raise, so `destination_map` moves each raise into the existing `Call` and
+/// `legalize_row` sums their probabilities there in `f32` (spec 8.4's legality-after-mapping
+/// rule). The `Call` keeps its own 2-chip EV; the moved raises' EVs are never used.
+fn legalized_call_node(source: &[f32]) -> ExpandedNode {
+    let actions: Vec<Action> = (0..source.len()).map(|i| if i == 0 { CALL } else { Action::Raise { to: 9 + i as u32 } }).collect();
+    let legal = [LegalAction::Fold, LegalAction::Call { cost: 2 }, LegalAction::Raise { min_to: 20, max_to: 100 }, LegalAction::AllIn { to: 100 }];
+    let (menu, map) = destination_map(&actions, &legal).expect("every raise has a legal destination");
+    assert_eq!(menu, vec![CALL], "every raise was moved into the existing call");
+    let evs: Vec<Option<f32>> = (0..source.len()).map(|i| Some(2.0 + i as f32)).collect();
+    let row = legalize_row(&menu, &map, source, &evs, &mut vec![]);
+    assert_eq!(row.unsupported, None);
+    ExpandedNode {
+        actor: H,
+        actions: row.actions.iter().map(|m| m.action).collect(),
+        probs: vec![row.actions.iter().map(|m| m.probability).collect(); COMBOS],
+        ev_chips: vec![row.actions.iter().map(|m| m.ev_chips).collect(); COMBOS],
+        available: vec![true; COMBOS],
+        ev_reference: EvReference::DecisionIncrementalVerified,
+        source: SourceKind::PokerDataJson,
+    }
+}
+
+/// T16-R1: a source row admitted by spec 8.2 (`|sum - 1| <= 1e-3`, the wide gate's own formula)
+/// whose `legalize_row` output sums above 1 is normalized once and mixes to finite advice, on one
+/// branch and beside a stopped branch whose posterior stays unresolved (never renormalized away).
+fn assert_admitted_row_mixes(source: &[f32]) {
+    let wide: f64 = source.iter().map(|&p| f64::from(p)).sum();
+    assert!((wide - 1.0).abs() <= 1e-3, "spec 8.2 admits the source row: sum {wide}");
+    let n = legalized_call_node(source);
+    let carried = n.probs[0][0];
+    assert!(carried > 1.0, "legalize_row's merged Call probability exceeds 1: {carried}");
+    let m = mix_nodes(&branches(&[1.0]), &[at(0, Some(n.clone()), "k0")], H, 0, 2);
+    assert_eq!(m.unsupported, None);
+    let c = advice(&m, CALL);
+    assert_eq!(c.frequency, Some(1.0), "the admitted row is normalized to sum 1 before mixing");
+    assert_eq!(c.ev_bb, Some(1.0), "the Call's own 2 chips at 2 chips per bb");
+    assert_eq!(c.unavailable, None);
+    assert_eq!(m.unresolved_mass, 0.0);
+    let mix = m.range_mix.as_ref().expect("a node strategy exists");
+    assert_eq!(mix.len(), 1);
+    close(f64::from(mix[0].1), 1.0);
+    // Beside a stopped 0.25 branch: the posterior is not renormalized over the covered branch.
+    let mut bs = branches(&[0.75, 0.25]);
+    bs[1].stopped = Some("missing node k1".into());
+    let m = mix_nodes(&bs, &[at(0, Some(n), "k0"), at(1, None, "k1")], H, 0, 2);
+    assert_eq!(m.unsupported, None);
+    let c = advice(&m, CALL);
+    close(f64::from(c.frequency.unwrap()), 0.75);
+    assert_eq!(c.ev_bb, None);
+    close(f64::from(covered(c)), 0.75);
+    close(f64::from(m.unresolved_mass), 0.25);
+    close(frequency_total(&m) + f64::from(m.unresolved_mass), 1.0);
+    close(f64::from(m.range_mix.as_ref().unwrap()[0].1), 1.0);
+}
+
+#[test]
+fn admitted_rounded_halves_moved_into_the_call_mix_without_panicking() {
+    // Two 0.5002 probabilities (source sum 1.0004, admitted); the raise moves into the call.
+    assert_admitted_row_mixes(&[0.5002, 0.5002]);
+}
+
+#[test]
+fn exact_decimal_tenths_accumulated_in_f32_mix_without_panicking() {
+    // Ten 0.1 probabilities sum to 1 in decimal; f32 accumulation in legalize_row gives 1.0000001.
+    assert_admitted_row_mixes(&[0.1; 10]);
+}
+
+#[test]
+fn a_row_on_the_admission_boundary_survives_its_f32_carrier() {
+    // Two 0.5005 weights: spec 8.2's wide (f64) gate admits the sum 1.001, but the f32 values the
+    // mapped node carries sum to 1.0010000467 -- outside 1 +- 1e-3 by f32 rounding alone. An
+    // admitted row must never abort the recommendation, so the assembly admits it too.
+    assert!((0.5005_f64 + 0.5005_f64 - 1.0).abs() <= 1e-3, "spec 8.2 admits the wide row");
+    let n = legalized_call_node(&[0.5005, 0.5005]);
+    let carried = f64::from(n.probs[0][0]);
+    assert!((carried - 1.0).abs() > 1e-3, "the f32 carrier lies just outside 1 +- 1e-3: {carried}");
+    let m = mix_nodes(&branches(&[1.0]), &[at(0, Some(n), "k0")], H, 0, 2);
+    assert_eq!(m.unsupported, None);
+    assert_eq!(advice(&m, CALL).frequency, Some(1.0));
+}
+
+#[test]
+#[should_panic(expected = "mix_nodes: branch 0's node \"k0\" combo 0 probabilities sum to 1.0011000633239746, outside spec 8.2's 1 +- 1e-3")]
+fn a_row_just_above_the_admission_tolerance_is_rejected() {
+    // Source sum 1.0011: outside 1 +- 1e-3, so spec 8.2 never admits it; the assembly rejects it
+    // with a diagnostic naming the node and the sum instead of normalizing it.
+    let n = legalized_call_node(&[0.5, 0.5011]);
+    mix_nodes(&branches(&[1.0]), &[at(0, Some(n), "k0")], H, 0, 2);
+}
+
+#[test]
+#[should_panic(expected = "mix_nodes: branch 0's node \"k0\" combo 0 probabilities sum to 0.9988000392913818, outside spec 8.2's 1 +- 1e-3")]
+fn a_row_just_below_the_admission_tolerance_is_rejected() {
+    let n = legalized_call_node(&[0.5, 0.4988]);
+    mix_nodes(&branches(&[1.0]), &[at(0, Some(n), "k0")], H, 0, 2);
+}
+
+#[test]
+#[should_panic(expected = "mix_nodes: branch 0's node \"k0\" combo 3 is explicitly unreachable but its probabilities sum to 1, not exactly 0")]
+fn an_unreachable_row_that_is_not_all_zero_is_rejected() {
+    // Spec 8.2: an unreachable class sums to exactly 0; only that all-zero row is kept as is.
+    let mut n = verified(&[(FOLD, 0.5, Some(0.0)), (CALL, 0.5, Some(2.0))]);
+    n.available[3] = false;
+    mix_nodes(&branches(&[1.0]), &[at(0, Some(n), "k0")], H, 0, 2);
 }
 
 #[test]
