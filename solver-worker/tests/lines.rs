@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 const S: Duration = Duration::from_secs(1);
 
-/// Task 12's placeholder answer to a well-formed line: the complete ack, every field pinned (review M1).
-/// Task 13 replaces the placeholder handler and updates these expectations with it.
-fn placeholder_ack(id: &str) -> Value { json!({"type": "ack", "id": id, "status": "rejected", "reason": "not implemented yet"}) }
+/// The §4.5 answer to the well-formed line these tests send, a `cancel` of the never-seen target "nope": the
+/// complete ack, every field pinned (review M1 of Task 12), so a stray `reason` or `replaced` fails too.
+fn unknown_target_ack(id: &str) -> Value { json!({"type": "ack", "id": id, "status": "unknown_target"}) }
 
 #[test]
 fn oversized_request_line_is_rejected_and_the_worker_survives() {
@@ -24,7 +24,7 @@ fn oversized_request_line_is_rejected_and_the_worker_survives() {
     assert_eq!(a, json!({"type": "ack", "id": "unknown", "status": "rejected", "reason": "line exceeds 1 MiB"}));
     // the worker is still reading: a following well-formed line is answered, not swallowed
     w.send(r#"{"type":"cancel","id":"7","target":"nope"}"#);
-    assert_eq!(w.recv_until(5 * S, |m: &Value| m["id"] == "7").unwrap(), placeholder_ack("7"));
+    assert_eq!(w.recv_until(5 * S, |m: &Value| m["id"] == "7").unwrap(), unknown_target_ack("7"));
 }
 
 #[test]
@@ -49,7 +49,7 @@ fn eof_behind_queued_lines_answers_every_line_before_exiting() {
     assert_eq!(w.wait_exit(5 * S), Some(0));
     for i in 0..N {
         let a = w.recv(5 * S).unwrap_or_else(|| panic!("no answer to line {i}"));
-        assert_eq!(a, placeholder_ack(&i.to_string()), "answer {i}");
+        assert_eq!(a, unknown_target_ack(&i.to_string()), "answer {i}");
     }
     assert!(w.recv(S).is_none(), "nothing after the last answer");
 }
@@ -110,7 +110,7 @@ fn a_request_line_that_is_not_utf8_is_rejected_as_such_and_the_worker_survives()
     assert_eq!(next()["type"], "ready");
     let not_utf8 = json!({"type": "ack", "id": "unknown", "status": "rejected", "reason": "line is not valid UTF-8"});
     assert_eq!(next(), not_utf8);
-    assert_eq!(next(), placeholder_ack("9"));
+    assert_eq!(next(), unknown_target_ack("9"));
     assert_eq!(next(), not_utf8);
     assert_eq!(exit_code(&mut child, 5 * S), Some(0));
     assert!(lines.recv_timeout(S).is_err(), "nothing after the last answer");
