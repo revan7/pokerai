@@ -38,8 +38,11 @@
 //! the first attempt, only when the failure allows it and a `_min` template exists, one retry on that template is sent
 //! if §7's admission passes, with only what is left until final delivery. A retry never rewinds the reported stage, and
 //! its terminal is never published as the first attempt's. A request that finds no live worker (a restart that failed
-//! earlier) relaunches it once before anything is sent. At the watchdog's fire the client stops and cleans nothing up:
-//! the watchdog delivers the `Final`, and the kill and restart of a still-busy worker after it are `serve_request`'s.
+//! earlier) relaunches it once before anything is sent. A restart or relaunch that fails ends the solve with a
+//! non-retryable `EngineError` naming both causes. Identity and the watchdog's cutoff are judged on every receive
+//! result, a link failure included, before it is classified or anything is recovered. At the watchdog's fire the client
+//! stops and cleans nothing up: the watchdog delivers the `Final`, and the kill and restart of a still-busy worker after
+//! it are `serve_request`'s.
 
 use crate::bench_support::spot_identity;
 use crate::core::EngineCore;
@@ -138,10 +141,12 @@ fn engine_error(m: impl Into<String>, retryable: bool) -> UnsupportedReason { Un
 fn superseded() -> UnsupportedReason { engine_error("superseded by a newer request", false) }
 
 /// The reason of a solve whose worker could not be restarted after the attempt failed with `reason` (§12): both causes,
-/// named. No live worker is left, which is retryable as `ready_for_requests` has it: the next request relaunches it.
+/// named. Not retryable (P2T23-I3): the link has already made its bounded launches, and its failure can be permanent (a
+/// `ready` it refused, which a rebuilt binary alone cures) in a way the engine cannot tell from a transient one (a typed
+/// refusal is follow-up P2.W2). No live worker is left; the next request relaunches it once.
 fn restart_failed(reason: UnsupportedReason, e: &WorkerLinkError) -> UnsupportedReason {
     let failure = match reason { UnsupportedReason::EngineError { message, .. } => message, other => format!("{other:?}") };
-    engine_error(format!("{failure}; restarting the worker failed: {e}"), true)
+    engine_error(format!("{failure}; restarting the worker failed: {e}"), false)
 }
 
 /// §7 retry admission's `p95(_min template)`: until plan 4's bench matrix exists (plan 4 Task 21), the street budget,
@@ -205,19 +210,24 @@ enum Watch {
     /// Waiting for this solve's terminal: the attempt's hang bound and, while the worker reports `Solving`, the time the
     /// heartbeat is due (its last `progress` + `HEARTBEAT_MS`).
     Waiting { hang_bound_ms: u64, heartbeat_due_ms: Option<u64> },
+    /// A receive while waiting returned a link failure (an exit, an end of stdout, a faulty line): the worker may still
+    /// be running the job, and the failure is classified as it is unless the decision is gone or the fire has come (the
+    /// hang bound and the heartbeat do not apply to it, P2T23-I1).
+    Failed,
     /// This solve's terminal has arrived (within the hang bound, which no longer applies): before a validated success
     /// is exposed.
     AfterTerminal,
 }
 
 /// Whether the attempt can no longer act at `now_ms`, and how it ends, checked in this order at the top of the receive
-/// loop, on every reply the moment the client observes it (ruling 22-I1), before the request is sent and before a
-/// validated success is exposed: the decision is no longer active (ruling 22-I2), and only while waiting may the worker
-/// still be running its job; the watchdog's fire has come, and it delivers the `Final` (§7); while waiting, the
-/// attempt's hang bound has come, or the heartbeat is due (§12). `None` while the attempt may go on.
+/// loop, on every receive result the moment the client observes it (a reply or a link failure: ruling 22-I1,
+/// P2T23-I1), before the request is sent and before a validated success is exposed: the decision is no longer active
+/// (ruling 22-I2), and only once sent and before its terminal may the worker still be running its job; the watchdog's
+/// fire has come, and it delivers the `Final` (§7); while waiting, the attempt's hang bound has come, or the heartbeat
+/// is due (§12). `None` while the attempt may go on (or, after a link failure, while that failure stands).
 fn ended_at(core: &EngineCore, plan: &SolvePlan, now_ms: u64, watch: Watch) -> Option<AttemptEnd> {
     if !core.identity_active(&plan.identity) {
-        return Some(AttemptEnd::Superseded { running: matches!(watch, Watch::Waiting { .. }) });
+        return Some(AttemptEnd::Superseded { running: matches!(watch, Watch::Waiting { .. } | Watch::Failed) });
     }
     if now_ms >= plan.deadlines.watchdog_fire_ms() {
         return Some(AttemptEnd::DeadlinePassed);
@@ -225,7 +235,7 @@ fn ended_at(core: &EngineCore, plan: &SolvePlan, now_ms: u64, watch: Watch) -> O
     match watch {
         Watch::Waiting { hang_bound_ms, .. } if now_ms >= hang_bound_ms => Some(AttemptEnd::Hang),
         Watch::Waiting { heartbeat_due_ms: Some(due_ms), .. } if now_ms >= due_ms => Some(AttemptEnd::Heartbeat),
-        Watch::BeforeSend | Watch::Waiting { .. } | Watch::AfterTerminal => None,
+        Watch::BeforeSend | Watch::Waiting { .. } | Watch::Failed | Watch::AfterTerminal => None,
     }
 }
 
@@ -244,9 +254,10 @@ fn street_violated(deadline_ms: u64, first_terminal_ms: Option<u64>, now_ms: u64
 /// adapter version and AVX2 in `build_features` are checked here before every request (a mismatch answers every
 /// request with `EngineError("worker/proto version mismatch")` until the worker is rebuilt); `threads == requested` was
 /// checked by the link at launch against its own launch argument (`ProcessWorker`), which the engine core does not hold.
-/// No live worker (killed, or a restart that failed) is a retryable `EngineError`.
+/// `run_solve` relaunches a missing worker before it asks, so no `ready` here means a restart that reported success and
+/// left no live worker: a failed restart, not retryable (P2T23-I3).
 fn ready_for_requests(core: &EngineCore) -> Result<(), UnsupportedReason> {
-    let ready = core.worker.ready().ok_or_else(|| engine_error("worker not ready: no live worker", true))?;
+    let ready = core.worker.ready().ok_or_else(|| engine_error("worker not ready: no live worker after a restart that reported success", false))?;
     validate_ready(ready, ready.threads).map_err(|e| engine_error(format!("worker/proto version mismatch: {e}"), false))
 }
 
@@ -320,8 +331,10 @@ fn exploitability_pct(chips: f32, pot: u32) -> Result<f32, String> {
 /// The cancel-then-kill of §7/§12, for a solve `target` superseded while the worker may still be running it (never one
 /// superseded before its send: nothing reached the worker). Sends `cancel` for it under a fresh request id and waits at
 /// most `CANCEL_KILL_MS` from the send for the job's `result{cancelled}`, the only confirmation (§12); anything else read
-/// meanwhile is discarded, a late reply of the job included. Unconfirmed by then, the worker is killed and restarted. A
-/// link failure (the cancel cannot be sent, the worker exits or breaks the protocol in the window) is answered by a
+/// meanwhile is discarded, a late reply of the job included. The window is judged at the engine-clock time the client
+/// observes each receive result, not by the bound the receive was given (P2T23-I2, as ruling 22-I1 for replies): a
+/// confirmation observed at or after the bound is too late. Unconfirmed by then, the worker is killed and restarted. A
+/// link failure within the window (the cancel cannot be sent, the worker exits or breaks the protocol) is answered by a
 /// restart at once. Returns whether the worker was restarted; a restart that fails leaves no live worker, which the next
 /// request relaunches (`run_solve`), and is never a panic.
 pub(crate) fn cancel_or_kill(core: &mut EngineCore, target: &str) -> bool {
@@ -332,15 +345,19 @@ pub(crate) fn cancel_or_kill(core: &mut EngineCore, target: &str) -> bool {
     }
     let sent = core.clock.now_ms();
     let until = sent.checked_add(CANCEL_KILL_MS).unwrap_or_else(|| panic!("the kill bound of a cancel sent at {sent} ms overflows u64"));
+    let kill = |core: &mut EngineCore| {
+        core.worker.kill();
+        let _ = core.worker.restart();
+        true
+    };
     loop {
         let now = core.clock.now_ms();
-        if now >= until {
-            core.worker.kill();
-            let _ = core.worker.restart();
-            return true;
-        }
+        if now >= until { return kill(core); }
         // What is left of the window, never more: `recv` keeps it for the whole call.
-        match core.worker.recv(Duration::from_millis(until - now)) {
+        let received = core.worker.recv(Duration::from_millis(until - now));
+        // Judged when observed: whatever the receive returned at or after the bound came too late.
+        if core.clock.now_ms() >= until { return kill(core); }
+        match received {
             Ok(Some(WorkerMessage::Result { id, status: ResultStatus::Cancelled, .. })) if id == target => return false,
             Ok(_) => {}
             Err(_) => {
@@ -384,19 +401,27 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
         if let Some(end) = ended_at(core, plan, now, watch) { return (end, None); }
         // What is left until the earliest bound, never more: `recv` keeps it for the whole call.
         let bound_ms = expected_by.min(fire_ms).min(heartbeat_due_ms.unwrap_or(u64::MAX));
-        let msg = match core.worker.recv(Duration::from_millis(bound_ms - now)) {
+        let received = core.worker.recv(Duration::from_millis(bound_ms - now));
+        // Identity and expiry on every receive result, at the engine-clock time the client observes it (ruling 22-I1,
+        // P2T23-I1): the receive's bound limits the wait, not when the client runs again (a suspend, a stalled thread),
+        // and an unconfirmed end of stdout spends the whole bound. A mutation that landed while the reply was in flight
+        // (or in the same receive), or a result seen at or after the watchdog's fire, ends the attempt before anything
+        // of it is forwarded, validated, accepted, classified or recovered, as the top of the loop would have a moment
+        // later (§4.4, §7, §12); a reply seen at or after the hang bound or the heartbeat's due time ends it the same way.
+        let at_ms = core.clock.now_ms();
+        let msg = match received {
             Ok(Some(msg)) => msg,
             Ok(None) => continue,
-            Err(WorkerLinkError::Exit { code }) => return (AttemptEnd::Exit(code), None),
-            Err(WorkerLinkError::Eof | WorkerLinkError::Spawn(_)) => return (AttemptEnd::Ended, None),
-            Err(e @ (WorkerLinkError::Protocol(_) | WorkerLinkError::LineTooLong(_))) => return (AttemptEnd::Protocol(e.to_string()), None),
+            Err(e) => {
+                if let Some(end) = ended_at(core, plan, at_ms, Watch::Failed) { return (end, None); }
+                let end = match e {
+                    WorkerLinkError::Exit { code } => AttemptEnd::Exit(code),
+                    WorkerLinkError::Eof | WorkerLinkError::Spawn(_) => AttemptEnd::Ended,
+                    e @ (WorkerLinkError::Protocol(_) | WorkerLinkError::LineTooLong(_)) => AttemptEnd::Protocol(e.to_string()),
+                };
+                return (end, None);
+            }
         };
-        // Identity and expiry on every reply, at the engine-clock time the client observes it (ruling 22-I1): the
-        // receive's bound limits the wait, not when the client runs again (a suspend, a stalled thread). A mutation that
-        // landed while the reply was in flight (or in the same receive), or a reply seen at or after the watchdog's fire,
-        // the hang bound or the heartbeat's due time, ends the attempt before anything of the reply is forwarded,
-        // validated or accepted, as the top of the loop would have a moment later (§4.4, §7, §12).
-        let at_ms = core.clock.now_ms();
         if let Some(end) = ended_at(core, plan, at_ms, Watch::Waiting { hang_bound_ms: expected_by, heartbeat_due_ms }) { return (end, None); }
         match msg {
             WorkerMessage::Ack { id, status, reason, .. } if id == req.id => match status {
@@ -518,11 +543,12 @@ pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, si
         Ok(b) => b,
         Err(r) => return fail(core, r, &template, restarts, None),
     };
-    // No live worker (a restart that failed earlier, a kill): one relaunch before anything is sent (review P2T22R).
+    // No live worker (a restart that failed earlier, a kill): one relaunch before anything is sent (review P2T22R). A
+    // relaunch that fails is not retryable, as any failed restart (`restart_failed`, P2T23-I3).
     if core.worker.ready().is_none() {
         restarts += 1;
         if let Err(e) = core.worker.restart() {
-            return fail(core, engine_error(format!("worker not ready: no live worker, and relaunching it failed: {e}"), true), &template, restarts, None);
+            return fail(core, engine_error(format!("worker not ready: no live worker, and relaunching it failed: {e}"), false), &template, restarts, None);
         }
     }
     if let Err(reason) = ready_for_requests(core) { return fail(core, reason, &template, restarts, None); }
