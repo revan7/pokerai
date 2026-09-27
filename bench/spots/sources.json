@@ -1,6 +1,30 @@
 {
   "bundles": [
     {
+      "absent": [
+        "C",
+        "FFFFCR",
+        "FFFFF",
+        "FFFFRRR",
+        "FFFRC",
+        "FFFRFR",
+        "FFFRRF",
+        "FFRFFR",
+        "FFRFRF",
+        "FFRRFF",
+        "FRFFFR",
+        "FRFFRF",
+        "FRFRFF",
+        "FRRFFF",
+        "RCFFF",
+        "RFFFFR",
+        "RFFFRF",
+        "RFFRFF",
+        "RFRFFF",
+        "RRFFFFR",
+        "RRFFFF",
+        "RR"
+      ],
       "bytes": 151264,
       "manifest": {
         "accuracy": "unverified",
@@ -54,9 +78,24 @@
         "envelope_version": 2,
         "pages": 6,
         "url": "https://poker-coaching.s3.amazonaws.com/tools/preflop-charts/online-6max-gto-charts.pdf"
+      },
+      "source_pdf": {
+        "bytes": 2055584,
+        "sha256": "f5686c6dd672c782249752c60cd4ff5850378271e2139abc2b15e690149d091b",
+        "source_file": "fixtures/charts/sources/pokercoaching_100.pdf",
+        "url": "https://poker-coaching.s3.amazonaws.com/tools/preflop-charts/online-6max-gto-charts.pdf"
       }
     },
     {
+      "absent": [
+        "C",
+        "FFFFC",
+        "FFFFRRR",
+        "FFRCF",
+        "RCF",
+        "RRFFFFR",
+        "RR"
+      ],
       "bytes": 280688,
       "manifest": {
         "accuracy": "unverified",
@@ -124,6 +163,12 @@
         "envelope_version": 2,
         "pages": 13,
         "url": "https://rangeconverter.com/articles/poker-charts-6-max-200bb-no-limit-texas-holdem"
+      },
+      "source_pdf": {
+        "bytes": 5169125,
+        "sha256": "f0797be2a9894c520af90e70c17e2b7dee208215eab58b6ae953e8cc81bf70e2",
+        "source_file": "fixtures/charts/sources/rangeconverter_200.pdf",
+        "url": "https://rangeconverter.com/downloads/6-max-200bb-Poker-Charts-No-Limit-Texas-Holdem-Cash"
       }
     }
   ],

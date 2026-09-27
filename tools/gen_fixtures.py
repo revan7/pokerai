@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 import warnings
 from pathlib import Path
 
@@ -306,6 +307,20 @@ def _run_sources(repo: Path, check: bool) -> None:
         print(f"wrote {repo / 'bench/spots/sources.json'}")
 
 
+# The pre-subcommand-table flat CLI (plan 1), still the documented regeneration command in
+# docs/superpowers/plans/2026-09-10-plan-1-foundation.md:3637,3645,5318 ("tools/gen_fixtures.py
+# --out fixtures/hands"). Task 17's fix round (M1) keeps it working as a compatibility alias for
+# `hands` rather than silently breaking the published command: these are exactly its flags, so if
+# the first token is one of them (never a subcommand name), `hands` is implied.
+_LEGACY_HANDS_FLAGS = {"--out", "--count", "--seed"}
+
+
+def _alias_legacy_flat_hands_command(argv: list[str]) -> list[str]:
+    if argv and argv[0] in _LEGACY_HANDS_FLAGS:
+        return ["hands", *argv]
+    return argv
+
+
 def main(argv: list[str] | None = None) -> int:
     # The subcommand table (plan 4 Task 17); `sources` is added here and extended by Task 19
     # with `worker` and `e2e` (see that task's brief for the shared shape this mirrors).
@@ -324,7 +339,8 @@ def main(argv: list[str] | None = None) -> int:
         help="regenerate bench/spots/sources.json in memory and compare bytes instead of writing",
     )
 
-    args = parser.parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(_alias_legacy_flat_hands_command(raw_argv))
     if args.command == "sources":
         _run_sources(repo, args.check)
         return 0
