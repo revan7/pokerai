@@ -79,11 +79,11 @@ pub enum Op { TreeBuild, TreeCheck, GameConfig, MemoryCheck, Allocate, LockValid
 
 /// The hooks seam, deterministic for the tests (standing ruling: a hook places a cancel or a measurement
 /// exactly, never a sleep racing the computation). Production (`Stderr`) keeps every default: nothing
-/// at a checkpoint, at a poll or around an operation, the measurement unchanged, and diagnostics on
-/// stderr (§4.5: stdout carries protocol only). Every hook is called on the job's own thread, never with
-/// the protocol lock held, and none of them polls or decides anything: a hook that blocks holds the job
-/// exactly where it is called while control goes on answering stdin (the executor's checkpoint barrier,
-/// `protocol::executor_loop_with`).
+/// at a checkpoint, at a poll or around an operation, the measurement and the loop's clock unchanged,
+/// and diagnostics on stderr (§4.5: stdout carries protocol only). Every hook is called on the job's own
+/// thread, never with the protocol lock held, and none of them polls or decides anything: a hook that
+/// blocks holds the job exactly where it is called while control goes on answering stdin (the
+/// executor's checkpoint barrier, `protocol::executor_loop_with`).
 pub trait Hooks {
     /// Called at each checkpoint, immediately before the cancel flag is polled.
     fn checkpoint(&mut self, _at: Checkpoint) {}
@@ -101,6 +101,14 @@ pub trait Hooks {
     fn node_site(&mut self, _at: NodeSite) {}
     /// A raw measurement as the solve loop produced it, before it is reported.
     fn measured(&mut self, raw: f32) -> f32 { raw }
+    /// The §7 loop's clock (`solve_loop::run`'s `clock`): each reading of the milliseconds elapsed since the job
+    /// started, as the loop takes it before comparing it with the deadline and the extraction margin (its stop rule,
+    /// its measurement budget, its progress coalescing). Production returns it unchanged. A test scripts it to place
+    /// the §7 stop point exactly (P2.T17 fix round 1, review I1): held at a loop site by a blocking hook, the job's
+    /// loop sees the time the test sets once it is released, so `best_so_far` and `no_iteration` are forced by where
+    /// the test moves the clock, not by how fast the solver runs. Like `measured` it passes an input through and
+    /// decides nothing; the loop's measured step costs, the job's `elapsed_ms` and every other timing stay real.
+    fn loop_clock(&mut self, real_ms: f64) -> f64 { real_ms }
     fn log(&mut self, line: &str) { eprintln!("{line}"); }
 }
 /// The production hooks: every default.
@@ -142,17 +150,17 @@ impl Reporter {
 /// The job's three seams. Production (`run`) passes `Stderr` hooks, the real §7 loop (`real_loop`) and
 /// `win::set_priority_class`; a test records events, scripts a loop's stop over real iterations
 /// (P2.T11 review M1) or records the priority calls (review M2). `solve` receives the game, the loop
-/// parameters, the cancel flag, the job's per-report callback and its per-site callback, exactly what
-/// `solve_loop::run` takes.
+/// parameters, the cancel flag, the job's per-report callback, its per-site callback and its clock, exactly
+/// what `solve_loop::run` takes.
 struct Seams<'s> {
     hooks: &'s mut dyn Hooks,
-    solve: &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>), &mut dyn FnMut(LoopSite)) -> solve_loop::LoopOutcome,
+    solve: &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>), &mut dyn FnMut(LoopSite), &mut dyn FnMut(f64) -> f64) -> solve_loop::LoopOutcome,
     set_priority: &'s mut dyn FnMut(bool),
 }
 
 /// The production loop seam: `solve_loop::run`, unchanged.
-fn real_loop(game: &PostFlopGame, params: &solve_loop::LoopParams, cancel: &AtomicBool, progress: &mut dyn FnMut(u32, Option<f32>), at_site: &mut dyn FnMut(LoopSite)) -> solve_loop::LoopOutcome {
-    solve_loop::run(game, params, cancel, progress, at_site)
+fn real_loop(game: &PostFlopGame, params: &solve_loop::LoopParams, cancel: &AtomicBool, progress: &mut dyn FnMut(u32, Option<f32>), at_site: &mut dyn FnMut(LoopSite), clock: &mut dyn FnMut(f64) -> f64) -> solve_loop::LoopOutcome {
+    solve_loop::run(game, params, cancel, progress, at_site, clock)
 }
 
 /// Runs one `solve` (module docs). `staged` is the lock set this request consumes (§4.5; the executor has
@@ -260,9 +268,9 @@ fn run_with(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobContro
     let mut reporter = Reporter::new(req.pot);
     hooks.enter(Op::Solve);
     let out = {
-        // Both loop callbacks reach the hooks: a report's measurement (`measured`, and `log` through the
-        // noise policy) and each site (`loop_site`). The loop calls them one at a time, so the shared
-        // borrow is never taken twice.
+        // The loop's callbacks reach the hooks: a report's measurement (`measured`, and `log` through the
+        // noise policy), each site (`loop_site`) and each clock reading (`loop_clock`). The loop calls them
+        // one at a time, so the shared borrow is never taken twice.
         let hooks = RefCell::new(&mut *hooks);
         let (progress, reporter) = (&mut ctl.progress, &mut reporter);
         let mut report = |iterations: u32, raw: Option<f32>| {
@@ -277,7 +285,8 @@ fn run_with(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobContro
             progress(Stage::Solving, iterations, reported, ms(t0), adm.estimate_bytes);
         };
         let mut at_site = |at: LoopSite| hooks.borrow_mut().loop_site(at);
-        solve(&game, &params, &cancel, &mut report, &mut at_site)
+        let mut clock = |real_ms: f64| hooks.borrow_mut().loop_clock(real_ms);
+        solve(&game, &params, &cancel, &mut report, &mut at_site, &mut clock)
     };
     hooks.leave(Op::Solve);
     if out.cancelled { return done(JobOutcome::Cancelled); }
@@ -409,7 +418,7 @@ mod tests {
     }
 
     /// The loop seam's type, as a test writes a scripted loop.
-    type Scripted<'s> = &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>), &mut dyn FnMut(LoopSite)) -> solve_loop::LoopOutcome;
+    type Scripted<'s> = &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>), &mut dyn FnMut(LoopSite), &mut dyn FnMut(f64) -> f64) -> solve_loop::LoopOutcome;
 
     /// Runs the job through all three seams: `probe` as the hooks, `solve` as the loop (the real §7
     /// loop, as in production, when `None`), and a priority setter that records its calls in the
@@ -704,7 +713,7 @@ mod tests {
         let req = solve_request("river_two_combo", 0);
         let target = (f64::from(req.pot) * f64::from(req.target_bp) / 10_000.0) as f32;
         let mut measured = None;
-        let mut scripted = |game: &PostFlopGame, params: &solve_loop::LoopParams, cancel: &AtomicBool, progress: &mut dyn FnMut(u32, Option<f32>), _at_site: &mut dyn FnMut(LoopSite)| {
+        let mut scripted = |game: &PostFlopGame, params: &solve_loop::LoopParams, cancel: &AtomicBool, progress: &mut dyn FnMut(u32, Option<f32>), _at_site: &mut dyn FnMut(LoopSite), _clock: &mut dyn FnMut(f64) -> f64| {
             assert_eq!(params.target_chips, target);
             for i in 0..3 {
                 assert!(!cancel.load(Ordering::SeqCst));
