@@ -15,10 +15,17 @@
 //! and every outcome of that contract can be scripted.
 //!
 //! The worker's timeline. Every item is due at a time on the fake clock: the `Delay`s before it add up from the start
-//! of the worker's timeline, which is the engine's first call (`send` or `recv`) after the worker's launch (its
-//! creation by `scripted`, or a `restart`), so a test may set the clock before the engine's first request without
-//! spending the worker's delays. Due times do not depend on what the engine has read: the process writes, closes its
-//! stdin and exits when those are due, however far behind the engine's reading is. What the engine sees of them:
+//! of the worker's timeline, which is the engine's first call on the worker after its launch (its creation by
+//! `scripted`, or a `restart`): a `send`, a `recv`, or the kill that ends it. So a test may set the clock before the
+//! engine's first request without spending the worker's delays. Due times do not depend on what the engine has read:
+//! the process writes, closes its stdin and exits when those are due, however far behind the engine's reading is. Nor
+//! do they wait for requests: an item with no `Delay` before it is due at the engine's first call, and a `Delay` before
+//! the replies to a later request runs from the item before it, not from that request (an engine that idles past it
+//! finds those replies already written when it sends). So an end meant to follow a request (`Exit`, `Eof`,
+//! `StdinClosed`) is scripted after that request's replies with a `Delay` of at least 1 ms before it (`ack,
+//! Delay { ms: 1 }, Exit { .. }`); without one it is due at the engine's first call, and the `send` of that very
+//! request reports it before the request is taken (a reply for `IdRef::Last` then has no request to answer, and its
+//! panic says why). What the engine sees of them:
 //! - `recv(timeout)` has one deadline, `now + timeout` on the fake clock, for the whole call. It reads the worker's
 //!   stdout in script order; waiting for the next item is moving the fake clock to its due time. With nothing due by
 //!   the deadline (the next item is due later, a `Hang`, the end of the script) the call moves the clock to its
@@ -40,13 +47,24 @@
 //!
 //! Process generations. A worker process owns its end: the `Delay`s and `StdinClosed`s leading to its terminator
 //! (`Hang`, `Exit`, or `Eof`), and after an `Eof` the confirmation of its exit (`Delay`s and `StdinClosed`s ending at
-//! an `Exit`, or at a `Hang`: never confirmed). Anything else after an `Eof` is the next process's: none of it reaches
-//! the engine, nor does its time pass, before a restart. `kill` is idempotent and leaves no live worker: `send` and
-//! `recv` answer `Eof` at once and `ready` is `None` until `restart`. A kill (and a restart, which kills first)
-//! discards whatever is left of the killed process's end, delays included, and nothing else: a scripted reply is
-//! never discarded. `restart` is counted, then fails with `Spawn` (no live worker) when a `SpawnFails` is next in the
-//! script, and otherwise launches a new worker process with `default_ready`, its stdin open and a timeline of its own:
-//! what is left of the script is that worker's, measured from its own start.
+//! an `Exit`, or at a `Hang`: never confirmed). An `InvalidateIdentity` among them is not the process's (a mutation
+//! reaches the engine, not the worker) and interrupts none of it. Anything else after an `Eof` is the next process's:
+//! none of it reaches the engine, nor does its time pass, before a restart. `kill` is idempotent and leaves no live
+//! worker: `send` and `recv` answer `Eof` at once and `ready` is `None` until `restart`. A kill (and a restart, which
+//! kills first) takes with the killed process what the real kill drops with its channels:
+//! - once its exit is due on the fake clock (whether or not `send` or `recv` has reported it yet), everything scripted
+//!   up to and including that exit, the lines it wrote that the engine has not read included: what an exited process
+//!   wrote goes with it;
+//! - else, once the closure of its stdin is due (a `StdinClosed`, its writer state), likewise everything up to and
+//!   including that `StdinClosed`, and then whatever is left of its end: the next worker's stdin is open;
+//! - before either, whatever is left of its end, delays included, and nothing else: a scripted reply is never
+//!   discarded unless its process's exit or stdin closure is already due at the kill (a reply after a due closure
+//!   is the next worker's, as is one after any kill point).
+//!
+//! An `InvalidateIdentity` a kill passes stays, in order, at the front of the script: the mutation still arrives, at
+//! the next worker's first `recv`. `restart` is counted, then fails with `Spawn` (no live worker) when a `SpawnFails`
+//! is next in the script, and otherwise launches a new worker process with `default_ready`, its stdin open and a
+//! timeline of its own: what is left of the script is that worker's, measured from its own start.
 use crate::clock::Clock;
 use crate::identity::IdentityState;
 use crate::worker::link::{WorkerLink, WorkerLinkError};
@@ -113,7 +131,8 @@ impl Clock for FakeClock {
 pub enum IdRef {
     /// Resolved when the reply is delivered. In an `Ack`, the id of the last request sent (the worker acks every
     /// request, §4.5); in a `Progress` or `Result`, the id of the last `solve` sent (only a solve has them). Resolving
-    /// it before any such request was sent is a broken script, and panics.
+    /// it before any such request was sent is a broken script, and panics; when the engine did send one and `send`
+    /// refused it (an end already due at the engine's first call, say), the panic says why.
     Last,
     /// This id, e.g. a superseded request's.
     Fixed(String),
@@ -129,12 +148,15 @@ pub enum FakeReply {
     /// A `result` line.
     Result { id: IdRef, status: ResultStatus, solution: Option<StreetSolution>, error: Option<WorkerError>, elapsed_ms: u32 },
     /// `ms` of fake time pass on the worker's timeline before its next item: the delay runs from the item before it
-    /// (from the start of the timeline for a first item), whether or not the engine has read that item. A `recv` whose
-    /// deadline comes first returns there, and the rest of the delay is still ahead of the next call.
+    /// (from the start of the timeline for a first item), whether or not the engine has read that item, and whenever
+    /// the engine sends the request that the next item answers: the timeline does not wait for requests. A `recv`
+    /// whose deadline comes first returns there, and the rest of the delay is still ahead of the next call.
     Delay { ms: u64 },
     /// The worker's stdout ends; the process lives on, and keeps taking requests, until its exit, which the items
     /// after it may confirm (`Delay`s and `StdinClosed`s ending at an `Exit`; see the module doc). `recv` answers
-    /// `Err(Eof)` after spending its whole budget for as long as the exit is not confirmed.
+    /// `Err(Eof)` after spending its whole budget for as long as the exit is not confirmed. With no `Delay` before it,
+    /// it is due at the engine's first call (see the module doc): `Delay { ms: 1 }` before it places it after the
+    /// replies to that call's request.
     Eof,
     /// One line that is not a message: `Err(Protocol(..))` with this text.
     Malformed(String),
@@ -144,22 +166,33 @@ pub enum FakeReply {
     /// `Eof`, `Err(Eof)`: the exit is never confirmed).
     Hang,
     /// The worker closes its stdin and lives on: from then on `send` answers `Err(Eof)` at once (the exit unconfirmed)
-    /// until its exit is due. Its stdout is not affected: `recv` goes on reading the script.
+    /// until its exit is due. Its stdout is not affected: `recv` goes on reading the script. With no `Delay` before it,
+    /// it is due at the engine's first call (see the module doc). The real link's first `send` after its worker closes
+    /// its stdin is usually queued and lost (`Ok`, and no reply ever comes), only a later `send` answering `Eof`; a
+    /// script says so by placing `StdinClosed` just after that send on the timeline (a `Delay` before it), so that the
+    /// send is `Ok` and recorded (the engine did send it) and no reply to it is scripted. Once due, a kill discards it
+    /// with the process, with the lines written before it (see the module doc): the next worker's stdin is open.
     StdinClosed,
     /// Simulates a mutation arriving while the solve is live: the active identity is cancelled.
     /// `recv` consumes it and continues to the next scripted item in the SAME call, so a script that wants the
     /// client to observe the invalidation before the next reply must write `InvalidateIdentity, Delay { ms: 1 }, ...`;
     /// the `Delay` makes `recv` return `Ok(None)` and the receive loop re-check the identity (see Task 28).
     /// Precisely: the first `Delay` a call reaches after an `InvalidateIdentity` ends that call with `Ok(None)` once it
-    /// has run (or at the call's deadline, whichever comes first).
+    /// has run (or at the call's deadline, whichever comes first). It is not the worker's: a kill passes over it (the
+    /// killed process's end behind it goes with that process) and leaves it at the front of the script, for the next
+    /// worker's first `recv`; after an `Eof` it interrupts no confirmation, and the call that reaches it on the timeline
+    /// (confirming the exit, or waiting for it) consumes it.
     InvalidateIdentity,
     /// The worker process exits with `code`, and its stdout ends with it (after an `Eof`: the confirmation of that
     /// end). `recv` answers `Err(Exit { code })` once it has returned every reply scripted before it, and keeps
     /// answering it at once, as `send` does, until the worker is killed or restarted; `send` answers it as soon as the
-    /// exit is due, even while those replies are still queued.
+    /// exit is due, even while those replies are still queued. With no `Delay` before it, it is due at the engine's
+    /// first call, whose `send` then reports it before the request is taken (see the module doc): `Delay { ms: 1 }`
+    /// before it places it after the replies to that call's request.
     Exit { code: i32 },
     /// The next `restart` fails to launch a worker: `Err(Spawn(reason))`, leaving no live worker. Only `restart`
-    /// consumes it, and only as the next item of the script; a live worker has nothing to say in its place.
+    /// consumes it, and only as the next item of the script (past any `InvalidateIdentity` a kill left at the front); a
+    /// live worker has nothing to say in its place.
     SpawnFails(String),
 }
 
@@ -195,10 +228,11 @@ enum Proc {
 /// What one poll of the process finds at the current fake time (the real `send`'s `try_wait` and writer check).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Polled {
-    /// The process has exited with this code.
-    Exited(i32),
-    /// The process lives on but has closed its stdin.
-    StdinClosed,
+    /// The process has exited with this code; the `Exit` is at this index of the script.
+    Exited { code: i32, at: usize },
+    /// The process lives on but has closed its stdin: at this index of the script (the last `StdinClosed` due), or
+    /// `None` when `recv` has already passed it.
+    StdinClosed { at: Option<usize> },
     /// The process takes requests.
     TakingRequests,
 }
@@ -217,12 +251,20 @@ pub struct FakeWorker {
     state: Arc<Mutex<FakeState>>,
     clock: Arc<FakeClock>,
     identity: Arc<Mutex<IdentityState>>,
+    /// Why `send` refused the engine's last refused request, and its last refused solve: the panic of an `IdRef::Last`
+    /// with nothing to resolve to names it.
+    refused_request: Option<String>,
+    refused_solve: Option<String>,
 }
 
 /// The end of a `Delay { ms }` that starts at `t`.
 fn delay_end(t: u64, ms: u64) -> u64 {
     t.checked_add(ms).unwrap_or_else(|| panic!("FakeReply::Delay {{ ms: {ms} }} from {t} overflows the fake clock"))
 }
+
+/// The fix for the commonest cause of a request refused by an end already due (see the module doc).
+const UNDELAYED_END: &str = "the timeline does not wait for requests: an end with no `Delay` before it is due at the engine's first call \
+    after the worker's launch or restart; to place it after a request's replies, script `Delay { ms: 1 }` before it";
 
 impl FakeWorker {
     /// A `ready` that `validate_ready` accepts for a 16-thread worker.
@@ -236,7 +278,7 @@ impl FakeWorker {
     pub fn scripted(clock: Arc<FakeClock>, identity: Arc<Mutex<IdentityState>>, script: Vec<FakeReply>) -> (Box<FakeWorker>, Arc<Mutex<FakeState>>) {
         let state = Arc::new(Mutex::new(FakeState::default()));
         let w = FakeWorker { script: script.into(), anchor: None, proc: Proc::Live, stdin_closed: false, ready: Some(Self::default_ready()),
-            state: state.clone(), clock, identity };
+            state: state.clone(), clock, identity, refused_request: None, refused_solve: None };
         (Box::new(w), state)
     }
 
@@ -247,8 +289,11 @@ impl FakeWorker {
             IdRef::Last => {
                 let s = lock(&self.state);
                 let last = if of_solve { s.last_solve_id.clone() } else { s.sent.last().map(|m| request_id(m).to_string()) };
-                last.unwrap_or_else(|| panic!("FakeReply::{reply} with IdRef::Last: no {} has been sent, so there is no id to answer",
-                    if of_solve { "solve" } else { "request" }))
+                last.unwrap_or_else(|| {
+                    let refused = if of_solve { &self.refused_solve } else { &self.refused_request };
+                    let why = refused.as_ref().map_or(String::new(), |r| format!(" ({r})"));
+                    panic!("FakeReply::{reply} with IdRef::Last: no {} has been sent, so there is no id to answer{why}", if of_solve { "solve" } else { "request" })
+                })
             }
         }
     }
@@ -269,13 +314,13 @@ impl FakeWorker {
     /// Where the timeline stands (it has started: every `send` and `recv` on a worker process starts it first).
     fn anchor(&self) -> u64 { self.anchor.expect("the worker's timeline starts at the engine's first call") }
 
-    /// The confirmation of an exit after stdout has ended, when the items from `from` are one: nothing but `Delay`s and
-    /// `StdinClosed`s up to an `Exit` (or a `Hang`: never confirmed), whose index this is. `None` otherwise: the process
-    /// never confirms its exit, and those items are the next process's.
+    /// The confirmation of an exit after stdout has ended, when the items from `from` are one: nothing but `Delay`s,
+    /// `StdinClosed`s and identity markers (not the process's) up to an `Exit` (or a `Hang`: never confirmed), whose
+    /// index this is. `None` otherwise: the process never confirms its exit, and those items are the next process's.
     fn confirmation_end(&self, from: usize) -> Option<usize> {
         for (i, item) in self.script.iter().enumerate().skip(from) {
             match item {
-                FakeReply::Delay { .. } | FakeReply::StdinClosed => {}
+                FakeReply::Delay { .. } | FakeReply::StdinClosed | FakeReply::InvalidateIdentity => {}
                 FakeReply::Exit { .. } | FakeReply::Hang => return Some(i),
                 _ => return None,
             }
@@ -283,13 +328,15 @@ impl FakeWorker {
         None
     }
 
-    /// How many items at the front of the script are the running process's pending end, which a kill discards (see
-    /// the module doc): the `Delay`s and `StdinClosed`s leading to its terminator, the terminator, and after an `Eof`
-    /// the confirmation of its exit. Zero when the process has something else to do first: a reply is never discarded.
+    /// How many items at the front of the script are the running process's pending end, which a kill discards before
+    /// its exit is due (see the module doc): the `Delay`s, `StdinClosed`s and identity markers leading to its
+    /// terminator, the terminator, and after an `Eof` the confirmation of its exit. Zero when the process has something
+    /// else to do first: short of a due exit or stdin closure (`end_process`), a reply is never discarded.
     fn pending_end(&self) -> usize {
         match self.proc {
             Proc::Live => {
-                let lead = self.script.iter().take_while(|r| matches!(r, FakeReply::Delay { .. } | FakeReply::StdinClosed)).count();
+                let lead = self.script.iter()
+                    .take_while(|r| matches!(r, FakeReply::Delay { .. } | FakeReply::StdinClosed | FakeReply::InvalidateIdentity)).count();
                 match self.script.get(lead) {
                     Some(FakeReply::Hang | FakeReply::Exit { .. }) => lead + 1,
                     Some(FakeReply::Eof) => self.confirmation_end(lead + 1).map_or(lead + 1, |end| end + 1),
@@ -301,12 +348,12 @@ impl FakeWorker {
         }
     }
 
-    /// One poll of the process at `now`, as the real `send` makes it: has it exited by then, or closed its stdin? It
-    /// takes nothing from the script and never moves the clock; the replies due by then are written, and stay queued
-    /// for `recv`.
+    /// One poll of the process at `now`, as the real `send` makes it: has it exited by then, or closed its stdin (and
+    /// where in the script)? It takes nothing from the script and never moves the clock; the replies due by then are
+    /// written, and stay queued for `recv`.
     fn poll(&self, now: u64) -> Polled {
         let mut t = self.anchor();
-        let mut stdin_closed = self.stdin_closed;
+        let mut closed_at = None;
         // The process's own items: the whole script while its stdout is open, only the confirmation of its exit once
         // stdout has ended.
         let mut own = match self.proc {
@@ -320,8 +367,8 @@ impl FakeWorker {
                     t = delay_end(t, *ms);
                     if t > now { break; }
                 }
-                FakeReply::StdinClosed => stdin_closed = true,
-                FakeReply::Exit { code } => return Polled::Exited(*code),
+                FakeReply::StdinClosed => closed_at = Some(i),
+                FakeReply::Exit { code } => return Polled::Exited { code: *code, at: i },
                 FakeReply::Eof => own = self.confirmation_end(i + 1).map_or(i + 1, |end| end + 1),
                 FakeReply::Hang | FakeReply::SpawnFails(_) => break,
                 // Output written and not yet read, or a mutation (not the process's): the process goes on.
@@ -330,7 +377,7 @@ impl FakeWorker {
             }
             i += 1;
         }
-        if stdin_closed { Polled::StdinClosed } else { Polled::TakingRequests }
+        if closed_at.is_some() || self.stdin_closed { Polled::StdinClosed { at: closed_at } } else { Polled::TakingRequests }
     }
 
     /// `recv` while stdout is open: the timeline up to the next line, the end of stdout, or the deadline.
@@ -401,35 +448,105 @@ impl FakeWorker {
     }
 
     /// `recv` once stdout has ended: the exit, confirmed when it is due by the deadline (what is left of the call's
-    /// budget), else the unconfirmed `Eof` after the whole budget.
+    /// budget), else the unconfirmed `Eof` after the whole budget. The identity markers within the confirmation that
+    /// the call reaches on the timeline arrive on the way.
     fn confirm_exit(&mut self, deadline: Option<u64>) -> Result<Option<WorkerMessage>, WorkerLinkError> {
         let now = self.clock.now_ms();
-        if let Some(end) = self.confirmation_end(0) {
-            if let FakeReply::Exit { code } = &self.script[end] {
-                let code = *code;
-                let due = self.script.iter().take(end).fold(self.anchor(), |t, r| match r { FakeReply::Delay { ms } => delay_end(t, *ms), _ => t });
-                // Already due, or due before the deadline; due exactly at the deadline is the next call's, as for a line.
-                if due <= now || deadline.is_none_or(|d| due < d) {
-                    self.clock.advance_to(due);
-                    self.script.drain(..=end);
-                    self.anchor = Some(due);
-                    self.proc = Proc::Exited(code);
-                    return Err(WorkerLinkError::Exit { code });
+        // Already due, or due before the deadline; due exactly at the deadline is the next call's, as for a line.
+        let reached = |due: u64| due <= now || deadline.is_none_or(|d| due < d);
+        if let Some(mut end) = self.confirmation_end(0) {
+            let (mut due, mut i) = (self.anchor(), 0);
+            while i < end {
+                match &self.script[i] {
+                    FakeReply::Delay { ms } => {
+                        due = delay_end(due, *ms);
+                        if !reached(due) { break; }
+                        i += 1;
+                    }
+                    FakeReply::InvalidateIdentity => {
+                        self.script.remove(i);
+                        end -= 1;
+                        lock(&self.identity).cancel_active();
+                    }
+                    _ => i += 1,
                 }
+            }
+            // Every delay before the end was reached, so the end is due by this call.
+            if let (true, FakeReply::Exit { code }) = (i == end, &self.script[end]) {
+                let code = *code;
+                self.clock.advance_to(due);
+                self.script.drain(..=end);
+                self.anchor = Some(due);
+                self.proc = Proc::Exited(code);
+                return Err(WorkerLinkError::Exit { code });
             }
         }
         self.wait_out(deadline, "the worker's stdout has ended and its exit is not confirmed");
         Err(WorkerLinkError::Eof)
     }
 
-    /// The kill of the running process: its pending end goes with it (see the module doc), and no worker is left.
+    /// The kill of the running process (see the module doc): once its exit is due, everything scripted through that
+    /// exit goes with it, the lines it wrote and the engine has not read included, as the real kill drops the dead
+    /// process's queued output; its stdin closure, once due, likewise (it is that process's writer state), then what
+    /// is left of its end; before either, its pending end. The identity markers among those items are not the
+    /// process's: they stay, in order, at the front of the script. No worker is left.
     fn end_process(&mut self) {
-        let end = self.pending_end();
-        self.script.drain(..end);
+        let mut kept = Vec::new();
+        if let Proc::Live | Proc::Ended = self.proc {
+            self.start_timeline(); // a kill before any other call is the engine's first call on this worker
+            match self.poll(self.clock.now_ms()) {
+                Polled::Exited { at, .. } => self.discard(at + 1, &mut kept),
+                Polled::StdinClosed { at: Some(at) } => {
+                    self.discard(at + 1, &mut kept);
+                    // What is left of its end follows the closure (after an `Eof`, the rest of the confirmation).
+                    let end = self.pending_end();
+                    self.discard(end, &mut kept);
+                }
+                Polled::StdinClosed { at: None } | Polled::TakingRequests => {
+                    let end = self.pending_end();
+                    self.discard(end, &mut kept);
+                }
+            }
+        } // a confirmed exit has already taken its process's items; a killed worker has none left
+        for marker in kept.into_iter().rev() {
+            self.script.push_front(marker);
+        }
         self.proc = Proc::Gone;
         self.anchor = None;
         self.stdin_closed = false;
         self.ready = None;
+    }
+
+    /// Drops the first `n` items of the script with the killed process, keeping the identity markers among them (not
+    /// the process's) in `kept`, in order.
+    fn discard(&mut self, n: usize, kept: &mut Vec<FakeReply>) {
+        kept.extend(self.script.drain(..n).filter(|r| matches!(r, FakeReply::InvalidateIdentity)));
+    }
+
+    /// Why the link refuses to send `msg` now, if it does: the error `send` answers, and what happened, for the panic
+    /// of an `IdRef::Last` left with nothing to resolve to.
+    fn refusal(&mut self, msg: &EngineMessage) -> Option<(WorkerLinkError, String)> {
+        let id = request_id(msg);
+        // The real link's check, before anything else: a request it cannot write is refused.
+        if let Err(e) = encode_request(msg) {
+            let why = format!("the link could not write request {id:?}: {e}");
+            return Some((e, why));
+        }
+        match self.proc {
+            Proc::Gone => return Some((WorkerLinkError::Eof, format!("there was no live worker (killed, or its relaunch failed) when the engine sent request {id:?}"))),
+            Proc::Exited(code) => return Some((WorkerLinkError::Exit { code }, format!("the worker's exit (code {code}) was already confirmed when the engine sent request {id:?}"))),
+            Proc::Live | Proc::Ended => {}
+        }
+        self.start_timeline();
+        let now = self.clock.now_ms();
+        let (err, end) = match self.poll(now) {
+            Polled::Exited { code, .. } => (WorkerLinkError::Exit { code }, format!("`Exit {{ code: {code} }}`")),
+            // It no longer takes requests and the poll found no exit: unconfirmed, and never recorded as an exit.
+            Polled::StdinClosed { .. } => (WorkerLinkError::Eof, "`StdinClosed`".to_string()),
+            Polled::TakingRequests => return None,
+        };
+        Some((err, format!("the worker's scripted {end} was already due at {now} ms when the engine sent request {id:?}, so `send` reported it and the \
+            worker never took the request; {UNDELAYED_END}")))
     }
 }
 
@@ -453,18 +570,10 @@ fn on_the_wire(msg: WorkerMessage) -> WorkerMessage {
 
 impl WorkerLink for FakeWorker {
     fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError> {
-        encode_request(msg)?; // the real link's check, before anything else: a request it cannot write is refused
-        match self.proc {
-            Proc::Gone => return Err(WorkerLinkError::Eof),
-            Proc::Exited(code) => return Err(WorkerLinkError::Exit { code }),
-            Proc::Live | Proc::Ended => {}
-        }
-        self.start_timeline();
-        match self.poll(self.clock.now_ms()) {
-            Polled::Exited(code) => return Err(WorkerLinkError::Exit { code }),
-            // It no longer takes requests and the poll found no exit: unconfirmed, and never recorded as an exit.
-            Polled::StdinClosed => return Err(WorkerLinkError::Eof),
-            Polled::TakingRequests => {}
+        if let Some((err, why)) = self.refusal(msg) {
+            if matches!(msg, EngineMessage::Solve(_)) { self.refused_solve = Some(why.clone()); }
+            self.refused_request = Some(why);
+            return Err(err);
         }
         let mut s = lock(&self.state);
         match msg {
@@ -495,8 +604,10 @@ impl WorkerLink for FakeWorker {
     fn restart(&mut self) -> Result<(), WorkerLinkError> {
         self.end_process();
         lock(&self.state).restarts += 1;
-        if let Some(FakeReply::SpawnFails(_)) = self.script.front() {
-            let Some(FakeReply::SpawnFails(reason)) = self.script.pop_front() else { unreachable!("the front was a SpawnFails") };
+        // The next item, past the identity markers a kill left at the front (they stay for the next worker).
+        let next = self.script.iter().position(|r| !matches!(r, FakeReply::InvalidateIdentity));
+        if let Some(i) = next.filter(|i| matches!(self.script[*i], FakeReply::SpawnFails(_))) {
+            let Some(FakeReply::SpawnFails(reason)) = self.script.remove(i) else { unreachable!("the next item was a SpawnFails") };
             return Err(WorkerLinkError::Spawn(reason));
         }
         // A new process: stdin open, its timeline starting at the engine's next call.
@@ -969,6 +1080,200 @@ mod tests {
         w.restart().unwrap();
         w.send(&EngineMessage::Shutdown { id: "1".into() }).unwrap();
         assert_eq!(acked(w.recv(ms(100))), "next");
+    }
+
+    /// The ids of the requests the worker took, in order.
+    fn sent_ids(state: &Arc<Mutex<FakeState>>) -> Vec<String> { state.lock().unwrap().sent.iter().map(|m| request_id(m).to_string()).collect() }
+    fn ack_last() -> FakeReply { FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None } }
+    /// A `result{ok}` for the last solve, with a solution for `solve`'s tree.
+    fn ok_last() -> FakeReply {
+        FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(uniform_solution(&tree(Street::River, "river_std_v1"), &[], 0.3)), error: None, elapsed_ms: 5 }
+    }
+
+    /// Ruling 19-R1-1 (the re-review's X1): `send` reports an exit already due while a line the process wrote before it
+    /// is still queued, and the engine restarts, as it answers a send-side exit. What the exited process wrote goes with
+    /// it, as the real kill drops the dead process's queued output: the new worker takes the request and answers from
+    /// its own script, never with the dead worker's line or its exit. The same through `kill`, with an exit confirmed
+    /// after the end of stdout.
+    #[test]
+    fn a_restart_after_send_reported_an_exit_leaves_none_of_the_dead_process_output_to_the_next_worker() {
+        let (clock, _identity, mut w, state) = rig(vec![ack("a"), FakeReply::Delay { ms: 100 }, ack("b"), FakeReply::Exit { code: 7 },
+            FakeReply::Delay { ms: 100 }, ack("c")]);
+        assert_eq!(acked(w.recv(ms(0))), "a");
+        clock.set_ms(150); // the worker writes "b" at 100 and exits
+        assert!(matches!(w.send(&EngineMessage::Shutdown { id: "1".into() }), Err(WorkerLinkError::Exit { code: 7 })));
+        w.restart().unwrap();
+        w.send(&EngineMessage::Shutdown { id: "2".into() }).unwrap();
+        let got = w.recv(ms(1_000));
+        assert!(matches!(&got, Ok(Some(WorkerMessage::Ack { id, .. })) if id == "c"), "the dead worker's output reached its successor: {got:?}");
+        assert_eq!(clock.now_ms(), 250, "the new worker's own delay, from its launch at 150");
+        let after = w.recv(ms(100));
+        assert!(matches!(after, Ok(None)), "the dead worker's exit reached its successor: {after:?}");
+        assert_eq!(sent_ids(&state), ["2"]);
+        // Through `kill` (the cancel-then-kill path): a line not read, then the end of stdout and an exit due by the kill.
+        let (clock, _identity, mut w, _state) = rig(vec![ack("a"), ack("b"), FakeReply::Eof, FakeReply::Delay { ms: 50 }, FakeReply::Exit { code: 3 }, ack("next")]);
+        assert_eq!(acked(w.recv(ms(0))), "a");
+        clock.set_ms(100);
+        w.kill();
+        w.restart().unwrap();
+        assert_eq!(acked(w.recv(ms(10))), "next", "the dead worker's unread line and its exit went with it");
+    }
+
+    /// Ruling 19-R1-1 (the re-review's X2): "crash, then a successful retry", driven as `run_attempt` drives it. The
+    /// first `send` meets the exit (scripted with no `Delay`, so due at the engine's first call) and the request is not
+    /// taken; the engine restarts and retries; the retry is taken and answered, and only it is recorded.
+    #[test]
+    fn a_crash_reported_by_send_then_a_restart_lets_the_retry_be_taken_and_answered() {
+        let (_clock, _identity, mut w, state) = rig(vec![ack_last(), FakeReply::Exit { code: 3 }, ack_last(), ok_last()]);
+        let first = w.send(&solve("solve-1"));
+        assert!(matches!(first, Err(WorkerLinkError::Exit { code: 3 })), "{first:?}");
+        w.restart().unwrap();
+        let retry = w.send(&solve("solve-2"));
+        assert!(retry.is_ok(), "the retry met the dead worker's exit again: {retry:?}");
+        assert_eq!(acked(w.recv(ms(10))), "solve-2");
+        match w.recv(ms(10)) { Ok(Some(WorkerMessage::Result { id, status: ResultStatus::Ok, .. })) => assert_eq!(id, "solve-2"), other => panic!("expected the retry's result, got {other:?}") }
+        assert_eq!(sent_ids(&state), ["solve-2"]);
+        assert_eq!(state.lock().unwrap().last_solve_id.as_deref(), Some("solve-2"));
+    }
+
+    /// Ruling 19-R1-1, before any call: a kill is the engine's first call on that worker, so an exit scripted with no
+    /// `Delay` before it is due at the kill, and the line written before it goes with the process too.
+    #[test]
+    fn a_kill_before_any_call_takes_an_undelayed_exit_and_the_lines_before_it() {
+        let (_clock, _identity, mut w, _state) = rig(vec![ack("a"), FakeReply::Exit { code: 3 }, ack("next")]);
+        w.kill();
+        w.restart().unwrap();
+        assert_eq!(acked(w.recv(ms(10))), "next");
+    }
+
+    /// Ruling 19-R1-2: the documented idiom. The timeline does not wait for requests, so an exit meant to follow a
+    /// request's replies is scripted after them with a `Delay` of at least 1 ms (the re-review's X7): the request is
+    /// taken and answered, then the exit; the retry after the restart likewise. Without the `Delay` (X5) the exit is due
+    /// at the engine's first call, and that call's `send` reports it before the request is taken.
+    #[test]
+    fn an_exit_after_a_one_ms_delay_follows_the_request_and_without_it_precedes_it() {
+        let (clock, _identity, mut w, state) = rig(vec![ack_last(), FakeReply::Delay { ms: 1 }, FakeReply::Exit { code: 3 }, ack_last(), ok_last()]);
+        w.send(&solve("solve-1")).unwrap();
+        assert_eq!(acked(w.recv(ms(100))), "solve-1");
+        assert!(matches!(w.recv(ms(100)), Err(WorkerLinkError::Exit { code: 3 })));
+        w.restart().unwrap();
+        w.send(&solve("solve-2")).unwrap();
+        assert_eq!(acked(w.recv(ms(100))), "solve-2");
+        assert!(matches!(w.recv(ms(100)), Ok(Some(WorkerMessage::Result { id, .. })) if id == "solve-2"));
+        assert_eq!((clock.now_ms(), sent_ids(&state)), (1, vec!["solve-1".to_string(), "solve-2".to_string()]));
+        let (_clock, _identity, mut w, state) = rig(vec![ack_last(), ack_last(), FakeReply::Exit { code: 3 }]);
+        assert!(matches!(w.send(&solve("solve-1")), Err(WorkerLinkError::Exit { code: 3 })));
+        assert!(sent_ids(&state).is_empty());
+    }
+
+    /// Ruling 19-R1-2: a reply for `IdRef::Last` when the only request was refused because an end scripted with no
+    /// `Delay` was due at the engine's first call panics with a message naming that cause and the idiom.
+    #[test]
+    #[should_panic(expected = "was already due at 0 ms when the engine sent request \"solve-1\"")]
+    fn a_last_id_reply_after_a_send_refused_by_an_undelayed_exit_names_the_cause() {
+        let (_clock, _identity, mut w, _state) = rig(vec![ack_last(), FakeReply::Exit { code: 3 }]);
+        let _ = w.send(&solve("solve-1"));
+        let _ = w.recv(ms(10)); // drain, as the link allows after a send-side exit: the ack has no request to answer
+    }
+
+    /// Ruling 19-R1-3 (the re-review's R-e): an `InvalidateIdentity` is not the worker's, so a kill reaches past it: the
+    /// `Hang` scripted for the killed worker goes with it and the replacement answers the retry. The mutation itself
+    /// still arrives, at the replacement's first receive.
+    #[test]
+    fn a_restart_reaches_past_an_identity_marker_so_the_killed_worker_hang_goes_with_it() {
+        let (clock, identity, mut w, state) = rig(vec![FakeReply::Delay { ms: 7_000 }, FakeReply::InvalidateIdentity, FakeReply::Hang, ack_last()]);
+        let decision = { let mut s = identity.lock().unwrap(); s.set_config(); s.begin_hand(); s.next_decision().unwrap() };
+        w.send(&solve("1")).unwrap();
+        assert!(w.recv(ms(5_000)).unwrap().is_none());
+        assert!(identity.lock().unwrap().is_active(&decision), "the mutation is due at 7 000");
+        w.restart().unwrap(); // the heartbeat's restart at 5 000
+        w.send(&solve("retry")).unwrap();
+        let got = w.recv(ms(8_650));
+        assert!(matches!(&got, Ok(Some(WorkerMessage::Ack { id, .. })) if id == "retry"), "the killed worker's hang reached its successor: {got:?}");
+        assert_eq!(clock.now_ms(), 5_000);
+        assert!(!identity.lock().unwrap().is_active(&decision), "the mutation still arrived");
+        assert_eq!(kills_and_restarts(&state), (0, 1));
+    }
+
+    /// Ruling 19-R1-3, after the end of stdout: an `InvalidateIdentity` does not interrupt the confirmation of the exit.
+    /// A restart before the exit discards the confirmation behind it; a receive that reaches the exit confirms it, the
+    /// mutation arriving within that call.
+    #[test]
+    fn an_identity_marker_does_not_interrupt_the_confirmation_of_an_exit() {
+        let (clock, identity, mut w, _state) = rig(vec![ack("a"), FakeReply::Eof, FakeReply::Delay { ms: 50 }, FakeReply::InvalidateIdentity,
+            FakeReply::Delay { ms: 50 }, FakeReply::Exit { code: 3 }, ack("next")]);
+        let decision = { let mut s = identity.lock().unwrap(); s.set_config(); s.begin_hand(); s.next_decision().unwrap() };
+        assert_eq!(acked(w.recv(ms(10))), "a");
+        assert!(matches!(w.recv(ms(40)), Err(WorkerLinkError::Eof)));
+        assert!(identity.lock().unwrap().is_active(&decision), "the mutation is due at 50");
+        assert!(matches!(w.recv(ms(20)), Err(WorkerLinkError::Eof)), "the exit, due at 100, is not confirmed by 60");
+        assert!(!identity.lock().unwrap().is_active(&decision), "the call reached the mutation at 50");
+        w.restart().unwrap();
+        let got = w.recv(ms(1_000));
+        assert!(matches!(&got, Ok(Some(WorkerMessage::Ack { id, .. })) if id == "next"), "the killed worker's confirmation reached its successor: {got:?}");
+        assert_eq!(clock.now_ms(), 60);
+        let (clock, identity, mut w, _state) = rig(vec![FakeReply::Eof, FakeReply::InvalidateIdentity, FakeReply::Delay { ms: 100 }, FakeReply::Exit { code: 3 }]);
+        let decision = { let mut s = identity.lock().unwrap(); s.set_config(); s.begin_hand(); s.next_decision().unwrap() };
+        assert!(matches!(w.recv(ms(200)), Err(WorkerLinkError::Exit { code: 3 })));
+        assert_eq!(clock.now_ms(), 100);
+        assert!(!identity.lock().unwrap().is_active(&decision));
+    }
+
+    /// A scripted failed relaunch behind an `InvalidateIdentity` a kill passed over is still the next restart's.
+    #[test]
+    fn a_failed_relaunch_behind_a_kept_identity_marker_is_still_the_next_restart() {
+        let (_clock, identity, mut w, _state) = rig(vec![FakeReply::Delay { ms: 100 }, FakeReply::InvalidateIdentity, FakeReply::Hang,
+            FakeReply::SpawnFails("no binary".into()), ack("r")]);
+        let decision = { let mut s = identity.lock().unwrap(); s.set_config(); s.begin_hand(); s.next_decision().unwrap() };
+        assert!(w.recv(ms(50)).unwrap().is_none());
+        assert!(matches!(w.restart(), Err(WorkerLinkError::Spawn(m)) if m == "no binary"));
+        w.restart().unwrap();
+        assert_eq!(acked(w.recv(ms(10))), "r");
+        assert!(!identity.lock().unwrap().is_active(&decision));
+    }
+
+    /// Ruling 19-R2-1 (the round-2 probe Y1): the closure of its stdin is the process's writer state, so a kill or
+    /// restart discards a due `StdinClosed` as it discards a due exit, with the lines written before it, and then what
+    /// is left of that process's end: the replacement starts with an open stdin, takes requests, and is served its own
+    /// script (what follows the closure, as after any kill point before the exit is due).
+    #[test]
+    fn a_restart_discards_the_dead_process_due_stdin_closure_so_the_replacement_takes_requests() {
+        let shutdown = |id: &str| EngineMessage::Shutdown { id: id.into() };
+        // Y1: `send` reports the closed stdin, and the engine restarts.
+        let (clock, _identity, mut w, state) = rig(vec![ack("a"), FakeReply::Delay { ms: 10 }, FakeReply::StdinClosed, ack("b"), FakeReply::Delay { ms: 100 },
+            FakeReply::Exit { code: 3 }, ack("next")]);
+        assert_eq!(acked(w.recv(ms(0))), "a");
+        clock.set_ms(50);
+        assert!(matches!(w.send(&shutdown("1")), Err(WorkerLinkError::Eof)), "the dead process closed its stdin at 10");
+        w.restart().unwrap();
+        w.send(&shutdown("2")).unwrap();
+        clock.set_ms(100);
+        let later = w.send(&shutdown("3"));
+        assert!(later.is_ok(), "the dead process's stdin closure reached its successor: {later:?}");
+        assert_eq!(acked(w.recv(ms(100))), "b", "the replacement's script, from the item after the closure");
+        assert!(matches!(w.recv(ms(100)), Err(WorkerLinkError::Exit { code: 3 })));
+        assert_eq!(clock.now_ms(), 150, "the replacement's own delay, from its launch at 50");
+        assert_eq!(sent_ids(&state), ["2", "3"]);
+        // Through `kill`, with lines written before the closure unread: they go with it, and so does the end behind it.
+        let (clock, _identity, mut w, state) = rig(vec![ack("a"), ack("b"), FakeReply::Delay { ms: 10 }, FakeReply::StdinClosed, FakeReply::Delay { ms: 100 },
+            FakeReply::Exit { code: 3 }, ack("next")]);
+        w.send(&shutdown("1")).unwrap();
+        clock.set_ms(50);
+        w.kill();
+        w.restart().unwrap();
+        w.send(&shutdown("2")).unwrap();
+        let got = w.recv(ms(10));
+        assert!(matches!(&got, Ok(Some(WorkerMessage::Ack { id, .. })) if id == "next"), "the dead worker's lines or end reached its successor: {got:?}");
+        assert_eq!(sent_ids(&state), ["1", "2"]);
+        // After the end of stdout, a closure within the confirmation of the exit: the rest of the confirmation goes too.
+        let (clock, _identity, mut w, _state) = rig(vec![ack("a"), FakeReply::Eof, FakeReply::Delay { ms: 10 }, FakeReply::StdinClosed, FakeReply::Delay { ms: 100 },
+            FakeReply::Exit { code: 3 }, ack("next")]);
+        w.send(&shutdown("1")).unwrap();
+        clock.set_ms(50);
+        w.restart().unwrap();
+        w.send(&shutdown("2")).unwrap();
+        let got = w.recv(ms(10));
+        assert!(matches!(&got, Ok(Some(WorkerMessage::Ack { id, .. })) if id == "next"), "the dead worker's end reached its successor: {got:?}");
     }
 
     /// A relaunch that fails leaves no live worker (`Spawn`), and a later restart can succeed; a live worker has nothing
