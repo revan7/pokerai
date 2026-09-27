@@ -300,13 +300,14 @@ fn approx_reason_floats_are_validated_both_directions() {
     assert!(serde_json::to_string(&inf_posts).is_err(), "infinite straddle posts must not serialize as null");
     let ok_posts = ApproxReason::StraddleMapped { posts: [0.25, 0.5, 1.0] };
     assert_eq!(serde_json::from_str::<ApproxReason>(&serde_json::to_string(&ok_posts).unwrap()).unwrap(), ok_posts);
-    // BetTranslation: observed_pct finite, deviation in [0,1], mapped = (finite size, unit weight).
+    // BetTranslation: observed_pct finite, deviation non-negative and unbounded (see
+    // `bet_translation_deviation_is_a_non_negative_unbounded_distance`), mapped = (finite size,
+    // unit weight).
     let bt = |observed: &str, mapped: &str, deviation: &str| format!(r#"{{"kind":"BetTranslation","street":"flop","seat":2,"observed_pct":{observed},"mapped":{mapped},"deviation":{deviation},"prominent":true}}"#);
     assert!(serde_json::from_str::<ApproxReason>(&bt("0.73", "[[0.5,0.468],[1.0,0.532]]", "0.23")).is_ok());
     assert!(serde_json::from_str::<ApproxReason>(&bt("1e39", "[[0.5,0.468],[1.0,0.532]]", "0.23")).is_err());
     assert!(serde_json::from_str::<ApproxReason>(&bt("0.73", "[[0.5,1.00000001]]", "0.23")).is_err(), "a mapped weight above 1 must be rejected");
     assert!(serde_json::from_str::<ApproxReason>(&bt("0.73", "[[1e39,0.5]]", "0.23")).is_err(), "a mapped size that overflows f32 must be rejected");
-    assert!(serde_json::from_str::<ApproxReason>(&bt("0.73", "[[0.5,0.468]]", "1.5")).is_err(), "a deviation above 1 must be rejected");
     let nan_mapped = ApproxReason::BetTranslation { street: Street::Flop, seat: Seat(2), observed_pct: 0.73, mapped: vec![(0.5, f32::NAN)], deviation: 0.23, prominent: true };
     assert!(serde_json::to_string(&nan_mapped).is_err());
     // SprBucketed / MenuRounded / BranchResidual: finite scalars.
@@ -315,6 +316,54 @@ fn approx_reason_floats_are_validated_both_directions() {
     assert!(serde_json::to_string(&ApproxReason::BranchResidual { seat: Seat(1), residual_mass_pct: f32::INFINITY, cause: "cap".into() }).is_err());
     let ok_residual = ApproxReason::BranchResidual { seat: Seat(1), residual_mass_pct: 35.2, cause: "cap".into() };
     assert_eq!(serde_json::from_str::<ApproxReason>(&serde_json::to_string(&ok_residual).unwrap()).unwrap(), ok_residual);
+}
+
+/// Ruling 13-R4 (P3.T13 fix round 1): spec 8.4's `d = min(|s - A|, |s - B|)` is a non-negative
+/// distance between pot fractions with no upper bound -- a 100 bb open shove against a lone 2.5 bb
+/// menu size at ordinary source blinds is `s = 39.6`, `A = 0.6`, `d = 39` -- so
+/// `BetTranslation.deviation` round-trips every finite non-negative value through both the JSON
+/// (IPC) and the bincode (cache) path, and still rejects a negative or non-finite value on both:
+/// JSON in its wide form before narrowing (a tiny negative that would narrow to `-0.0`, an `f64`
+/// that overflows `f32`), bincode on the native `f32` it reads.
+#[test]
+fn bet_translation_deviation_is_a_non_negative_unbounded_distance() {
+    let reason = |deviation: f32| ApproxReason::BetTranslation {
+        street: Street::Preflop,
+        seat: Seat(2),
+        observed_pct: 39.6,
+        mapped: vec![(0.6, 1.0)],
+        deviation,
+        prominent: deviation > 0.10,
+    };
+    for d in [0.0_f32, 1.0, 1.5, 39.0] {
+        let r = reason(d);
+        let text = serde_json::to_string(&r).unwrap_or_else(|e| panic!("JSON serialize deviation {d}: {e}"));
+        assert_eq!(serde_json::from_str::<ApproxReason>(&text).unwrap_or_else(|e| panic!("JSON read deviation {d}: {e}")), r);
+        let bytes = bincode::serialize(&r).unwrap_or_else(|e| panic!("bincode serialize deviation {d}: {e}"));
+        assert_eq!(bincode::deserialize::<ApproxReason>(&bytes).unwrap_or_else(|e| panic!("bincode read deviation {d}: {e}")), r);
+    }
+
+    // JSON read: the wide value is checked before it is narrowed.
+    let bt = |deviation: &str| format!(r#"{{"kind":"BetTranslation","street":"preflop","seat":2,"observed_pct":39.6,"mapped":[[0.6,1.0]],"deviation":{deviation},"prominent":true}}"#);
+    assert_eq!(serde_json::from_str::<ApproxReason>(&bt("39")).unwrap(), reason(39.0));
+    for bad in ["-0.1", "-1e-50", "1e39"] {
+        assert!(serde_json::from_str::<ApproxReason>(&bt(bad)).is_err(), "JSON deviation {bad} must be rejected");
+    }
+
+    // Write, on both paths: a negative or non-finite in-memory value never reaches the wire.
+    for bad in [-1.0_f32, -f32::MIN_POSITIVE, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert!(serde_json::to_string(&reason(bad)).is_err(), "JSON must refuse deviation {bad}");
+        assert!(bincode::serialize(&reason(bad)).is_err(), "bincode must refuse deviation {bad}");
+    }
+
+    // bincode read: a negative or NaN bit pattern crafted onto the wire is rejected.
+    let bytes = bincode::serialize(&reason(39.0)).unwrap();
+    let at = bytes.windows(4).position(|w| w == 39.0_f32.to_le_bytes()).expect("the deviation's f32 is on the wire");
+    for bad in [-39.0_f32, f32::NAN] {
+        let mut crafted = bytes.clone();
+        crafted[at..at + 4].copy_from_slice(&bad.to_le_bytes());
+        assert!(bincode::deserialize::<ApproxReason>(&crafted).is_err(), "bincode must refuse deviation {bad}");
+    }
 }
 
 /// S1: `Assumptions.ranges_used`, `ExperimentalHu.ranges_used`, `Recommendation.range_mix` and

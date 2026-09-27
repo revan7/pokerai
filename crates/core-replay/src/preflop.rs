@@ -11,50 +11,70 @@
 //! For every branch of the shared list, in order:
 //!
 //! - a residual or stopped branch is copied through unchanged (frozen);
-//! - a live branch looks up the actor's node under **its own translated history**
-//!   ([`query_translated`]; the observed prefix still supplies depth, eligibility, rake, roles and
-//!   the short-handed folds). No node (spec section 9.3): the branch stops for the rest of the
-//!   preflop street -- `q` and every mass frozen, no node for any seat, reason
-//!   `UnconditionedPriorStreet{Preflop, seat, "missing node <key>"}` -- and is never resumed at a
-//!   later present node;
-//! - the observed action on the node's menu (section 8.3's size rule): one [`condition`] with
-//!   that action's column, the child keeping the branch's id;
-//! - an off-menu wager: section 8.4's pseudo-harmonic interpolation at the branch's mapped parent
-//!   (`wager_fraction`/`menu_fractions`/`interpolate`, Task 10), disclosed as `BetTranslation`,
-//!   and the branch is split over the mapped menu sizes by the kernel's [`split_action`]; a size
-//!   with no pot fraction there stops the branch (`unmappable size at <key>`).
+//! - a live branch looks up the actor's node under **its own translated history**, with the exact
+//!   source step it chose at each translated edge carried alongside (the observed prefix still
+//!   supplies depth, eligibility, rake, roles and the short-handed folds). No node (spec section
+//!   9.3): the branch stops for the rest of the preflop street -- `q` and every mass frozen, no
+//!   node for any seat, reason `UnconditionedPriorStreet{Preflop, seat, "missing node <key>"}` --
+//!   and is never resumed at a later present node;
+//! - the observed action on the node's menu (section 8.3's size rule): one [`condition`](crate::branches::condition) with
+//!   that action's column, the branch keeping its id and recording the **observed** action (only
+//!   translated wagers are replaced, section 8.4);
+//! - an off-menu wager: section 8.4's pseudo-harmonic interpolation at the branch's mapped
+//!   **source** parent, disclosed as `BetTranslation`, and the branch is split over the mapped
+//!   menu sizes; a size with no pot fraction there stops the branch (`unmappable size at <key>`).
 //!
-//! Every applying branch's candidates are built before anything is decided. If no applying branch
-//! has support (spec section 9.2's zero-support rule), the update is rejected: every `q` and mass
-//! keeps its pre-action value and `UnconditionedPriorStreet{"zero support after <action>"}` is
-//! added. Navigation is still kept truthful without a guessed action: a branch whose observed
-//! action was on its menu advances along that one mapped action (no likelihood), and a branch
-//! whose action was an off-menu wager -- which could only advance along an unobserved menu size --
-//! stops. Otherwise the candidates replace the list, the cap runs once ([`cap_branches`]) and
-//! every seat is rescaled once ([`rescale`]).
+//! Every branch's choice is decided first, then the whole pre-action generation is expanded by one
+//! [`split_batch`] call (below). If no applying branch has support (spec section 9.2's
+//! zero-support rule), the update is rejected: every `q` and mass keeps its pre-action value and
+//! `UnconditionedPriorStreet{"zero support after <action>"}` is added. Navigation is still kept
+//! truthful without a guessed action: a branch whose observed action was on its menu advances along
+//! that observed action (no likelihood), and a branch whose action was an off-menu wager -- which
+//! could only advance along an unobserved menu size -- stops. Otherwise the batch replaces the
+//! list, the cap runs once ([`cap_branches`]) and every seat is rescaled once ([`rescale`]).
 //!
-//! # Ruling 13-pre and the kernel's split
+//! # Source-step identity (ruling 13-R1)
 //!
-//! A generation is expanded through [`split_action`] over the **whole** branch list, so ids are
-//! allocated after every id of the generation and parent links come from the kernel's own
-//! compaction pass (never per-branch slices, whose ids collide). `split_action` applies one common
-//! choice list to every live branch it is given, while replay branches each carry their own menu;
-//! every other live branch is therefore held frozen for the call and released after it. When a
-//! single branch splits at an observed action -- every split the synthetic source can produce --
-//! that is exactly one call per observed action. When several branches split at the same action
-//! with different menus, one whole-list call is made per splitting branch, each over the list the
-//! previous call returned, in list order.
+//! A translated edge is recorded as the chip action its menu size expands to, and a chip amount
+//! cannot always name its source size: at a 3-chip big blind both 2.5 and 2.6 bb are
+//! `Raise{to: 8}`. The walk therefore carries, per branch, the exact source step it chose at each
+//! translated edge and looks every node up with it
+//! ([`core_preflop::PreflopInvocation::answer_history_sourced`]); an on-menu observed action is
+//! kept as observed, so its own resolution is the one it was conditioned with. The chip-only
+//! public entry points ([`query_translated`], and a standalone [`apply_preflop_action`], which
+//! holds only the branches' chip histories) recover an edge from its chip amount only when exactly
+//! one source size rounds to it; otherwise the lookup is an explicit unresolved missing path and
+//! the branch stops on it -- never a silently chosen other edge.
+//!
+//! # Source-unit interpolation (ruling 13-R2)
+//!
+//! The pot fractions of section 8.4 are taken at the source node's own parent: the source's posts
+//! (0.5 and 1 source unit, by virtual role -- behind a straddle the physical SB's post is not in
+//! the virtual tree, spec section 8.3) and every source step of the branch's resolved key, in
+//! source units, before any chip rounding. The observed amount and every menu size are expressed
+//! in one exact integer scale, milli-chips (a source amount of `x` thousandths of a unit is
+//! `x * unit`, an actual chip amount `c` is `c * 1000`), so fractional source sizes survive; an
+//! `AllIn` menu entry keeps the actor's actual maximum (P3.T9).
+//!
+//! # One generation per observed action (ruling 13-R3)
+//!
+//! The kernel's [`split_batch`] takes the complete pre-action generation with one choice per
+//! branch -- kept (frozen), stopped, retained on the menu, or split over its own menu -- and
+//! allocates ids and remaps parents once, so several branches splitting at the same action with
+//! different menus keep every parent link even across the `u8` id compaction; zero-support
+//! removals are part of the same pass.
 
 use crate::branches::{
-    cap_branches, condition, initial, marginal, missing_reason, range_output, rescale, split_action, stop_branch, zero_reason,
+    cap_branches, initial, marginal, missing_reason, range_output, rescale, split_batch, stop_branch, zero_reason, BranchChoice,
     HistoryBranch,
 };
 use crate::snapshot::StreetSnapshot;
 use core_preflop::{
-    interpolate, menu_fractions, menu_step_index, prefix_state, wager_fraction, ExpandedNode, Interpolation, PreflopAnswer,
-    PreflopInvocation, PreflopStore,
+    interpolate, menu_step_index, ExpandedNode, Interpolation, PreflopAnswer, PreflopInvocation, PreflopNode, PreflopNodeKey,
+    PreflopStep, PreflopStore,
 };
-use proto::{Action, ApproxReason, Card, HandConfig, HandState, Range1326, Seat, Street, UnsupportedReason, COMBOS};
+use proto::{Action, ApproxReason, Card, HandConfig, HandState, Position, Range1326, Seat, Street, UnsupportedReason, COMBOS};
+use std::collections::BTreeMap;
 
 /// Everything one replay reads (spec section 9.1). `snapshots` are the street solutions
 /// registered for this hand; Task 13 consumes none of them (selection is Task 14, the postflop
@@ -123,9 +143,11 @@ pub fn replay(input: ReplayInput) -> ReplayOutput {
 }
 
 /// Applies every observed preflop action of `input.state`, in order, through
-/// [`apply_preflop_action`]'s transaction, stopping at the first postflop action. One mapping memo
-/// ([`PreflopInvocation`]) serves the whole walk, keyed by the observed prefix index and each
-/// branch's translated history. `output` must be the start state [`replay`] builds (every live
+/// [`apply_preflop_action`]'s transaction, stopping at the first postflop action. One walk state
+/// serves every action: the mapping memo ([`PreflopInvocation`]), keyed by the observed prefix
+/// index, each branch's translated history and the source steps carried along it, and those
+/// carried source steps themselves (ruling 13-R1), so every translated edge is navigated as the
+/// source size it was mapped to. `output` must be the start state [`replay`] builds (every live
 /// branch carries one translated action per applied observed action).
 pub fn walk_preflop(input: &ReplayInput, output: &mut ReplayOutput) {
     let mut run = ReplayState::default();
@@ -146,10 +168,15 @@ pub fn walk_preflop(input: &ReplayInput, output: &mut ReplayOutput) {
 /// act next holds its node key (`SeatMass::node`); every other seat's node is `None`, since its next
 /// decision depends on actions not yet observed.
 ///
+/// A standalone call holds only the branches' chip histories (spec section 9.1's
+/// `translated`), not the source steps [`walk_preflop`] carries between actions, so its lookups
+/// are chip-only (ruling 13-R1): a translated edge whose chip amount is the rounding of two source
+/// sizes is an explicit unresolved missing path, and that branch stops on it.
+///
 /// # Panics
 /// Always, if `(seat, observed)` is not the preflop action recorded at `prefix_len`, if a live
 /// branch does not carry exactly `prefix_len` translated actions, or through the kernel's own
-/// invariant checks ([`condition`], [`split_action`], [`cap_branches`], [`rescale`]).
+/// invariant checks ([`split_batch`] and its `condition`, [`cap_branches`], [`rescale`]).
 pub fn apply_preflop_action(input: &ReplayInput, output: &mut ReplayOutput, prefix_len: usize, seat: Seat, observed: &Action) -> bool {
     apply_with(input, output, &mut ReplayState::default(), prefix_len, seat, observed)
 }
@@ -159,8 +186,10 @@ pub fn apply_preflop_action(input: &ReplayInput, output: &mut ReplayOutput, pref
 /// onto the source's own sizes -- while depth, eligibility, rake, roles and the short-handed folds
 /// still come from the **observed** prefix (section 8.3 is hindsight-free and money is never
 /// rewritten). A branch that translated villain's raise to menu size A therefore looks up the next
-/// node under A. Delegates to [`PreflopStore::query_history`]; the walk memoizes it per
-/// `(prefix_len, branch.translated)`.
+/// node under A. Delegates to the chip-only [`PreflopStore::query_history`]: the branch's chip
+/// history is all it holds, so a translated edge that two source sizes round to is an explicit
+/// unresolved missing path (ruling 13-R1); the walk itself looks nodes up with the source steps it
+/// carried, memoized per `(prefix_len, branch.translated, carried steps)`.
 pub fn query_translated(store: &PreflopStore, cfg: &HandConfig, state: &HandState, prefix_len: usize, branch: &HistoryBranch) -> PreflopAnswer {
     store.query_history(cfg, state, prefix_len, &branch.translated)
 }
@@ -249,33 +278,66 @@ pub fn publish(output: &mut ReplayOutput, state: &HandState) {
 
 /// The per-invocation state of one walk: the mapping memo of spec section 8.3 ("mappings are
 /// cached per prefix within a replay run"), keyed by the observed prefix index plus the branch's
-/// translated history -- never by final-hand flags.
+/// translated history and carried source steps -- never by final-hand flags -- and the source
+/// steps themselves (ruling 13-R1).
 #[derive(Debug, Default)]
 struct ReplayState {
     lookups: PreflopInvocation,
+    /// Per live or stopped branch id: the exact source step chosen at each entry of its
+    /// `translated` history -- `Some` at a translated edge, `None` at an observed action the
+    /// branch kept as observed. A branch without an entry (a standalone transaction's input)
+    /// carries none, so its lookups are chip-only.
+    sources: BTreeMap<u8, Vec<Option<PreflopStep>>>,
 }
 
 impl ReplayState {
-    fn lookup(&mut self, input: &ReplayInput, prefix_len: usize, branch: &HistoryBranch) -> PreflopAnswer {
-        self.lookups.answer_history(input.store, input.cfg, input.state, prefix_len, &branch.translated)
+    /// The source steps carried along `b`'s translated history (all `None` when none are).
+    ///
+    /// # Panics
+    /// Always, if a carried list does not have one entry per translated action.
+    fn sources_of(&self, b: &HistoryBranch) -> Vec<Option<PreflopStep>> {
+        match self.sources.get(&b.id) {
+            Some(carried) => {
+                assert!(
+                    carried.len() == b.translated.len(),
+                    "replay: branch {} carries {} source steps for {} translated actions",
+                    b.id,
+                    carried.len(),
+                    b.translated.len()
+                );
+                carried.clone()
+            }
+            None => vec![None; b.translated.len()],
+        }
+    }
+
+    /// The branch's node at `prefix_len`, looked up under its translated history with the source
+    /// steps it carries.
+    fn lookup(&mut self, input: &ReplayInput, prefix_len: usize, b: &HistoryBranch) -> PreflopAnswer {
+        let sources = self.sources_of(b);
+        self.lookups.answer_history_sourced(input.store, input.cfg, input.state, prefix_len, &b.translated, &sources)
+    }
+
+    /// Keeps the carried steps of `branches` that can still be looked up: every non-residual
+    /// branch's (the residual has no history of its own).
+    fn retain_for(&mut self, branches: &[HistoryBranch]) {
+        self.sources.retain(|id, _| branches.iter().any(|b| b.id == *id && !b.residual));
     }
 }
 
-/// What one observed action does to one branch, decided before any branch is replaced.
-enum Plan {
-    /// A residual or already stopped branch: copied through unchanged.
-    Frozen,
-    /// The actor has no node here, or the action cannot be mapped: the branch stops, frozen.
-    Stop(String),
-    /// On the menu: the mapped menu action and the conditioned child (`None` when `M_k = 0`).
-    OnMenu { action: Action, child: Option<HistoryBranch> },
-    /// An off-menu wager: this branch's own interpolation choices for `split_action`.
-    Split { choices: Vec<(Action, f64, Vec<f64>)> },
+/// What one observed action does to one branch, decided before any branch is replaced: the
+/// kernel's [`BranchChoice`] and, for a split, the exact source step of each of its choices, in
+/// choice order (empty otherwise).
+struct Plan {
+    choice: BranchChoice,
+    steps: Vec<PreflopStep>,
 }
 
-/// A stopped branch's cause marker while another branch of the same generation is split: it can
-/// never be a genuine cause (it opens with a NUL), and it never outlives [`split_one`].
-const HELD: &str = "\u{0}held while another branch of this generation is split";
+impl Plan {
+    fn only(choice: BranchChoice) -> Self {
+        Plan { choice, steps: vec![] }
+    }
+}
 
 fn apply_with(input: &ReplayInput, output: &mut ReplayOutput, run: &mut ReplayState, prefix_len: usize, seat: Seat, observed: &Action) -> bool {
     let recorded = input.state.actions.get(prefix_len);
@@ -296,74 +358,64 @@ fn apply_with(input: &ReplayInput, output: &mut ReplayOutput, run: &mut ReplaySt
     if let Some(reason) = notes.unsupported {
         output.unsupported.get_or_insert(reason);
     }
-    let applying = plans.iter().any(|p| matches!(p, Plan::OnMenu { .. } | Plan::Split { .. }));
 
-    // Every applying branch's candidates, in list order, before anything is decided.
-    let mut next: Vec<HistoryBranch> = Vec::with_capacity(output.branches.len() + 1);
-    let mut targets: Vec<(usize, &[(Action, f64, Vec<f64>)])> = Vec::new();
-    let mut supported = false;
-    for (b, plan) in output.branches.iter().zip(&plans) {
-        match plan {
-            Plan::Frozen => next.push(b.clone()),
-            Plan::Stop(cause) => {
-                let mut stopped = b.clone();
-                stop_branch(&mut stopped, cause.clone());
-                next.push(stopped);
-            }
-            Plan::OnMenu { action, child } => {
-                if let Some(child) = child {
-                    let mut child = child.clone();
-                    child.translated.push((seat, *action));
-                    supported = true;
-                    next.push(child);
-                }
-            }
-            Plan::Split { choices } => {
-                targets.push((next.len(), choices.as_slice()));
-                next.push(b.clone());
-            }
-        }
-    }
-    let mut offset: isize = 0;
-    for (position, choices) in targets {
-        let at = usize::try_from(position as isize + offset).expect("a split target stays in the list");
-        let before = next.len();
-        next = split_one(next, at, seat, choices);
-        let children = next.len() + 1 - before;
-        supported |= children > 0;
-        offset += children as isize - 1;
-    }
+    // Ruling 13-R3: the complete pre-action generation, each branch with its own choice, in ONE
+    // kernel call -- ids allocated and parents remapped once, zero-support removals included.
+    let choices: Vec<BranchChoice> = plans.iter().map(|p| p.choice.clone()).collect();
+    let batch = split_batch(&output.branches, seat, &choices);
 
-    if applying && !supported {
+    if batch.applying && !batch.supported {
         // Spec section 9.2: reject the update; every `q` and mass keeps its pre-action value.
         let cause = format!("zero support after {observed:?}");
+        let mut carried = BTreeMap::new();
         let kept: Vec<HistoryBranch> = output
             .branches
             .iter()
             .zip(&plans)
             .map(|(b, plan)| {
+                let mut sources = run.sources_of(b);
                 let mut b = b.clone();
-                match plan {
-                    Plan::Frozen => {}
-                    Plan::Stop(stop) => stop_branch(&mut b, stop.clone()),
-                    // The one mapped action: the path stays derivable without a guessed action.
-                    Plan::OnMenu { action, .. } => b.translated.push((seat, *action)),
+                match &plan.choice {
+                    BranchChoice::Keep => {}
+                    BranchChoice::Stop(stop) => stop_branch(&mut b, stop.clone()),
+                    // The observed on-menu action: the path stays derivable without a guessed action.
+                    BranchChoice::Retain { action, .. } => {
+                        b.translated.push((seat, *action));
+                        sources.push(None);
+                    }
                     // Only an unobserved menu size could advance it.
-                    Plan::Split { .. } => stop_branch(&mut b, cause.clone()),
+                    BranchChoice::Split(_) => stop_branch(&mut b, cause.clone()),
                 }
+                carried.insert(b.id, sources);
                 b
             })
             .collect();
         output.branches = kept;
+        run.sources = carried;
+        run.retain_for(&output.branches);
         output.reasons.push(zero_reason(Street::Preflop, seat, observed));
         refresh_nodes(input, output, run, prefix_len + 1);
         return false;
     }
-    output.branches = next;
-    if supported {
+
+    // Each output branch carries its origin's source steps, plus the step it took here.
+    let mut carried = BTreeMap::new();
+    for (b, &(i, choice)) in batch.branches.iter().zip(&batch.origin) {
+        let mut sources = run.sources_of(&output.branches[i]);
+        match (&plans[i].choice, choice) {
+            (BranchChoice::Retain { .. }, None) => sources.push(None),
+            (BranchChoice::Split(_), Some(c)) => sources.push(Some(plans[i].steps[c].clone())),
+            _ => {}
+        }
+        carried.insert(b.id, sources);
+    }
+    run.sources = carried;
+    output.branches = batch.branches;
+    if batch.supported {
         cap_branches(&mut output.branches); // one global cap per observed action
         rescale(&mut output.branches, &mut output.log_reach);
     }
+    run.retain_for(&output.branches);
     refresh_nodes(input, output, run, prefix_len + 1);
     true
 }
@@ -388,7 +440,7 @@ struct Notes {
 /// Decides what the observed action does to branch `b` (see [`Plan`]).
 fn plan_branch(input: &ReplayInput, run: &mut ReplayState, step: &Observed, b: &HistoryBranch, notes: &mut Notes) -> Plan {
     if b.residual || b.stopped.is_some() {
-        return Plan::Frozen;
+        return Plan::only(BranchChoice::Keep);
     }
     let (prefix_len, seat, observed) = (step.prefix_len, step.seat, step.action);
     assert!(
@@ -403,47 +455,54 @@ fn plan_branch(input: &ReplayInput, run: &mut ReplayState, step: &Observed, b: &
             notes.mapping.push(r.clone());
         }
     }
-    let (Some(node), Some(expanded)) = (answer.node.as_ref(), answer.expanded.as_ref()) else {
-        return stop_without_node(seat, &answer, notes);
+    let (Some(node), Some(expanded), Some(key)) = (answer.node.as_ref(), answer.expanded.as_ref(), answer.source_key.as_ref()) else {
+        return Plan::only(stop_without_node(seat, &answer, notes));
     };
     assert_eq!(answer.actor, Some(seat), "apply_preflop_action: the prefix's actor is the observed actor");
     if let Some(a) = menu_step_index(&node.actions, observed, answer.unit) {
-        let p = likelihood(expanded, a);
-        return Plan::OnMenu { action: expanded.actions[a], child: condition(b, seat, &p, 1.0) };
+        // On the menu: one `condition` with that action's column. The branch records the OBSERVED
+        // action (spec section 8.4 replaces only translated wagers; ruling 13-R1), whose own
+        // resolution against this node is the step `a` it was conditioned with.
+        return Plan::only(BranchChoice::Retain { action: *observed, p: likelihood(expanded, a) });
     }
     let Some(to) = raise_to(observed) else {
         // A non-wager this node does not list has no likelihood here, and none is guessed.
         let cause = format!("unmappable action {observed:?} at {}", answer.key);
         notes.events.push(stop_reason(seat, &cause));
-        return Plan::Stop(cause);
+        return Plan::only(BranchChoice::Stop(cause));
     };
-    let (own, call, pot) = parent_money(input, b, seat);
-    let mapped = wager_fraction(to, own, call, pot)
-        .zip(menu_fractions(&expanded.actions, own, call, pot))
+    // Ruling 13-R2: the pot fractions at the SOURCE parent, in one exact scale.
+    let parent = source_parent(key, node.actor, answer.unit);
+    let mapped = source_fraction(u64::from(to) * 1000, &parent)
+        .zip(source_menu(node, expanded, &parent, answer.unit))
         .and_then(|(s, menu)| interpolate(s, &menu).map(|t| (s, menu, t)));
     let Some((s, menu, t)) = mapped else {
         let cause = format!("unmappable size at {}", answer.key);
         notes.events.push(stop_reason(seat, &cause));
-        return Plan::Stop(cause);
+        return Plan::only(BranchChoice::Stop(cause));
     };
     notes.events.push(translation_reason(Street::Preflop, seat, s, &menu, &t));
-    Plan::Split { choices: t.choices.iter().map(|&(a, f)| (expanded.actions[a], f, likelihood(expanded, a))).collect() }
+    Plan {
+        choice: BranchChoice::Split(t.choices.iter().map(|&(a, f)| (expanded.actions[a], f, likelihood(expanded, a))).collect()),
+        steps: t.choices.iter().map(|&(a, _)| node.actions[a].clone()).collect(),
+    }
 }
 
 /// The stop of a branch whose lookup found no node for the actor: `missing node <key>` for a
-/// coverage gap (spec section 9.3); any other unsupported answer (a format, history or config the
+/// coverage gap (spec section 9.3) -- an absent node, an off-menu history, or a translated edge a
+/// chip-only lookup cannot resolve; any other unsupported answer (a format, history or config the
 /// store cannot map at all) also marks the replay `unsupported`, keeping the first reason.
-fn stop_without_node(seat: Seat, answer: &PreflopAnswer, notes: &mut Notes) -> Plan {
+fn stop_without_node(seat: Seat, answer: &PreflopAnswer, notes: &mut Notes) -> BranchChoice {
     match answer.unsupported.as_ref() {
         Some(UnsupportedReason::MissingPreflopNode { key }) => {
             notes.events.push(missing_reason(seat, key));
-            Plan::Stop(format!("missing node {key}"))
+            BranchChoice::Stop(format!("missing node {key}"))
         }
         Some(other) => {
             notes.unsupported.get_or_insert_with(|| other.clone());
             let cause = format!("unsupported preflop lookup: {other:?}");
             notes.events.push(stop_reason(seat, &cause));
-            Plan::Stop(cause)
+            BranchChoice::Stop(cause)
         }
         None => panic!("apply_preflop_action: a preflop answer without a node states why: {answer:?}"),
     }
@@ -452,33 +511,6 @@ fn stop_without_node(seat: Seat, answer: &PreflopAnswer, notes: &mut Notes) -> P
 /// `UnconditionedPriorStreet{Preflop, seat, cause}`, the cause being the branch's stop cause.
 fn stop_reason(seat: Seat, cause: &str) -> ApproxReason {
     ApproxReason::UnconditionedPriorStreet { street: Street::Preflop, seat, cause: cause.to_string() }
-}
-
-/// Expands the branch at `at` through one [`split_action`] call over the whole generation, every
-/// other live branch held frozen for the call (see the module docs, ruling 13-pre): ids come after
-/// every id of the generation and parents from the kernel's compaction pass.
-///
-/// # Panics
-/// Always, if the target is not a live branch or some branch already carries the hold marker.
-fn split_one(mut generation: Vec<HistoryBranch>, at: usize, seat: Seat, choices: &[(Action, f64, Vec<f64>)]) -> Vec<HistoryBranch> {
-    assert!(
-        !generation[at].residual && generation[at].stopped.is_none(),
-        "split_one: branch {} is not live",
-        generation[at].id
-    );
-    for (i, b) in generation.iter_mut().enumerate() {
-        assert!(b.stopped.as_deref() != Some(HELD), "split_one: branch {} is already held", b.id);
-        if i != at && !b.residual && b.stopped.is_none() {
-            b.stopped = Some(HELD.to_string());
-        }
-    }
-    let mut out = split_action(&generation, seat, choices);
-    for b in &mut out {
-        if b.stopped.as_deref() == Some(HELD) {
-            b.stopped = None;
-        }
-    }
-    out
 }
 
 /// One menu action's likelihood column over 1326 combos, as `f64`: `P(a | c)` from the expanded
@@ -502,39 +534,106 @@ fn raise_to(action: &Action) -> Option<u32> {
     }
 }
 
-/// `(own, call, pot)` in chips at the mapped parent of `seat`'s next action in `branch`: the live
-/// posts (the model's own, at prefix 0), then every action of the branch's translated history --
-/// fold and check add nothing, a call matches the highest contribution, a wager sets the
-/// contribution to its menu amount -- each capped at the seat's starting stack. This is the
-/// branch's source path expressed in the chip domain that `wager_fraction` and `menu_fractions`
-/// (and the expanded menu they read) use; it is a standalone replay, never
-/// `core_model::apply_action`, so a rounded source raise that would be illegal at the live table
-/// never touches the observed hand (source navigation and model legality are separate).
-fn parent_money(input: &ReplayInput, branch: &HistoryBranch, seat: Seat) -> (u32, u32, u32) {
-    let root = prefix_state(input.state, 0);
-    let mut committed: [u64; 6] = std::array::from_fn(|i| u64::from(root.derived.committed_this_street[i]));
-    let cap: [u64; 6] = std::array::from_fn(|i| committed[i] + u64::from(root.derived.stacks_remaining[i]));
-    for (s, a) in &branch.translated {
-        let i = usize::from(s.0);
-        let highest = committed.iter().copied().max().unwrap_or(0);
-        committed[i] = match a {
-            Action::Fold | Action::Check => committed[i],
-            Action::Call => highest.min(cap[i]).max(committed[i]),
-            Action::Bet { to } | Action::Raise { to } | Action::AllIn { to } => u64::from(*to).min(cap[i]).max(committed[i]),
-        };
+/// The money at a mapped source parent (spec section 8.4, ruling 13-R2), in **milli-chips at the
+/// source's own amounts**: a source amount of `x` thousandths of a source unit is `x * unit`
+/// (exact), and an actual chip amount `c` is `c * 1000` (exact). A fractional source amount (2.5
+/// bb at a 3-chip unit is 7.5 chips) and an observed chip amount therefore share one integer scale,
+/// and no amount is rounded to the chip before a pot fraction is taken. `own` is the actor's
+/// contribution, `call` what it owes, `pot` the pot before its call, all in that scale.
+struct SourceParent {
+    own: u64,
+    call: u64,
+    pot: u64,
+}
+
+/// A slot per position for [`source_parent`]'s contributions.
+fn position_slot(p: Position) -> usize {
+    match p {
+        Position::Btn => 0,
+        Position::Sb => 1,
+        Position::Bb => 2,
+        Position::Utg => 3,
+        Position::Hj => 4,
+        Position::Co => 5,
     }
-    let i = usize::from(seat.0);
+}
+
+/// The source parent of `actor`'s decision at the node found under `key` (spec section 8.4:
+/// "reconstructed from the financial state at the mapped parent node"), rebuilt from the source's
+/// own tree in source units: the source posts (0.5 and 1 source unit, spec section 8.2's fixed
+/// source blinds, by the key's -- possibly virtual -- roles: behind a straddle the virtual SB and
+/// BB post and the physical SB's post is not represented, spec section 8.3), then every step of
+/// the key's history -- fold and check add nothing, a call matches the highest contribution, a
+/// raise sets the contribution to its exact source size, an all-in to the source stack
+/// (`depth_bb`) -- each capped at that source stack. Never the live posts, the live stacks, or a
+/// chip-rounded size.
+fn source_parent(key: &PreflopNodeKey, actor: Position, unit: u32) -> SourceParent {
+    let unit = u64::from(unit);
+    let stack = u64::from(key.depth_bb) * 1000 * unit;
+    let mut committed = [0_u64; 6];
+    committed[position_slot(Position::Sb)] = 500 * unit;
+    committed[position_slot(Position::Bb)] = 1000 * unit;
+    for (position, step) in &key.history {
+        let highest = committed.iter().copied().max().unwrap_or(0);
+        let to = match step {
+            PreflopStep::Fold | PreflopStep::Check => continue,
+            PreflopStep::Call => highest,
+            PreflopStep::Raise { to_bb_x1000 } => u64::from(*to_bb_x1000) * unit,
+            PreflopStep::AllIn => stack,
+        };
+        let slot = &mut committed[position_slot(*position)];
+        *slot = (*slot).max(to.min(stack));
+    }
+    let own = committed[position_slot(actor)];
     let highest = committed.iter().copied().max().unwrap_or(0);
-    let own = committed[i];
-    let call = highest.min(cap[i]).saturating_sub(own);
-    let pot: u64 = committed.iter().sum();
-    let narrow = |x: u64, what: &str| u32::try_from(x).unwrap_or_else(|_| panic!("parent_money: {what} {x} exceeds the chip domain"));
-    (narrow(own, "own contribution"), narrow(call, "call"), narrow(pot, "pot"))
+    SourceParent { own, call: highest.min(stack).saturating_sub(own), pot: committed.iter().sum() }
+}
+
+/// Spec section 8.4's pot fraction of a wager to `to` (milli-chips) at `parent`:
+/// `(to - own - call) / (pot + call)`, computed from exact integers -- the wide, one-scale twin of
+/// `core_preflop::wager_fraction`, with the same domain. `None` when there is nothing to take a
+/// fraction of (`pot + call == 0`) or the amount does not cover the call (`to < own + call`): a
+/// recoverable translation-domain mismatch (the observed amount against a mapped parent whose
+/// call follows a larger translated size), never a panic.
+fn source_fraction(to: u64, parent: &SourceParent) -> Option<f64> {
+    let covered = parent.own + parent.call;
+    let denom = parent.pot + parent.call;
+    if denom == 0 || to < covered {
+        return None;
+    }
+    let s = (to - covered) as f64 / denom as f64;
+    s.is_finite().then_some(s)
+}
+
+/// The node's own wager sizes as the `(menu index, pot fraction)` pairs `interpolate` takes, at
+/// `parent` (spec section 8.4: "the source node's menu fractions"): a `Raise` at its exact source
+/// size (`to_bb_x1000 * unit` milli-chips, never its chip rounding) and `AllIn` at the actor's
+/// ACTUAL maximum, the expanded node's chip amount (P3.T9), times 1000. `None` when any size has
+/// no fraction there, so a bracket is never silently narrowed (as `core_preflop::menu_fractions`).
+///
+/// # Panics
+/// Always, if the expanded node's action at a source `AllIn` is not an `AllIn`.
+fn source_menu(node: &PreflopNode, expanded: &ExpandedNode, parent: &SourceParent, unit: u32) -> Option<Vec<(usize, f64)>> {
+    node.actions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, step)| {
+            let to = match step {
+                PreflopStep::Raise { to_bb_x1000 } => u64::from(*to_bb_x1000) * u64::from(unit),
+                PreflopStep::AllIn => match expanded.actions[i] {
+                    Action::AllIn { to } => u64::from(to) * 1000,
+                    other => panic!("source_menu: the source all-in at menu index {i} expanded to {other:?}"),
+                },
+                PreflopStep::Fold | PreflopStep::Check | PreflopStep::Call => return None,
+            };
+            Some(source_fraction(to, parent).map(|s| (i, s)))
+        })
+        .collect()
 }
 
 /// Spec section 8.4's disclosure of one translated wager: the observed pot fraction, the mapped
-/// menu sizes (as pot fractions at the mapped parent) with their interpolation weights, the
-/// deviation, and `prominent = d > 0.10`.
+/// menu sizes (as pot fractions at the mapped source parent) with their interpolation weights,
+/// the deviation, and `prominent = d > 0.10`.
 fn translation_reason(street: Street, seat: Seat, s: f64, menu: &[(usize, f64)], t: &Interpolation) -> ApproxReason {
     let size = |i: usize| menu.iter().find(|(j, _)| *j == i).map(|(_, x)| *x).expect("an interpolation choice is a menu size");
     ApproxReason::BetTranslation {

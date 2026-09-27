@@ -640,10 +640,12 @@ fn an_off_menu_open_translates_and_looks_up_under_the_mapped_size() {
     assert_eq!(out.ranges[3], Some(scaled(&column(&store, &act(&root, &[Action::Raise { to: 2500 }]), 1, 1))));
 }
 
-/// At a three-chip big blind the source's 2.5 bb open is the chip action `Raise{to: 8}` (7.5
-/// rounded half up). A branch carrying that chip action must look its next node up under the
-/// source's own 2500, which a thousandth conversion of 8 chips (2667) would miss: the translated
-/// history is resolved against the source's menus, like the observed prefix (P3.T8 R3).
+/// At a three-chip big blind the source's 2.5 bb open is 7.5 chips, so both a 7-chip and an
+/// 8-chip open are on the menu (within half a chip). The branch keeps the OBSERVED open (spec
+/// section 8.4: only translated wagers are replaced; ruling 13-R1: the observed on-menu history
+/// stays faithful), and its next node is looked up under the source's own 2500, which a thousandth
+/// conversion of 8 chips (2667) would miss: the history is resolved against the source's menus,
+/// like the observed prefix (P3.T8 R3).
 #[test]
 fn translated_sizes_resolve_against_the_source_menu() {
     let store = full_store();
@@ -651,13 +653,13 @@ fn translated_sizes_resolve_against_the_source_menu() {
     let root = table(&cfg);
     assert_eq!(core_preflop::to_source_step(&Action::Raise { to: 8 }, 3), raise_bb_x1000(2667), "the naive conversion");
     for open in [7u32, 8] {
-        // Both 7 and 8 chips are within half a chip of 7.5: on the menu, mapped to the menu action.
+        // Both 7 and 8 chips are within half a chip of 7.5: on the menu, kept as observed.
         let called = act(&root, &[Action::Raise { to: open }, Action::Call]);
         let out = run(&store, &called);
         assert_eq!(out.branches.len(), 1);
         let b = &out.branches[0];
         assert_eq!(b.id, 0, "{open}: an on-menu open is not a split");
-        assert_eq!(b.translated, vec![(UTG, Action::Raise { to: 8 }), (HJ, Action::Call)], "{open}");
+        assert_eq!(b.translated, vec![(UTG, Action::Raise { to: open }), (HJ, Action::Call)], "{open}");
         assert!(!out.reasons.iter().any(|r| matches!(r, ApproxReason::BetTranslation { .. })), "{open}: {:?}", out.reasons);
         let call = column(&store, &act(&root, &[Action::Raise { to: 8 }]), 1, 1);
         assert_eq!(out.ranges[3], Some(scaled(&call)), "{open}: HJ conditioned at the source's 2500 node");
@@ -937,4 +939,376 @@ fn snapshot_records_round_trip_through_serde() {
     assert_eq!(back, snapshot);
     let copy = snapshot.clone();
     assert_eq!(format!("{copy:?}"), format!("{snapshot:?}"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// P3.T13 fix round 1 (task-13-review.md R1-R3 and Q4): in-memory multi-size sources. Each source
+// holds exactly the nodes listed (under the synthetic bundle's own manifest); nothing is invented
+// for a key of the committed fixture.
+// ---------------------------------------------------------------------------------------------
+
+type MemNodes = Vec<(Vec<(Position, PreflopStep)>, PreflopNode)>;
+
+/// A class-major probability table for a node with `n` actions: every entry positive, the pattern
+/// distinct per `seed`, each class's row summing to 1 (in `f32`).
+fn mixed(seed: usize, n: usize) -> Vec<Vec<f32>> {
+    (0..169)
+        .map(|c| {
+            let w: Vec<f32> = (0..n).map(|a| 1.0 + ((c * (a + seed + 1) + 3 * a + seed) % 7) as f32).collect();
+            let t: f32 = w.iter().sum();
+            w.iter().map(|x| x / t).collect()
+        })
+        .collect()
+}
+
+/// An in-memory node with no EV and no unreachable class.
+fn mem_node(actor: Position, actions: Vec<PreflopStep>, seed: usize) -> PreflopNode {
+    let n = actions.len();
+    PreflopNode {
+        actor,
+        actions,
+        probs: mixed(seed, n),
+        ev_source_sb: None,
+        unreachable: [false; 169],
+        committed_by_actor_sb: 0.0,
+        fold_wide_verified: false,
+    }
+}
+
+/// A source holding exactly `nodes`, each at its history, under the synthetic bundle's manifest
+/// (100 bb, its rake profile).
+fn store_of(nodes: MemNodes) -> PreflopStore {
+    let (info, _) = synthetic_nodes();
+    let nodes = nodes.into_iter().map(|(history, node)| (key(history), node)).collect();
+    PreflopStore::from_sources(vec![Box::new(PokerDataJson { info, nodes })])
+}
+
+/// Column `a` of the in-memory node at `history`, expanded from its 169 classes to 1326 combos.
+fn column_at(nodes: &MemNodes, history: &[(Position, PreflopStep)], a: usize) -> Vec<f64> {
+    let node = &nodes.iter().find(|(h, _)| h.as_slice() == history).expect("the in-memory source holds this history").1;
+    let mut col = vec![0.0; COMBOS];
+    for class in 0..169u8 {
+        for c in proto::class_combos(class) {
+            col[usize::from(c)] = f64::from(node.probs[usize::from(class)][a]);
+        }
+    }
+    col
+}
+
+/// A fold followed by raises to the given sizes (thousandths of a source unit).
+fn raise_menu(sizes: &[u32]) -> Vec<PreflopStep> {
+    std::iter::once(PreflopStep::Fold).chain(sizes.iter().map(|&s| raise_bb_x1000(s))).collect()
+}
+
+/// The integrated likelihood under uniform masses: the column's mean.
+fn mean(p: &[f64]) -> f64 {
+    p.iter().sum::<f64>() / COMBOS as f64
+}
+
+/// A published range equal to `unscaled / max(unscaled)`, at the output's `f32` precision.
+fn assert_range_close(actual: &Option<Range1326>, unscaled: &[f64], what: &str) {
+    let r = actual.as_ref().unwrap_or_else(|| panic!("{what}: a dealt seat has a range"));
+    let max = unscaled.iter().copied().fold(0.0_f64, f64::max);
+    for c in 0..COMBOS {
+        let want = unscaled[c] / max;
+        assert!((f64::from(r.0[c]) - want).abs() <= 1e-6, "{what}: combo {c}: {} != {want}", r.0[c]);
+    }
+}
+
+/// Two likelihood columns that no published range could confuse at `f32` precision.
+fn assert_columns_differ(a: &[f64], b: &[f64]) {
+    let (ma, mb) = (a.iter().copied().fold(0.0, f64::max), b.iter().copied().fold(0.0, f64::max));
+    assert!(a.iter().zip(b).any(|(x, y)| (x / ma - y / mb).abs() > 1e-3), "the continuation columns must differ");
+}
+
+/// UTG opens 2.5 or 2.6 bb; HJ's continuation after each size is its own node, with its own call
+/// column.
+fn sub_chip_nodes() -> MemNodes {
+    let hj = || vec![PreflopStep::Fold, PreflopStep::Call];
+    vec![
+        (vec![], mem_node(Position::Utg, raise_menu(&[2500, 2600]), 1)),
+        (vec![(Position::Utg, raise_bb_x1000(2500))], mem_node(Position::Hj, hj(), 2)),
+        (vec![(Position::Utg, raise_bb_x1000(2600))], mem_node(Position::Hj, hj(), 5)),
+    ]
+}
+
+/// UTG opens 2.5 or 3.5 bb; HJ faces each size with its own raise menu: 6 or 9 bb after 2.5, 7 or
+/// 12 bb after 3.5.
+fn ladder_nodes() -> MemNodes {
+    let hj = |sizes: &[u32]| [PreflopStep::Fold, PreflopStep::Call].into_iter().chain(sizes.iter().map(|&s| raise_bb_x1000(s))).collect();
+    vec![
+        (vec![], mem_node(Position::Utg, raise_menu(&[2500, 3500]), 1)),
+        (vec![(Position::Utg, raise_bb_x1000(2500))], mem_node(Position::Hj, hj(&[6000, 9000]), 2)),
+        (vec![(Position::Utg, raise_bb_x1000(3500))], mem_node(Position::Hj, hj(&[7000, 12000]), 3)),
+    ]
+}
+
+/// Ruling 13-R1 (task-13-review.md R1): a source offering 2.5 and 2.6 bb at a three-chip big
+/// blind. A 7-chip open is exactly the 2500 edge (distances 500 and 800 in `to * 1000 - source *
+/// unit`); an 8-chip open is exactly 2600's (the closer of two sizes within half a chip). Each
+/// open keeps its observed chip amount in the branch, so HJ's next node is the continuation of the
+/// edge the open was conditioned with -- never the other size's, which rounding 7.5 bb up to 8
+/// chips selected before.
+#[test]
+fn an_exact_sub_chip_open_navigates_its_own_source_edge() {
+    let nodes = sub_chip_nodes();
+    let store = store_of(nodes.clone());
+    let cfg = config_at(3);
+    let root = table(&cfg);
+    let hj_call = |edge: u32| column_at(&nodes, &[(Position::Utg, raise_bb_x1000(edge))], 1);
+    assert_columns_differ(&hj_call(2500), &hj_call(2600));
+    for (open, edge, raise) in [(7u32, 2500u32, 1usize), (8, 2600, 2)] {
+        let called = act(&root, &[Action::Raise { to: open }, Action::Call]);
+        let out = run(&store, &called);
+        assert_eq!(out.branches.len(), 1, "{open}");
+        let b = &out.branches[0];
+        assert_eq!((b.id, b.parent, b.stopped.clone()), (0, None, None), "{open}: an on-menu open is not a split");
+        assert_eq!(b.translated, vec![(UTG, Action::Raise { to: open }), (HJ, Action::Call)], "{open}: the observed history is kept");
+        assert!(!out.reasons.iter().any(|r| matches!(r, ApproxReason::BetTranslation { .. })), "{open}: {:?}", out.reasons);
+        assert_range_close(&out.ranges[2], &column_at(&nodes, &[], raise), &format!("{open}: UTG conditioned by the {edge} column"));
+        assert_range_close(&out.ranges[3], &hj_call(edge), &format!("{open}: HJ conditioned at the node after {edge}"));
+    }
+}
+
+/// Ruling 13-R1: a translated edge keeps the source size it chose, which its chip amount cannot
+/// name. At a three-chip big blind a 6-chip open (below 2.5 bb) clamps to 2500 and a 9-chip open
+/// (above 2.6 bb, no all-in on the menu) clamps to 2600; both sizes are the chip action
+/// `Raise{to: 8}`. The walk carries each branch's source step, so HJ's call is conditioned at the
+/// continuation of the edge the open was mapped to. A chip-only query of the same branch cannot
+/// tell the two edges apart and says so (an explicit unresolved missing path, never either node),
+/// and a standalone transaction, which holds only that chip history, stops the branch on it.
+#[test]
+fn a_translated_edge_keeps_its_source_size_past_chip_rounding() {
+    let nodes = sub_chip_nodes();
+    let store = store_of(nodes.clone());
+    let cfg = config_at(3);
+    let root = table(&cfg);
+    for (open, edge, raise) in [(6u32, 2500u32, 1usize), (9, 2600, 2)] {
+        let opened = act(&root, &[Action::Raise { to: open }]);
+        let called = act(&opened, &[Action::Call]);
+        let after_open = run(&store, &opened);
+        assert_eq!(after_open.branches.len(), 1, "{open}");
+        let b = &after_open.branches[0];
+        assert_eq!((b.id, b.parent, b.split_by), (1, Some(0), Some(UTG)), "{open}: a clamped translation is a split child");
+        assert_eq!(b.translated, vec![(UTG, Action::Raise { to: 8 })], "{open}: both source sizes are 8 chips");
+        let hj_key = key(vec![(Position::Utg, raise_bb_x1000(edge))]);
+        assert_eq!(b.seats.iter().find(|s| s.seat == HJ).unwrap().node, Some(hj_key), "{open}: HJ's next node is under {edge}");
+
+        let out = run(&store, &called);
+        assert_eq!(out.branches.len(), 1, "{open}");
+        assert_eq!(out.branches[0].translated, vec![(UTG, Action::Raise { to: 8 }), (HJ, Action::Call)], "{open}");
+        assert_eq!(out.branches[0].stopped, None, "{open}");
+        assert_range_close(&out.ranges[2], &column_at(&nodes, &[], raise), &format!("{open}: UTG conditioned by the {edge} column"));
+        let hj_call = column_at(&nodes, &[(Position::Utg, raise_bb_x1000(edge))], 1);
+        assert_range_close(&out.ranges[3], &hj_call, &format!("{open}: HJ conditioned at the node after {edge}"));
+
+        // The chip history alone is ambiguous: an explicit unresolved missing path.
+        let chip_only = query_translated(&store, &cfg, &called, 1, b);
+        assert!(chip_only.node.is_none() && chip_only.expanded.is_none(), "{open}: {chip_only:?}");
+        assert!(
+            chip_only.key.contains("unresolved") && chip_only.key.contains("2500") && chip_only.key.contains("2600"),
+            "{open}: {}",
+            chip_only.key
+        );
+        assert_eq!(chip_only.unsupported, Some(UnsupportedReason::MissingPreflopNode { key: chip_only.key.clone() }));
+        assert_eq!(chip_only.actor, Some(HJ));
+        let mut standalone = after_open.clone();
+        let input = ReplayInput { cfg: &cfg, state: &called, store: &store, snapshots: &[] };
+        assert!(apply_preflop_action(&input, &mut standalone, 1, HJ, &Action::Call), "{open}");
+        let s = &standalone.branches[0];
+        assert_eq!(s.stopped, Some(format!("missing node {}", chip_only.key)), "{open}");
+        assert_eq!(s.q.to_bits(), b.q.to_bits(), "{open}");
+        for (x, z) in s.seats.iter().zip(&b.seats) {
+            assert_eq!(x.mass, z.mass, "{open}: seat {:?} is frozen", x.seat);
+        }
+        assert!(standalone.reasons.contains(&missing_reason(HJ, &chip_only.key)), "{open}: {:?}", standalone.reasons);
+    }
+}
+
+/// A two-way translated open at the root of [`ladder_nodes`]: the disclosed pot fractions `(s, A,
+/// B)`, the deviation and its prominence (`d > 0.10`, stated by the caller from the hand
+/// calculation), the pseudo-harmonic weights `f_A` and `1 - f_A`, each child's `q = f_X * M_X` and
+/// chip action, and the opener's marginal `f_A P_A + f_B P_B` combo by combo (spec section 8.4).
+fn check_two_way_open(
+    out: &ReplayOutput,
+    nodes: &MemNodes,
+    seat: Seat,
+    (s, a, b): (f64, f64, f64),
+    fa: f64,
+    chips: [Action; 2],
+    want_prominent: bool,
+) {
+    let fb = 1.0 - fa;
+    let (pa, pb) = (column_at(nodes, &[], 1), column_at(nodes, &[], 2));
+    let (observed, mapped, deviation, prominent) = out
+        .reasons
+        .iter()
+        .find_map(|r| match r {
+            ApproxReason::BetTranslation { street: Street::Preflop, seat: by, observed_pct, mapped, deviation, prominent } if *by == seat => {
+                Some((*observed_pct, mapped.clone(), *deviation, *prominent))
+            }
+            _ => None,
+        })
+        .expect("the translation is disclosed");
+    assert!((f64::from(observed) - s).abs() < 1e-6, "observed {observed} != {s}");
+    assert_eq!(mapped.len(), 2, "{mapped:?}");
+    for ((size, weight), (want_size, want_weight)) in mapped.iter().zip([(a, fa), (b, fb)]) {
+        assert!((f64::from(*size) - want_size).abs() < 1e-6 && (f64::from(*weight) - want_weight).abs() < 1e-6, "{mapped:?}");
+    }
+    assert!((f64::from(deviation) - (s - a).abs().min((s - b).abs())).abs() < 1e-6, "{deviation}");
+    assert_eq!(prominent, want_prominent, "prominent = d > 0.10 at d = {deviation}");
+    assert_eq!(out.branches.len(), 2);
+    for (k, (branch, (f, p, chip))) in out.branches.iter().zip([(fa, &pa, chips[0]), (fb, &pb, chips[1])]).enumerate() {
+        assert_eq!((branch.id, branch.parent, branch.split_by), (k as u8 + 1, Some(0), Some(seat)));
+        assert_eq!(branch.translated, vec![(seat, chip)]);
+        close(branch.q, f * mean(p), "q = f_X * M_X");
+    }
+    let expected: Vec<f64> = (0..COMBOS).map(|c| fa * pa[c] + fb * pb[c]).collect();
+    assert_range_close(&out.ranges[usize::from(seat.0)], &expected, "the opener's marginal is f_A P_A + f_B P_B");
+}
+
+/// Ruling 13-R2 (the review's example): at a three-chip big blind with a one-chip small blind, a
+/// 9-chip open against a 2.5/3.5 bb menu is interpolated at the SOURCE parent -- posts 0.5 and 1
+/// source bb, UTG owes 1, the pot is 1.5 -- with the observed and the menu sizes in one scale:
+/// `s = (3 - 1) / (1.5 + 1) = 0.8`, `A = 0.6`, `B = 1.0`, so `f_A = 0.2 * 1.6 / (0.4 * 1.8) = 4/9`
+/// and `f_B = 5/9` (the live posts and chip-rounded sizes gave `f_A = 8/13`).
+#[test]
+fn interpolation_uses_the_source_parents_money_at_a_three_chip_blind() {
+    let nodes = ladder_nodes();
+    let store = store_of(nodes.clone());
+    let cfg = config_at(3);
+    assert_eq!(cfg.sb_chips, 1);
+    let opened = act(&table(&cfg), &[Action::Raise { to: 9 }]);
+    let out = run(&store, &opened);
+    // d = min(0.2, 0.2) = 0.2: prominent.
+    check_two_way_open(&out, &nodes, UTG, (0.8, 0.6, 1.0), 4.0 / 9.0, [Action::Raise { to: 8 }, Action::Raise { to: 11 }], true);
+}
+
+/// Ruling 13-R2 behind a straddle (spec section 8.3): the source unit is the 4-chip straddle, the
+/// HJ seat opens as the virtual UTG, and the source parent is the VIRTUAL tree's -- the virtual SB
+/// (the physical BB, 2 chips = 0.5 S) and the virtual BB (the straddler, 1 S) post, while the
+/// physical SB's chip is not represented. An 11-chip open is `s = (2.75 - 1) / (1.5 + 1) = 0.7`
+/// against `A = 0.6` and `B = 1.0`: `f_A = 0.3 * 1.6 / (0.4 * 1.7) = 12/17` (counting the physical
+/// SB's chip in the pot gave `17/24`).
+#[test]
+fn a_straddled_off_menu_open_interpolates_in_the_virtual_tree() {
+    let nodes = ladder_nodes();
+    let store = store_of(nodes.clone());
+    let straddle = 4;
+    let cfg = HandConfig {
+        config_revision: 7,
+        sb_chips: 1,
+        bb_chips: 2,
+        straddle: Some(proto::UtgStraddle { amount_chips: straddle }),
+        rake: Rake::PotRake { rate: 0.05, cap_mchips: straddle * 500, no_flop_no_drop: true },
+        chip_label: "$1".into(),
+    };
+    let root = core_model::begin_hand(
+        &cfg,
+        BeginHand { hand_id: 4, button: BTN, hero: BB, dealt: (0..6).map(Seat).collect(), stacks_start: vec![100 * straddle; 6], hero_cards: None },
+    )
+    .expect("a straddled six-max table");
+    let opened = act(&root, &[Action::Raise { to: 11 }]);
+    assert_eq!(opened.actions[0].seat, HJ);
+    let out = run(&store, &opened);
+    // d = min(0.1, 0.3) = 0.1, which is not above the 0.10 prominence threshold.
+    check_two_way_open(&out, &nodes, HJ, (0.7, 0.6, 1.0), 12.0 / 17.0, [Action::Raise { to: 10 }, Action::Raise { to: 14 }], false);
+    assert!(out.reasons.contains(&ApproxReason::StraddleMapped { posts: [0.25, 0.5, 1.0] }), "{:?}", out.reasons);
+}
+
+/// Ruling 13-R3 through the public transaction: two live branches at ids 252 and 253 (UTG's 3 bb
+/// open translated to 2.5 bb and to 3.5 bb), each facing HJ's 7.5 bb raise at its own node with its
+/// own menu (6/9 bb after 2.5, 7/12 bb after 3.5). Both split in ONE generation: the ids are
+/// compacted once (252 -> 0, 253 -> 1) and all four children keep their parents' links. Hand
+/// calculation at each source parent (posts 0.5/1, HJ owes UTG's size): after 2.5 bb,
+/// `s = 5 / 6.5 = 10/13` between `7/13` and `1`, `f = (3/13)(20/13) / ((6/13)(23/13)) = 10/23`;
+/// after 3.5 bb, `s = 4 / 8.5 = 8/17` between `7/17` and `1`, `f = (9/17)(24/17) / ((10/17)(25/17))
+/// = 0.864`. HJ's marginal is `sum_k q_k (f_kA P_kA + f_kB P_kB)`.
+#[test]
+fn several_branches_split_at_one_action_in_one_generation() {
+    let nodes = ladder_nodes();
+    let store = store_of(nodes.clone());
+    let cfg = config_at(10);
+    let state = act(&table(&cfg), &[Action::Raise { to: 30 }, Action::Raise { to: 75 }]);
+    let parent = |id: u8, q: f64, open: u32| {
+        let mut b = initial(&state.dealt).remove(0);
+        b.id = id;
+        b.q = q;
+        b.translated = vec![(UTG, Action::Raise { to: open })];
+        b
+    };
+    let mut out = ReplayOutput {
+        ranges: vec![None; 6],
+        branches: vec![parent(252, 0.4, 25), parent(253, 0.3, 35)],
+        folded_ranges: vec![],
+        log_reach: vec![0.0; 6],
+        reasons: vec![],
+        unsupported: None,
+    };
+    let input = ReplayInput { cfg: &cfg, state: &state, store: &store, snapshots: &[] };
+    assert!(apply_preflop_action(&input, &mut out, 1, HJ, &Action::Raise { to: 75 }));
+    assert_eq!(
+        out.branches.iter().map(|b| (b.id, b.parent)).collect::<Vec<_>>(),
+        vec![(2, Some(0)), (3, Some(0)), (4, Some(1)), (5, Some(1))],
+        "one generation-wide allocation keeps every parent link"
+    );
+    let after = |open: u32| vec![(Position::Utg, raise_bb_x1000(open * 100))];
+    let children = [
+        (0.4, 10.0 / 23.0, 25u32, 2usize, 60u32),
+        (0.4, 13.0 / 23.0, 25, 3, 90),
+        (0.3, 0.864, 35, 2, 70),
+        (0.3, 0.136, 35, 3, 120),
+    ];
+    let mut expected = vec![0.0; COMBOS];
+    for (b, &(q, f, open, a, chips)) in out.branches.iter().zip(&children) {
+        let p = column_at(&nodes, &after(open), a);
+        assert_eq!(b.split_by, Some(HJ));
+        assert_eq!(b.translated, vec![(UTG, Action::Raise { to: open }), (HJ, Action::Raise { to: chips })]);
+        close(b.q, q * f * mean(&p), "q = q_k * f_X * M_kX");
+        for (e, x) in expected.iter_mut().zip(&p) {
+            *e += q * f * x;
+        }
+    }
+    let r = marginal(&out.branches, HJ);
+    let peak = expected.iter().copied().fold(0.0_f64, f64::max);
+    for c in 0..COMBOS {
+        close(r[c], expected[c] / peak, "HJ's rescaled marginal is sum_k q_k (f_A P_A + f_B P_B)");
+    }
+    let translations = out.reasons.iter().filter(|r| matches!(r, ApproxReason::BetTranslation { seat, .. } if *seat == HJ)).count();
+    assert_eq!(translations, 2, "one disclosure per splitting branch: {:?}", out.reasons);
+}
+
+/// Q4 (task-13-review.md): a recoverable translation-domain mismatch through the public walk. UTG's
+/// 2 bb open clamps to the source's only size, 5 bb; HJ's legal min-raise to 3 bb is then below the
+/// 5 bb HJ owes at the mapped source parent, so the observed wager has no pot fraction there. The
+/// branch stops with `unmappable size at <key>` -- a disclosed stop, no guessed size and no
+/// zero-support rejection -- keeping its q and masses. (The menu-side twin, a source all-in below
+/// the mapped call, cannot follow a legal observed wager: the observed raise never exceeds the
+/// actor's own maximum.)
+#[test]
+fn a_raise_below_the_mapped_call_stops_as_an_unmappable_size() {
+    let hj = vec![PreflopStep::Fold, PreflopStep::Call, raise_bb_x1000(12000)];
+    let store = store_of(vec![
+        (vec![], mem_node(Position::Utg, raise_menu(&[5000]), 1)),
+        (vec![(Position::Utg, raise_bb_x1000(5000))], mem_node(Position::Hj, hj, 2)),
+    ]);
+    let cfg = config_at(10);
+    let opened = act(&table(&cfg), &[Action::Raise { to: 20 }]);
+    let raised = act(&opened, &[Action::Raise { to: 30 }]);
+    let after_open = run(&store, &opened);
+    let out = run(&store, &raised);
+    let cause = format!("unmappable size at {}", key(vec![(Position::Utg, raise_bb_x1000(5000))]));
+    assert_eq!(out.branches.len(), 1);
+    let b = &out.branches[0];
+    assert_eq!(b.stopped, Some(cause.clone()));
+    assert_eq!(b.translated, vec![(UTG, Action::Raise { to: 50 })], "the clamped open, and no guessed size for HJ");
+    assert_eq!(b.q.to_bits(), after_open.branches[0].q.to_bits());
+    for (s, z) in b.seats.iter().zip(&after_open.branches[0].seats) {
+        assert_eq!(s.mass, z.mass, "seat {:?}", s.seat);
+    }
+    assert_eq!(out.log_reach, after_open.log_reach);
+    assert!(out.reasons.contains(&unconditioned(Street::Preflop, HJ, &cause)), "{:?}", out.reasons);
+    assert!(!out.reasons.iter().any(|r| matches!(r, ApproxReason::BetTranslation { seat, .. } if *seat == HJ)));
+    assert!(!out.reasons.contains(&zero_reason(Street::Preflop, HJ, &Action::Raise { to: 30 })));
+    assert_eq!(out.unsupported, None);
 }

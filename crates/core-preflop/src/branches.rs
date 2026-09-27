@@ -42,7 +42,10 @@
 //! # Transactional updates (for the replay walk that calls this kernel)
 //!
 //! One observed action is one transaction over the whole list: the caller builds every applying
-//! branch's candidate children first, and only then replaces the list. If every **applying**
+//! branch's candidate children first, and only then replaces the list. [`split_batch`] is that
+//! transaction's one pass over the complete pre-action generation, each branch with its own
+//! [`BranchChoice`] (kept, stopped, retained on the menu, or split over its own menu), so ids are
+//! allocated and parents remapped once for the whole generation (ruling 13-R3). If every **applying**
 //! branch (live, with a node for the actor) has zero integrated support, the update is rejected:
 //! the pre-action branches are kept unchanged and
 //! `UnconditionedPriorStreet{cause: "zero support after <action>"}` is added (spec section 9.2).
@@ -738,75 +741,168 @@ pub fn residual_reason(bs: &[HistoryBranch], hero: Seat) -> Option<ApproxReason>
     Some(ApproxReason::BranchResidual { seat: hero, residual_mass_pct: pct, cause: "cap".into() })
 }
 
-/// Splits every **live** branch (a residual or a stopped branch is copied through unchanged, per
-/// [`condition`]'s own frozen-branch rule) across one observed wager's common menu -- `(action, f,
-/// p)` triples, applied as [`condition`]`(branch, actor, p, f)` -- preserving parent creation
-/// order and, within one parent, choice order (child A before child B); a choice whose integrated
-/// likelihood is 0 does not create a child. This is the test-only common-menu case: production
+/// Splits every **live** branch across one observed wager's **common** menu -- `(action, f, p)`
+/// triples, applied as [`condition`]`(branch, actor, p, f)` -- and copies every residual or stopped
+/// branch through unchanged. This is [`split_batch`] with [`BranchChoice::Split`]`(choices)` for
+/// every live branch and [`BranchChoice::Keep`] for every frozen one, kept as a wrapper for the
+/// callers whose branches share one menu (the kernel's own tests and worked examples). Production
 /// replay's branches can each carry a different menu (a different translated history reaching a
-/// different node), so it builds each branch's own choices and calls [`condition`] directly,
-/// running [`cap_branches`] once after every parent in the batch has been expanded -- never per
-/// parent, or an earlier parent's overflow would compete against a later, still-unexpanded
-/// parent's children for the same four live slots (see the module docs' transactional-update
-/// section).
-///
-/// Every created child's `parent` is set to its parent's `id`, `split_by` to `actor`, and `action`
-/// is appended to its `translated` history; every other field ([`condition`]'s own `q` and mass
-/// update aside) is copied from the parent.
-///
-/// Ids keep creation order, which is the cap's tie-break (ties keep the earlier-created branch).
-/// The input generation's ids must be distinct. New children are counted in a wide integer and
-/// numbered after every input id, in creation order, so every new child sorts after every older
-/// retained branch; nothing is narrowed to `u8` until the ids are final:
-/// - If every child's id fits in a `u8` (at most `u8::MAX`), copied-through branches keep their
-///   ids and `parent` references unchanged, and the children take the ids one past the highest
-///   input id onward.
-/// - Otherwise the ids are compacted. A collision-free old-to-new map is built from the whole input
-///   generation first -- its ids in ascending (creation) order become `0, 1, 2, ...`, including
-///   the parents consumed by this split -- and the children take the ids after it. Every `parent`
-///   reference is remapped through that map, never through output ids: a child names its
-///   consumed parent's mapped id, a slot that no output branch holds, so no branch becomes its
-///   own parent and no child names a sibling, a cousin or a frozen branch; a reference to a branch
-///   outside the input generation (an ancestor that no longer exists) becomes `None` rather than
-///   resolving to an unrelated output branch.
-///
-/// A parent all of whose children have `M = 0` (an impossible action against that parent's public
-/// range) contributes nothing to `out`; a parent whose *every* child across the whole `bs` is
-/// dropped this way is the zero-support case, handled by the caller (this batch-transactional
-/// function does not itself reject an update -- spec section 9.2's zero-support rejection keeps
-/// the pre-action list, which is `bs` unchanged, not an empty `out`).
+/// different node), so the replay walk calls [`split_batch`] once per observed action with each
+/// branch's own choice; see it for the id allocation, the parent remap and the zero-support
+/// contract, which this wrapper inherits unchanged.
 ///
 /// # Panics
 /// Always, if two input branches share an id, if a compacted input generation and its new
 /// children together exceed the 256 ids a `u8` can address, or through [`condition`]'s own
 /// panics.
 pub fn split_action(bs: &[HistoryBranch], actor: Seat, choices: &[(Action, f64, Vec<f64>)]) -> Vec<HistoryBranch> {
+    let plan: Vec<BranchChoice> = bs
+        .iter()
+        .map(|b| if b.residual || b.stopped.is_some() { BranchChoice::Keep } else { BranchChoice::Split(choices.to_vec()) })
+        .collect();
+    split_generation(bs, actor, &plan, "split_action").branches
+}
+
+/// What one observed action does to one branch of the pre-action generation, in a
+/// [`split_batch`] call (P3.T13 fix round 1, ruling 13-R3). Each branch gets its own choice,
+/// because each carries its own translated history and therefore its own node and menu.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BranchChoice {
+    /// Copied through unchanged, id and every field kept: the residual, a stopped branch, or a
+    /// live branch the action is not applied in.
+    Keep,
+    /// A live branch stops for the rest of the street (spec section 9.3): `stopped` records the
+    /// cause and every seat's node is cleared; `q`, every mass, the history and the id are kept.
+    Stop(String),
+    /// An on-menu action in a live branch (spec section 8.4): one [`condition`]`(branch, actor, p,
+    /// 1)` in place -- the branch keeps its id, `parent` and `split_by`, and `action` is appended to
+    /// its `translated` history. `M = 0` removes the branch.
+    Retain { action: Action, p: Vec<f64> },
+    /// An off-menu wager in a live branch (spec section 8.4): one child per `(action, f, p)` choice,
+    /// in choice order (child A before child B), each [`condition`]`(branch, actor, p, f)` with
+    /// `parent` = the branch's id, `split_by` = the actor and `action` appended; a choice with
+    /// `M = 0` creates no child, so a branch whose every choice has `M = 0` is removed.
+    Split(Vec<(Action, f64, Vec<f64>)>),
+}
+
+/// The next generation [`split_batch`] builds, with where each of its branches came from.
+#[derive(Clone, Debug)]
+pub struct BatchSplit {
+    /// The branches, in input order: a kept, stopped or retained branch in its input position, a
+    /// split parent's children in its place, in choice order; removed branches are absent.
+    pub branches: Vec<HistoryBranch>,
+    /// Per output branch, in the same order: the index of the input branch it came from, and for a
+    /// split child the index of its choice (`None` for a kept, stopped or retained branch).
+    pub origin: Vec<(usize, Option<usize>)>,
+    /// Some input branch applied the action ([`BranchChoice::Retain`] or [`BranchChoice::Split`]).
+    pub applying: bool,
+    /// Some applying branch produced an output branch (a retained branch or a child with `M > 0`).
+    /// `applying && !supported` is spec section 9.2's zero-support case, which the caller rejects
+    /// by keeping the pre-action list -- this function never rejects an update itself.
+    pub supported: bool,
+}
+
+/// One observed action applied to the **complete pre-action generation** `bs` in a single pass,
+/// each branch with its own [`BranchChoice`] (P3.T13 fix round 1, ruling 13-R3): kept, stopped,
+/// retained on the menu, or split over its own menu. Ids are allocated and parents remapped **once**
+/// against that whole generation -- so a later parent's overflow never compacts an earlier parent's
+/// children into branches from outside the generation, as chained whole-list calls did -- and
+/// branches removed for zero support stay part of the generation whose ids are mapped. `actor` is
+/// the seat whose action it is; every [`condition`] conditions that seat's masses.
+///
+/// Ids keep creation order, which is the cap's tie-break (ties keep the earlier-created branch).
+/// The input generation's ids must be distinct. New children are counted in a wide integer and
+/// numbered after every input id, in creation order, so every new child sorts after every older
+/// branch; nothing is narrowed to `u8` until the ids are final:
+/// - If every child's id fits in a `u8` (at most `u8::MAX`), kept, stopped and retained branches
+///   keep their ids and `parent` references unchanged, and the children take the ids one past the
+///   highest input id onward.
+/// - Otherwise the ids are compacted. A collision-free old-to-new map is built from the whole input
+///   generation first -- its ids in ascending (creation) order become `0, 1, 2, ...`, including the
+///   parents consumed by a split and the branches removed for zero support -- and the children take
+///   the ids after it. Every `parent` reference is remapped through that map, never through output
+///   ids: a child names its consumed parent's mapped id, a slot that no output branch holds, so no
+///   branch becomes its own parent and no child names a sibling, a cousin or a frozen branch; a
+///   reference to a branch outside the input generation (an ancestor that no longer exists)
+///   becomes `None` rather than resolving to an unrelated output branch.
+///
+/// The cap is not run here: the caller runs [`cap_branches`] once after the whole batch, never per
+/// parent, so an earlier parent's overflow never competes against a later, still-unexpanded
+/// parent's children for the same four live slots.
+///
+/// # Panics
+/// Always, if `plan` does not hold one choice per input branch, if a residual or stopped branch is
+/// given anything but [`BranchChoice::Keep`], if two input branches share an id, if a compacted
+/// input generation and its new children together exceed the 256 ids a `u8` can address, or
+/// through [`condition`]'s own panics.
+pub fn split_batch(bs: &[HistoryBranch], actor: Seat, plan: &[BranchChoice]) -> BatchSplit {
+    split_generation(bs, actor, plan, "split_batch")
+}
+
+/// The one allocation pass behind [`split_batch`] and [`split_action`]; `context` names the public
+/// entry point in every assertion.
+fn split_generation(bs: &[HistoryBranch], actor: Seat, plan: &[BranchChoice], context: &str) -> BatchSplit {
+    assert!(plan.len() == bs.len(), "{context}: {} choices for {} input branches", plan.len(), bs.len());
     // The input generation's ids in creation order; distinct, so the old-to-new map is collision-free.
     let mut generation: Vec<u8> = bs.iter().map(|b| b.id).collect();
     generation.sort_unstable();
     for pair in generation.windows(2) {
-        assert!(pair[0] != pair[1], "split_action: branch id {} appears more than once in the input generation", pair[0]);
+        assert!(pair[0] != pair[1], "{context}: branch id {} appears more than once in the input generation", pair[0]);
     }
 
     let mut out: Vec<HistoryBranch> = Vec::new();
+    let mut origin: Vec<(usize, Option<usize>)> = Vec::new();
     // Per output entry: `Some(k)` for the `k`-th new child in creation order, `None` for a branch
-    // copied through unchanged. `k` is a wide counter; nothing is narrowed until the ids are final.
+    // that keeps its identity. `k` is a wide counter; nothing is narrowed until the ids are final.
     let mut child_rank: Vec<Option<usize>> = Vec::new();
     let mut children = 0_usize;
-    for b in bs {
-        if b.residual || b.stopped.is_some() {
-            out.push(b.clone());
-            child_rank.push(None);
-            continue;
-        }
-        for (action, f, p) in choices {
-            let Some(mut child) = condition(b, actor, p, *f) else { continue };
-            child.parent = Some(b.id);
-            child.split_by = Some(actor);
-            child.translated.push((actor, action.clone()));
-            out.push(child);
-            child_rank.push(Some(children));
-            children += 1;
+    let (mut applying, mut supported) = (false, false);
+    for (i, (b, choice)) in bs.iter().zip(plan).enumerate() {
+        let frozen = b.residual || b.stopped.is_some();
+        assert!(
+            !frozen || *choice == BranchChoice::Keep,
+            "{context}: branch {} is frozen (residual or stopped) and can only be kept, not {choice:?}",
+            b.id
+        );
+        match choice {
+            BranchChoice::Keep => {
+                out.push(b.clone());
+                origin.push((i, None));
+                child_rank.push(None);
+            }
+            BranchChoice::Stop(cause) => {
+                let mut stopped = b.clone();
+                stopped.stopped = Some(cause.clone());
+                for s in &mut stopped.seats {
+                    s.node = None;
+                }
+                out.push(stopped);
+                origin.push((i, None));
+                child_rank.push(None);
+            }
+            BranchChoice::Retain { action, p } => {
+                applying = true;
+                let Some(mut child) = condition(b, actor, p, 1.0) else { continue };
+                child.translated.push((actor, *action));
+                supported = true;
+                out.push(child);
+                origin.push((i, None));
+                child_rank.push(None);
+            }
+            BranchChoice::Split(choices) => {
+                applying = true;
+                for (c, (action, f, p)) in choices.iter().enumerate() {
+                    let Some(mut child) = condition(b, actor, p, *f) else { continue };
+                    child.parent = Some(b.id);
+                    child.split_by = Some(actor);
+                    child.translated.push((actor, *action));
+                    supported = true;
+                    out.push(child);
+                    origin.push((i, Some(c)));
+                    child_rank.push(Some(children));
+                    children += 1;
+                }
+            }
         }
     }
 
@@ -822,19 +918,19 @@ pub fn split_action(bs: &[HistoryBranch], actor: Seat, choices: &[(Action, f64, 
         let base = generation.len();
         assert!(
             base + children <= id_space,
-            "split_action: {base} input branches and {children} new children cannot be addressed by a u8 id"
+            "{context}: {base} input branches and {children} new children cannot be addressed by a u8 id"
         );
         let mapped = |old: u8| generation.binary_search(&old).ok();
         for (b, rank) in out.iter_mut().zip(&child_rank) {
             let wide = match rank {
                 Some(k) => base + k,
-                None => mapped(b.id).expect("a copied-through branch belongs to the input generation"),
+                None => mapped(b.id).expect("a branch that keeps its identity belongs to the input generation"),
             };
             b.parent = b.parent.and_then(mapped).map(narrow_id);
             b.id = narrow_id(wide);
         }
     }
-    out
+    BatchSplit { branches: out, origin, applying, supported }
 }
 
 /// Narrows a final wide branch id to the public `u8` field.
@@ -842,5 +938,5 @@ pub fn split_action(bs: &[HistoryBranch], actor: Seat, choices: &[(Action, f64, 
 /// # Panics
 /// Always, if `wide` does not fit in a `u8` (the callers check the id space before narrowing).
 fn narrow_id(wide: usize) -> u8 {
-    u8::try_from(wide).unwrap_or_else(|_| panic!("split_action: branch id {wide} does not fit in a u8"))
+    u8::try_from(wide).unwrap_or_else(|_| panic!("split_generation: branch id {wide} does not fit in a u8"))
 }

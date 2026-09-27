@@ -29,7 +29,8 @@ pub(crate) fn domain_unit_interval(x: f64) -> bool { (0.0..=1.0).contains(&x) }
 /// `rake_rate` (spec 2): a fraction, never a full rake (half-open at 1).
 pub(crate) fn domain_rake_rate(x: f64) -> bool { (0.0..1.0).contains(&x) }
 /// Magnitudes that are never negative but are not bounded above: tree thresholds (spec 4.6),
-/// range mass (up to 1,326 combos) and exploitability percentages.
+/// range mass (up to 1,326 combos), exploitability percentages and bet-translation deviations
+/// (spec 8.4's `d`, a distance between pot fractions).
 pub(crate) fn domain_non_negative(x: f64) -> bool { x >= 0.0 }
 
 /// Reads a wire number as `f64`, checks it is finite and inside `domain`, and only then narrows to

@@ -28,6 +28,11 @@ use std::collections::HashMap;
 /// SB to chips (P3.T9, [`crate::ev::expand_node`]). A caller that finds `node: None` and
 /// `unsupported: Some(MissingPreflopNode)` has the truth, and no `NodeStrategy` with zero EVs is
 /// ever fabricated to fill the gap.
+///
+/// `source_key` is `Some` exactly when `node` is: the structured key the node was found under --
+/// the source's own depth, and the history in the source's own steps and (virtual) positions,
+/// short-handed lookup-only folds first (P3.T13 fix round 1, ruling 13-R2: the replay reconstructs
+/// the source parent's posts and contributions from it, in source units, before any chip rounding).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreflopAnswer {
     pub key: String,
@@ -39,6 +44,7 @@ pub struct PreflopAnswer {
     pub reasons: Vec<ApproxReason>,
     pub notes: Vec<String>,
     pub unsupported: Option<UnsupportedReason>,
+    pub source_key: Option<PreflopNodeKey>,
 }
 
 impl PreflopAnswer {
@@ -53,6 +59,7 @@ impl PreflopAnswer {
             reasons: vec![],
             notes: vec![],
             unsupported: None,
+            source_key: None,
         }
     }
 }
@@ -163,7 +170,7 @@ fn menu_size(menu: &[PreflopStep], to: u32, unit: u32) -> Option<u32> {
 /// The position in one source node's `menu` of the step a live chip `action` is (spec section
 /// 8.3's size rule; P3.T13): `Fold`, `Check` and `Call` are their like-named step; a `Bet` or
 /// `Raise` is the closest `Raise` size within [`size_matches`]'s half-chip tolerance, ties to the
-/// smaller size -- the same resolution the key walk below applies to every historical wager, so an
+/// smaller size -- the same resolution the key walk below applies to every observed wager, so an
 /// action on the menu here is the step a key built from it carries; an `AllIn` is the `AllIn` step
 /// (the source's all-in, which expands to the actor's own maximum). `None` when the node offers no
 /// such step: an off-menu wager, which section 8.4 translates, or a non-wager this node does not
@@ -222,11 +229,30 @@ pub fn observed_history(
 struct ResolvedHistory {
     /// The lookup-only short-handed folds followed by the observed steps.
     history: Vec<(Position, PreflopStep)>,
-    /// Why a wager could not be resolved onto a size the source offers, if one could not be. The
-    /// history is still built -- the off-menu action is preserved at its own size for Tasks 10/13's
-    /// translated branch -- but it is not looked up, because the source's tree does not contain
-    /// that branch and a rounded size must never select a node the hand did not reach.
-    off_menu: Option<String>,
+    /// Why the history cannot be looked up, if it cannot; the first cause is kept. The history is
+    /// still built -- an off-menu action is preserved at its own size for Tasks 10/13's translated
+    /// branch -- but it is not looked up, because a rounded or guessed size must never select a
+    /// node the hand did not reach.
+    unkeyed: Option<Unkeyed>,
+}
+
+/// Why a resolved history is not looked up.
+enum Unkeyed {
+    /// A wager is not a size the source offers there (or the source has no node to resolve it
+    /// against): the source's tree does not contain the branch.
+    OffMenu(String),
+    /// A translated chip wager is the chip rounding of more than one source size at its node, and
+    /// the caller carried no source step to say which (ruling 13-R1): the edge cannot be recovered
+    /// unambiguously, so no edge is chosen for it.
+    Unresolved(String),
+}
+
+/// The chip amount a source raise of `to_bb_x1000` thousandths expands to at `unit` chips per
+/// source unit: round half up in exact `u64` arithmetic, the conversion `crate::ev::expand_node`
+/// applies to every source raise (so a translated chip wager is exactly this value of the size the
+/// replay chose).
+fn source_chips(to_bb_x1000: u32, unit: u32) -> u64 {
+    (u64::from(to_bb_x1000) * u64::from(unit) + 500) / 1000
 }
 
 /// Resolves each historical wager against the selected source's menu **at the corresponding prefix
@@ -234,22 +260,38 @@ struct ResolvedHistory {
 /// and an off-menu size is never rounded into a key (P3.T8 fix round 1, R3).
 ///
 /// The walk rebuilds the key node by node: folds, checks, calls and all-ins map directly, and each
-/// raise is compared -- in exact chips, with no thousandth rounding in between -- against the
-/// `Raise` sizes the node reached so far actually offers. Once a wager is off-menu (or the source
-/// has no node at that prefix, so no menu exists to resolve against) the remaining raises are
-/// recorded at their own converted size and no further lookup is attempted.
+/// raise is resolved -- in exact chips, with no thousandth rounding in between -- against the
+/// `Raise` sizes the node reached so far actually offers. Once the history cannot be keyed (an
+/// off-menu wager, no node at that prefix, or an unresolved translated edge) the remaining raises
+/// are recorded at their own converted size and no further lookup is attempted.
 ///
 /// `steps` is the chip history the key is built from: the observed preflop prefix for
 /// [`PreflopStore::query`], or a replay branch's translated history for
-/// [`PreflopStore::query_history`] (P3.T13). A translated wager is a menu action the replay took
-/// from an expanded node -- the source size rounded to the chip -- so it resolves back onto that
-/// source size here, which a thousandth conversion of the rounded chips would not (7.5 chips round
-/// to 8, and 8 chips convert to 2667, not the source's 2500).
+/// [`PreflopStore::query_history`] / [`PreflopStore::query_history_sourced`] (P3.T13). `observed`
+/// is the observed prefix (equal to `steps` for `query`), and `sources` holds, per step, the exact
+/// source step the replay chose there, if it carried one (ruling 13-R1). Each raise resolves by the
+/// first rule that applies:
+/// - **a carried source step** is the edge: it must be a `Raise` within half a chip of the chip
+///   amount (else the history is malformed: a typed `Err`), and the node must offer it (else the
+///   history is off-menu). No chip amount is re-resolved, so two source sizes that round to the
+///   same chips stay two edges;
+/// - **the observed action itself** (an on-menu observed step the branch kept faithfully, and every
+///   step of `query`) resolves by section 8.3's size rule, the closest size within half a chip
+///   ([`menu_size`]) -- the resolution the observed action was conditioned with;
+/// - **a translated chip wager without a carried step** (the chip-only public queries) is a menu
+///   action the replay took from an expanded node, i.e. some source size rounded to the chip, so it
+///   resolves to the one size of the node's menu whose chip rounding ([`source_chips`]) it is: 7.5
+///   chips round to 8, and 8 chips must find the source's 2500, which a thousandth conversion (2667)
+///   would miss. Two such sizes (2500 and 2600 both round to 8 chips at a 3-chip unit) cannot be
+///   told apart: the history is **unresolved**, never keyed under either; none is off-menu.
 ///
-/// `Err` is the one condition that is neither a match nor an off-menu branch: a raise whose size
-/// has no representation in the source-key domain at all (R4).
+/// `Err` is a condition that is neither a match nor an unkeyed branch: a raise whose size has no
+/// representation in the source-key domain at all (R4), or a carried source step that is not the
+/// chip action it is carried with.
 fn resolve_against_source(
     steps: &[(Seat, Action)],
+    sources: &[Option<PreflopStep>],
+    observed: &[(Seat, Action)],
     roles: &[(Seat, Position)],
     mapped: bool,
     unit: u32,
@@ -259,16 +301,26 @@ fn resolve_against_source(
     info: &BundleInfo,
 ) -> Result<ResolvedHistory, UnsupportedReason> {
     let mut history = short.to_vec();
-    let mut off_menu: Option<String> = None;
-    for &(seat, action) in steps {
+    let mut unkeyed: Option<Unkeyed> = None;
+    let malformed = |reason: String| UnsupportedReason::UnsupportedHistory { reason };
+    for (i, &(seat, action)) in steps.iter().enumerate() {
         let role = roles.iter().find(|(s, _)| *s == seat).expect("dealt seat").1;
+        let carried = sources.get(i).cloned().flatten();
         let step = match action {
-            Action::Fold => PreflopStep::Fold,
-            Action::Check => PreflopStep::Check,
-            Action::Call => PreflopStep::Call,
-            Action::AllIn { .. } => PreflopStep::AllIn,
+            Action::Fold | Action::Check | Action::Call | Action::AllIn { .. } => {
+                let like = match action {
+                    Action::Fold => PreflopStep::Fold,
+                    Action::Check => PreflopStep::Check,
+                    Action::Call => PreflopStep::Call,
+                    _ => PreflopStep::AllIn,
+                };
+                if let Some(chosen) = carried.filter(|chosen| *chosen != like) {
+                    return Err(malformed(format!("seat {}'s {action:?} is carried with the source step {chosen:?}", seat.0)));
+                }
+                like
+            }
             Action::Bet { to } | Action::Raise { to } => {
-                let node = if off_menu.is_some() {
+                let node = if unkeyed.is_some() {
                     None
                 } else {
                     source.lookup(&PreflopNodeKey {
@@ -278,27 +330,63 @@ fn resolve_against_source(
                         history: history.clone(),
                     })
                 };
-                match node.as_ref().and_then(|n| menu_size(&n.actions, to, unit)) {
-                    Some(source_to) => PreflopStep::Raise { to_bb_x1000: source_to },
-                    None => {
-                        if off_menu.is_none() {
-                            off_menu = Some(match node {
-                                Some(_) => format!("seat {}'s raise to {to} chips is not a size the source offers at that node", seat.0),
-                                None => format!("the source has no node before seat {}'s raise, so its sizes cannot be resolved", seat.0),
-                            });
+                let menu = node.as_ref().map(|n| n.actions.as_slice());
+                let (resolved, cause) = match carried.as_ref() {
+                    Some(&PreflopStep::Raise { to_bb_x1000: s }) => {
+                        if !size_matches(to, s, unit) {
+                            return Err(malformed(format!(
+                                "seat {}'s raise to {to} chips is carried with the source size {s}, which is not within half a chip of it",
+                                seat.0
+                            )));
                         }
-                        PreflopStep::Raise {
-                            to_bb_x1000: to_bb_x1000(to, unit).ok_or_else(|| UnsupportedReason::UnsupportedHistory {
-                                reason: format!("a raise to {to} chips is not representable in {unit}-chip source units"),
-                            })?,
+                        match menu {
+                            Some(menu) if menu.contains(&PreflopStep::Raise { to_bb_x1000: s }) => (Some(s), None),
+                            Some(_) => (None, Some(Unkeyed::OffMenu(format!("seat {}'s source size {s} is not a size the source offers at that node", seat.0)))),
+                            None => (None, Some(Unkeyed::OffMenu(format!("the source has no node before seat {}'s raise, so its sizes cannot be resolved", seat.0)))),
                         }
                     }
+                    Some(other) => return Err(malformed(format!("seat {}'s {action:?} is carried with the source step {other:?}", seat.0))),
+                    None => match menu {
+                        None => (None, Some(Unkeyed::OffMenu(format!("the source has no node before seat {}'s raise, so its sizes cannot be resolved", seat.0)))),
+                        Some(menu) if observed.get(i) == Some(&(seat, action)) => match menu_size(menu, to, unit) {
+                            Some(s) => (Some(s), None),
+                            None => (None, Some(Unkeyed::OffMenu(format!("seat {}'s raise to {to} chips is not a size the source offers at that node", seat.0)))),
+                        },
+                        Some(menu) => {
+                            let rounding: Vec<u32> = menu
+                                .iter()
+                                .filter_map(|m| match m {
+                                    PreflopStep::Raise { to_bb_x1000 } if source_chips(*to_bb_x1000, unit) == u64::from(to) => Some(*to_bb_x1000),
+                                    _ => None,
+                                })
+                                .collect();
+                            match rounding.as_slice() {
+                                [s] => (Some(*s), None),
+                                [] => (None, Some(Unkeyed::OffMenu(format!("seat {}'s raise to {to} chips is not a size the source offers at that node", seat.0)))),
+                                several => (None, Some(Unkeyed::Unresolved(format!(
+                                    "seat {}'s translated raise to {to} chips is the chip rounding of the source sizes {several:?} at that node, and a chip history cannot tell them apart",
+                                    seat.0
+                                )))),
+                            }
+                        }
+                    },
+                };
+                if unkeyed.is_none() {
+                    unkeyed = cause;
+                }
+                match (resolved, carried.as_ref()) {
+                    (Some(s), _) | (None, Some(&PreflopStep::Raise { to_bb_x1000: s })) => PreflopStep::Raise { to_bb_x1000: s },
+                    _ => PreflopStep::Raise {
+                        to_bb_x1000: to_bb_x1000(to, unit).ok_or_else(|| {
+                            malformed(format!("a raise to {to} chips is not representable in {unit}-chip source units"))
+                        })?,
+                    },
                 }
             }
         };
         history.push((virtual_position(role, mapped), step));
     }
-    Ok(ResolvedHistory { history, off_menu })
+    Ok(ResolvedHistory { history, unkeyed })
 }
 
 impl PreflopStore {
@@ -321,20 +409,53 @@ impl PreflopStore {
     /// for `AllIn`, and every mapping reason (section 8.3 is hindsight-free, and actual money is
     /// never rewritten). A branch that translated villain's raise to menu size A therefore looks up
     /// the next actor's node under A. Each wager in `history` is resolved against the selected
-    /// source's own menus exactly as the observed prefix's are (see `resolve_against_source`), so
-    /// a chip-rounded menu action finds the source size it came from.
+    /// source's own menus (see `resolve_against_source`): an observed on-menu action by section
+    /// 8.3's size rule, exactly as the observed prefix's are, and a translated chip wager onto the
+    /// one source size whose chip rounding it is.
+    ///
+    /// This is the **chip-only** query (ruling 13-R1): a chip amount cannot always name its source
+    /// edge -- at a 3-chip unit the sizes 2500 and 2600 both expand to `Raise{to: 8}` -- and such a
+    /// translated edge is an explicit unresolved missing path, `MissingPreflopNode` with an
+    /// `[unresolved: ...]` key, never a lookup under either size. A caller that chose the edge
+    /// carries it with [`PreflopStore::query_history_sourced`].
     ///
     /// `history` must follow the observed prefix actor by actor (one entry per preflop action of the
     /// prefix, same seats in the same order): a translated history differs from the observed one only
     /// in its wager sizes. Anything else is a typed `UnsupportedHistory` answer, never a lookup of a
     /// different decision.
     pub fn query_history(&self, cfg: &HandConfig, state: &HandState, prefix_len: usize, history: &[(Seat, Action)]) -> PreflopAnswer {
-        self.answer_for(cfg, state, prefix_len, Some(history))
+        self.answer_for(cfg, state, prefix_len, Some((history, &vec![None; history.len()])))
+    }
+
+    /// [`PreflopStore::query_history`] with the exact source step the replay chose at each
+    /// translated edge carried alongside the chip history (P3.T13 fix round 1, ruling 13-R1):
+    /// `sources[i]` is `Some(step)` for a translated wager -- the menu step whose chip action
+    /// `history[i]` is -- and `None` for an observed action the branch kept as observed. A carried
+    /// step is navigated as it is, never reconstructed from its rounded chip amount, so two source
+    /// sizes that round to the same chips stay two edges. `sources` must have one entry per
+    /// `history` entry, and a carried step must be the chip action it is carried with (a `Raise`
+    /// within half a chip, or the like-named step); anything else is a typed `UnsupportedHistory`.
+    pub fn query_history_sourced(
+        &self,
+        cfg: &HandConfig,
+        state: &HandState,
+        prefix_len: usize,
+        history: &[(Seat, Action)],
+        sources: &[Option<PreflopStep>],
+    ) -> PreflopAnswer {
+        self.answer_for(cfg, state, prefix_len, Some((history, sources)))
     }
 
     /// The shared body of [`PreflopStore::query`] (`history == None`: the observed prefix) and
-    /// [`PreflopStore::query_history`] (`Some`: a branch's translated history).
-    fn answer_for(&self, cfg: &HandConfig, state: &HandState, prefix_len: usize, history: Option<&[(Seat, Action)]>) -> PreflopAnswer {
+    /// [`PreflopStore::query_history`] / [`PreflopStore::query_history_sourced`] (`Some`: a
+    /// branch's translated history and the source steps carried with it).
+    fn answer_for(
+        &self,
+        cfg: &HandConfig,
+        state: &HandState,
+        prefix_len: usize,
+        history: Option<(&[(Seat, Action)], &[Option<PreflopStep>])>,
+    ) -> PreflopAnswer {
         let mut answer = PreflopAnswer::empty();
         // Screened on `state` before `prefix_state`, which cannot re-derive a postflop action with
         // the board cleared (it asserts instead); the reason reported is the same either way.
@@ -432,9 +553,9 @@ impl PreflopStore {
         // translated history, which must follow the observed prefix actor by actor.
         let observed: Vec<(Seat, Action)> =
             prefix.actions.iter().filter(|a| a.street == Street::Preflop).map(|a| (a.seat, a.action)).collect();
-        let steps: &[(Seat, Action)] = match history {
-            None => &observed,
-            Some(translated) => {
+        let (steps, sources): (&[(Seat, Action)], &[Option<PreflopStep>]) = match history {
+            None => (&observed, &[]),
+            Some((translated, sources)) => {
                 let follows = translated.len() == observed.len()
                     && translated.iter().zip(&observed).all(|((seat, _), (actual, _))| seat == actual);
                 if !follows {
@@ -447,19 +568,26 @@ impl PreflopStore {
                     });
                     return answer;
                 }
-                translated
+                if sources.len() != translated.len() {
+                    answer.unsupported = Some(UnsupportedReason::UnsupportedHistory {
+                        reason: format!("{} carried source steps for a translated history of {} actions", sources.len(), translated.len()),
+                    });
+                    return answer;
+                }
+                (translated, sources)
             }
         };
         // Every wager is resolved against the selected source's own menus before it can enter the
         // key (R3); the mapping reasons above are already recorded, because reasons accumulate even
         // when the history itself turns out not to be answerable.
-        let resolved = match resolve_against_source(steps, &roles, mapped, unit, &short, candidate.as_ref(), used, info) {
-            Ok(resolved) => resolved,
-            Err(reason) => {
-                answer.unsupported = Some(reason);
-                return answer;
-            }
-        };
+        let resolved =
+            match resolve_against_source(steps, sources, &observed, &roles, mapped, unit, &short, candidate.as_ref(), used, info) {
+                Ok(resolved) => resolved,
+                Err(reason) => {
+                    answer.unsupported = Some(reason);
+                    return answer;
+                }
+            };
         // The key is built from the CANDIDATE, not from the live config.
         let key = PreflopNodeKey {
             depth_bb: used,
@@ -471,17 +599,28 @@ impl PreflopStore {
         // An off-menu wager puts the hand on a branch the source's tree does not contain, so there
         // is nothing to look up: the action is preserved at its own size for Tasks 10/13 to
         // translate, and the node is reported missing rather than resolved to a neighbouring size.
+        // An unresolved translated edge (ruling 13-R1) is not looked up either: its chip amount
+        // names more than one source edge, and no edge is chosen for it.
         //
-        // The reported key carries the off-menu marker, because the only size a `PreflopStep` can
-        // carry is a thousandth of a unit and that conversion can land on a size the source does
-        // offer (7501 chips at a 3000-chip unit rounds to the source's own 2500). Marking it keeps
-        // the answer's key from ever being equal to a real node key -- the same way the brief's own
+        // The reported key carries a marker, because the only size a `PreflopStep` can carry is a
+        // thousandth of a unit and that conversion can land on a size the source does offer (7501
+        // chips at a 3000-chip unit rounds to the source's own 2500). Marking it keeps the answer's
+        // key from ever being equal to a real node key -- the same way the brief's own
         // `"no bundle"` and `"no acquired depth"` labels are not node keys.
-        if let Some(cause) = resolved.off_menu {
-            answer.key = format!("{} [off-menu: {cause}]", answer.key);
-            answer.notes.push(format!("off-menu wager kept for translation: {cause}"));
-            answer.unsupported = Some(UnsupportedReason::MissingPreflopNode { key: answer.key.clone() });
-            return answer;
+        match resolved.unkeyed {
+            Some(Unkeyed::OffMenu(cause)) => {
+                answer.key = format!("{} [off-menu: {cause}]", answer.key);
+                answer.notes.push(format!("off-menu wager kept for translation: {cause}"));
+                answer.unsupported = Some(UnsupportedReason::MissingPreflopNode { key: answer.key.clone() });
+                return answer;
+            }
+            Some(Unkeyed::Unresolved(cause)) => {
+                answer.key = format!("{} [unresolved: {cause}]", answer.key);
+                answer.notes.push(format!("translated edge not recoverable from its chip amount: {cause}"));
+                answer.unsupported = Some(UnsupportedReason::MissingPreflopNode { key: answer.key.clone() });
+                return answer;
+            }
+            None => {}
         }
         // A miss in the selected source is final: a lower-ranked bundle is never searched to hide
         // it (section 8.3, "Missing nodes stay missing").
@@ -514,6 +653,7 @@ impl PreflopStore {
                     .expect("a seat never holds more than its starting stack");
                 answer.expanded = Some(expand_node(&node, info, actor, unit, actor_max_to));
                 answer.node = Some(node);
+                answer.source_key = Some(key);
             }
             None => answer.unsupported = Some(UnsupportedReason::MissingPreflopNode { key: answer.key.clone() }),
         }
@@ -532,11 +672,13 @@ impl PreflopStore {
 ///
 /// An entry is keyed by everything a mapping depends on within a run: the hand identity and
 /// revision, the config revision, the dealt seats and their starting stacks, the prefix length, the
-/// prefix's own chip history and -- for [`PreflopInvocation::answer_history`] (P3.T13) -- the
-/// branch-translated history the node was looked up under. That last component is what makes two
-/// history branches at the same observed prefix distinct entries; no final-hand state (later folds,
-/// the board) is part of any key. A caller must not reuse one invocation across two different
-/// stores.
+/// prefix's own chip history and -- for [`PreflopInvocation::answer_history`] and
+/// [`PreflopInvocation::answer_history_sourced`] (P3.T13) -- the branch-translated history the
+/// node was looked up under, with the source steps carried along it. That last component is what
+/// makes two history branches at the same observed prefix distinct entries, including two whose
+/// chip histories agree but whose carried source edges differ (ruling 13-R1); no final-hand state
+/// (later folds, the board) is part of any key. A caller must not reuse one invocation across two
+/// different stores.
 #[derive(Debug, Default)]
 pub struct PreflopInvocation {
     entries: HashMap<MappingKey, PreflopAnswer>,
@@ -554,8 +696,32 @@ struct MappingKey {
     stacks_start: Vec<u32>,
     history: Vec<(Seat, Action)>,
     /// `None` for [`PreflopStore::query`] (the observed prefix is the node history); `Some` for
-    /// [`PreflopStore::query_history`], holding the translated history.
-    translated: Option<Vec<(Seat, Action)>>,
+    /// [`PreflopStore::query_history`] / [`PreflopStore::query_history_sourced`], holding the
+    /// translated history and the source step carried at each entry (all `None` for the chip-only
+    /// query, which answers exactly like the sourced one with nothing carried).
+    translated: Option<(Vec<(Seat, Action)>, Vec<Option<StepKey>>)>,
+}
+
+/// A hashable image of one carried [`PreflopStep`] for [`MappingKey`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum StepKey {
+    Fold,
+    Check,
+    Call,
+    Raise(u32),
+    AllIn,
+}
+
+impl From<&PreflopStep> for StepKey {
+    fn from(step: &PreflopStep) -> Self {
+        match step {
+            PreflopStep::Fold => StepKey::Fold,
+            PreflopStep::Check => StepKey::Check,
+            PreflopStep::Call => StepKey::Call,
+            PreflopStep::Raise { to_bb_x1000 } => StepKey::Raise(*to_bb_x1000),
+            PreflopStep::AllIn => StepKey::AllIn,
+        }
+    }
 }
 
 impl PreflopInvocation {
@@ -577,7 +743,8 @@ impl PreflopInvocation {
 
     /// [`PreflopStore::query_history`]'s answer for this observed prefix index and translated
     /// history, computed once per distinct pair within this invocation (P3.T13). The returned
-    /// answer is identical to calling `store.query_history` directly.
+    /// answer is identical to calling `store.query_history` directly (the chip-only query: an
+    /// ambiguous translated edge is an explicit unresolved missing path).
     pub fn answer_history(
         &mut self,
         store: &PreflopStore,
@@ -586,7 +753,23 @@ impl PreflopInvocation {
         prefix_len: usize,
         history: &[(Seat, Action)],
     ) -> PreflopAnswer {
-        self.memoized(store, cfg, state, prefix_len, Some(history))
+        self.memoized(store, cfg, state, prefix_len, Some((history, &vec![None; history.len()])))
+    }
+
+    /// [`PreflopStore::query_history_sourced`]'s answer for this observed prefix index, translated
+    /// history and carried source steps, computed once per distinct triple within this invocation
+    /// (P3.T13 fix round 1, ruling 13-R1: the replay walk's lookup path). The returned answer is
+    /// identical to calling `store.query_history_sourced` directly.
+    pub fn answer_history_sourced(
+        &mut self,
+        store: &PreflopStore,
+        cfg: &HandConfig,
+        state: &HandState,
+        prefix_len: usize,
+        history: &[(Seat, Action)],
+        sources: &[Option<PreflopStep>],
+    ) -> PreflopAnswer {
+        self.memoized(store, cfg, state, prefix_len, Some((history, sources)))
     }
 
     fn memoized(
@@ -595,7 +778,7 @@ impl PreflopInvocation {
         cfg: &HandConfig,
         state: &HandState,
         prefix_len: usize,
-        translated: Option<&[(Seat, Action)]>,
+        translated: Option<(&[(Seat, Action)], &[Option<PreflopStep>])>,
     ) -> PreflopAnswer {
         self.lookups += 1;
         let key = MappingKey {
@@ -611,7 +794,8 @@ impl PreflopInvocation {
                 .take(prefix_len.min(state.actions.len()))
                 .map(|a| (a.seat, a.action))
                 .collect(),
-            translated: translated.map(<[(Seat, Action)]>::to_vec),
+            translated: translated
+                .map(|(history, sources)| (history.to_vec(), sources.iter().map(|s| s.as_ref().map(StepKey::from)).collect())),
         };
         if let Some(cached) = self.entries.get(&key) {
             self.hits += 1;
@@ -619,14 +803,14 @@ impl PreflopInvocation {
         }
         let answer = match translated {
             None => store.query(cfg, state, prefix_len),
-            Some(history) => store.query_history(cfg, state, prefix_len, history),
+            Some((history, sources)) => store.query_history_sourced(cfg, state, prefix_len, history, sources),
         };
         self.entries.insert(key, answer.clone());
         answer
     }
 
-    /// Calls made to [`PreflopInvocation::answer`] and [`PreflopInvocation::answer_history`] in
-    /// this run.
+    /// Calls made to [`PreflopInvocation::answer`], [`PreflopInvocation::answer_history`] and
+    /// [`PreflopInvocation::answer_history_sourced`] in this run.
     pub fn lookups(&self) -> u64 {
         self.lookups
     }
