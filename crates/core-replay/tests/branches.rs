@@ -692,9 +692,11 @@ fn split_action_wires_parent_split_by_translated_and_freezes_residual_and_stoppe
     assert_eq!(out[1].seats[0].mass, before_stopped_mass);
 }
 
-/// A child whose id counter would exceed `u8::MAX` is compacted to `0..out.len()` in creation
-/// order (never a silent id collision left in the output), and child order (A before B) survives
-/// the compaction.
+/// A child whose id counter would exceed `u8::MAX` triggers compaction in creation order (never a
+/// silent id collision left in the output), and child order (A before B) survives the compaction.
+/// The input generation is mapped first (254 -> 0) and the children follow it (1, 2), so both
+/// name their consumed parent as 0 -- an id no output branch holds (fix round 1, R2: the earlier
+/// expectation `[0, 1]` came with parent `Some(0)`, i.e. child A named itself as its parent).
 #[test]
 fn split_action_compacts_ids_past_u8_max() {
     let mut b = two_combos();
@@ -704,7 +706,8 @@ fn split_action_compacts_ids_past_u8_max() {
     let out = split_action(&b, actor, &choices);
     assert_eq!(out.len(), 2);
     let ids: Vec<u8> = out.iter().map(|c| c.id).collect();
-    assert_eq!(ids, vec![0, 1], "254/255 would otherwise collide; compaction must yield unique, ordered ids");
+    assert_eq!(ids, vec![1, 2], "254/255 would otherwise collide; compaction must yield unique, ordered ids after the input generation");
+    assert_eq!(out.iter().map(|c| c.parent).collect::<Vec<_>>(), vec![Some(0), Some(0)]);
     assert_eq!(out[0].translated.last(), Some(&(actor, Action::Raise { to: 50 })));
     assert_eq!(out[1].translated.last(), Some(&(actor, Action::Raise { to: 100 })));
 }
@@ -802,4 +805,336 @@ fn cap_branches_merges_a_second_overflow_into_the_existing_residual() {
     for (c, (a, z)) in before2.iter().zip(&after2).enumerate() {
         assert!((a - z).abs() <= 1e-12, "combo {c}: marginal moved from {a} to {z} across the second cap");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// P3.T12 fix round 1 (task-12-review.md R1-R3, orchestrator rulings): creation-ordered id
+// compaction after a u8 wraparound, a collision-free old-to-new parent remap built from the input
+// generation, and an underflow-safe residual merge (normalized weights) that keeps a representable
+// positive support alive.
+// ---------------------------------------------------------------------------------------------
+
+/// A two-seat branch with uniform masses (weight 1 on all 1326 combos for both seats) and the given
+/// identity and weight, tagged with a one-entry translated history `(Seat(1), Raise{to: tag})` so
+/// each input history can be traced through `split_action` and `cap_branches`.
+fn tagged(id: u8, parent: Option<u8>, q: f64, tag: u32) -> HistoryBranch {
+    HistoryBranch {
+        id,
+        parent,
+        split_by: None,
+        translated: vec![(Seat(1), Action::Raise { to: tag })],
+        q,
+        residual: false,
+        stopped: None,
+        seats: [Seat(0), Seat(1)].iter().map(|&seat| SeatMass { seat, node: None, mass: vec![1.0; 1326] }).collect(),
+    }
+}
+
+/// `tagged`, marked as the frozen residual (no history of its own).
+fn tagged_residual(id: u8, parent: Option<u8>, q: f64) -> HistoryBranch {
+    let mut r = tagged(id, parent, q, 0);
+    r.residual = true;
+    r.translated.clear();
+    r
+}
+
+/// `tagged`, marked as stopped on the current street.
+fn tagged_stopped(id: u8, parent: Option<u8>, q: f64, tag: u32) -> HistoryBranch {
+    let mut s = tagged(id, parent, q, tag);
+    s.stopped = Some(format!("missing node K{tag}"));
+    s
+}
+
+/// A two-choice common menu with `f = .5` each and likelihood 1 at every combo: `M = 1`, so every
+/// child has exactly half its parent's `q` and its parent's masses.
+fn even_split() -> Vec<(Action, f64, Vec<f64>)> {
+    vec![(Action::Raise { to: 50 }, 0.5, vec![1.0; 1326]), (Action::Raise { to: 100 }, 0.5, vec![1.0; 1326])]
+}
+
+/// R1 (review reproduction plus a residual): live ids 251/252 (`q = .2`) split into four children
+/// of `q = .1`, alongside stopped ids 253/254 (`q = .1`) and a residual. The child id counter wraps
+/// past `u8::MAX`, so ids are compacted -- and compaction must keep creation order: the input
+/// generation is renumbered in its original order first (7, 251, 252, 253, 254 -> 0..4) and every
+/// new child sorts after every older retained branch (5..8). All six non-residual weights tie at
+/// `.1`, so the cap keeps the two older stopped branches and the earliest two children (251's A
+/// then B) and merges 252's two children into the existing residual.
+#[test]
+fn cap_after_id_wraparound_keeps_older_stopped_ties() {
+    let actor = Seat(0);
+    let input = vec![
+        tagged(251, None, 0.2, 251),
+        tagged(252, None, 0.2, 252),
+        tagged_stopped(253, Some(240), 0.1, 253),
+        tagged_stopped(254, Some(241), 0.1, 254),
+        tagged_residual(7, Some(2), 0.05),
+    ];
+    let mut out = split_action(&input, actor, &even_split());
+    assert_eq!(out.len(), 7);
+    for b in out.iter().filter(|b| !b.residual) {
+        assert_eq!(b.q, 0.1, "every non-residual weight ties at .1");
+    }
+    assert_eq!(
+        out.iter().map(|b| b.id).collect::<Vec<_>>(),
+        vec![5, 6, 7, 8, 3, 4, 0],
+        "input generation 0..4 in creation order, children 5..8 after it"
+    );
+    assert_eq!(
+        out.iter().map(|b| b.parent).collect::<Vec<_>>(),
+        vec![Some(1), Some(1), Some(2), Some(2), None, None, None],
+        "children name their parent's compacted id; references outside the input generation (240, 241, 2) resolve to None, never to an output branch"
+    );
+    let retained_max = out.iter().filter(|b| b.split_by.is_none()).map(|b| b.id).max().unwrap();
+    assert!(
+        out.iter().filter(|b| b.split_by.is_some()).all(|b| b.id > retained_max),
+        "every new child sorts after every older retained branch"
+    );
+
+    cap_branches(&mut out);
+    let survivors: Vec<(u8, Vec<(Seat, Action)>, Option<String>)> =
+        out.iter().filter(|b| !b.residual).map(|b| (b.id, b.translated.clone(), b.stopped.clone())).collect();
+    assert_eq!(
+        survivors,
+        vec![
+            (3, vec![(Seat(1), Action::Raise { to: 253 })], Some("missing node K253".to_string())),
+            (4, vec![(Seat(1), Action::Raise { to: 254 })], Some("missing node K254".to_string())),
+            (5, vec![(Seat(1), Action::Raise { to: 251 }), (actor, Action::Raise { to: 50 })], None),
+            (6, vec![(Seat(1), Action::Raise { to: 251 }), (actor, Action::Raise { to: 100 })], None),
+        ],
+        "the two older stopped branches and the earliest two children survive the equal-q tie"
+    );
+    let residuals: Vec<&HistoryBranch> = out.iter().filter(|b| b.residual).collect();
+    assert_eq!(residuals.len(), 1);
+    assert_eq!(residuals[0].id, 0, "the existing residual is extended, never replaced");
+    close(residuals[0].q, 0.05 + 0.1 + 0.1);
+    close(out.iter().map(|b| b.q).sum(), 0.65);
+}
+
+/// R2 shared check: `split_action` over a stopped branch (id 20, stale parent 12), the live
+/// parents `live`, whose children overflow the u8 id space, and a residual (id 5, stale parent 1).
+/// The old-to-new id map is built from the whole input generation (sorted ids -> 0, 1, 2, ...)
+/// before any id is narrowed; children take the ids after it, and every child's `parent` is its
+/// parent's mapped id -- a slot no output branch holds, since the parent was consumed by the split
+/// -- so no branch is its own parent and no child names a sibling, cousin or frozen branch.
+/// References outside the input generation (the frozen branches' stale 12 and 1) become `None`,
+/// never an unrelated output branch. Frozen branches keep their flags, weight and masses.
+fn check_collision_free_parent_remap(live: &[u8]) {
+    let actor = Seat(0);
+    let mut input = vec![tagged_stopped(20, Some(12), 0.1, 20)];
+    input.extend(live.iter().map(|&id| tagged(id, None, 0.2, u32::from(id))));
+    input.push(tagged_residual(5, Some(1), 0.05));
+    let out = split_action(&input, actor, &even_split());
+
+    let mut old: Vec<u8> = input.iter().map(|b| b.id).collect();
+    old.sort_unstable();
+    let rank = |id: u8| u8::try_from(old.iter().position(|&o| o == id).unwrap()).unwrap();
+    let base = u8::try_from(old.len()).unwrap();
+
+    let ids: Vec<u8> = out.iter().map(|b| b.id).collect();
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "live {live:?}: output ids {ids:?} collide");
+    for b in &out {
+        assert_ne!(b.parent, Some(b.id), "live {live:?}: branch {} is its own parent", b.id);
+    }
+
+    let menu = even_split();
+    let children: Vec<&HistoryBranch> = out.iter().filter(|b| b.split_by.is_some()).collect();
+    assert_eq!(children.len(), 2 * live.len());
+    for (k, child) in children.iter().enumerate() {
+        let parent_old = live[k / 2];
+        assert_eq!(child.id, base + u8::try_from(k).unwrap(), "live {live:?}: child {k} id");
+        assert_eq!(child.parent, Some(rank(parent_old)), "live {live:?}: child {k} parent");
+        assert!(!ids.contains(&rank(parent_old)), "live {live:?}: child {k}'s parent id resolves to an output branch");
+        assert_eq!(child.translated, vec![(Seat(1), Action::Raise { to: u32::from(parent_old) }), (actor, menu[k % 2].0)]);
+    }
+    for (a, z) in children.iter().zip(children.iter().skip(1)) {
+        assert_eq!(a.parent == z.parent, a.translated[0] == z.translated[0], "live {live:?}: siblings share one parent id, cousins never do");
+    }
+
+    let stopped = out.iter().find(|b| b.stopped.is_some()).expect("the stopped branch is copied through");
+    assert_eq!((stopped.id, stopped.parent, stopped.q), (rank(20), None, 0.1));
+    assert_eq!(stopped.translated, vec![(Seat(1), Action::Raise { to: 20 })]);
+    assert!(stopped.seats.iter().all(|s| s.mass == vec![1.0; 1326]));
+    let residual = out.iter().find(|b| b.residual).expect("the residual is copied through");
+    assert_eq!((residual.id, residual.parent, residual.q), (rank(5), None, 0.05));
+    assert!(residual.seats.iter().all(|s| s.mass == vec![1.0; 1326]));
+}
+
+/// R2 seeded at 254: one live parent at 254 (children would take 255 and 256) and two live
+/// parents 253/254.
+#[test]
+fn split_action_remaps_parents_collision_free_seeded_at_254() {
+    check_collision_free_parent_remap(&[254]);
+    check_collision_free_parent_remap(&[253, 254]);
+}
+
+/// R2 seeded at 255: the review's reproduction (one live parent at 255, whose two children used to
+/// saturate to 255 and compact to a self-parent and a sibling alias) plus two live parents 254/255.
+#[test]
+fn split_action_remaps_parents_collision_free_seeded_at_255() {
+    check_collision_free_parent_remap(&[255]);
+    check_collision_free_parent_remap(&[254, 255]);
+}
+
+/// The old-to-new id map must be collision-free, so the input generation's ids must be distinct.
+#[test]
+#[should_panic(expected = "split_action: branch id 3 appears more than once in the input generation")]
+fn split_action_rejects_duplicate_input_ids() {
+    let input = vec![tagged(3, None, 0.2, 1), tagged_stopped(3, None, 0.1, 2)];
+    split_action(&input, Seat(0), &even_split());
+}
+
+/// R3 (review reproduction): six branches, three seats each, every seat's masses totalling 1326.
+/// The four retained branches (`q = .1`) have no combo-0 mass; the two overflow branches have the
+/// smallest positive `f64` weight and the only combo-0 support (mass .5), so the pre-cap combo-0
+/// marginal is the representable `5e-324`. The merge must use normalized weights so neither
+/// `q * mass` product rounds to zero first: the residual keeps mass .5 on combo 0 (1.5 on combo 1,
+/// 1 elsewhere) for every seat, every marginal is unchanged, combo 0 stays positive and the output
+/// boundary still reports it as `f32::MIN_POSITIVE`.
+#[test]
+fn cap_branches_keeps_support_that_exists_only_in_overflow() {
+    let tiny = f64::from_bits(1);
+    let seats = [Seat(0), Seat(1), Seat(2)];
+    let branch = |id: u8, q: f64, m0: f64, m1: f64| {
+        let mut mass = vec![1.0; 1326];
+        mass[0] = m0;
+        mass[1] = m1;
+        HistoryBranch {
+            id,
+            parent: None,
+            split_by: None,
+            translated: vec![],
+            q,
+            residual: false,
+            stopped: None,
+            seats: seats.iter().map(|&seat| SeatMass { seat, node: None, mass: mass.clone() }).collect(),
+        }
+    };
+    let mut bs: Vec<HistoryBranch> = (0..4u8).map(|id| branch(id, 0.1, 0.0, 2.0)).collect();
+    bs.push(branch(4, tiny, 0.5, 1.5));
+    bs.push(branch(5, tiny, 0.5, 1.5));
+    for b in &bs {
+        for s in &b.seats {
+            assert_eq!(s.mass.iter().sum::<f64>(), 1326.0, "equal per-seat totals");
+        }
+    }
+    let before: Vec<Vec<f64>> = seats.iter().map(|&s| marginal(&bs, s)).collect();
+    for r in &before {
+        assert_eq!(r[0], tiny, "the pre-cap combo-0 marginal is the representable 5e-324");
+    }
+
+    cap_branches(&mut bs);
+    assert_eq!(bs.iter().filter(|b| !b.residual).count(), 4);
+    let residual = bs.iter().find(|b| b.residual).expect("the overflow forms the residual");
+    assert_eq!(residual.q, 2.0 * tiny);
+    for (k, &seat) in seats.iter().enumerate() {
+        let s = &residual.seats[k];
+        assert_eq!(s.seat, seat);
+        assert_eq!(s.mass[0], 0.5, "seat {seat:?}: residual combo-0 mass");
+        assert_eq!(s.mass[1], 1.5, "seat {seat:?}: residual combo-1 mass");
+        assert!(s.mass[2..].iter().all(|&w| w == 1.0), "seat {seat:?}: residual masses elsewhere");
+        let after = marginal(&bs, seat);
+        assert!(after[0] > 0.0, "seat {seat:?}: combo 0 lost its only (overflow) support");
+        assert_eq!(after[0], before[k][0], "seat {seat:?}: combo-0 marginal");
+        for (c, (a, z)) in before[k].iter().zip(&after).enumerate() {
+            assert!((a - z).abs() <= 1e-12, "seat {seat:?} combo {c}: marginal moved from {a} to {z}");
+        }
+        assert_eq!(range_output(&after).0[0], f32::MIN_POSITIVE, "seat {seat:?}: positive reach stays positive at the output");
+    }
+}
+
+/// R3's rejection side: a merged mass whose exact weighted average is below the smallest positive
+/// `f64` (weight `2^-1074` merged into a residual of weight .5, mass .2: 0.4 of the smallest
+/// positive value) is unrepresentable support, not zero support -- rejected with a named
+/// assertion, as `condition` and `marginal` do, never left as a silent zero.
+#[test]
+#[should_panic(expected = "cap_branches: residual seat Seat(0) mass[0] underflowed to 0 despite a positive branch weight and mass on some merged branch")]
+fn cap_branches_rejects_an_unrepresentable_merged_support() {
+    let tiny = f64::from_bits(1);
+    let branch = |id: u8, q: f64, m0: f64| {
+        let mut mass = vec![1.0; 1326];
+        mass[0] = m0;
+        HistoryBranch {
+            id,
+            parent: None,
+            split_by: None,
+            translated: vec![],
+            q,
+            residual: false,
+            stopped: None,
+            seats: vec![SeatMass { seat: Seat(0), node: None, mass }],
+        }
+    };
+    let mut bs: Vec<HistoryBranch> = (0..4u8).map(|id| branch(id, 0.1, 0.0)).collect();
+    bs.push(branch(4, tiny, 0.2));
+    let mut residual = branch(5, 0.5, 0.0);
+    residual.residual = true;
+    bs.push(residual);
+    cap_branches(&mut bs);
+}
+
+/// With normalized weights a merge whose every weight is zero has no average to take (`0 / 0`);
+/// the zero-weight branches contribute nothing to any marginal, so the residual keeps its own
+/// masses and weight 0 rather than turning into NaN.
+#[test]
+fn cap_branches_merges_zero_weight_overflow_without_nan() {
+    let seat = Seat(0);
+    let mut bs: Vec<HistoryBranch> = [0.3, 0.25, 0.2, 0.15, 0.0, 0.0]
+        .iter()
+        .enumerate()
+        .map(|(id, &q)| {
+            let mut mass = vec![0.0; 1326];
+            mass[0] = 1.0 + id as f64;
+            mass[1] = 7.0 - id as f64;
+            HistoryBranch {
+                id: u8::try_from(id).unwrap(),
+                parent: None,
+                split_by: None,
+                translated: vec![],
+                q,
+                residual: false,
+                stopped: None,
+                seats: vec![SeatMass { seat, node: None, mass }],
+            }
+        })
+        .collect();
+    let before = marginal(&bs, seat);
+    cap_branches(&mut bs);
+    let r = bs.iter().find(|b| b.residual).expect("the zero-weight overflow forms the residual");
+    assert_eq!(r.id, 4);
+    assert_eq!(r.q, 0.0);
+    assert_eq!((r.seats[0].mass[0], r.seats[0].mass[1]), (5.0, 3.0), "the first merged branch's masses are kept");
+    assert_eq!(marginal(&bs, seat), before);
+}
+
+/// Guard for the merge's overflow fallback (green before and after the fix): masses far above the
+/// power-of-two scale used against underflow (here `1e300`) still merge to their finite weighted
+/// average instead of overflowing to infinity.
+#[test]
+fn cap_branches_merges_huge_masses_without_overflow() {
+    let seat = Seat(0);
+    let mut bs: Vec<HistoryBranch> = (0..6u8)
+        .map(|id| {
+            let mut mass = vec![0.0; 1326];
+            mass[0] = 1e300;
+            mass[1] = 1e300 * (1.0 + f64::from(id));
+            HistoryBranch {
+                id,
+                parent: None,
+                split_by: None,
+                translated: vec![],
+                q: 0.3 - f64::from(id) * 0.05,
+                residual: false,
+                stopped: None,
+                seats: vec![SeatMass { seat, node: None, mass }],
+            }
+        })
+        .collect();
+    cap_branches(&mut bs);
+    let r = bs.iter().find(|b| b.residual).expect("the overflow forms the residual");
+    let (q4, q5) = (0.3 - 4.0 * 0.05, 0.3 - 5.0 * 0.05);
+    let expected1 = (q4 * 5e300 + q5 * 6e300) / (q4 + q5);
+    assert!(r.seats[0].mass[0].is_finite() && (r.seats[0].mass[0] / 1e300 - 1.0).abs() < 1e-12, "{}", r.seats[0].mass[0]);
+    assert!(r.seats[0].mass[1].is_finite() && (r.seats[0].mass[1] / expected1 - 1.0).abs() < 1e-12, "{}", r.seats[0].mass[1]);
 }
