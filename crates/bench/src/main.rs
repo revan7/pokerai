@@ -1,4 +1,5 @@
-use bench::{gen_spots, materialize};
+use bench::{gen_spots, materialize, report, runner, suite};
+use engine::worker::link::WorkerLink;
 use std::collections::HashMap;
 
 /// Parses `--flag value` pairs from the arguments following the subcommand. Every flag must be
@@ -45,6 +46,22 @@ fn required_u32(map: &HashMap<String, String>, name: &str) -> Result<u32, String
     raw.parse::<u32>().map_err(|_| format!("--{name} must be a non-negative integer, got {raw:?}"))
 }
 
+/// An optional numeric option: applies `default` only when the flag was never given at all; a value
+/// that is present but fails to parse is rejected by name and by the offending text, never silently
+/// replaced by the default (the same rule `required_u32` applies to a required flag).
+fn optional_u8(map: &HashMap<String, String>, name: &str, default: u8) -> Result<u8, String> {
+    match map.get(name) {
+        None => Ok(default),
+        Some(raw) => raw.parse::<u8>().map_err(|_| format!("--{name} must be an integer 0-255, got {raw:?}")),
+    }
+}
+fn optional_u32(map: &HashMap<String, String>, name: &str, default: u32) -> Result<u32, String> {
+    match map.get(name) {
+        None => Ok(default),
+        Some(raw) => raw.parse::<u32>().map_err(|_| format!("--{name} must be a non-negative integer, got {raw:?}")),
+    }
+}
+
 fn cmd_materialize(rest: &[String]) -> Result<String, String> {
     let map = parse_options(rest, &["template", "pot", "eff", "prefix"])?;
     let template = required(&map, "template")?;
@@ -70,12 +87,53 @@ fn cmd_gen_spots(rest: &[String]) -> Result<i32, String> {
     Ok(code)
 }
 
+/// Runs `--suite` (default `river_std`) `--reps` times (default 5) per spot against a fresh
+/// release-worker process per spot (cold = the first rep in that fresh process), measures a §13.5
+/// cancel latency against the suite's first spot, and appends the resulting report section to
+/// `--out/<BENCH_DATE or 2026-09-10>-i7-13700K.md` (default `--out docs/bench`).
+///
+/// The worker binary is never built here: it is discovered through `POKERAI_WORKER` or the
+/// workspace's default release path, and a worker that fails to spawn (most commonly because it was
+/// never built) is reported by name with a pointer to `cargo build --release -p solver-worker`
+/// rather than silently producing an empty or partial report.
+fn cmd_run(rest: &[String]) -> Result<(), String> {
+    let map = parse_options(rest, &["suite", "threads", "reps", "out"])?;
+    let suite_name = optional(&map, "suite", "river_std");
+    let threads = optional_u8(&map, "threads", 16)?;
+    let reps = optional_u32(&map, "reps", 5)?;
+    let out = std::path::PathBuf::from(optional(&map, "out", "docs/bench"));
+    let suite = suite::Suite::load(&std::path::PathBuf::from("bench/spots").join(format!("{suite_name}.json")))?;
+    let exe = std::env::var("POKERAI_WORKER").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from("target/release/solver-worker.exe"));
+    let mut rep = report::Report::new(&suite_name, threads, reps);
+    for spot in &suite.spots {
+        // cold = the first rep in a freshly spawned process; a fresh process is used per spot so a
+        // later spot's cold rep is never warmed by an earlier spot's solve.
+        let mut worker = engine::worker::process::ProcessWorker::spawn(&exe, threads).map_err(|e| {
+            format!("{}: {e} -- build the release worker first (cargo build --release -p solver-worker) or point POKERAI_WORKER at an existing one", exe.display())
+        })?;
+        for r in 1..=reps {
+            let res = runner::run_spot(&mut worker, spot, r, r == 1);
+            println!("{} rep {} {} {} ms", res.spot, r, res.status, res.wall_ms);
+            rep.push(res);
+        }
+        if spot.id == suite.spots[0].id {
+            if let Some((a, b)) = runner::cancel_latency(&mut worker, spot) {
+                rep.set_cancel_latency(a, b);
+            }
+        }
+        worker.kill();
+    }
+    let date = std::env::var("BENCH_DATE").unwrap_or_else(|_| "2026-09-10".into());
+    rep.append_to(&out.join(format!("{date}-i7-13700K.md"))).map_err(|e| e.to_string())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (code, message) = match args.get(1).map(String::as_str) {
         Some("materialize") => match cmd_materialize(&args[2..]) { Ok(json) => { println!("{json}"); (0, None) } Err(e) => (2, Some(e)) },
         Some("gen-spots") => match cmd_gen_spots(&args[2..]) { Ok(code) => (code, None), Err(e) => (2, Some(e)) },
-        _ => (1, Some("usage: bench materialize --template ID --pot P --eff E [--prefix ...] | bench gen-spots [--source r8] [--out DIR] | bench run ... (Task 30)".to_string())),
+        Some("run") => match cmd_run(&args[2..]) { Ok(()) => (0, None), Err(e) => (2, Some(e)) },
+        _ => (1, Some("usage: bench materialize --template ID --pot P --eff E [--prefix ...] | bench gen-spots [--source r8] [--out DIR] | bench run --suite river_std|river_min|turn_std|turn_min [--threads N] [--reps R] [--out DIR]".to_string())),
     };
     if let Some(m) = message { eprintln!("{m}"); }
     std::process::exit(code);
