@@ -144,7 +144,7 @@ pub fn worker_deadline_ms(street: Street) -> u32 {
 /// The budgets a suite on `street` is scored against, and what counts as a violation of them.
 pub fn budget_summary(street: Street) -> String {
     format!(
-        "street {} ms (worker deadline_ms {}, extraction margin {} ms), final delivery {} ms; a street violation is a terminal after the street budget or, on the river and turn, one without a solution at the raw target",
+        "street {} ms (worker deadline_ms {}, extraction margin {} ms), final delivery {} ms; a street violation is a terminal after the street budget or, on the river and turn, a delivered solution (`ok`/`best_so_far`) short of the raw target; a worker `error` is a failure counted under Unsupported",
         street_budget_ms(street, FLOP_BUDGET_S),
         worker_deadline_ms(street),
         extraction_margin_ms(street),
@@ -161,15 +161,19 @@ pub fn reached_target(exploitability_chips: f32, pot: u32, target_bp: u16) -> bo
 
 /// Whether a first-attempt terminal on `street` that arrived `wall_ms` after the send violates the street contract:
 /// - late: after the §7 street budget, on every street;
-/// - on the river and the turn, also a terminal without a solution at the raw target (`at_target == false`: a
-///   `best_so_far`, an `ok` above the raw target, an `error` or a `cancelled`), however early: the street budget is
+/// - on the river and the turn, also a *delivered* solution (`ok` or `best_so_far`) short of the raw target
+///   (`at_target == false`: a `best_so_far`, or an `ok` above the raw target), however early: the street budget is
 ///   the time to *reach the target* (spec 13.5), and spec 13.3's `deadline_best_so_far_labelling` logs a turn
-///   `best_so_far` as a violation. The single-raised-pot flop miss is the one designed no-target outcome (spec 7);
-///   the flop suites and that exception are plan 4's, so a flop terminal is judged by its lateness only here.
-pub fn street_violation(street: Street, wall_ms: u64, at_target: bool) -> bool {
+///   `best_so_far` as a violation. A timely worker `error` is a failure already counted under Unsupported, not a
+///   street-deadline violation: spec 7, spec 12 and plan 2 Task 22 note 3 attach the violation only to a delivered
+///   solution short of the target, never to a failed solve. A `cancelled` terminal never reaches this predicate:
+///   `run_spot` sends no cancel, so one arriving there is a protocol anomaly rejected before this runs. The
+///   single-raised-pot flop miss is the one designed no-target outcome (spec 7); the flop suites and that exception
+///   are plan 4's, so a flop terminal is judged by its lateness only here.
+pub fn street_violation(street: Street, wall_ms: u64, status: ResultStatus, at_target: bool) -> bool {
     let late = wall_ms > street_budget_ms(street, FLOP_BUDGET_S);
-    let target_required = matches!(street, Street::River | Street::Turn);
-    late || (target_required && !at_target)
+    let delivered_short_of_target = matches!(status, ResultStatus::Ok | ResultStatus::BestSoFar) && !at_target;
+    late || (matches!(street, Street::River | Street::Turn) && delivered_short_of_target)
 }
 
 /// Waits for the next message until the absolute `deadline_ms` on `clock`; `Ok(None)` once it has passed. Every
@@ -262,6 +266,9 @@ pub fn run_spot(worker: &mut dyn WorkerLink, clock: &dyn Clock, spot: &Spot, rep
                 if ack_ms.is_none() {
                     return Err(RunError::Protocol(format!("{what}: its terminal result arrived before the solve was acknowledged")));
                 }
+                if status == ResultStatus::Cancelled {
+                    return Err(RunError::Protocol(format!("{what}: a cancelled terminal although no cancel was sent")));
+                }
                 break (status, solution);
             }
             Some(_) => {}
@@ -288,7 +295,7 @@ pub fn run_spot(worker: &mut dyn WorkerLink, clock: &dyn Clock, spot: &Spot, rep
         memory_bytes: solution.as_ref().map(|s| s.memory_bytes).unwrap_or(0),
         peak_ws_bytes: worker.peak_working_set_bytes(),
         mode: solution.as_ref().map(|s| s.mode.clone()).unwrap_or_default(),
-        street_violation: street_violation(street, wall_ms, at_target),
+        street_violation: street_violation(street, wall_ms, status, at_target),
         final_violation: wall_ms > final_delivery_ms(street, FLOP_BUDGET_S),
     })
 }
@@ -467,18 +474,32 @@ mod tests {
     #[test]
     fn a_river_or_turn_row_violates_the_street_budget_when_late_or_off_target() {
         // below budget, above target: the spec 13.3 `deadline_best_so_far_labelling` case
-        assert!(street_violation(Street::River, 1_500, false));
-        assert!(street_violation(Street::Turn, 5_500, false));
+        assert!(street_violation(Street::River, 1_500, ResultStatus::BestSoFar, false));
+        assert!(street_violation(Street::Turn, 5_500, ResultStatus::BestSoFar, false));
         // at target, timely: no violation (arriving exactly at the budget is not late)
-        assert!(!street_violation(Street::River, 1_500, true));
-        assert!(!street_violation(Street::River, 2_000, true));
-        assert!(!street_violation(Street::Turn, 5_900, true));
+        assert!(!street_violation(Street::River, 1_500, ResultStatus::Ok, true));
+        assert!(!street_violation(Street::River, 2_000, ResultStatus::Ok, true));
+        assert!(!street_violation(Street::Turn, 5_900, ResultStatus::Ok, true));
         // late, even at target
-        assert!(street_violation(Street::River, 2_001, true));
-        assert!(street_violation(Street::Turn, 6_001, true));
+        assert!(street_violation(Street::River, 2_001, ResultStatus::Ok, true));
+        assert!(street_violation(Street::Turn, 6_001, ResultStatus::Ok, true));
         // the flop's no-target exception (single-raised-pot miss) belongs to plan 4's suites: only lateness here
-        assert!(!street_violation(Street::Flop, 5_000, false));
-        assert!(street_violation(Street::Flop, 10_001, true));
+        assert!(!street_violation(Street::Flop, 5_000, ResultStatus::BestSoFar, false));
+        assert!(street_violation(Street::Flop, 10_001, ResultStatus::Ok, true));
+    }
+
+    // ---- N1: a timely worker `error` is a failure already counted under Unsupported, not a street
+    // violation; only lateness (or a river/turn miss on a *delivered* solution) counts ----
+
+    #[test]
+    fn a_timely_error_is_not_a_street_violation_but_a_late_one_is() {
+        assert!(
+            !street_violation(Street::River, 40, ResultStatus::Error, false),
+            "a timely worker error is a failure already counted under Unsupported, not a deadline violation"
+        );
+        assert!(street_violation(Street::River, 2_001, ResultStatus::Error, false), "a late terminal is always a violation, even an error");
+        assert!(!street_violation(Street::Turn, 100, ResultStatus::Error, false));
+        assert!(street_violation(Street::Turn, 6_001, ResultStatus::Error, false));
     }
 
     // ---- run_spot: I5 (rejected), I2 (violations through a measured row), bounded waits ----
@@ -562,6 +583,35 @@ mod tests {
         let (mut w, _state, clock) = fake(vec![result(&s, ResultStatus::Ok, Some(1.0))]);
         let err = run_spot(&mut *w, &*clock, &s, 1, true).unwrap_err();
         assert!(matches!(err, RunError::Protocol(_)), "{err:?}");
+    }
+
+    // ---- N1: a timely worker `error` is measured, not a street violation; a late one still is ----
+
+    #[test]
+    fn a_timely_error_row_is_measured_and_not_a_street_violation_but_a_late_one_is() {
+        let s = river();
+        let error_result = |ms: u32| FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None, error: None, elapsed_ms: ms };
+        let (mut w, _state, clock) = fake(vec![ack(AckStatus::Accepted), delay(40), error_result(1)]);
+        let row = run_spot(&mut *w, &*clock, &s, 1, true).unwrap();
+        assert_eq!((row.wall_ms, row.status.as_str()), (40, "error"));
+        assert!(
+            !row.street_violation,
+            "a timely worker error is a failure already counted under Unsupported, not a street violation: {row:?}"
+        );
+
+        let (mut w, _state, clock) = fake(vec![ack(AckStatus::Accepted), delay(2_001), error_result(1)]);
+        let row = run_spot(&mut *w, &*clock, &s, 1, true).unwrap();
+        assert!(row.street_violation, "a late terminal is always a violation, even an error: {row:?}");
+    }
+
+    // ---- N1: `run_spot` sent no cancel, so a `cancelled` terminal there is a protocol anomaly ----
+
+    #[test]
+    fn an_unsolicited_cancelled_terminal_in_run_spot_is_a_protocol_failure() {
+        let s = river();
+        let (mut w, _state, clock) = fake(vec![ack(AckStatus::Accepted), result(&s, ResultStatus::Cancelled, None)]);
+        let err = run_spot(&mut *w, &*clock, &s, 1, true).unwrap_err();
+        assert!(matches!(&err, RunError::Protocol(m) if m.contains("cancelled") && m.contains("no cancel")), "{err:?}");
     }
 
     // ---- I1: the cancel probe ----

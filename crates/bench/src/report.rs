@@ -158,13 +158,17 @@ impl Report {
         } else {
             let pct = |pred: &dyn Fn(&SpotResult) -> bool| 100.0 * self.rows.iter().filter(|r| pred(r)).count() as f64 / n as f64;
             let peak = self.rows.iter().map(|r| r.peak_ws_bytes).max().unwrap_or(0);
+            // Classified by the raw target (`SpotResult::at_target`), never by status alone: an `ok` that
+            // missed the raw target (possible when its rounded display bp still equals the target) is
+            // Approximate, matching `engine::assemble::coverage_for_solve`'s literal classification. A
+            // `cancelled` status no longer reaches a row (`runner::run_spot` rejects an unsolicited one).
             (
                 format!("{:.1} MB", peak as f64 / 1_048_576.0),
                 format!(
                     "Exact {:.1}% / Approximate {:.1}% / Unsupported {:.1}%",
-                    pct(&|r| r.status == "ok"),
-                    pct(&|r| r.status == "best_so_far"),
-                    pct(&|r| r.status == "error" || r.status == "cancelled")
+                    pct(&|r| r.status == "ok" && r.at_target),
+                    pct(&|r| r.status == "best_so_far" || (r.status == "ok" && !r.at_target)),
+                    pct(&|r| r.status == "error")
                 ),
             )
         };
@@ -302,8 +306,11 @@ mod tests {
         assert_eq!(c[2], "p50 6 ms / p95 7 ms / max 7 ms", "wall time of a failed row is still measured");
         // all best_so_far
         assert_eq!(render(vec![r(1_900, "best_so_far", 190), r(1_950, "best_so_far", 170)])[3], "n/a (0 of 2 at target)");
-        // an `ok` above the raw target is not a time-to-target sample
-        assert_eq!(render(vec![row(40, "ok", 50, false)])[3], "n/a (0 of 1 at target)");
+        // an `ok` above the raw target is not a time-to-target sample, and (N2) the coverage column
+        // classifies it Approximate, by the raw target, never Exact
+        let ok_above_target = render(vec![row(40, "ok", 50, false)]);
+        assert_eq!(ok_above_target[3], "n/a (0 of 1 at target)");
+        assert_eq!(ok_above_target[5], "Exact 0.0% / Approximate 100.0% / Unsupported 0.0%");
         // empty
         let c = render(vec![]);
         assert_eq!((c[2].as_str(), c[3].as_str(), c[4].as_str(), c[5].as_str()), ("n/a (no rows)", "n/a (0 of 0 at target)", "n/a (no rows)", "n/a (no rows)"));
