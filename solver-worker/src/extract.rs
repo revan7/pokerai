@@ -207,10 +207,23 @@ fn result_line_len(sol: StreetSolution, id: &str) -> (Result<usize, String>, Str
 /// `Ok(None)` when `cancel` is observed between nodes or after the last one (§4.5: `Extracting`
 /// answers a cancel after the node being extracted). The game is left at the root.
 pub fn street_solution(game: &mut PostFlopGame, req: &SolveRequest, meta: SolutionMeta, cancel: &AtomicBool) -> Result<Option<StreetSolution>, String> {
-    export(game, req, meta, cancel, Limits { max_nodes: MAX_EXPORTED_NODES, max_line: RESULT_LINE_MAX })
+    street_solution_observed(game, req, meta, cancel, &mut |_| {})
 }
 
-fn export(game: &mut PostFlopGame, req: &SolveRequest, meta: SolutionMeta, cancel: &AtomicBool, limits: Limits) -> Result<Option<StreetSolution>, String> {
+/// Where the export is, as `street_solution_observed` reports it immediately before it happens (the job's hooks
+/// seam, `job::Hooks::node_site`), each with the number of nodes extracted so far: `Poll`, a cancel poll (one
+/// precedes every node and one follows the last: the node boundaries of `Extracting`); `Extract`, a node's
+/// extraction, about to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeSite { Poll(usize), Extract(usize) }
+
+/// `street_solution` with its polls and extractions reported to `at_site` (`NodeSite`). The job passes its
+/// hooks' `node_site`, a no-op in production; the call neither polls nor decides anything.
+pub fn street_solution_observed(game: &mut PostFlopGame, req: &SolveRequest, meta: SolutionMeta, cancel: &AtomicBool, at_site: &mut dyn FnMut(NodeSite)) -> Result<Option<StreetSolution>, String> {
+    export(game, req, meta, cancel, Limits { max_nodes: MAX_EXPORTED_NODES, max_line: RESULT_LINE_MAX }, at_site)
+}
+
+fn export(game: &mut PostFlopGame, req: &SolveRequest, meta: SolutionMeta, cancel: &AtomicBool, limits: Limits, at_site: &mut dyn FnMut(NodeSite)) -> Result<Option<StreetSolution>, String> {
     let index = index_materialized(&req.tree.materialized);
     let street: Vec<&MaterializedNode> = req.tree.materialized.iter().filter(|n| n.street == req.tree.root_street).collect();
     let paths = street.iter()
@@ -221,10 +234,13 @@ fn export(game: &mut PostFlopGame, req: &SolveRequest, meta: SolutionMeta, cance
     let over_count = street.len() > limits.max_nodes;
     let order: Vec<usize> = if over_count { vec![requested] } else { (0..street.len()).collect() };
     let mut nodes = Vec::with_capacity(order.len());
-    for &i in &order {
+    for (extracted, &i) in order.iter().enumerate() {
+        at_site(NodeSite::Poll(extracted));
         if cancel.load(Ordering::SeqCst) { return Ok(None); }
+        at_site(NodeSite::Extract(extracted));
         nodes.push(extract_node(game, street[i], &paths[i])?);
     }
+    at_site(NodeSite::Poll(order.len()));
     if cancel.load(Ordering::SeqCst) { return Ok(None); }
     let (requested_index, export) = if over_count { (0, "truncated") } else { (requested, "street") };
     let requested_index = u32::try_from(requested_index).map_err(|_| format!("requested index {requested_index} does not fit u32"))?;
@@ -671,20 +687,20 @@ mod tests {
         let (full_len, full) = result_line_len(full, &req.id);
         let full_len = full_len.unwrap();
 
-        let by_count = export(&mut game, &req, meta(), &no_cancel(), Limits { max_nodes: 2, max_line: RESULT_LINE_MAX }).unwrap().unwrap();
+        let by_count = export(&mut game, &req, meta(), &no_cancel(), Limits { max_nodes: 2, max_line: RESULT_LINE_MAX }, &mut |_| {}).unwrap().unwrap();
         assert_eq!((by_count.nodes.len(), by_count.requested, by_count.export.as_str()), (1, 0, "truncated"));
         assert_eq!(by_count.covered_paths, vec![req.history.clone()]);
         assert_eq!(by_count.nodes[0], full.nodes[1]);
         assert_eq!(validate_solution(&by_count, &req.tree.materialized).unwrap(), vec![vec![0]]);
 
-        let at = export(&mut game, &req, meta(), &no_cancel(), Limits { max_nodes: MAX_EXPORTED_NODES, max_line: full_len }).unwrap().unwrap();
+        let at = export(&mut game, &req, meta(), &no_cancel(), Limits { max_nodes: MAX_EXPORTED_NODES, max_line: full_len }, &mut |_| {}).unwrap().unwrap();
         assert_eq!(at, full, "a line exactly at the limit is exported whole");
-        let by_bytes = export(&mut game, &req, meta(), &no_cancel(), Limits { max_nodes: MAX_EXPORTED_NODES, max_line: full_len - 1 }).unwrap().unwrap();
+        let by_bytes = export(&mut game, &req, meta(), &no_cancel(), Limits { max_nodes: MAX_EXPORTED_NODES, max_line: full_len - 1 }, &mut |_| {}).unwrap().unwrap();
         assert_eq!(by_bytes, by_count, "one byte over: the requested node only");
 
         let (one_len, _) = result_line_len(by_count, &req.id);
         let tight = Limits { max_nodes: MAX_EXPORTED_NODES, max_line: one_len.unwrap() - 1 };
-        let e = export(&mut game, &req, meta(), &no_cancel(), tight).unwrap_err();
+        let e = export(&mut game, &req, meta(), &no_cancel(), tight, &mut |_| {}).unwrap_err();
         assert!(e.contains("requested node"), "{e}");
         assert!(game.history().is_empty());
     }

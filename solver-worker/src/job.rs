@@ -10,10 +10,13 @@
 //! `out_of_memory` has no producer here (P2.T11 review ruling 1): `memory::admit` is the job's preventive
 //! check (`tree_too_large`), and an allocation that fails anyway aborts the process, which the engine
 //! sees as a worker exit (§10.3).
+use crate::extract::NodeSite;
+use crate::solve_loop::LoopSite;
 use crate::{cards, extract, locks, memory, solve_loop, tree_build, win};
 use postflop_solver::{finalize, CardConfig, PostFlopGame};
 use proto::worker::{validate_solution, NodeLock, SolveRequest, Stage, StreetSolution, WorkerError, FAILURE_CODES};
 use proto::{index_materialized, resolve_chip_path_indexed, Street};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -64,32 +67,44 @@ impl Drop for Priority<'_> {
 /// one right after the `Extracting` notification (ahead of the uninterruptible `finalize`), one after
 /// `finalize`, one after the export and one after self-validation, before the terminal is chosen
 /// (P2.T11 review I1). The polls at iteration boundaries belong to `solve_loop::run` and those around
-/// each node to `extract::street_solution`.
+/// each node to `extract::street_solution`; the hooks see them as `Hooks::loop_site` and `Hooks::node_site`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Checkpoint { Start, TreeBuilt, TreeChecked, GameConfigured, MemoryChecked, Allocated, LocksValidated, LockApplied(u16), SolveEnded, ExtractingNotified, Finalized, Exported, Validated }
+pub enum Checkpoint { Start, TreeBuilt, TreeChecked, GameConfigured, MemoryChecked, Allocated, LocksValidated, LockApplied(u16), SolveEnded, ExtractingNotified, Finalized, Exported, Validated }
 
 /// The job's expensive operations, as the seam observes them: `Hooks::enter` and `Hooks::leave` bracket
 /// each one, so a test sees exactly which work started after a cancel. `LockApply(k)` applies the
 /// `k`-th staged lock (from 1); `Solve` is the whole §7 loop, `Export` the whole street export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Op { TreeBuild, TreeCheck, GameConfig, MemoryCheck, Allocate, LockValidate, LockApply(u16), Solve, Finalize, Export, Validate }
+pub enum Op { TreeBuild, TreeCheck, GameConfig, MemoryCheck, Allocate, LockValidate, LockApply(u16), Solve, Finalize, Export, Validate }
 
 /// The hooks seam, deterministic for the tests (standing ruling: a hook places a cancel or a measurement
 /// exactly, never a sleep racing the computation). Production (`Stderr`) keeps every default: nothing
-/// at a checkpoint or around an operation, the measurement unchanged, and diagnostics on stderr (§4.5:
-/// stdout carries protocol only).
-trait Hooks {
+/// at a checkpoint, at a poll or around an operation, the measurement unchanged, and diagnostics on
+/// stderr (§4.5: stdout carries protocol only). Every hook is called on the job's own thread, never with
+/// the protocol lock held, and none of them polls or decides anything: a hook that blocks holds the job
+/// exactly where it is called while control goes on answering stdin (the executor's checkpoint barrier,
+/// `protocol::executor_loop_with`).
+pub trait Hooks {
     /// Called at each checkpoint, immediately before the cancel flag is polled.
     fn checkpoint(&mut self, _at: Checkpoint) {}
     /// Called immediately before an operation starts.
     fn enter(&mut self, _op: Op) {}
     /// Called as soon as an operation has returned, before its result is looked at.
     fn leave(&mut self, _op: Op) {}
+    /// Called inside the §7 loop (`solve_loop::LoopSite`, with the iterations completed) immediately
+    /// before each cancel poll (the iteration boundaries of `Solving`) and each solve step or
+    /// measurement.
+    fn loop_site(&mut self, _at: LoopSite) {}
+    /// Called inside the street export (`extract::NodeSite`, with the nodes extracted) immediately
+    /// before each cancel poll (the node boundaries of `Extracting`: one precedes every node and one
+    /// follows the last) and each node's extraction.
+    fn node_site(&mut self, _at: NodeSite) {}
     /// A raw measurement as the solve loop produced it, before it is reported.
     fn measured(&mut self, raw: f32) -> f32 { raw }
     fn log(&mut self, line: &str) { eprintln!("{line}"); }
 }
-struct Stderr;
+/// The production hooks: every default.
+pub struct Stderr;
 impl Hooks for Stderr {}
 
 /// Review ruling (c) of P2.T10 at the job's measurement boundary: every measurement the job emits (in a
@@ -127,23 +142,31 @@ impl Reporter {
 /// The job's three seams. Production (`run`) passes `Stderr` hooks, the real §7 loop (`real_loop`) and
 /// `win::set_priority_class`; a test records events, scripts a loop's stop over real iterations
 /// (P2.T11 review M1) or records the priority calls (review M2). `solve` receives the game, the loop
-/// parameters, the cancel flag and the job's per-report callback, exactly what `solve_loop::run` takes.
+/// parameters, the cancel flag, the job's per-report callback and its per-site callback, exactly what
+/// `solve_loop::run` takes.
 struct Seams<'s> {
     hooks: &'s mut dyn Hooks,
-    solve: &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>)) -> solve_loop::LoopOutcome,
+    solve: &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>), &mut dyn FnMut(LoopSite)) -> solve_loop::LoopOutcome,
     set_priority: &'s mut dyn FnMut(bool),
 }
 
 /// The production loop seam: `solve_loop::run`, unchanged.
-fn real_loop(game: &PostFlopGame, params: &solve_loop::LoopParams, cancel: &AtomicBool, progress: &mut dyn FnMut(u32, Option<f32>)) -> solve_loop::LoopOutcome {
-    solve_loop::run(game, params, cancel, progress)
+fn real_loop(game: &PostFlopGame, params: &solve_loop::LoopParams, cancel: &AtomicBool, progress: &mut dyn FnMut(u32, Option<f32>), at_site: &mut dyn FnMut(LoopSite)) -> solve_loop::LoopOutcome {
+    solve_loop::run(game, params, cancel, progress, at_site)
 }
 
 /// Runs one `solve` (module docs). `staged` is the lock set this request consumes (§4.5; the executor has
 /// matched its `spot`). The deadline is the absolute instant `deadline_ms` after entry: Building counts
 /// against it (§7).
 pub fn run(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl) -> JobResult {
-    run_with(req, staged, ctl, Seams { hooks: &mut Stderr, solve: &mut real_loop, set_priority: &mut win::set_priority_class })
+    run_hooked(req, staged, ctl, &mut Stderr)
+}
+
+/// `run` with the caller's hooks in place of `Stderr` (the executor's seam, `protocol::executor_loop_with`):
+/// the real §7 loop and the real priority setter, every checkpoint, operation, poll and step reported to `hooks`.
+/// With `Stderr` it is `run`.
+pub fn run_hooked(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl, hooks: &mut dyn Hooks) -> JobResult {
+    run_with(req, staged, ctl, Seams { hooks, solve: &mut real_loop, set_priority: &mut win::set_priority_class })
 }
 
 fn run_with(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl, seams: Seams<'_>) -> JobResult {
@@ -237,15 +260,24 @@ fn run_with(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobContro
     let mut reporter = Reporter::new(req.pot);
     hooks.enter(Op::Solve);
     let out = {
-        let (progress, reporter, hooks) = (&mut ctl.progress, &mut reporter, &mut *hooks);
+        // Both loop callbacks reach the hooks: a report's measurement (`measured`, and `log` through the
+        // noise policy) and each site (`loop_site`). The loop calls them one at a time, so the shared
+        // borrow is never taken twice.
+        let hooks = RefCell::new(&mut *hooks);
+        let (progress, reporter) = (&mut ctl.progress, &mut reporter);
         let mut report = |iterations: u32, raw: Option<f32>| {
             let reported = match raw {
                 None => None,
-                Some(raw) => match reporter.report(hooks.measured(raw), &mut *hooks) { Ok(chips) => Some(chips), Err(_) => return },
+                Some(raw) => {
+                    let mut h = hooks.borrow_mut();
+                    let raw = h.measured(raw);
+                    match reporter.report(raw, &mut **h) { Ok(chips) => Some(chips), Err(_) => return }
+                }
             };
             progress(Stage::Solving, iterations, reported, ms(t0), adm.estimate_bytes);
         };
-        solve(&game, &params, &cancel, &mut report)
+        let mut at_site = |at: LoopSite| hooks.borrow_mut().loop_site(at);
+        solve(&game, &params, &cancel, &mut report, &mut at_site)
     };
     hooks.leave(Op::Solve);
     if out.cancelled { return done(JobOutcome::Cancelled); }
@@ -261,7 +293,7 @@ fn run_with(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobContro
     op!(Op::Finalize, finalize(&mut game));
     checkpoint!(Checkpoint::Finalized);
     let meta = extract::SolutionMeta { exploitability_chips: expl, iterations: out.iterations, memory_bytes: adm.estimate_bytes, mode: adm.mode, locks_applied };
-    let exported = op!(Op::Export, extract::street_solution(&mut game, req, meta, &ctl.cancel));
+    let exported = op!(Op::Export, extract::street_solution_observed(&mut game, req, meta, &ctl.cancel, &mut |at| hooks.node_site(at)));
     let sol = match exported { Ok(Some(s)) => s, Ok(None) => return done(JobOutcome::Cancelled), Err(e) => return done(internal(e)) };
     // The export's last poll precedes its result-line sizing: a cancel during the sizing is answered here.
     checkpoint!(Checkpoint::Exported);
@@ -348,17 +380,19 @@ mod tests {
     fn stages(reports: &Reports) -> Vec<Stage> { reports.lock().unwrap().iter().map(|r| r.0).collect() }
 
     /// What the seams saw, in order: a checkpoint (just before its poll), an operation's entry or
-    /// completion, or a call of the priority setter.
+    /// completion, a call of the priority setter, or (when the probe records them) a site of the §7
+    /// loop or of the export (just before it: a poll, a step, a measurement, a node's extraction).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Event { At(Checkpoint), Enter(Op), Leave(Op), Priority(bool) }
+    enum Event { At(Checkpoint), Enter(Op), Leave(Op), Priority(bool), Loop(LoopSite), Node(NodeSite) }
     type Log = Rc<RefCell<Vec<Event>>>;
 
     /// The job's deterministic hooks: records every event in the shared log, raises the cancel flag on
     /// one of them (at a checkpoint, or as an operation starts or completes: a cancel arriving during
-    /// it), substitutes the raw exploitability measurement, and keeps the stderr lines.
-    struct Probe { cancel: Arc<AtomicBool>, cancel_at: Option<Event>, substitute: Option<f32>, log: Log, lines: Vec<String> }
+    /// it), substitutes the raw exploitability measurement, and keeps the stderr lines. The loop's and
+    /// the export's sites are recorded only when `sites` is set.
+    struct Probe { cancel: Arc<AtomicBool>, cancel_at: Option<Event>, substitute: Option<f32>, log: Log, lines: Vec<String>, sites: bool }
     impl Probe {
-        fn new(c: &JobControl) -> Probe { Probe { cancel: c.cancel.clone(), cancel_at: None, substitute: None, log: Log::default(), lines: Vec::new() } }
+        fn new(c: &JobControl) -> Probe { Probe { cancel: c.cancel.clone(), cancel_at: None, substitute: None, log: Log::default(), lines: Vec::new(), sites: false } }
         fn record(&mut self, e: Event) {
             self.log.borrow_mut().push(e);
             if self.cancel_at == Some(e) { self.cancel.store(true, Ordering::SeqCst); }
@@ -368,12 +402,14 @@ mod tests {
         fn checkpoint(&mut self, at: Checkpoint) { self.record(Event::At(at)); }
         fn enter(&mut self, op: Op) { self.record(Event::Enter(op)); }
         fn leave(&mut self, op: Op) { self.record(Event::Leave(op)); }
+        fn loop_site(&mut self, at: LoopSite) { if self.sites { self.record(Event::Loop(at)); } }
+        fn node_site(&mut self, at: NodeSite) { if self.sites { self.record(Event::Node(at)); } }
         fn measured(&mut self, raw: f32) -> f32 { self.substitute.unwrap_or(raw) }
         fn log(&mut self, line: &str) { self.lines.push(line.to_string()); }
     }
 
     /// The loop seam's type, as a test writes a scripted loop.
-    type Scripted<'s> = &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>)) -> solve_loop::LoopOutcome;
+    type Scripted<'s> = &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>), &mut dyn FnMut(LoopSite)) -> solve_loop::LoopOutcome;
 
     /// Runs the job through all three seams: `probe` as the hooks, `solve` as the loop (the real §7
     /// loop, as in production, when `None`), and a priority setter that records its calls in the
@@ -459,6 +495,7 @@ mod tests {
                 Event::Leave(_) | Event::Enter(Solve | Export) => k + 1,
                 Event::Enter(_) => k + 2,
                 Event::Priority(_) => unreachable!("`events` leaves out the priority calls"),
+                Event::Loop(_) | Event::Node(_) => unreachable!("this probe does not record the loop's or the export's sites"),
             };
             let t = traced(&req, Some(&locks), |_| false, Some(at), None);
             assert!(matches!(t.outcome, JobOutcome::Cancelled), "cancel at {at:?}: {:?}", t.outcome);
@@ -497,6 +534,44 @@ mod tests {
             let last = t.reports.last().unwrap();
             assert!(cancel_on(last), "{what}: nothing reported after the cancelling notification: {:?}", t.reports);
             if what == "solving transition" { assert!(t.reports.iter().all(|r| r.1 == 0), "{what}: no iteration: {:?}", t.reports); }
+        }
+    }
+
+    /// Fix round 1 (review P2.T14-I2), the seam the executor's checkpoint barrier holds a job at: inside
+    /// the §7 loop every solve step and the measurement sit between two polls (one before every step,
+    /// one after it, one after the measurement), and inside the export every node's extraction sits
+    /// between two polls (one before every node, one after the last); each site reaches the hooks
+    /// immediately before it happens. A cancel raised at a poll is answered by that very poll; one raised
+    /// as a step, a measurement or an extraction starts is answered by the poll right after it. Either
+    /// way the run is the uncancelled one up to that poll and the one event that follows closes the
+    /// operation it is in: no further step, measurement or node starts.
+    #[test]
+    fn a_cancel_at_any_loop_or_node_site_is_answered_by_the_next_poll() {
+        use crate::extract::NodeSite::{Extract, Poll};
+        use LoopSite::{Boundary, Iteration, Measured, Measurement, Stepped};
+        let (mut req, locks) = lock_job();
+        req.target_bp = u16::MAX;                        // the first measurement (iteration 10) reaches it
+        let run_sited = |cancel_at: Option<Event>| {
+            let (mut c, reports) = recording(|_| false);
+            let mut probe = Probe::new(&c);
+            (probe.sites, probe.cancel_at) = (true, cancel_at);
+            let r = run_seamed(&req, Some(&locks), &mut c, &mut probe, None);
+            Trace::new(r, &reports, probe)
+        };
+        let full = run_sited(None);
+        assert!(matches!(full.outcome, JobOutcome::Ok(_)), "{:?}", full.outcome);
+        let sites: Vec<(usize, Event)> = full.events.iter().copied().enumerate().filter(|(_, e)| matches!(e, Event::Loop(_) | Event::Node(_))).collect();
+        let mut want: Vec<Event> = (0..10).flat_map(|i| [Boundary(i), Iteration(i + 1), Stepped(i + 1)]).chain([Measurement(10), Measured(10)]).map(Event::Loop).collect();
+        want.extend([Poll(0), Extract(0), Poll(1), Extract(1), Poll(2), Extract(2), Poll(3)].map(Event::Node));
+        assert_eq!(sites.iter().map(|(_, e)| *e).collect::<Vec<_>>(), want, "ten steps and a measurement, then three nodes, each between two polls");
+        for (k, at) in sites {
+            let t = run_sited(Some(at));
+            assert!(matches!(t.outcome, JobOutcome::Cancelled), "cancel at {at:?}: {:?}", t.outcome);
+            let answered = match at { Event::Loop(Iteration(_) | Measurement(_)) | Event::Node(Extract(_)) => k + 1, _ => k };
+            assert!(matches!(full.events[answered], Event::Loop(Boundary(_) | Stepped(_) | Measured(_)) | Event::Node(Poll(_))), "cancel at {at:?}: answered at the poll {:?}", full.events[answered]);
+            let closing = if matches!(at, Event::Loop(_)) { Event::Leave(Op::Solve) } else { Event::Leave(Op::Export) };
+            assert_eq!(t.events[..=answered], full.events[..=answered], "cancel at {at:?}: the same run up to the poll that answers it");
+            assert_eq!(t.events[answered + 1..], [closing], "cancel at {at:?}: nothing starts after that poll");
         }
     }
 
@@ -629,7 +704,7 @@ mod tests {
         let req = solve_request("river_two_combo", 0);
         let target = (f64::from(req.pot) * f64::from(req.target_bp) / 10_000.0) as f32;
         let mut measured = None;
-        let mut scripted = |game: &PostFlopGame, params: &solve_loop::LoopParams, cancel: &AtomicBool, progress: &mut dyn FnMut(u32, Option<f32>)| {
+        let mut scripted = |game: &PostFlopGame, params: &solve_loop::LoopParams, cancel: &AtomicBool, progress: &mut dyn FnMut(u32, Option<f32>), _at_site: &mut dyn FnMut(LoopSite)| {
             assert_eq!(params.target_chips, target);
             for i in 0..3 {
                 assert!(!cancel.load(Ordering::SeqCst));

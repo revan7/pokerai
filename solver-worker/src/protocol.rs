@@ -11,7 +11,7 @@
 //!
 //! | Message | `Idle` | `Building` / `Solving` / `Extracting` | `Stopping` |
 //! |---|---|---|---|
-//! | `solve` | `duplicate` if its id is remembered as finished; else `precheck`'s reason, or `accepted` -> `Building`; either way it takes the staged lock set (below) | `duplicate` for the live id or a finished id, else `busy` | `stopping` |
+//! | `solve` | `duplicate` if its id is remembered as finished; else `precheck`'s reason, or `accepted` -> `Building`; either way it takes the staged lock set (below), as does a line naming a `solve` that the wire codec refuses | `duplicate` for the live id or a finished id, else `busy` | `stopping` |
 //! | `cancel` | a finished id: `already_finished`; else `unknown_target` | the live id: `accepted`, the job's flag raised; else as `Idle` | the live id (if any): `accepted`; else as `Idle` |
 //! | `shutdown` | `accepted`, `Exit(0)` -> `Stopping` (a staged set discarded) | `accepted`, the job cancelled -> `Stopping`; `Exit(0)` follows its terminal | `accepted`, nothing else |
 //! | stdin EOF | `Exit(0)` -> `Stopping` (a staged set discarded) | the job cancelled -> `Stopping` | nothing |
@@ -20,17 +20,23 @@
 //! Lock staging (§4.5). At most one lock set is staged (`Proto::staged`, with the spot it belongs to), and only
 //! while the worker is `Idle`: a `lock` is refused in any other state, a stop discards the set, and a `solve`
 //! always takes it, so a live job and a staged set never coexist (asserted). The set belongs to exactly one
-//! `solve`, the next one decided: rejected, the set is discarded with it; accepted with another spot, the job ends
-//! `result{error{lock_mismatch}}` at once (§4.5) and the set is discarded; accepted with the same spot, the set is
-//! checked against that solve's `tree.materialized` by the engine's own validator (`proto::worker::validate_locks`,
-//! which needs the tree, so it cannot run at staging), and either goes to the job, which validates it again and
-//! applies it in `Building` (`locks::apply`), or ends the job `lock_mismatch` at once. The job's own end (ok,
-//! error, cancel) is the set's end too: nothing is ever staged again but by a new `lock`.
+//! `solve`, the next one decided. Any request whose envelope identifies as `type: "solve"` discards the staged set
+//! when it is rejected, whichever layer rejects it: the typed wire decode (valid JSON whose top-level object has
+//! `"type": "solve"` but that is not a valid `solve`, e.g. `rake_rate: 1.0`; `handle_line_via`), `precheck`, or
+//! admission (`duplicate`; `busy` and `stopping` never meet a staged set). The discard and the rejection ack happen
+//! under the protocol lock in one decision. Unidentifiable input (invalid JSON, invalid UTF-8, an over-limit line,
+//! an unknown or missing `type`) leaves staging untouched, as does every other message's rejection. Accepted with
+//! another spot, the job ends `result{error{lock_mismatch}}` at once (§4.5) and the set is discarded; accepted with
+//! the same spot, the set is checked against that solve's `tree.materialized` by the engine's own validator
+//! (`proto::worker::validate_locks`, which needs the tree, so it cannot run at staging), and either goes to the
+//! job, which validates it again and applies it in `Building` (`locks::apply`), or ends the job `lock_mismatch` at
+//! once. The job's own end (ok, error, cancel) is the set's end too: nothing is ever staged again but by a new
+//! `lock`.
 //!
 //! Every rejection is `ack{rejected, reason}` and changes no state, with the one exception above: a rejected
-//! `solve` still takes the staged set with it. A line that does not parse is no message at all (not a `solve`): it
-//! is rejected with the id `lenient_id` recovers and changes nothing. Every decision is a pure function of the
-//! request and the state (no clock is read), taken and acked under one hold of the protocol lock.
+//! `solve` still takes the staged set with it. A line the wire codec refuses is rejected with the id `lenient_id`
+//! recovers. Every decision is a pure function of the request and the state (no clock is read), taken and acked
+//! under one hold of the protocol lock.
 use crate::job::{self, JobControl, JobOutcome};
 use crate::locks;
 use crate::writer::Out;
@@ -225,11 +231,35 @@ pub fn precheck(req: &SolveRequest) -> Result<(), String> {
 /// One stdin line: parsed as an `EngineMessage` and handled, or rejected with the parser's reason and the id
 /// `lenient_id` recovers. A blank line is ignored.
 pub fn handle_line(shared: &Shared, line: &str) {
+    handle_line_via(shared, line, &mut |o| { let _ = shared.out.send(o); });
+}
+
+/// `handle_line` with its publication step passed in (`handle_message_via`'s seam). A line the typed decode refuses is
+/// rejected under one hold of the protocol lock, like every other ack; when the line still identifies itself as a
+/// `solve` (`names_solve`), that same hold discards the staged lock set (module docs), so the discard and the
+/// rejection are one decision. Any other refused line changes nothing.
+fn handle_line_via(shared: &Shared, line: &str, publish: &mut dyn FnMut(Out)) {
     if line.trim().is_empty() { return; }
     match serde_json::from_str::<EngineMessage>(line) {
-        Ok(msg) => handle_message(shared, msg),
-        Err(e) => { let _ = shared.out.send(rejection(&lenient_id(line), format!("invalid message: {e}"))); }
+        Ok(msg) => handle_message_via(shared, msg, publish),
+        Err(e) => {
+            // Both read the line (up to 1 MiB) before the lock is taken, so the hold stays as short as any other.
+            let (refusal, solve) = (rejection(&lenient_id(line), format!("invalid message: {e}")), names_solve(line));
+            let mut p = shared.proto.lock().unwrap();
+            if solve {
+                assert!(p.staged.is_none() || p.state == WorkerState::Idle, "a lock set is staged while the worker is {:?}", p.state);
+                p.staged = None;
+            }
+            publish(refusal);
+        }
     }
+}
+
+/// Whether a line the typed decode refused still identifies itself as a `solve`: valid JSON whose top-level object has
+/// `"type": "solve"`. Anything else is unidentifiable (not JSON, which includes a line that is not UTF-8 or is over the
+/// line limit and never reaches the decoder; not an object; no `type`; another or an unknown type) and names no solve.
+fn names_solve(line: &str) -> bool {
+    matches!(serde_json::from_str::<serde_json::Value>(line), Ok(serde_json::Value::Object(o)) if o.get("type").and_then(|t| t.as_str()) == Some("solve"))
 }
 
 /// §4.5's state machine for one message (the module's table).
@@ -271,7 +301,8 @@ fn handle_message_via(shared: &Shared, msg: EngineMessage, publish: &mut dyn FnM
 /// job produces.
 ///
 /// The staged lock set belongs to this solve whatever its fate (module docs), so it is taken before any test: a
-/// rejection discards it (the one state change a rejection ever makes); an admitted job carries it when it is for
+/// rejection discards it (the one state change a rejection ever makes, here or, for a line naming a `solve` that the
+/// wire codec refuses, in `handle_line_via`); an admitted job carries it when it is for
 /// this solve's spot and fits its tree, and otherwise ends `lock_mismatch` right after its `accepted` ack, retired
 /// under this same hold of the protocol lock (`retire`) with no job handed over, like a terminal from the executor.
 fn admit(shared: &Shared, p: &mut Proto, req: SolveRequest, publish: &mut dyn FnMut(Out)) {
@@ -411,11 +442,20 @@ fn progress_to(sh: Arc<Shared>, pid: String) -> Box<dyn FnMut(Stage, u32, Option
 
 /// The executor thread: one job at a time, panics caught at the boundary (`internal`, retryable).
 pub fn executor_loop(shared: Arc<Shared>, jobs: Receiver<Job>) {
+    executor_loop_with(shared, jobs, &mut job::Stderr);
+}
+
+/// `executor_loop` with the jobs' hooks passed in (`job::Hooks`, via `job::run_hooked`). Production passes
+/// `job::Stderr`, whose every hook is a no-op but for its stderr diagnostics, so both are the same loop. A test
+/// passes hooks that record where each job goes and can hold it at a chosen Building checkpoint, Solving iteration
+/// boundary or Extracting node boundary (a checkpoint barrier): the hooks run on this thread, never with the
+/// protocol lock held, so control keeps answering while a job is held.
+pub fn executor_loop_with(shared: Arc<Shared>, jobs: Receiver<Job>, hooks: &mut dyn job::Hooks) {
     for job in jobs {
         let id = job.req.id.clone();
         let mut ctl = JobControl { cancel: job.cancel.clone(), progress: progress_to(shared.clone(), id.clone()) };
         let started = Instant::now();
-        let (outcome, elapsed) = caught(started, || job::run(&job.req, job.locks.as_deref(), &mut ctl));
+        let (outcome, elapsed) = caught(started, || job::run_hooked(&job.req, job.locks.as_deref(), &mut ctl, &mut *hooks));
         terminal(&shared, &id, outcome, elapsed);
     }
 }
@@ -921,7 +961,32 @@ mod tests {
         c.handed();
         c
     }
-    enum In { M(EngineMessage), Eof }
+    enum In { M(EngineMessage), L(String), Eof }
+
+    // Fix round 1 (review P2.T14-I1): lines the typed decode refuses. A line that still identifies itself as a
+    // `solve` (valid JSON, top-level `"type": "solve"`) takes the staged set with it; anything unidentifiable does not.
+    /// `msg` as its wire line, edited as a JSON value by `f`.
+    fn wire_with(msg: &EngineMessage, f: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut v = serde_json::to_value(msg).expect("the message serializes");
+        f(&mut v);
+        v.to_string()
+    }
+    /// The rejection `handle_line` gives `line`, which the typed decode must refuse: the codec's own reason.
+    fn codec_refusal(id: &str, line: &str) -> Item {
+        let e = serde_json::from_str::<EngineMessage>(line).expect_err("the wire codec refuses the line");
+        refused(id, &format!("invalid message: {e}"))
+    }
+    /// `lock_river`'s own solve under `id`, with `rake_rate: 1.0`: valid JSON naming a `solve`, refused by the codec's
+    /// half-open rake domain (the reviewer's replay).
+    fn rake_one(id: &str) -> String { wire_with(&locked_solve(id), |v| v["rake_rate"] = serde_json::json!(1.0)) }
+    /// `lock_river`'s own solve under `id` with its pot written `NaN`: not JSON at all (§13.2), so it names no type.
+    fn nan_pot(id: &str) -> String {
+        let msg = locked_solve(id);
+        let EngineMessage::Solve(r) = &msg else { unreachable!() };
+        let line = serde_json::to_string(&msg).unwrap().replacen(&format!("\"pot\":{}", r.pot), "\"pot\":NaN", 1);
+        assert!(line.contains("\"pot\":NaN") && line.contains("\"type\":\"solve\""), "{line}");
+        line
+    }
 
     /// §4.5's state table, row by row: from a start state, one input queues exactly the listed items, hands the
     /// executor the listed number of jobs, and changes the state exactly as listed (a rejection changes nothing).
@@ -945,7 +1010,24 @@ mod tests {
         let stopped_discarded: fn(&mut Snap) = |s| { s.state = Stopping; s.stopping = true; s.staged = None; };
         let bad = bad_lock_reason();
         let spot = lock_spot();
+        // Fix round 1 (review P2.T14-I1): lines the typed decode refuses, each with the codec's own reason.
+        let extra_field = wire_with(&locked_solve("21"), |v| v["extra"] = serde_json::json!(1));
+        let untyped = wire_with(&locked_solve("21"), |v| { v.as_object_mut().unwrap().remove("type"); });
+        let mistyped = wire_with(&locked_solve("21"), |v| v["type"] = serde_json::json!("solves"));
+        let wide_lock = wire_with(&river_lock("19", &spot), |v| v["locks"][0]["probs"][0] = serde_json::json!([-0.1, 1.1]));
+        let wide_cancel = wire_with(&cancel("13", "nope"), |v| v["extra"] = serde_json::json!(1));
+        let line = |l: &String| In::L(l.clone());
         let rows: Vec<(&str, Start, In, Vec<Item>, usize, fn(&mut Snap))> = vec![
+            ("a solve the wire codec refuses (rake_rate 1) discards the staged set", Start::Staged, line(&rake_one("21")), vec![codec_refusal("21", &rake_one("21"))], 0, discarded),
+            ("a solve the wire codec refuses (an unknown field) discards the staged set", Start::Staged, line(&extra_field), vec![codec_refusal("21", &extra_field)], 0, discarded),
+            ("a solve the wire codec refuses, idle: nothing staged, nothing changes", Start::Idle, line(&rake_one("21")), vec![codec_refusal("21", &rake_one("21"))], 0, same),
+            ("a solve the wire codec refuses while solving: nothing changes", Start::Live(Solving), line(&rake_one("12")), vec![codec_refusal("12", &rake_one("12"))], 0, same),
+            ("a solve the wire codec refuses while stopping: nothing changes", Start::StoppingIdle, line(&rake_one("21")), vec![codec_refusal("21", &rake_one("21"))], 0, same),
+            ("a line that is not JSON names no type: the staged set stays", Start::Staged, line(&nan_pot("21")), vec![codec_refusal("21", &nan_pot("21"))], 0, same),
+            ("a message without a type: the staged set stays", Start::Staged, line(&untyped), vec![codec_refusal("21", &untyped)], 0, same),
+            ("a message of an unknown type: the staged set stays", Start::Staged, line(&mistyped), vec![codec_refusal("21", &mistyped)], 0, same),
+            ("a lock the wire codec refuses: the staged set stays", Start::Staged, line(&wide_lock), vec![codec_refusal("19", &wide_lock)], 0, same),
+            ("a cancel the wire codec refuses: the staged set stays", Start::Staged, line(&wide_cancel), vec![codec_refusal("13", &wide_cancel)], 0, same),
             ("admit", Start::Idle, In::M(solve("river_two_combo", "21")), vec![acked("21", Accepted)], 1, admitted),
             ("admit after a finished job", Start::Finished9, In::M(solve("river_two_combo", "21")), vec![acked("21", Accepted)], 1, admitted),
             ("precheck", Start::Idle, In::M(unchecked("21")), vec![refused("21", DONK_MISSING)], 0, same),
@@ -996,7 +1078,7 @@ mod tests {
             let c = start(from);
             let mut after = c.snap();
             change(&mut after);
-            let got = match input { In::M(m) => c.msg(m), In::Eof => c.eof() };
+            let got = match input { In::M(m) => c.msg(m), In::L(l) => c.line(&l), In::Eof => c.eof() };
             assert_eq!(got, want, "{label} ({from:?}): queued");
             let handed = c.handed();
             assert_eq!(handed.len(), jobs, "{label} ({from:?}): jobs handed to the executor");
@@ -1240,6 +1322,29 @@ mod tests {
                 assert!(!handed, "{label}: no job handed over before {item}");
             }
             assert!(c.queued().is_empty(), "{label}: everything was published through the seam");
+        }
+    }
+
+    /// Fix round 1 (review P2.T14-I1): a line the typed decode refuses is rejected under the protocol lock like every
+    /// other ack. When it still identifies itself as a `solve`, that same hold discards the staged set: the rejection is
+    /// published with the lock held and, once the lock is free, nothing is staged. Unidentifiable input leaves the set.
+    #[test]
+    fn a_refused_line_is_rejected_under_the_protocol_lock_and_a_named_solve_takes_the_staged_set() {
+        let spot = lock_spot();
+        let rows: [(&str, String, &str, Option<String>); 4] = [
+            ("a solve the wire codec refuses", rake_one("21"), "21", None),
+            ("a line that is not JSON", nan_pot("21"), "21", Some(spot.clone())),
+            ("a message of an unknown type", wire_with(&locked_solve("21"), |v| v["type"] = serde_json::json!("solves")), "21", Some(spot.clone())),
+            ("a lock the wire codec refuses", wire_with(&river_lock("19", &spot), |v| v["locks"][0]["probs"][0] = serde_json::json!([-0.1, 1.1])), "19", Some(spot.clone())),
+        ];
+        for (label, line, id, left) in rows {
+            let c = start(Start::Staged);
+            let mut log = Vec::new();
+            handle_line_via(&c.shared, &line, &mut |o| log.push((seen_now(&c.shared, "21"), o)));
+            let want = match codec_refusal(id, &line) { Ok(m) => m, Err(_) => unreachable!() };
+            assert!(matches!(log.as_slice(), [(Seen::LockHeld, Out::Msg(m))] if *m == want), "{label}: one rejection, published under the lock: {:?}", log.iter().map(|(s, o)| (s, published(o))).collect::<Vec<_>>());
+            assert_eq!(c.snap().staged, left, "{label}: the staged set once the lock is free");
+            assert!(c.queued().is_empty() && c.handed().is_empty(), "{label}");
         }
     }
 
