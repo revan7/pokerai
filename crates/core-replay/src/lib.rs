@@ -10,3 +10,5 @@ pub use branches::*; // SeatMass, HistoryBranch, initial, marginal, posterior, c
 // pub mod preflop; pub mod postflop; pub mod snapshot;
 // pub use snapshot::*;              // SnapshotKey, SnapshotProvenance, StreetSnapshot,
 //                                   // SnapshotStore, select_snapshot, covered_prefix
+// P3.T16: the branch-supported assembly of hero's current preflop decision (spec section 8.4).
+pub use core_preflop::{mix_action, mix_nodes, range_mix_weight, BranchNode, MixedNode};
