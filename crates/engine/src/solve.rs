@@ -1,6 +1,6 @@
 //! The solve client (spec 5 step 7, 7, 12): one live solve on the worker, with absolute deadlines, identity checked on
-//! every reply, stale ids discarded and the result validated before it is accepted. Task 23 adds the heartbeat, the
-//! cancel-then-kill of a superseded request and the `_min` retry; everything else is final here.
+//! every reply, stale ids discarded and the result validated before it is accepted, made resilient by the heartbeat,
+//! the cancel-then-kill of a superseded request, the one `_min` retry and the §12 error-code policy (Task 23).
 //!
 //! Deadlines. The request's deadlines are absolute on the engine's clock (`Deadlines`, Task 20). The worker receives
 //! the relative `deadline_ms` computed at send time from what is left until the street deadline (`worker_deadline_ms`);
@@ -28,10 +28,22 @@
 //! A reply carrying another id (a superseded request's, a cancel's) is discarded without side effects: an `ack` for
 //! another id, accepted or rejected, frees nothing. A reply for this solve that breaks the protocol is a protocol error,
 //! answered by restarting the worker (§12).
+//!
+//! Resilience (§7, §12). While the worker reports `Solving`, no `progress` for `HEARTBEAT_MS` ends the attempt as a hung
+//! worker, judged like the hang bound (at the top of the loop and on every reply observed). A decision superseded after
+//! its request was sent is cancelled (`cancel_or_kill`): the worker has `CANCEL_KILL_MS` to confirm with the job's
+//! `result{cancelled}`, else it is killed and restarted; one superseded before the send, or after its terminal arrived,
+//! has nothing to cancel. A failed attempt is classified by `classify`: the worker is restarted (kill, reap, respawn) when
+//! it exited, broke the protocol, hung or missed the heartbeat, and its new `ready` is validated again; then, only after
+//! the first attempt, only when the failure allows it and a `_min` template exists, one retry on that template is sent
+//! if §7's admission passes, with only what is left until final delivery. A retry never rewinds the reported stage, and
+//! its terminal is never published as the first attempt's. A request that finds no live worker (a restart that failed
+//! earlier) relaunches it once before anything is sent. At the watchdog's fire the client stops and cleans nothing up:
+//! the watchdog delivers the `Final`, and the kill and restart of a still-busy worker after it are `serve_request`'s.
 
 use crate::bench_support::spot_identity;
 use crate::core::EngineCore;
-use crate::deadline::{Deadlines, DELIVERY_MARGIN_MS, PIPE_MARGIN_MS};
+use crate::deadline::{retry_admitted, Deadlines, DELIVERY_MARGIN_MS, PIPE_MARGIN_MS};
 use crate::tree::{build_tree_full, TemplateSelection, TreeBuild};
 use crate::watchdog::{SharedSink, StreetDeadline};
 use crate::worker::link::WorkerLinkError;
@@ -100,6 +112,8 @@ pub struct SolveOutcome {
     /// The engine-clock time the first attempt's terminal `result` arrived, as published to the plan's street deadline
     /// at receipt (ruling 22-I4); `None` when no terminal of the first attempt was received. Never a retry's.
     pub first_terminal_ms: Option<u64>,
+    /// The worker restarts this solve made, failed ones included: the relaunch of a missing worker before the request,
+    /// the restart after a failed attempt, and the kill-and-restart answering an unconfirmed cancel.
     pub restarts: u8,
     /// Display only: the raw exploitability in basis points of the solved pot, rounded (§4.4).
     pub reached_bp: Option<u16>,
@@ -122,6 +136,21 @@ fn status_name(s: ResultStatus) -> &'static str {
 fn engine_error(m: impl Into<String>, retryable: bool) -> UnsupportedReason { UnsupportedReason::EngineError { message: m.into(), retryable } }
 /// The reason of a solve whose decision is no longer active (§4.4, §12).
 fn superseded() -> UnsupportedReason { engine_error("superseded by a newer request", false) }
+
+/// The reason of a solve whose worker could not be restarted after the attempt failed with `reason` (§12): both causes,
+/// named. No live worker is left, which is retryable as `ready_for_requests` has it: the next request relaunches it.
+fn restart_failed(reason: UnsupportedReason, e: &WorkerLinkError) -> UnsupportedReason {
+    let failure = match reason { UnsupportedReason::EngineError { message, .. } => message, other => format!("{other:?}") };
+    engine_error(format!("{failure}; restarting the worker failed: {e}"), true)
+}
+
+/// §7 retry admission's `p95(_min template)`: until plan 4's bench matrix exists (plan 4 Task 21), the street budget,
+/// taken from the request's own deadlines (`street_deadline_ms - t0_ms`, which `Deadlines::for_request` makes
+/// `deadline::street_budget_ms(street, flop_budget_s)`, so a raised flop budget counts as the §7 budget it is).
+fn min_template_p95_ms(d: &Deadlines) -> u64 {
+    d.street_deadline_ms.checked_sub(d.t0_ms)
+        .unwrap_or_else(|| panic!("street deadline {} ms precedes the request's admission at t0 {} ms", d.street_deadline_ms, d.t0_ms))
+}
 
 /// Milliseconds from `from` to `to` on the engine clock. Both are readings of one monotonic clock taken in that order,
 /// and every solve ends by the watchdog's fire (at most 35 s after `t0`), so the span fits a `u32`: anything else is an
@@ -168,20 +197,35 @@ fn terminal_for(status: ResultStatus, exploitability_chips: f32, pot: u32, targe
     }
 }
 
+/// Where an attempt stands when `ended_at` judges it.
+#[derive(Debug, Clone, Copy)]
+enum Watch {
+    /// Immediately before the send: nothing has reached the worker, and there is no hang bound yet.
+    BeforeSend,
+    /// Waiting for this solve's terminal: the attempt's hang bound and, while the worker reports `Solving`, the time the
+    /// heartbeat is due (its last `progress` + `HEARTBEAT_MS`).
+    Waiting { hang_bound_ms: u64, heartbeat_due_ms: Option<u64> },
+    /// This solve's terminal has arrived (within the hang bound, which no longer applies): before a validated success
+    /// is exposed.
+    AfterTerminal,
+}
+
 /// Whether the attempt can no longer act at `now_ms`, and how it ends, checked in this order at the top of the receive
-/// loop, on every reply the moment the client observes it (ruling 22-I1), before the request is sent (no hang bound
-/// yet) and before a validated success is exposed (the hang bound no longer applies: the terminal arrived within it):
-/// the decision is no longer active (ruling 22-I2); the watchdog's fire has come, and it delivers the `Final` (§7); the
-/// attempt's hang bound has come. `None` while the attempt may go on.
-fn ended_at(core: &EngineCore, plan: &SolvePlan, now_ms: u64, hang_bound_ms: Option<u64>) -> Option<AttemptEnd> {
+/// loop, on every reply the moment the client observes it (ruling 22-I1), before the request is sent and before a
+/// validated success is exposed: the decision is no longer active (ruling 22-I2), and only while waiting may the worker
+/// still be running its job; the watchdog's fire has come, and it delivers the `Final` (§7); while waiting, the
+/// attempt's hang bound has come, or the heartbeat is due (§12). `None` while the attempt may go on.
+fn ended_at(core: &EngineCore, plan: &SolvePlan, now_ms: u64, watch: Watch) -> Option<AttemptEnd> {
     if !core.identity_active(&plan.identity) {
-        Some(AttemptEnd::Superseded)
-    } else if now_ms >= plan.deadlines.watchdog_fire_ms() {
-        Some(AttemptEnd::DeadlinePassed)
-    } else if hang_bound_ms.is_some_and(|hang_bound_ms| now_ms >= hang_bound_ms) {
-        Some(AttemptEnd::Hang)
-    } else {
-        None
+        return Some(AttemptEnd::Superseded { running: matches!(watch, Watch::Waiting { .. }) });
+    }
+    if now_ms >= plan.deadlines.watchdog_fire_ms() {
+        return Some(AttemptEnd::DeadlinePassed);
+    }
+    match watch {
+        Watch::Waiting { hang_bound_ms, .. } if now_ms >= hang_bound_ms => Some(AttemptEnd::Hang),
+        Watch::Waiting { heartbeat_due_ms: Some(due_ms), .. } if now_ms >= due_ms => Some(AttemptEnd::Heartbeat),
+        Watch::BeforeSend | Watch::Waiting { .. } | Watch::AfterTerminal => None,
     }
 }
 
@@ -221,10 +265,15 @@ pub(crate) enum AttemptEnd {
     Protocol(String),
     /// No terminal `result` by the attempt's hang bound (a reply observed at or after it included, ruling 22-I1).
     Hang,
+    /// §12 heartbeat: no `progress` for `HEARTBEAT_MS` while the worker reported `Solving` (a reply observed at or after
+    /// that point included, as for the hang bound).
+    Heartbeat,
     /// `ack{rejected}` for this solve: the worker started no work.
     Rejected(String),
-    /// The decision is no longer active (before the send: nothing was sent).
-    Superseded,
+    /// The decision is no longer active. `running`: the request had reached the worker and its terminal had not been
+    /// taken, so the worker may still be running the job, which `run_solve` cancels (`cancel_or_kill`). Before the send,
+    /// or once the terminal arrived, there is nothing to cancel.
+    Superseded { running: bool },
     /// The watchdog's fire time was reached (a reply observed at or after it included, ruling 22-I1; before the send:
     /// nothing was sent); the watchdog delivers the request's `Final` (§7).
     DeadlinePassed,
@@ -268,15 +317,50 @@ fn exploitability_pct(chips: f32, pot: u32) -> Result<f32, String> {
     Ok(if pct == 0.0 { 0.0 } else { pct })
 }
 
-/// One send/receive cycle, with the engine-clock time its terminal `result` arrived, if one was received. Task 23 adds
-/// the heartbeat branch and the cancel-then-kill of a superseded request.
+/// The cancel-then-kill of §7/§12, for a solve `target` superseded while the worker may still be running it (never one
+/// superseded before its send: nothing reached the worker). Sends `cancel` for it under a fresh request id and waits at
+/// most `CANCEL_KILL_MS` from the send for the job's `result{cancelled}`, the only confirmation (§12); anything else read
+/// meanwhile is discarded, a late reply of the job included. Unconfirmed by then, the worker is killed and restarted. A
+/// link failure (the cancel cannot be sent, the worker exits or breaks the protocol in the window) is answered by a
+/// restart at once. Returns whether the worker was restarted; a restart that fails leaves no live worker, which the next
+/// request relaunches (`run_solve`), and is never a panic.
+pub(crate) fn cancel_or_kill(core: &mut EngineCore, target: &str) -> bool {
+    let id = core.next_id();
+    if core.worker.send(&EngineMessage::Cancel { id, target: target.to_string() }).is_err() {
+        let _ = core.worker.restart();
+        return true;
+    }
+    let sent = core.clock.now_ms();
+    let until = sent.checked_add(CANCEL_KILL_MS).unwrap_or_else(|| panic!("the kill bound of a cancel sent at {sent} ms overflows u64"));
+    loop {
+        let now = core.clock.now_ms();
+        if now >= until {
+            core.worker.kill();
+            let _ = core.worker.restart();
+            return true;
+        }
+        // What is left of the window, never more: `recv` keeps it for the whole call.
+        match core.worker.recv(Duration::from_millis(until - now)) {
+            Ok(Some(WorkerMessage::Result { id, status: ResultStatus::Cancelled, .. })) if id == target => return false,
+            Ok(_) => {}
+            Err(_) => {
+                let _ = core.worker.restart();
+                return true;
+            }
+        }
+    }
+}
+
+/// One send/receive cycle, with the engine-clock time its terminal `result` arrived, if one was received. While the
+/// worker reports `Solving`, the heartbeat bounds the wait too (§12); recovery (a cancel, a restart, a retry) is
+/// `run_solve`'s, after the attempt has ended.
 ///
 /// `first`: the request's street deadline when this is the first attempt. The terminal's arrival is published to it at
 /// receipt, before the result is checked, validated or anything is recovered (ruling 22-I4). A retry passes `None`: its
 /// terminal never replaces the first attempt's (§7 judges the first attempt only).
 pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &SharedSink, req: &SolveRequest, first: Option<&StreetDeadline>) -> (AttemptEnd, Option<u64>) {
     // Immediately before the send: a decision superseded, or a request expired, while it was prepared starts no work.
-    if let Some(end) = ended_at(core, plan, core.clock.now_ms(), None) { return (end, None); }
+    if let Some(end) = ended_at(core, plan, core.clock.now_ms(), Watch::BeforeSend) { return (end, None); }
     if let Err(e) = core.worker.send(&EngineMessage::Solve(req.clone())) {
         let end = match e {
             WorkerLinkError::Protocol(m) => AttemptEnd::Unsent(m),
@@ -292,11 +376,15 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
         .checked_add(u64::from(req.deadline_ms) + DELIVERY_MARGIN_MS + PIPE_MARGIN_MS + RESULT_GRACE_MS)
         .unwrap_or_else(|| panic!("the hang bound of a solve sent at {sent} ms overflows u64"));
     let fire_ms = plan.deadlines.watchdog_fire_ms();
+    // While the worker reports `Solving`: when the heartbeat is due, its last `progress` + `HEARTBEAT_MS` (§12).
+    let mut heartbeat_due_ms: Option<u64> = None;
     loop {
         let now = core.clock.now_ms();
-        if let Some(end) = ended_at(core, plan, now, Some(expected_by)) { return (end, None); }
-        // What is left until the earlier bound, never more: `recv` keeps it for the whole call.
-        let msg = match core.worker.recv(Duration::from_millis(expected_by.min(fire_ms) - now)) {
+        let watch = Watch::Waiting { hang_bound_ms: expected_by, heartbeat_due_ms };
+        if let Some(end) = ended_at(core, plan, now, watch) { return (end, None); }
+        // What is left until the earliest bound, never more: `recv` keeps it for the whole call.
+        let bound_ms = expected_by.min(fire_ms).min(heartbeat_due_ms.unwrap_or(u64::MAX));
+        let msg = match core.worker.recv(Duration::from_millis(bound_ms - now)) {
             Ok(Some(msg)) => msg,
             Ok(None) => continue,
             Err(WorkerLinkError::Exit { code }) => return (AttemptEnd::Exit(code), None),
@@ -305,11 +393,11 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
         };
         // Identity and expiry on every reply, at the engine-clock time the client observes it (ruling 22-I1): the
         // receive's bound limits the wait, not when the client runs again (a suspend, a stalled thread). A mutation that
-        // landed while the reply was in flight (or in the same receive), or a reply seen at or after the watchdog's fire
-        // or the hang bound, ends the attempt before anything of the reply is forwarded, validated or accepted, as the
-        // top of the loop would have a moment later (§4.4, §7, §12).
+        // landed while the reply was in flight (or in the same receive), or a reply seen at or after the watchdog's fire,
+        // the hang bound or the heartbeat's due time, ends the attempt before anything of the reply is forwarded,
+        // validated or accepted, as the top of the loop would have a moment later (§4.4, §7, §12).
         let at_ms = core.clock.now_ms();
-        if let Some(end) = ended_at(core, plan, at_ms, Some(expected_by)) { return (end, None); }
+        if let Some(end) = ended_at(core, plan, at_ms, Watch::Waiting { hang_bound_ms: expected_by, heartbeat_due_ms }) { return (end, None); }
         match msg {
             WorkerMessage::Ack { id, status, reason, .. } if id == req.id => match status {
                 AckStatus::Accepted => {}
@@ -322,6 +410,9 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
                     Ok(p) => p,
                     Err(m) => return (AttemptEnd::Protocol(m), None),
                 };
+                // Each progress resets the heartbeat, which runs only while the worker reports `Solving` (§12).
+                heartbeat_due_ms = (stage == Stage::Solving).then(|| at_ms.checked_add(HEARTBEAT_MS)
+                    .unwrap_or_else(|| panic!("the heartbeat due after a progress at {at_ms} ms overflows u64")));
                 core.set_stage(stage_name(stage));
                 sink.lock().unwrap().emit(RecommendationEvent::Progress { identity: plan.identity.clone(), stage: stage_name(stage).into(), iterations,
                     exploitability_pct, elapsed_ms: ms_between(plan.deadlines.t0_ms, at_ms) });
@@ -364,9 +455,10 @@ pub(crate) fn failed(core: &EngineCore, t_start: u64, reason: UnsupportedReason,
         elapsed_ms: ms_between(t_start, core.clock.now_ms()), template_used: template.to_string(), street_violation, first_terminal_ms, restarts, reached_bp: None }
 }
 
-/// Maps a non-success attempt end to its §12 reason, whether a retry is allowed and whether the worker must be
+/// Maps a non-success attempt end to its §12 reason, whether a `_min` retry is allowed and whether the worker must be
 /// restarted. `stage` is the furthest stage the request reached (`EngineCore::stage`), reported when the deadline
-/// passed.
+/// passed. A superseded or expired attempt is never retried here and never restarts the worker: a running job of a
+/// superseded decision is cancelled (`cancel_or_kill`), and the cleanup after the watchdog's fire is `serve_request`'s.
 pub(crate) fn classify(end: AttemptEnd, stage: &str) -> (UnsupportedReason, bool, bool) {
     match end {
         AttemptEnd::Result { status: ResultStatus::Cancelled, .. } => (engine_error("worker cancelled the job", true), true, false),
@@ -382,57 +474,126 @@ pub(crate) fn classify(end: AttemptEnd, stage: &str) -> (UnsupportedReason, bool
         AttemptEnd::Ended => (engine_error("the worker stopped taking requests or closed its stdout, and its exit was not confirmed", true), true, true),
         AttemptEnd::Protocol(m) => (engine_error(format!("protocol error: {m}"), true), true, true),
         AttemptEnd::Hang => (engine_error("no terminal result by the worker deadline", true), true, true),
+        AttemptEnd::Heartbeat => (engine_error(format!("no progress for {HEARTBEAT_MS} ms while solving (heartbeat)"), true), true, true),
         AttemptEnd::Rejected(r) => (engine_error(format!("solve rejected: {r}"), true), false, false),
-        AttemptEnd::Superseded => (superseded(), false, false),
+        AttemptEnd::Superseded { .. } => (superseded(), false, false),
         AttemptEnd::DeadlinePassed => (UnsupportedReason::DeadlineExceeded { stage: stage.into() }, false, false),
     }
 }
 
-/// §5 step 7 / §7: one live solve with an absolute deadline. Task 23 wraps this in the retry loop.
+/// §5 step 7 / §7 / §12: one live solve with absolute deadlines, the heartbeat, the cancel-then-kill of a superseded
+/// request and at most one `_min` retry under §7's admission.
 ///
 /// A solve that cannot start starts no work: a decision already superseded (checked before anything is built, ruling
-/// 22-I2), a tree that does not build, a worker whose `ready` is refused (or no live worker), or a street deadline that
-/// leaves no room for one iteration returns `Failed` without a request.
+/// 22-I2), a tree that does not build, no live worker and a relaunch that fails, a worker whose `ready` is refused, or a
+/// street deadline that leaves no room for one iteration returns `Failed` without a request. A missing worker (a restart
+/// that failed earlier, a kill) is relaunched once, and its `ready` validated, before anything is sent.
+///
+/// The first attempt (`attempt_no` 0) has until the street deadline, and its terminal's arrival is published to the
+/// plan's street deadline at receipt (ruling 22-I4). A validated success ends the solve; so does a superseded decision
+/// (its running job cancelled, `cancel_or_kill`) or the watchdog's fire (nothing cleaned up: the watchdog delivers the
+/// `Final`, and the cleanup after it is `serve_request`'s). Any other failure restarts the worker when `classify` says so,
+/// validating its new `ready`; then one retry (`attempt_no` 1) is sent on the `_min` template, only after the first
+/// attempt, when the failure allows it, the decision is still active and §7's admission passes, with what is left until
+/// final delivery. The retry's failure is final. The street verdict is judged when `run_solve` returns, from the first
+/// attempt's terminal arrival alone (ruling 20-I1).
 pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, sink: &SharedSink) -> SolveOutcome {
     let t_start = core.clock.now_ms();
     assert!(t_start >= plan.deadlines.t0_ms, "run_solve at {t_start} ms, before its request's admission at t0 {} ms", plan.deadlines.t0_ms);
     let street_deadline_ms = plan.deadlines.street_deadline_ms;
     assert!(plan.street_deadline.deadline_ms() == street_deadline_ms,
         "the plan's shared street deadline is at {} ms, its deadlines' at {street_deadline_ms} ms", plan.street_deadline.deadline_ms());
-    let template = plan.template_id.clone();
-    let not_started = |core: &EngineCore, reason: UnsupportedReason| {
-        let violated = street_violated(street_deadline_ms, None, core.clock.now_ms());
-        failed(core, t_start, reason, input, &template, 0, violated, None)
-    };
-    // Before any construction: a decision superseded before its solve starts starts no work (ruling 22-I2).
-    if !core.identity_active(&plan.identity) { return not_started(core, superseded()); }
-    let b = match build_tree_full(&input.root, &TemplateSelection::from_history(&template, &input.root.history)) { Ok(b) => b, Err(r) => return not_started(core, r) };
-    if let Err(reason) = ready_for_requests(core) { return not_started(core, reason); }
-    let Some(deadline_ms) = plan.deadlines.worker_deadline_ms(core.clock.now_ms(), street_deadline_ms) else {
-        let stage = core.stage();
-        return not_started(core, UnsupportedReason::DeadlineExceeded { stage });
-    };
-    core.set_stage("building");
-    let req = request(core, input, plan, &b, deadline_ms);
-    // The first attempt: its terminal's arrival is published to the request's street deadline at receipt.
-    let (end, first_terminal_ms) = run_attempt(core, plan, sink, &req, Some(&plan.street_deadline));
-    if let AttemptEnd::Result { status: status @ (ResultStatus::Ok | ResultStatus::BestSoFar), solution: Some(sol), .. } = end {
+    // §12: a solve is never retried on the template it failed on.
+    assert!(plan.retry_template_id.as_deref() != Some(plan.template_id.as_str()), "the retry template {:?} is the solve's own", plan.template_id);
+    // Every failure, with the street verdict judged at the return from the first attempt's terminal arrival.
+    let fail = |core: &EngineCore, reason: UnsupportedReason, template: &str, restarts: u8, first_terminal_ms: Option<u64>| {
         let violated = street_violated(street_deadline_ms, first_terminal_ms, core.clock.now_ms());
-        let refused = |core: &EngineCore, reason: UnsupportedReason| failed(core, t_start, reason, input, &template, 0, violated, first_terminal_ms);
-        let paths = match validate(&b, plan, &sol) { Ok(paths) => paths, Err(e) => return refused(core, engine_error(format!("invalid solution: {e}"), false)) };
-        let terminal = match terminal_for(status, sol.exploitability_chips, b.pot, input.target_bp) { Ok(terminal) => terminal, Err(reason) => return refused(core, reason) };
-        // Identity and expiry again before the success is exposed: the checks after the receive held when the result
-        // was observed, and validation can take the client past the watchdog's fire (ruling 22-I1).
-        if let Some(end) = ended_at(core, plan, core.clock.now_ms(), None) {
-            let (reason, _retry_allowed, _restart) = classify(end, &core.stage());
-            return refused(core, reason);
+        failed(core, t_start, reason, input, template, restarts, violated, first_terminal_ms)
+    };
+    let mut template = plan.template_id.clone();
+    let mut restarts = 0u8;
+    // Before any construction: a decision superseded before its solve starts starts no work (ruling 22-I2).
+    if !core.identity_active(&plan.identity) { return fail(core, superseded(), &template, restarts, None); }
+    let mut b = match build_tree_full(&input.root, &TemplateSelection::from_history(&template, &input.root.history)) {
+        Ok(b) => b,
+        Err(r) => return fail(core, r, &template, restarts, None),
+    };
+    // No live worker (a restart that failed earlier, a kill): one relaunch before anything is sent (review P2T22R).
+    if core.worker.ready().is_none() {
+        restarts += 1;
+        if let Err(e) = core.worker.restart() {
+            return fail(core, engine_error(format!("worker not ready: no live worker, and relaunching it failed: {e}"), true), &template, restarts, None);
         }
-        return succeeded(core, t_start, &b, &template, sol, paths, terminal, violated, 0, first_terminal_ms);
     }
-    let (reason, _retry_allowed, restart) = classify(end, &core.stage());
-    if restart { let _ = core.worker.restart(); }
-    let violated = street_violated(street_deadline_ms, first_terminal_ms, core.clock.now_ms());
-    failed(core, t_start, reason, input, &template, u8::from(restart), violated, first_terminal_ms)
+    if let Err(reason) = ready_for_requests(core) { return fail(core, reason, &template, restarts, None); }
+    // The first attempt's terminal arrival (ruling 22-I4): a retry's never replaces it.
+    let mut first_terminal_ms = None;
+    for attempt_no in 0..2u8 {
+        // §7: the first attempt has until the street deadline, the retry until final delivery.
+        let until_ms = if attempt_no == 0 { street_deadline_ms } else { plan.deadlines.final_delivery_ms };
+        let Some(deadline_ms) = plan.deadlines.worker_deadline_ms(core.clock.now_ms(), until_ms) else {
+            let stage = core.stage();
+            return fail(core, UnsupportedReason::DeadlineExceeded { stage }, &template, restarts, first_terminal_ms);
+        };
+        // Advances only: a retry that starts at Building never rewinds the stage the first attempt reached.
+        core.set_stage("building");
+        let req = request(core, input, plan, &b, deadline_ms);
+        // Only the first attempt publishes its terminal's arrival to the request's street deadline.
+        let (end, terminal_ms) = run_attempt(core, plan, sink, &req, (attempt_no == 0).then_some(plan.street_deadline.as_ref()));
+        if attempt_no == 0 { first_terminal_ms = terminal_ms; }
+        if let AttemptEnd::Result { status: status @ (ResultStatus::Ok | ResultStatus::BestSoFar), solution: Some(sol), .. } = end {
+            let violated = street_violated(street_deadline_ms, first_terminal_ms, core.clock.now_ms());
+            let refused = |core: &EngineCore, reason: UnsupportedReason| failed(core, t_start, reason, input, &template, restarts, violated, first_terminal_ms);
+            let paths = match validate(&b, plan, &sol) { Ok(paths) => paths, Err(e) => return refused(core, engine_error(format!("invalid solution: {e}"), false)) };
+            let terminal = match terminal_for(status, sol.exploitability_chips, b.pot, input.target_bp) { Ok(terminal) => terminal, Err(reason) => return refused(core, reason) };
+            // Identity and expiry again before the success is exposed: the checks after the receive held when the
+            // result was observed, and validation can take the client past the watchdog's fire (ruling 22-I1).
+            if let Some(end) = ended_at(core, plan, core.clock.now_ms(), Watch::AfterTerminal) {
+                let (reason, _retry_allowed, _restart) = classify(end, &core.stage());
+                return refused(core, reason);
+            }
+            return succeeded(core, t_start, &b, &template, sol, paths, terminal, violated, restarts, first_terminal_ms);
+        }
+        match end {
+            // A job the worker may still be running is cancelled (§7/§12); before the send nothing was sent, and once
+            // its terminal arrived there is nothing left to cancel.
+            AttemptEnd::Superseded { running } => {
+                if running && cancel_or_kill(core, &req.id) { restarts += 1; }
+                return fail(core, superseded(), &template, restarts, first_terminal_ms);
+            }
+            // The watchdog delivers the `Final` (§7); the cleanup after it is `serve_request`'s, not the client's.
+            AttemptEnd::DeadlinePassed => {
+                let stage = core.stage();
+                return fail(core, UnsupportedReason::DeadlineExceeded { stage }, &template, restarts, first_terminal_ms);
+            }
+            _ => {}
+        }
+        let (reason, retry_allowed, restart) = classify(end, &core.stage());
+        if restart {
+            restarts += 1;
+            if let Err(e) = core.worker.restart() { return fail(core, restart_failed(reason, &e), &template, restarts, first_terminal_ms); }
+            // §12: the restarted worker's `ready` is validated again before anything more is sent to it.
+            if let Err(refused) = ready_for_requests(core) { return fail(core, refused, &template, restarts, first_terminal_ms); }
+        }
+        // §12: one retry, after the first attempt only, on the `_min` template, if the failure allows one.
+        let retry = match plan.retry_template_id.as_deref() {
+            Some(retry) if attempt_no == 0 && retry_allowed => retry,
+            _ => return fail(core, reason, &template, restarts, first_terminal_ms),
+        };
+        // §7: admitted only if what is left covers the `_min` p95 and every margin.
+        let p95_ms = min_template_p95_ms(&plan.deadlines);
+        if !retry_admitted(core.clock.now_ms(), plan.deadlines.final_delivery_ms, p95_ms, plan.deadlines.extraction_margin_ms) {
+            return fail(core, reason, &template, restarts, first_terminal_ms);
+        }
+        // A decision superseded meanwhile (during a restart, say) starts no retry: nothing is built or sent (ruling 22-I2).
+        if !core.identity_active(&plan.identity) { return fail(core, superseded(), &template, restarts, first_terminal_ms); }
+        template = retry.to_string();
+        b = match build_tree_full(&input.root, &TemplateSelection::from_history(&template, &input.root.history)) {
+            Ok(b) => b,
+            Err(r) => return fail(core, r, &template, restarts, first_terminal_ms),
+        };
+    }
+    unreachable!("run_solve: the retry (attempt 1) always returns")
 }
 
 #[cfg(test)]
