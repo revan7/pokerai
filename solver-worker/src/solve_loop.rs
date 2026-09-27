@@ -42,7 +42,9 @@ pub enum LoopSite { Boundary(u32), Stepped(u32), Measured(u32), Iteration(u32), 
 /// deterministically against scripted costs and a fake clock (`testutil::FakeOps`), never a real
 /// solve and never a timed sleep. `run` is the only production caller, via `RealOps`.
 trait LoopOps {
-    fn elapsed_ms(&self) -> f64;
+    /// The loop's clock: milliseconds since the job started. `&mut self` so `RealOps` can pass each reading
+    /// through `run`'s `clock` seam.
+    fn elapsed_ms(&mut self) -> f64;
     fn run_iteration(&mut self, iteration: u32) -> f64;
     fn measure_exploitability(&mut self) -> (f32, f64);
     /// Called immediately before each poll and each operation (`LoopSite`); it neither polls nor decides
@@ -50,10 +52,10 @@ trait LoopOps {
     fn at_site(&mut self, _at: LoopSite) {}
 }
 
-struct RealOps<'g, 'h> { game: &'g PostFlopGame, started: Instant, at_site: &'h mut dyn FnMut(LoopSite) }
+struct RealOps<'g, 'h> { game: &'g PostFlopGame, started: Instant, at_site: &'h mut dyn FnMut(LoopSite), clock: &'h mut dyn FnMut(f64) -> f64 }
 impl LoopOps for RealOps<'_, '_> {
     fn at_site(&mut self, at: LoopSite) { (self.at_site)(at) }
-    fn elapsed_ms(&self) -> f64 { self.started.elapsed().as_secs_f64() * 1000.0 }
+    fn elapsed_ms(&mut self) -> f64 { (self.clock)(self.started.elapsed().as_secs_f64() * 1000.0) }
     fn run_iteration(&mut self, iteration: u32) -> f64 {
         let t = Instant::now();
         solve_step(self.game, iteration);
@@ -67,9 +69,13 @@ impl LoopOps for RealOps<'_, '_> {
 }
 
 /// The §7 loop on `game`. `at_site` is called immediately before each of its cancel polls and each of its
-/// operations (`LoopSite`); the job passes its hooks' `loop_site`, a no-op in production.
-pub fn run(game: &PostFlopGame, p: &LoopParams, cancel: &AtomicBool, progress: impl FnMut(u32, Option<f32>), at_site: &mut dyn FnMut(LoopSite)) -> LoopOutcome {
-    let mut ops = RealOps { game, started: p.started, at_site };
+/// operations (`LoopSite`); the job passes its hooks' `loop_site`, a no-op in production. `clock` receives each
+/// reading of the loop's clock (milliseconds since `p.started`) and returns the reading the loop compares with the
+/// deadline; the job passes its hooks' `loop_clock`, the identity in production (P2.T17 fix round 1: a test places the
+/// stop point by moving this clock while the job is held, never by racing the solver). The measured step and
+/// measurement costs stay real.
+pub fn run(game: &PostFlopGame, p: &LoopParams, cancel: &AtomicBool, progress: impl FnMut(u32, Option<f32>), at_site: &mut dyn FnMut(LoopSite), clock: &mut dyn FnMut(f64) -> f64) -> LoopOutcome {
+    let mut ops = RealOps { game, started: p.started, at_site, clock };
     run_loop(&mut ops, p.deadline_ms as f64, p.extraction_margin_ms as f64, p.target_chips, cancel, progress)
 }
 
@@ -195,7 +201,7 @@ mod testutil {
     }
 
     impl LoopOps for FakeOps<'_> {
-        fn elapsed_ms(&self) -> f64 { self.clock_ms.get() }
+        fn elapsed_ms(&mut self) -> f64 { self.clock_ms.get() }
         fn run_iteration(&mut self, _iteration: u32) -> f64 {
             let call = self.step_calls.get() + 1;
             self.step_calls.set(call);
