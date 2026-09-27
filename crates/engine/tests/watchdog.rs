@@ -61,6 +61,17 @@ fn ended(wd: &Arc<Watchdog>, n: u64) {
 fn received<T>(rx: &mpsc::Receiver<T>, what: &str) -> T {
     rx.recv_timeout(ACK_LIVENESS).unwrap_or_else(|e| panic!("{what}: no acknowledgement within the {ACK_LIVENESS:?} liveness bound ({e})"))
 }
+/// Runs `Watchdog::disarm` through the acknowledgement bound (ruling 20-A): a watchdog that mishandles the generation
+/// lock fails the test naming this acknowledgement, instead of hanging the gate on an unbounded call.
+fn disarmed(wd: &Arc<Watchdog>) {
+    let wd = wd.clone();
+    acknowledged_within("Watchdog::disarm returned (the generation lock was free)", ACK_LIVENESS, move || wd.disarm());
+}
+/// Runs `Watchdog::arm` through the acknowledgement bound (ruling 20-A), for the same reason as `disarmed`.
+fn armed_on(wd: &Arc<Watchdog>, a: Armed) {
+    let wd = wd.clone();
+    acknowledged_within("Watchdog::arm returned (the generation lock was free)", ACK_LIVENESS, move || wd.arm(a));
+}
 
 #[test]
 fn watchdog_emits_final_at_delivery_minus_100ms() {
@@ -93,7 +104,7 @@ fn watchdog_disarm_retires_the_generation() {
     let (a, _delivered, street) = armed(sink, "solving");
     street.terminal_arrived(0);
     wd.arm(a);
-    wd.disarm();
+    disarmed(&wd);
     clock.set_ms(20_000);
     ended(&wd, 1); // the retired thread woke at the street deadline and ended
     assert!(events.recorded().is_empty(), "a retired generation emits nothing");
@@ -108,7 +119,7 @@ fn a_retired_generation_records_no_street_deadline() {
     let (a, _delivered, street) = armed(sink, "solving");
     wd.arm(a);
     clock.wait_for_waiter(2_000);
-    wd.disarm();
+    disarmed(&wd);
     clock.set_ms(20_000);
     ended(&wd, 1);
     assert!(events.recorded().is_empty(), "a retired generation emits nothing");
@@ -262,7 +273,7 @@ fn arming_retires_the_previous_generation() {
     let (first, first_delivered, first_street) = armed(sink.clone(), "building");
     let (second, second_delivered, second_street) = armed(sink, "solving");
     wd.arm(first);
-    wd.arm(second);
+    armed_on(&wd, second);
     clock.set_ms(14_900);
     ended(&wd, 2); // the retired first thread and the fired second one
     let ev = events.recorded();
@@ -372,18 +383,17 @@ fn disarm_returns_only_after_a_fire_in_progress_has_emitted() {
     received(&entered_rx, "the fire entered emit"); // it stays there until released
     assert!(wd.retirement_would_block(), "a fire holds the generation lock through its emission, so a disarm now blocks");
     let (calling_tx, calling_rx) = mpsc::channel();
-    std::thread::scope(|s| {
-        let (wd, order) = (&wd, &order);
-        // Moved in, so a failed acknowledgement below drops it and frees the fire before the scope joins the disarm.
-        let release_tx = release_tx;
-        s.spawn(move || {
-            calling_tx.send(()).unwrap();
-            wd.disarm();
-            order.lock().unwrap().push("disarm returned");
-        });
-        received(&calling_rx, "the disarm thread is calling disarm while the fire is still emitting");
-        release_tx.send(()).unwrap();
+    let (returned_tx, returned_rx) = mpsc::channel();
+    let (wd_thread, order_thread) = (wd.clone(), order.clone());
+    std::thread::spawn(move || {
+        calling_tx.send(()).unwrap();
+        wd_thread.disarm();
+        order_thread.lock().unwrap().push("disarm returned");
+        returned_tx.send(()).unwrap();
     });
+    received(&calling_rx, "the disarm thread is calling disarm while the fire is still emitting");
+    release_tx.send(()).unwrap();
+    received(&returned_rx, "disarm returned after the fire's emission");
     assert_eq!(*order.lock().unwrap(), ["emitted", "disarm returned"], "disarm returned while a fire of the generation it retires was still emitting");
     ended(&wd, 1);
     assert_eq!(events.recorded().len(), 1, "the fire that began before the disarm completes, once");
