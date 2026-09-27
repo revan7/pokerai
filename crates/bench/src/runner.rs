@@ -54,7 +54,7 @@ pub struct SpotResult {
     pub memory_bytes: u64,
     pub peak_ws_bytes: u64,
     pub mode: String,
-    /// `street_violation(street, wall_ms, at_target)`.
+    /// `street_violation(street, wall_ms, status, at_target)`.
     pub street_violation: bool,
     /// The terminal arrived after the §7 final delivery.
     pub final_violation: bool,

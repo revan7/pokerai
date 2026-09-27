@@ -256,7 +256,7 @@ mod tests {
             memory_bytes: 1 << 20,
             peak_ws_bytes: 2 << 20,
             mode: "f32".into(),
-            street_violation: wall > 2000 || !at_target,
+            street_violation: wall > 2000 || ((status == "ok" || status == "best_so_far") && !at_target),
             final_violation: wall > 15000,
         }
     }
@@ -301,7 +301,7 @@ mod tests {
             cells(&rep.to_markdown(), "river_std")
         };
         // all failed
-        let c = render(vec![r(5, "error", 0), r(7, "error", 0), r(6, "cancelled", 0)]);
+        let c = render(vec![r(5, "error", 0), r(7, "error", 0), r(6, "error", 0)]);
         assert_eq!(c[3], "n/a (0 of 3 at target)");
         assert_eq!(c[2], "p50 6 ms / p95 7 ms / max 7 ms", "wall time of a failed row is still measured");
         // all best_so_far
@@ -318,7 +318,7 @@ mod tests {
         assert_eq!(render(vec![r(7, "ok", 30)])[3], "p50 7 ms / p95 7 ms (1 of 1 at target)");
         assert_eq!(render(vec![r(0, "ok", 30)])[3], "p50 0 ms / p95 0 ms (1 of 1 at target)");
         // mixed
-        let c = render(vec![r(10, "ok", 30), r(2_500, "best_so_far", 90), r(50, "error", 0), r(30, "ok", 30), r(40, "cancelled", 0)]);
+        let c = render(vec![r(10, "ok", 30), r(2_500, "best_so_far", 90), r(50, "error", 0), r(30, "ok", 30), r(40, "error", 0)]);
         assert_eq!(c[3], "p50 10 ms / p95 30 ms (2 of 5 at target)");
     }
 
