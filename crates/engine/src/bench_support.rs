@@ -286,6 +286,85 @@ pub fn verify_source_lock(lock: &SourceLock, charts_dir: &std::path::Path) -> Re
     Ok(())
 }
 
+// --- Task 19: the fifty recorded e2e hands (`fixtures/hands/e2e/001.json`..`050.json` +
+// `manifest.json`, generated and frozen by `tools/gen_fixtures.py e2e` from `tools/e2e_hands.py`)
+// ---
+//
+// This is the Rust-side benchmark input format (Task 21 translates it into proto's actual wire
+// commands); it intentionally does not depend on `proto`'s JSON field layout. Hero's cards are
+// carried on `hero_cards` for hero-combo equity and terminal calculations only -- `load_records`
+// never derives a public range or cache key from a record, and this module has no way to.
+
+/// One event of a recorded hand's history: either an action (`seat`/`street`/`action` present,
+/// `cards` absent) or a board deal (`cards` present, the rest absent). `action` is kept as raw
+/// JSON (`{"kind": ..., "to": ...}`) -- Task 21 maps it into proto's action wire type; this crate
+/// does not need to interpret it to load and hash-verify the record.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct RecordedEvent {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub seat: Option<u8>,
+    pub street: Option<String>,
+    pub action: Option<serde_json::Value>,
+    pub cards: Option<String>,
+}
+
+/// One recorded e2e hand, exactly `tools/e2e_hands.py::records()`'s per-record v1 schema. `config`
+/// and `expected` are kept as raw JSON (nested shapes Task 21/26 read field-by-field); everything
+/// else is typed because `load_records`'s callers need it directly (seat count, stacks, hero seat
+/// and cards, the event list to replay).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct RecordedHand {
+    pub id: String,
+    pub version: u16,
+    pub config: serde_json::Value,
+    pub button: u8,
+    pub dealt: Vec<u8>,
+    pub stacks: Vec<u32>,
+    pub hero: u8,
+    pub hero_cards: String,
+    pub events: Vec<RecordedEvent>,
+    pub fault: Option<String>,
+    pub class: String,
+    pub expected: serde_json::Value,
+}
+
+/// Loads `fixtures/hands/e2e/001.json`..`050.json`, verifying every file's sha256 against
+/// `manifest.json` before returning any of them -- a byte drift (a hand hand-edited outside the
+/// generator, or a stale copy left over from a partial regeneration) is an error, never a silent
+/// load of mismatched data. The manifest itself is not a hand: this loads exactly 50 records, in
+/// `001`..`050` order, regardless of the manifest's own key order.
+pub fn load_records(dir: &std::path::Path) -> Result<Vec<RecordedHand>, String> {
+    use sha2::Digest;
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("manifest.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let hashes = manifest["sha256"]
+        .as_object()
+        .ok_or_else(|| "manifest.json has no 'sha256' object".to_string())?;
+    if hashes.len() != 50 {
+        return Err(format!("expected 50 records, found {}", hashes.len()));
+    }
+    let mut out = Vec::new();
+    for n in 1..=50 {
+        let name = format!("{n:03}.json");
+        let raw = std::fs::read(dir.join(&name)).map_err(|e| format!("{name}: {e}"))?;
+        let expected = hashes
+            .get(&name)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{name}: no hash in manifest.json"))?;
+        let actual = hex::encode(sha2::Sha256::digest(&raw));
+        if actual != expected {
+            return Err(format!("{name} does not match the frozen hash in manifest.json"));
+        }
+        out.push(
+            serde_json::from_slice::<RecordedHand>(&raw).map_err(|e| format!("{name}: {e}"))?,
+        );
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +375,112 @@ mod tests {
         let r = prepared_range("AA,KK", &board).unwrap();
         assert_eq!((range_mass(&r) * 1000.0).round() as u32, 9000);   // 6 aces + 3 kings (Kh is on the board)
         assert!(prepared_range("not a range", &board).is_err());
+    }
+}
+
+#[cfg(test)]
+mod recorded_hand_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    /// A fresh, uniquely-tagged directory, mirroring `source_lock_tests::temp_dir` above.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pokerai_recorded_hand_tests_{}_{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A minimal, structurally valid `RecordedHand` JSON document for record `id` -- every field
+    /// `RecordedHand` requires, values that do not need to mean anything beyond deserializing.
+    fn minimal_record_json(id: &str) -> Vec<u8> {
+        format!(
+            r#"{{"id":"{id}","version":1,"config":{{}},"button":0,"dealt":[0,1,2,3,4,5],
+                "stacks":[10000,10000,10000,10000,10000,10000],"hero":2,"hero_cards":"6s6h",
+                "events":[{{"type":"board","cards":"Kh7d2c"}}],"fault":null,"class":"hu_flop_srp",
+                "expected":{{"numeric_ev":true}}}}"#
+        )
+        .into_bytes()
+    }
+
+    /// Writes a manifest whose `sha256` map has exactly 50 entries (`001.json`..`050.json`), all
+    /// but any names in `overrides` mapped to a filler hash string that this function never
+    /// verifies against real file bytes -- callers that need loading to succeed past a given
+    /// record must instead provide that record's real hash via `overrides`.
+    fn write_manifest_50(dir: &Path, overrides: &std::collections::HashMap<String, String>) {
+        let mut hashes = serde_json::Map::new();
+        for n in 1..=50u32 {
+            let name = format!("{n:03}.json");
+            let hash = overrides.get(&name).cloned().unwrap_or_else(|| "0".repeat(64));
+            hashes.insert(name, serde_json::Value::String(hash));
+        }
+        let manifest = serde_json::json!({"version": 1, "synthetic": true, "sha256": hashes});
+        std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+    }
+
+    #[test]
+    fn load_records_reads_the_committed_fifty() {
+        let records = load_records(&repo_root().join("fixtures/hands/e2e")).unwrap();
+        assert_eq!(records.len(), 50);
+        assert_eq!(records[0].id, "001");
+        assert_eq!(records[49].id, "050");
+        assert!(records.iter().all(|r| r.version == 1));
+        assert!(records.iter().all(|r| r.dealt.len() == 6 && r.stacks.len() == 6));
+        let numeric = records
+            .iter()
+            .filter(|r| r.expected.get("numeric_ev") == Some(&serde_json::Value::Bool(true)))
+            .count();
+        assert_eq!(numeric, 22);
+        // hero's cards are carried on the record only -- confirms the field exists and is never
+        // itself a range/key type that could be mistaken for one.
+        assert!(records.iter().all(|r| r.hero_cards.len() == 4));
+    }
+
+    #[test]
+    fn load_records_rejects_a_manifest_with_the_wrong_record_count() {
+        let dir = temp_dir("wrong_count");
+        let mut hashes = serde_json::Map::new();
+        hashes.insert("001.json".into(), serde_json::Value::String("0".repeat(64)));
+        let manifest = serde_json::json!({"version": 1, "sha256": hashes});
+        std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+        let err = load_records(&dir).unwrap_err();
+        assert!(err.contains("expected 50 records, found 1"), "{err}");
+    }
+
+    #[test]
+    fn load_records_rejects_a_file_that_does_not_match_its_frozen_hash() {
+        let dir = temp_dir("bad_hash");
+        write_manifest_50(&dir, &std::collections::HashMap::new());
+        std::fs::write(dir.join("001.json"), minimal_record_json("001")).unwrap();
+        let err = load_records(&dir).unwrap_err();
+        assert!(err.contains("001.json does not match the frozen hash"), "{err}");
+    }
+
+    #[test]
+    fn load_records_rejects_a_missing_file() {
+        use sha2::Digest;
+        let dir = temp_dir("missing_file");
+        let raw = minimal_record_json("001");
+        let hash = hex::encode(sha2::Sha256::digest(&raw));
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("001.json".to_string(), hash);
+        write_manifest_50(&dir, &overrides);
+        std::fs::write(dir.join("001.json"), &raw).unwrap();
+        // 002.json is declared in the manifest (with a filler hash) but never written.
+        let err = load_records(&dir).unwrap_err();
+        assert!(err.contains("002.json"), "{err}");
+    }
+
+    #[test]
+    fn load_records_rejects_a_manifest_missing_the_sha256_object() {
+        let dir = temp_dir("no_sha256");
+        std::fs::write(dir.join("manifest.json"), r#"{"version":1}"#).unwrap();
+        let err = load_records(&dir).unwrap_err();
+        assert!(err.contains("sha256"), "{err}");
     }
 }
 

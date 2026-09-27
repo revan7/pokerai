@@ -1,0 +1,170 @@
+{
+  "button": 0,
+  "class": "hu_river",
+  "config": {
+    "bb_chips": 100,
+    "flop_budget_s": 10,
+    "rake": {
+      "cap_mchips": 50000,
+      "no_flop_no_drop": true,
+      "rate": 0.05
+    },
+    "sb_chips": 50,
+    "straddle": null,
+    "target_bp": 50,
+    "threads": 16
+  },
+  "dealt": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "events": [
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "seat": 3,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "seat": 4,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "seat": 5,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "raise",
+        "to": 250
+      },
+      "seat": 0,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "seat": 1,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "call"
+      },
+      "seat": 2,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "cards": "8s8d3c",
+      "type": "board"
+    },
+    {
+      "action": {
+        "kind": "check"
+      },
+      "seat": 2,
+      "street": "flop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "bet",
+        "to": 275
+      },
+      "seat": 0,
+      "street": "flop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "call"
+      },
+      "seat": 2,
+      "street": "flop",
+      "type": "action"
+    },
+    {
+      "cards": "8s8d3c4d",
+      "type": "board"
+    },
+    {
+      "action": {
+        "kind": "check"
+      },
+      "seat": 2,
+      "street": "turn",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "check"
+      },
+      "seat": 0,
+      "street": "turn",
+      "type": "action"
+    },
+    {
+      "cards": "8s8d3c4d2s",
+      "type": "board"
+    },
+    {
+      "action": {
+        "kind": "check"
+      },
+      "seat": 2,
+      "street": "river",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "allin",
+        "to": 19475
+      },
+      "seat": 0,
+      "street": "river",
+      "type": "action"
+    }
+  ],
+  "expected": {
+    "coverage": "Approximate",
+    "flop_miss_accuracy": null,
+    "numeric_ev": true,
+    "required_reasons": [
+      "ChartRounded",
+      "RakeProfileMapped",
+      "UnconditionedPriorStreet"
+    ],
+    "unsupported": null
+  },
+  "fault": null,
+  "hero": 2,
+  "hero_cards": "6s6h",
+  "id": "020",
+  "stacks": [
+    20000,
+    20000,
+    20000,
+    20000,
+    20000,
+    20000
+  ],
+  "version": 1
+}

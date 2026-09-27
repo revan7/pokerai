@@ -16,6 +16,7 @@ import json
 import random
 import sys
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 from pokerkit import Automation, Mode, NoLimitTexasHoldem
@@ -40,6 +41,7 @@ CONFIGS = [(1, 2, None, 3, 6), (1, 2, 4, 6, 6), (2, 5, 10, 6, 6), (2, 5, None, 3
 STACK_BB = [7, 8.5, 12.5, 20, 30, 50, 100, 150, 200]
 FOLD_P, WAGER_P, ALLIN_P = 0.25, 0.30, 0.06
 STREETS = ["preflop", "flop", "turn", "river"]
+STREET_INDEX = {street: i for i, street in enumerate(STREETS)}
 RANKS = "23456789TJQKA"
 SUITS = "cdhs"
 DECK = [r + s for r in RANKS for s in SUITS]
@@ -102,6 +104,118 @@ def spec_may_aggress(state, reopen: SpecReopen, i: int) -> bool:
     if state.stacks[i] + state.bets[i] <= facing or not reopen.may_raise(i):
         return False
     return any(j != i and state.statuses[j] and state.stacks[j] + state.bets[j] > facing for j in range(len(state.stacks)))
+
+
+# --- Plan 4 Task 19: PokerKit adapter for the fifty recorded e2e hands (`tools/e2e_hands.py`) ---
+
+
+def _board_cards_from_events(events: list) -> list[str]:
+    """The final dealt board of an event history (0, 3, 4 or 5 cards), split into two-character
+    cards. `events` may be a record's full history (`e2e_hands.records()`'s `events` field) or any
+    prefix of it that still contains every `board` event dealt so far."""
+    boards = [e["cards"] for e in events if e["type"] == "board"]
+    final = boards[-1] if boards else ""
+    return [final[i:i + 2] for i in range(0, len(final), 2)]
+
+
+@dataclass
+class Trace:
+    """The result of replaying one e2e record's complete event history through PokerKit: the
+    final `pokerkit` state, its seating ring (SB first, button last, the same order PokerKit's
+    `actor_index` indexes into), whether every step compared legal (see `replay_record`), and the
+    seat to act when the replay stops (`None` at a terminal street -- a fold-out, an all-in
+    runout, or showdown)."""
+
+    state: object
+    ring: list[int]
+    legal_at_every_step: bool
+    final_actor: int | None
+
+
+def replay_record(record: dict) -> Trace:
+    """Plan 1's PokerKit adapter, extended by Task 19: replays one `e2e_hands.records()` row's
+    complete event history through PokerKit (the plan-1 oracle for legal actions, pots, stacks and
+    refunds), comparing the legal actor, pot, committed amounts, stacks and board at every step.
+    Straddle and projection records are replayed as real, legal sequences first -- no record gets
+    a pass because it is "just a projection" or "just a straddle" case.
+
+    Fails loudly (`AssertionError`, naming the record id and event) on any illegal action (a wager
+    outside PokerKit's `[min_to, max_to)`, a check facing a bet, an all-in that is not the whole
+    stack, a fold with nothing owed, the wrong actor or street, a board dealt mid-street) and on
+    any PokerKit/spec-4.3 reopening divergence -- so `legal_at_every_step` is `True` on every
+    `Trace` this function actually returns; it never returns a `Trace` for an illegal replay.
+    """
+    cfg = record["config"]
+    button = record["button"]
+    ring = [s for s in ((button + k) % 6 for k in range(1, 7)) if s in record["dealt"]]
+    n = len(ring)
+    straddle = cfg["straddle"]
+    blinds = [cfg["sb_chips"], cfg["bb_chips"]] + ([straddle] if straddle else [])
+    blinds += [0] * (n - len(blinds))
+    state = NoLimitTexasHoldem.create_state(
+        AUTOMATIONS, False, 0, blinds, cfg["bb_chips"], [record["stacks"][s] for s in ring], n,
+        mode=Mode.CASH_GAME)
+    hero_index = ring.index(record["hero"])
+    used = {record["hero_cards"][:2], record["hero_cards"][2:]} | set(_board_cards_from_events(record["events"]))
+    spare = [c for c in DECK if c not in used]
+    for i in range(n):
+        _deal(state.deal_hole, record["hero_cards"] if i == hero_index else spare.pop() + spare.pop())
+    assert "".join(repr(c) for c in state.hole_cards[hero_index]) == record["hero_cards"], record["id"]
+    if straddle:
+        # the first full raise over a straddle is one straddle (min open 2S), as in generate_hand
+        state.completion_betting_or_raising_amount = straddle
+    reopen = SpecReopen(n, straddle or cfg["bb_chips"], max(state.bets))
+    board_so_far = ""
+    for k, e in enumerate(record["events"]):
+        where = f"record {record['id']} event {k} {e}"
+        if e["type"] == "board":
+            assert state.actor_index is None and state.can_deal_board(), where
+            assert e["cards"].startswith(board_so_far), where
+            new = e["cards"][len(board_so_far):]
+            assert len(new) == (6 if not board_so_far else 2), where
+            _deal(state.deal_board, new)
+            reopen.start_street(cfg["bb_chips"], 0)
+            board_so_far = e["cards"]
+            continue
+        i = state.actor_index
+        assert i is not None and ring[i] == e["seat"], where
+        assert state.street_index == STREET_INDEX[e["street"]], where
+        legal = legal_triple(state)
+        assert (legal["raise"] is not None) == spec_may_aggress(state, reopen, i), f"reopening divergence at {where}"
+        kind, to = e["action"]["kind"], e["action"].get("to")
+        facing = max(state.bets)
+        aggression = None
+        if kind == "fold":
+            assert to is None and legal["fold"], f"illegal fold at {where}: {legal}"
+            state.fold()
+        elif kind == "check":
+            assert to is None and legal["check_or_call"] == {"cost": 0}, f"illegal check at {where}: {legal}"
+            state.check_or_call()
+        elif kind == "call":
+            cc = legal["check_or_call"]
+            assert to is None and cc is not None and cc["cost"] > 0, f"illegal call at {where}: {legal}"
+            state.check_or_call()
+        elif kind in ("bet", "raise"):
+            assert (facing == 0) == (kind == "bet"), f"{kind} while facing {facing} at {where}"
+            rz = legal["raise"]
+            assert rz is not None and rz["min_to"] <= to < rz["max_to"], f"illegal {kind} to {to} at {where}: {legal}"
+            state.complete_bet_or_raise_to(to)
+            aggression = to
+        elif kind == "allin":
+            assert to == state.bets[i] + state.stacks[i], f"all-in to {to} is not the whole stack at {where}"
+            if to > facing:
+                assert legal["raise"] is not None and legal["raise"]["max_to"] == to, f"illegal all-in at {where}: {legal}"
+                state.complete_bet_or_raise_to(to)
+                aggression = to
+            else:
+                cc = legal["check_or_call"]
+                assert cc is not None and cc["cost"] == state.stacks[i], f"illegal all-in call at {where}: {legal}"
+                state.check_or_call()
+        else:
+            raise AssertionError(f"unknown action kind at {where}")
+        reopen.acted(i, aggression)
+    final_actor = ring[state.actor_index] if state.actor_index is not None else None
+    return Trace(state=state, ring=ring, legal_at_every_step=True, final_actor=final_actor)
 
 
 def normalize_pots(state, ring) -> list[dict]:
@@ -307,6 +421,18 @@ def _run_sources(repo: Path, check: bool) -> None:
         print(f"wrote {repo / 'bench/spots/sources.json'}")
 
 
+def _run_e2e(repo: Path, check: bool) -> None:
+    import e2e_hands
+
+    root = repo / "fixtures/hands/e2e"
+    if check:
+        e2e_hands.check_e2e(root)
+        print(f"{root} matches the generator")
+    else:
+        e2e_hands.write_e2e(root)
+        print(f"wrote fixtures/hands/e2e (50 records + manifest) to {root}")
+
+
 # The pre-subcommand-table flat CLI (plan 1), still the documented regeneration command in
 # docs/superpowers/plans/2026-09-10-plan-1-foundation.md:3637,3645,5318 ("tools/gen_fixtures.py
 # --out fixtures/hands"). Task 17's fix round (M1) keeps it working as a compatibility alias for
@@ -323,7 +449,7 @@ def _alias_legacy_flat_hands_command(argv: list[str]) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     # The subcommand table (plan 4 Task 17); `sources` is added here and extended by Task 19
-    # with `worker` and `e2e` (see that task's brief for the shared shape this mirrors).
+    # with `e2e` (see that task's brief for the shared shape this mirrors).
     repo = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(prog="gen_fixtures", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -339,10 +465,19 @@ def main(argv: list[str] | None = None) -> int:
         help="regenerate bench/spots/sources.json in memory and compare bytes instead of writing",
     )
 
+    p_e2e = sub.add_parser("e2e", help="freeze the fifty recorded e2e hand fixtures + manifest")
+    p_e2e.add_argument(
+        "--check", action="store_true",
+        help="regenerate fixtures/hands/e2e in memory and compare bytes instead of writing",
+    )
+
     raw_argv = sys.argv[1:] if argv is None else argv
     args = parser.parse_args(_alias_legacy_flat_hands_command(raw_argv))
     if args.command == "sources":
         _run_sources(repo, args.check)
+        return 0
+    if args.command == "e2e":
+        _run_e2e(repo, args.check)
         return 0
     _run_hands(args)
     return 0
