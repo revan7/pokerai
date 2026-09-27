@@ -147,14 +147,18 @@ impl Reporter {
     }
 }
 
+/// The loop seam: a solve loop receives the game, the loop parameters, the cancel flag, the job's per-report
+/// callback, its per-site callback and its clock, exactly what `solve_loop::run` takes, and returns the loop's outcome.
+pub type LoopSeam<'s> = &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>), &mut dyn FnMut(LoopSite), &mut dyn FnMut(f64) -> f64) -> solve_loop::LoopOutcome;
+
 /// The job's three seams. Production (`run`) passes `Stderr` hooks, the real §7 loop (`real_loop`) and
 /// `win::set_priority_class`; a test records events, scripts a loop's stop over real iterations
 /// (P2.T11 review M1) or records the priority calls (review M2). `solve` receives the game, the loop
 /// parameters, the cancel flag, the job's per-report callback, its per-site callback and its clock, exactly
-/// what `solve_loop::run` takes.
+/// what `solve_loop::run` takes (the `LoopSeam` alias above).
 struct Seams<'s> {
     hooks: &'s mut dyn Hooks,
-    solve: &'s mut dyn FnMut(&PostFlopGame, &solve_loop::LoopParams, &AtomicBool, &mut dyn FnMut(u32, Option<f32>), &mut dyn FnMut(LoopSite), &mut dyn FnMut(f64) -> f64) -> solve_loop::LoopOutcome,
+    solve: LoopSeam<'s>,
     set_priority: &'s mut dyn FnMut(bool),
 }
 
@@ -175,6 +179,15 @@ pub fn run(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl
 /// With `Stderr` it is `run`.
 pub fn run_hooked(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl, hooks: &mut dyn Hooks) -> JobResult {
     run_with(req, staged, ctl, Seams { hooks, solve: &mut real_loop, set_priority: &mut win::set_priority_class })
+}
+
+/// `run_hooked` with the caller's loop in place of the real §7 loop: test support, never called by the worker (the
+/// executor runs `run_hooked`), so it changes no production behaviour. The integration tests use it for a
+/// deterministic solve schedule (P2.T16 review I1, I4, I5: a fixed count of real `solve_step`s, whatever the
+/// machine's speed); everything else is the production job: every Building step, the reporting policy, `finalize`,
+/// the export and self-validation, each reported to `hooks`, and the real priority setter.
+pub fn run_scripted(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl, hooks: &mut dyn Hooks, solve: LoopSeam<'_>) -> JobResult {
+    run_with(req, staged, ctl, Seams { hooks, solve, set_priority: &mut win::set_priority_class })
 }
 
 fn run_with(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobControl, seams: Seams<'_>) -> JobResult {
