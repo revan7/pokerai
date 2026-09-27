@@ -5,8 +5,13 @@
 //! never depends on this crate) and are re-exported here at the crate root.
 
 pub mod branches;
-pub use branches::*; // SeatMass, HistoryBranch, initial, marginal, posterior, condition, rescale, range_output
+pub mod preflop;
+pub mod snapshot;
+pub use branches::*; // SeatMass, HistoryBranch, initial, marginal, posterior, condition, rescale, range_output,
+                     // cap_branches, split_action, residual_reason, stop_branch, missing_reason, zero_reason
+pub use preflop::*; // ReplayInput, ReplayOutput, replay, walk_preflop, apply_preflop_action, query_translated,
+                    // board_mask, block_and_rescale, publish
+pub use snapshot::*; // SnapshotKey, SnapshotProvenance, StreetSnapshot
 // added by later tasks in this plan:
-// pub mod preflop; pub mod postflop; pub mod snapshot;
-// pub use snapshot::*;              // SnapshotKey, SnapshotProvenance, StreetSnapshot,
-//                                   // SnapshotStore, select_snapshot, covered_prefix
+// pub mod postflop;                 // Task 15: walk_postflop
+// snapshot.rs gains SnapshotStore, select_snapshot, covered_prefix (Task 14)
