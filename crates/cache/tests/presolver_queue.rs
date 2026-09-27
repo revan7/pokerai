@@ -1539,3 +1539,993 @@ fn reconciling_an_unbound_item_is_refused() {
     let id = q.next_pending(0).unwrap().identity_hex();
     q.reconcile_item(&id, true);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task 15 (spec section 10.5): the scheduler -- the 30 s idle gate, live pre-emption, the launch
+// path, checkpointed saves, chunked reconciliation and the `presolver` thread -- built on the
+// task 14 queue under the orchestrator's rulings S1-S8 (task 14 re-review, section 4).
+//
+// The scheduler core (`Scheduler`) is driven one iteration at a time against `Fake`, an executor
+// whose clock is a `FakeClock` and whose jobs are scripted `JobPoll`s, so every core test is
+// deterministic and none sleeps. The two thread tests (`Presolver::start`) wait for events the
+// fake executor sends, bounded by a failure budget that only ever cuts a hang short.
+// ---------------------------------------------------------------------------------------------
+
+use cache::presolver::scheduler::{
+    JobPoll, LiveSignal, PreparedJob, PresolveExecutor, Presolver, PresolverCommand, Scheduler, BUSY_PUBLISH_MS, CHECKPOINT_MS,
+    RECONCILE_CHUNK, RECONCILE_PERIOD_MS, RESCAN_MS, TICK_MS,
+};
+use cache::presolver::PresolverStatus;
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
+
+/// Brief step 1, verbatim.
+#[test]
+fn idle_requires_no_hand_and_thirty_seconds() {
+    use cache::presolver::scheduler::eligible;
+    assert!(!eligible(false,false,29_999,0));assert!(eligible(false,false,30_000,0));
+    assert!(!eligible(true,false,60_000,0));assert!(!eligible(false,true,60_000,0));
+    assert!(!eligible(false,false,30_000,30_000));
+}
+
+/// Brief step 1, verbatim.
+#[test]
+fn presolver_status_round_trips_as_json() {
+    // cross-plan Or7: plan 5 renders this struct directly, so it must serialize.
+    let status=cache::presolver::scheduler::PresolverStatus{paused:true,
+        running:Some("t1-100bb-Btn-open-Bb-call".into()),pending:7,done:2,failed:1,
+        tier_done:[2,0,0],tier_total:[7020,14040,21060],measured_p50_s:Some(27.0),
+        estimated_remaining_s:Some(189.0),scenario_hits:vec![("t1-100bb-Btn-open-Bb-call".into(),3,10)]};
+    let text=serde_json::to_string(&status).unwrap();
+    let back:cache::presolver::scheduler::PresolverStatus=serde_json::from_str(&text).unwrap();
+    assert_eq!(status,back);
+    assert!(text.contains("\"tier_total\":[7020,14040,21060]"));
+    // the parent path Plan 5 and Engine::presolver_status name resolves to the same type
+    let parent:cache::presolver::PresolverStatus=status.clone();
+    assert_eq!(parent,status);
+    assert_eq!(cache::presolver::remaining_seconds(7,Some(27.0)),Some(189.0));
+}
+
+/// Brief step 5, verbatim.
+#[test]
+fn live_request_cancels_background_before_new_launch() {
+    use cache::presolver::scheduler::{next_action,ScheduleAction};
+    assert!(matches!(next_action(Some(7),true,true),ScheduleAction::Cancel(7)));
+    assert!(matches!(next_action(Some(7),false,true),ScheduleAction::Wait));
+    assert!(matches!(next_action(None,false,true),ScheduleAction::Launch));
+}
+
+/// `PresolverStatus` derives `ts_rs::TS` under the `typescript` feature (cross-plan Or7). It is not
+/// `#[ts(export)]`ed -- that would make every `--features typescript` test run write
+/// `crates/cache/bindings/PresolverStatus.ts` into the tree -- so plan 5 takes the declaration
+/// from `TS::decl` the way `proto::bindings` does; this pins its shape.
+#[cfg(feature = "typescript")]
+#[test]
+fn presolver_status_declares_its_typescript_shape() {
+    use ts_rs::TS;
+    let decl = PresolverStatus::decl(&ts_rs::Config::new().with_large_int("number"));
+    for field in [
+        "paused: boolean",
+        "running: string | null",
+        "pending: number",
+        "tier_total: [number, number, number]",
+        "measured_p50_s: number | null",
+        "scenario_hits: Array<[string, number, number]>",
+    ] {
+        assert!(decl.contains(field), "{field} missing from {decl}");
+    }
+}
+
+impl FakeClock {
+    /// Time passes in one process: both readings move forward by `ms`.
+    fn advance(&self, ms: u64) {
+        self.mono.fetch_add(ms, Ordering::SeqCst);
+        self.unix.fetch_add(ms, Ordering::SeqCst);
+    }
+
+    fn mono(&self) -> u64 {
+        self.mono.load(Ordering::SeqCst)
+    }
+}
+
+/// What the fake executor tells a thread test, which waits for these instead of sleeping.
+#[derive(Debug, PartialEq)]
+enum Event {
+    /// `prepare` was entered (before any gate blocks it).
+    Preparing,
+    Submitted(u64),
+    Cancelled(u64),
+    /// The scheduler computed a status to publish (`scenario_hits` is asked once per publication).
+    Published,
+}
+
+/// The fake executor's state, shared between the test's handle and the scheduler's.
+#[derive(Default)]
+struct FakeState {
+    generation: [u8; 32],
+    /// What successive `poll`s report; `Running` once the script is used up.
+    polls: VecDeque<JobPoll>,
+    /// Whether `store_and_verify` finds the completed entry durable at target.
+    durable: bool,
+    /// The games whose entries are on disk at target.
+    exists: BTreeSet<[u8; 32]>,
+    /// Every game's entry is on disk at target.
+    exists_everywhere: bool,
+    /// Slots whose preparation fails.
+    failing_preparation: BTreeSet<String>,
+    /// Slots whose preparation hands back a key on another board.
+    wrong_board: BTreeSet<String>,
+    submit_error: Option<String>,
+    next_job: u64,
+    /// Every submission: job id, slot id and the job's cancel flag.
+    submitted: Vec<(u64, String, Arc<AtomicBool>)>,
+    cancels: Vec<u64>,
+    /// The binding of every `entry_exists_at_target` question, in order.
+    asked: Vec<GameBinding>,
+    events: Option<mpsc::Sender<Event>>,
+    /// A one-shot gate the next `prepare` blocks on until the test sends on it.
+    gate: Option<mpsc::Receiver<()>>,
+}
+
+#[derive(Clone)]
+struct Fake {
+    state: Arc<Mutex<FakeState>>,
+    clock: FakeClock,
+}
+
+impl Fake {
+    fn new(clock: FakeClock, generation: [u8; 32]) -> Fake {
+        let fake = Fake { state: Arc::default(), clock };
+        fake.state().generation = generation;
+        fake
+    }
+
+    /// The same executor state -- the cache on disk, the scripted worker -- in a new process whose
+    /// clock is `clock`.
+    fn restarted(&self, clock: FakeClock) -> Fake {
+        Fake { state: Arc::clone(&self.state), clock }
+    }
+
+    fn state(&self) -> MutexGuard<'_, FakeState> {
+        self.state.lock().unwrap()
+    }
+
+    fn submitted(&self) -> Vec<(u64, String, Arc<AtomicBool>)> {
+        self.state().submitted.clone()
+    }
+
+    fn slots_submitted(&self) -> Vec<String> {
+        self.state().submitted.iter().map(|(_, slot, _)| slot.clone()).collect()
+    }
+
+    fn cancels(&self) -> Vec<u64> {
+        self.state().cancels.clone()
+    }
+
+    fn script(&self, polls: impl IntoIterator<Item = JobPoll>) {
+        self.state().polls.extend(polls);
+    }
+
+    fn send(&self, event: Event) {
+        if let Some(events) = &self.state().events {
+            let _ = events.send(event); // the test may already have stopped listening
+        }
+    }
+}
+
+/// The game `Fake::prepare` resolves `item` to under `generation`: task 14's `prepared` stand-in
+/// with the generation as the source bundle, so a new generation is a new identity.
+fn game_of(item: &QueueItem, generation: [u8; 32]) -> [u8; 32] {
+    let (key, spr) = prepared(item, &hex(&generation));
+    key.scenario_identity(spr)
+}
+
+/// The shared fixture entry, built once: what a completed fake job hands back.
+fn fixture_entry() -> &'static CacheEntry {
+    static ENTRY: OnceLock<CacheEntry> = OnceLock::new();
+    ENTRY.get_or_init(support::entry)
+}
+
+fn finished() -> JobPoll {
+    JobPoll::Complete(fixture_entry().clone())
+}
+
+/// A background solve input on `board`, shaped like the fixture entry's.
+fn solve_input(board: &[Card]) -> proto::SolveInput {
+    let e = fixture_entry();
+    proto::SolveInput {
+        root: proto::StreetRootSnapshot {
+            street: proto::Street::Flop,
+            board: board.to_vec(),
+            oop: proto::Seat(2),
+            ip: proto::Seat(0),
+            pot_root: e.source.pot,
+            stack_oop_root: e.source.stack_oop,
+            stack_ip_root: e.source.stack_ip,
+            dead_this_street: 0,
+            projected_from: 0,
+            history: vec![],
+            bb_chips: e.source.bb_chips,
+        },
+        ranges: e.source.ranges.clone(),
+        tree: e.tree.clone(),
+        target_bp: TARGET_BP,
+    }
+}
+
+const RAKE: proto::Rake = proto::Rake::PotRake { rate: 0.05, cap_mchips: 5000, no_flop_no_drop: true };
+
+impl PresolveExecutor for Fake {
+    fn clock(&self) -> Box<dyn QueueClock> {
+        Box::new(self.clock.clone())
+    }
+
+    fn generation(&self) -> [u8; 32] {
+        self.state().generation
+    }
+
+    fn prepare(&mut self, item: &QueueItem) -> Result<PreparedJob, String> {
+        self.send(Event::Preparing);
+        let gate = self.state().gate.take();
+        if let Some(gate) = gate {
+            gate.recv().expect("the test releases the gated preparation");
+        }
+        let state = self.state();
+        let id = item.identity_hex();
+        if state.failing_preparation.contains(&id) {
+            return Err(format!("no chart node for {}", item.scenario.id()));
+        }
+        let (mut key, spr) = prepared(item, &hex(&state.generation));
+        if state.wrong_board.contains(&id) {
+            key.canonical_board = canonical_flops_ordered().iter().find(|b| **b != item.board).unwrap().clone();
+        }
+        Ok(PreparedJob { item: item.clone(), input: solve_input(&item.board), rake: RAKE, bb_chips: 2, key, spr })
+    }
+
+    fn submit(&mut self, job: PreparedJob, cancel: Arc<AtomicBool>) -> Result<u64, String> {
+        let id = {
+            let mut state = self.state();
+            if let Some(error) = state.submit_error.clone() {
+                return Err(error);
+            }
+            state.next_job += 1;
+            let id = state.next_job;
+            state.submitted.push((id, job.item.identity_hex(), cancel));
+            id
+        };
+        self.send(Event::Submitted(id));
+        Ok(id)
+    }
+
+    fn poll(&mut self, _job: u64) -> JobPoll {
+        self.state().polls.pop_front().unwrap_or(JobPoll::Running)
+    }
+
+    fn cancel(&mut self, job: u64) {
+        self.state().cancels.push(job);
+        self.send(Event::Cancelled(job));
+    }
+
+    fn store_and_verify(&mut self, item: &QueueItem, _entry: &CacheEntry) -> bool {
+        let mut state = self.state();
+        let game = item.game.expect("a completed job's slot is bound").identity;
+        if state.durable {
+            state.exists.insert(game);
+        }
+        state.durable
+    }
+
+    fn entry_exists_at_target(&mut self, item: &QueueItem) -> bool {
+        let mut state = self.state();
+        let binding = item.game.expect("the scheduler asks only about bound slots");
+        state.asked.push(binding);
+        state.exists_everywhere || state.exists.contains(&binding.identity)
+    }
+
+    fn measured_p50_s(&self) -> Option<f64> {
+        Some(27.0)
+    }
+
+    fn scenario_hits(&self) -> Vec<(String, u64, u64)> {
+        self.send(Event::Published);
+        vec![("t1-100bb-Btn-open-Bb-call".into(), 3, 10)]
+    }
+}
+
+/// A scheduler over the cache root `dir`, driven by `fake`, and the live signal the engine's
+/// admission raises (`Presolver::notify_live_request` / `notify_hand(true)`).
+fn scheduler(dir: &Path, fake: &Fake) -> (Scheduler, LiveSignal) {
+    let live = LiveSignal::default();
+    (Scheduler::open(dir.to_path_buf(), Box::new(fake.clone()), live.clone()).unwrap(), live)
+}
+
+/// Moves the fake clock by `ms`, then runs one scheduler iteration.
+fn tick(s: &mut Scheduler, fake: &Fake, ms: u64) {
+    fake.clock.advance(ms);
+    s.step();
+}
+
+/// The first `n` slots in sweep order, as the scheduler's queue shows them.
+fn first_slots(s: &Scheduler, n: usize) -> Vec<QueueItem> {
+    s.queue().sweep_order()[..n].iter().map(|id| s.queue().item(id).unwrap()).collect()
+}
+
+fn board_text(board: &[Card]) -> String {
+    board.iter().map(ToString::to_string).collect()
+}
+
+/// Brief step 5: no submission before 30 idle seconds, then exactly one job while it runs -- bound
+/// to its normalized identity before it was launched, with its attempt charged.
+#[test]
+fn nothing_is_submitted_before_thirty_idle_seconds_and_one_job_runs_at_a_time() {
+    let tmp = TempDir::new("sched-idle");
+    let fake = Fake::new(FakeClock::new(1_000, UNIX), GEN_A);
+    let (mut s, _live) = scheduler(tmp.path(), &fake);
+    s.step();
+    tick(&mut s, &fake, 29_999);
+    assert!(fake.submitted().is_empty(), "no submission before 30 idle seconds");
+    tick(&mut s, &fake, 1);
+    assert_eq!(fake.submitted().len(), 1, "the first idle-eligible iteration submits one job");
+    for _ in 0..5 {
+        tick(&mut s, &fake, 60_000);
+    }
+    assert_eq!(fake.submitted().len(), 1, "exactly one job while it runs");
+
+    let item = s.queue().item(&fake.slots_submitted()[0]).unwrap();
+    assert!(is(&item, &tier(1)[0], &canonical_flops_ordered()[0]), "the sweep starts at tier 1, board 0, scenario 0");
+    assert_eq!((item.status.clone(), item.attempts), (TaskStatus::Pending, 1), "the running attempt is charged");
+    assert_eq!(item.game.map(|g| (g.generation, g.identity)), Some((GEN_A, game_of(&item, GEN_A))), "bound before it was launched");
+    let status = s.status();
+    assert_eq!(status.running, Some(format!("{} {}", tier(1)[0].id(), board_text(&item.board))));
+    assert_eq!((status.paused, status.pending, status.done, status.failed), (false, ALL, 0, 0));
+    assert_eq!((status.tier_done, status.tier_total), ([0, 0, 0], [7_020, 14_040, 21_060]));
+    assert_eq!((status.measured_p50_s, status.estimated_remaining_s), (Some(27.0), Some(f64::from(ALL) * 27.0)));
+    assert_eq!(status.scenario_hits, vec![("t1-100bb-Btn-open-Bb-call".to_string(), 3, 10)]);
+}
+
+/// Brief step 5 and the standing ruling: live admission pre-empts the running job at once -- the
+/// admitting thread sets the job's own cancel flag, without the scheduler or the executor -- and
+/// the scheduler records the cancel (refunding the attempt) without waiting for the job to wind
+/// down. A hand pre-empts the same way and holds scheduling off until it ends plus 30 s.
+#[test]
+fn a_live_request_preempts_the_running_job_at_once_and_its_attempt_is_refunded() {
+    let tmp = TempDir::new("sched-live");
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    let (mut s, live) = scheduler(tmp.path(), &fake);
+    tick(&mut s, &fake, 30_000);
+    let (job, slot, flag) = fake.submitted()[0].clone();
+    assert!(!flag.load(Ordering::SeqCst));
+
+    live.raise(); // engine admission, on the admitting thread
+    assert!(flag.load(Ordering::SeqCst), "admission sets the running job's cancel flag itself, before the scheduler runs");
+    assert!(fake.cancels().is_empty(), "admission neither calls nor waits for the executor");
+    s.apply(PresolverCommand::LiveRequest);
+    s.step();
+    assert_eq!(fake.cancels(), vec![job], "one cancellation, and no waiting for the job to wind down");
+    let item = s.queue().item(&slot).unwrap();
+    assert_eq!((item.status, item.attempts), (TaskStatus::Pending, 0), "the cancelled attempt is refunded");
+    assert_eq!(s.status().running, None);
+    tick(&mut s, &fake, 29_999);
+    assert_eq!(fake.submitted().len(), 1, "live work restarts the 30 s idle gate");
+    tick(&mut s, &fake, 1);
+    let second = fake.submitted()[1].clone();
+    assert_eq!(second.1, slot, "the pre-empted slot runs again first");
+    assert!(!second.2.load(Ordering::SeqCst), "every job gets a fresh cancel flag");
+
+    live.raise(); // Presolver::notify_hand(true)
+    s.apply(PresolverCommand::HandInProgress(true));
+    s.step();
+    assert_eq!(fake.cancels(), vec![job, second.0]);
+    assert!(second.2.load(Ordering::SeqCst));
+    tick(&mut s, &fake, 120_000);
+    assert_eq!(fake.submitted().len(), 2, "nothing is scheduled while a hand is in progress");
+    s.apply(PresolverCommand::HandInProgress(false));
+    tick(&mut s, &fake, 29_999);
+    assert_eq!(fake.submitted().len(), 2, "the idle gate restarts when the hand ends");
+    tick(&mut s, &fake, 1);
+    assert_eq!(fake.submitted().len(), 3);
+    assert_eq!(fake.cancels().len(), 2, "one cancellation per pre-emption");
+    let item = s.queue().item(&slot).unwrap();
+    assert_eq!((item.status, item.attempts), (TaskStatus::Pending, 1), "two pre-emptions cost no attempt");
+}
+
+/// Brief step 5: a worker terminal is not completion. When the completed entry does not read back
+/// durably at target the game is not Done -- it is a failed attempt, retried after the backoff --
+/// and it becomes Done only once `store_and_verify` confirms the entry on disk.
+#[test]
+fn a_completed_job_is_done_only_once_its_entry_reads_back_durably() {
+    let tmp = TempDir::new("sched-durable");
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    let (mut s, _live) = scheduler(tmp.path(), &fake);
+    fake.script([JobPoll::Running, finished()]);
+    tick(&mut s, &fake, 30_000);
+    let a = fake.slots_submitted()[0].clone();
+    tick(&mut s, &fake, 1); // completes, but the entry is not durable at target
+    let after = s.queue().item(&a).unwrap();
+    assert_ne!(after.status, TaskStatus::Done, "a worker terminal alone is not completion");
+    assert_eq!(
+        (after.status, after.attempts, after.last_error.as_deref()),
+        (TaskStatus::Failed { n: 1 }, 1, Some("entry not durable at target")),
+        "an unverified completion is a failed attempt, still pending its retry"
+    );
+    assert_eq!(s.status().done, 0);
+
+    tick(&mut s, &fake, 1); // A waits out its backoff while the next slot runs
+    let b = fake.slots_submitted()[1].clone();
+    assert_ne!(b, a);
+    fake.state().durable = true;
+    tick(&mut s, &fake, 30_000); // A is due again, but B still runs
+    assert_eq!(fake.submitted().len(), 2);
+    fake.script([finished()]);
+    tick(&mut s, &fake, 1);
+    assert_eq!(s.queue().item(&b).unwrap().status, TaskStatus::Done);
+    tick(&mut s, &fake, 1);
+    assert_eq!(fake.slots_submitted()[2], a, "A's retry runs before the sweep continues");
+    fake.script([finished()]);
+    tick(&mut s, &fake, 1);
+    let done = s.queue().item(&a).unwrap();
+    assert_eq!((done.status, done.attempts), (TaskStatus::Done, 2), "Done only once the entry reads back at target");
+    assert_eq!(s.status().done, 2);
+}
+
+/// Brief step 5: a pause lets the running job finish and launches nothing more; the cursor, the
+/// counters, the failure record and the pause itself survive a restart; a resume waits for 30 idle
+/// seconds and continues without repeating completed work, its due retry first.
+#[test]
+fn pause_restart_and_resume_keep_the_cursor_and_the_failure_counts() {
+    let tmp = TempDir::new("sched-restart");
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    fake.state().durable = true;
+    let (mut s, _live) = scheduler(tmp.path(), &fake);
+    fake.script([finished()]);
+    tick(&mut s, &fake, 30_000); // A launched and completed in one iteration
+    fake.script([JobPoll::Failed("worker exited".into())]);
+    tick(&mut s, &fake, 1); // B launched and failed
+    tick(&mut s, &fake, 1); // C launched, running
+    let ids = fake.slots_submitted();
+    assert_eq!(ids.len(), 3);
+    s.apply(PresolverCommand::Pause);
+    fake.script([finished()]);
+    tick(&mut s, &fake, 1);
+    assert_eq!(s.queue().item(&ids[2]).unwrap().status, TaskStatus::Done, "a pause lets the running job finish");
+    tick(&mut s, &fake, 600_000);
+    assert_eq!(fake.submitted().len(), 3, "a paused queue launches nothing");
+    let (cursor, counts) = (s.queue().cursor(), s.queue().status_counts());
+    assert!(s.status().paused);
+    assert_eq!(counts, (ALL - 3, 2, 1));
+    s.shutdown();
+    drop(s);
+
+    // A new process: its monotonic clock restarts, and the wall clock has moved on 20 minutes.
+    let restarted = fake.restarted(FakeClock::new(42, UNIX + 1_200_000));
+    let (mut s, _live) = scheduler(tmp.path(), &restarted);
+    assert_eq!((s.queue().cursor(), s.queue().status_counts()), (cursor, counts), "the cursor and the counters survive the restart");
+    assert!(s.status().paused, "and so does the pause");
+    let failed = s.queue().item(&ids[1]).unwrap();
+    assert_eq!((failed.status, failed.attempts, failed.last_error.as_deref()), (TaskStatus::Failed { n: 1 }, 1, Some("worker exited")));
+    tick(&mut s, &restarted, 600_000);
+    assert_eq!(restarted.submitted().len(), 3, "still paused after the restart");
+    s.apply(PresolverCommand::Resume);
+    tick(&mut s, &restarted, 29_999);
+    assert_eq!(restarted.submitted().len(), 3, "a resume waits for 30 idle seconds");
+    tick(&mut s, &restarted, 1);
+    assert_eq!(restarted.slots_submitted()[3], ids[1], "the due retry runs first ...");
+    assert_eq!(s.queue().cursor(), cursor, "... as a revisit that leaves the cursor where it was");
+    assert!(!restarted.slots_submitted()[3..].iter().any(|slot| *slot == ids[0] || *slot == ids[2]), "completed work is not repeated");
+    assert_eq!(s.queue().status_counts(), (ALL - 3, 2, 1));
+}
+
+/// Ruling S1 and the task 14 re-review's N2 test, through the real wiring: the queue runs on the
+/// executor's clock, and every `now_ms` the scheduler passes it comes from that same clock. A job
+/// that failed is restarted 5 s later (by the wall clock) on another monotonic timeline: 25 s of its
+/// backoff remain on the executor's clock, and the retry is the first job after the restart.
+#[test]
+fn a_restart_waits_out_the_remaining_backoff_on_the_executors_clock() {
+    let tmp = TempDir::new("sched-backoff");
+    let fake = Fake::new(FakeClock::new(5_000_000_000, UNIX), GEN_A);
+    let (mut s, _live) = scheduler(tmp.path(), &fake);
+    fake.script([JobPoll::Failed("worker exited".into())]);
+    tick(&mut s, &fake, 30_000); // launched and failed at UNIX + 30 s
+    let a = fake.slots_submitted()[0].clone();
+    assert_eq!(s.queue().item(&a).unwrap().retry_after_unix_ms, UNIX + 60_000, "the deadline comes from the executor's wall clock");
+    s.shutdown();
+    drop(s);
+
+    let t = 7_000_000_000;
+    let later = fake.restarted(FakeClock::new(t, UNIX + 35_000));
+    let (mut s, _live) = scheduler(tmp.path(), &later);
+    assert_ne!(s.queue().next_pending(t + 24_999).unwrap().identity_hex(), a, "25 s of the backoff remain on the executor's clock");
+    assert_eq!(s.queue().next_pending(t + 25_000).unwrap().identity_hex(), a);
+    tick(&mut s, &later, 29_999);
+    assert_eq!(later.submitted().len(), 1, "the idle gate runs on the same clock");
+    tick(&mut s, &later, 1);
+    assert_eq!(later.slots_submitted()[1], a, "the retry is the first job after the restart");
+}
+
+/// A queue under `dir` whose first slot completed under generation A; returns that slot.
+fn first_slot_done_under_generation_a(dir: &Path) -> QueueItem {
+    let mut q = open_at(dir, &FakeClock::new(0, UNIX));
+    q.set_generation(GEN_A);
+    let first = q.next_pending(0).unwrap();
+    let (key, spr) = prepared(&first, &hex(&GEN_A));
+    q.bind(&first.identity_hex(), &key, spr);
+    q.record_launch(&first.identity_hex());
+    q.record_done(&first.identity_hex());
+    q.save().unwrap();
+    first
+}
+
+/// Ruling S2: the executor's generation is declared before any reconciliation. Opened under a new
+/// generation, an old binding is stale at once -- pending, and never judged against the new
+/// generation's keys -- while under its own generation the startup sweep does check it.
+#[test]
+fn the_generation_is_declared_before_any_reconciliation() {
+    let (stale_dir, current_dir) = (TempDir::new("sched-generation-b"), TempDir::new("sched-generation-a"));
+
+    let first = first_slot_done_under_generation_a(stale_dir.path());
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_B);
+    fake.state().exists.insert(game_of(&first, GEN_A));
+    let (mut s, _live) = scheduler(stale_dir.path(), &fake);
+    assert_eq!(s.queue().generation(), GEN_B, "the executor's generation is declared on open");
+    assert_eq!(s.status().done, 0, "a stale binding does not count as done under the new generation");
+    assert!(s.reconciling());
+    tick(&mut s, &fake, 30_000);
+    assert!(!s.reconciling(), "the startup sweep has visited every slot");
+    let asked = fake.state().asked.clone();
+    assert!(!asked.is_empty());
+    assert!(asked.iter().all(|b| b.generation == GEN_B), "no verdict is taken on a binding of another generation: {asked:?}");
+
+    let first = first_slot_done_under_generation_a(current_dir.path());
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    fake.state().exists.insert(game_of(&first, GEN_A));
+    let (mut s, _live) = scheduler(current_dir.path(), &fake);
+    assert_eq!(s.status().done, 1);
+    tick(&mut s, &fake, 30_000);
+    assert!(!s.reconciling());
+    let checked = GameBinding { generation: GEN_A, identity: game_of(&first, GEN_A) };
+    assert!(fake.state().asked.contains(&checked), "under its own generation the binding is reconciled");
+    assert_eq!(s.queue().item(&first.identity_hex()).unwrap().status, TaskStatus::Done);
+}
+
+/// Ruling S3: the launch path is prepare -> bind -> reconcile_item -> re-check `next_pending` ->
+/// submit -> record_launch. An entry already on disk completes its slot without a solve; a failed
+/// preparation, or one that hands back a key on another board, is a failure of the slot itself (no
+/// identity, no panic); a submission refused after binding is charged to the game.
+#[test]
+fn the_launch_path_prepares_binds_checks_the_disk_and_submits_only_what_is_still_pending() {
+    let tmp = TempDir::new("sched-launch-path");
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    let (mut s, _live) = scheduler(tmp.path(), &fake);
+    let slots = first_slots(&s, 4);
+    let (a, b, c, d) = (&slots[0], &slots[1], &slots[2], &slots[3]);
+    fake.state().exists.insert(game_of(a, GEN_A));
+    fake.state().failing_preparation.insert(b.identity_hex());
+    fake.state().wrong_board.insert(c.identity_hex());
+
+    tick(&mut s, &fake, 30_000);
+    let found = s.queue().item(&a.identity_hex()).unwrap();
+    assert_eq!((found.status, found.attempts, found.game.map(|g| g.identity)), (TaskStatus::Done, 0, Some(game_of(a, GEN_A))));
+    assert!(fake.submitted().is_empty(), "an entry already at target is never solved again");
+    assert_eq!(fake.state().asked.last().map(|g| g.identity), Some(game_of(a, GEN_A)), "the disk is checked for the freshly bound game");
+    assert_eq!(s.wait_hint(), Duration::ZERO, "a slot resolved without a solve lets the next one follow at once");
+
+    s.step();
+    let failed = s.queue().item(&b.identity_hex()).unwrap();
+    assert_eq!(
+        (failed.status, failed.game, failed.last_error),
+        (TaskStatus::Failed { n: 1 }, None, Some(format!("no chart node for {}", b.scenario.id()))),
+        "a preparation failure belongs to the slot"
+    );
+    s.step();
+    let wrong = s.queue().item(&c.identity_hex()).unwrap();
+    assert_eq!((wrong.status, wrong.game), (TaskStatus::Failed { n: 1 }, None), "a key on another board is refused, never bound");
+    assert!(wrong.last_error.unwrap().contains("canonical flop"));
+
+    fake.state().submit_error = Some("worker unavailable".into());
+    s.step();
+    let refused = s.queue().item(&d.identity_hex()).unwrap();
+    assert_eq!(
+        (refused.status, refused.attempts, refused.game.map(|g| g.identity)),
+        (TaskStatus::Failed { n: 1 }, 1, Some(game_of(d, GEN_A))),
+        "a refused submission is a failed attempt of the bound game"
+    );
+    assert!(fake.submitted().is_empty());
+    assert_eq!(s.queue().cursor(), [0, 1, 0], "the cursor stepped over all four");
+    s.shutdown();
+    assert_eq!(saved(tmp.path()).games[&hex(&game_of(d, GEN_A))].status, TaskStatus::Failed { n: 1 }, "persisted as the game's failure");
+}
+
+/// Ruling S5: a source/config change reaches the scheduler as `PresolverCommand::SourceChanged`.
+/// An unchanged fingerprint changes nothing; a new one cancels the running job, records the cancel
+/// (its attempt refunded), then declares the new generation and saves it, and the slot is prepared
+/// again under the new generation.
+#[test]
+fn a_source_change_cancels_the_running_job_records_the_cancel_and_starts_a_new_generation() {
+    let tmp = TempDir::new("sched-source");
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    let (mut s, _live) = scheduler(tmp.path(), &fake);
+    tick(&mut s, &fake, 30_000);
+    let (job, slot, flag) = fake.submitted()[0].clone();
+    let item = s.queue().item(&slot).unwrap();
+    let saves = s.save_stats().saves;
+
+    s.apply(PresolverCommand::SourceChanged);
+    assert!(fake.cancels().is_empty(), "an unchanged fingerprint is no change");
+    assert_eq!(s.save_stats().saves, saves, "and writes nothing");
+
+    fake.state().generation = GEN_B;
+    s.apply(PresolverCommand::SourceChanged);
+    assert_eq!(fake.cancels(), vec![job]);
+    assert!(flag.load(Ordering::SeqCst), "the job's cancel flag is set");
+    assert_eq!(s.queue().generation(), GEN_B);
+    assert_eq!(s.save_stats().saves, saves + 1, "a generation change is saved at once");
+    let file = saved(tmp.path());
+    assert_eq!(file.generation, GEN_B);
+    let old = &file.games[&hex(&game_of(&item, GEN_A))];
+    assert_eq!((&old.status, old.attempts), (&TaskStatus::Pending, 0), "the cancel was recorded before the generation changed");
+
+    s.step();
+    assert_eq!(fake.slots_submitted()[1], slot, "the slot is prepared again under the new generation");
+    let rebound = s.queue().item(&slot).unwrap().game.unwrap();
+    assert_eq!((rebound.generation, rebound.identity), (GEN_B, game_of(&item, GEN_B)));
+}
+
+/// Ruling S7: after a generation change the counts start over -- every stale slot is pending until
+/// it is prepared again -- and lazy rebinding costs one iteration per slot but no idle tick: slots
+/// whose new entries are already on disk are rebound and found back to back.
+#[test]
+fn after_a_generation_change_the_counts_start_over_and_rebinding_waits_for_no_tick() {
+    let tmp = TempDir::new("sched-rebind");
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    fake.state().durable = true;
+    let (mut s, _live) = scheduler(tmp.path(), &fake);
+    fake.script([finished()]);
+    tick(&mut s, &fake, 30_000);
+    fake.script([finished()]);
+    s.step();
+    assert_eq!(s.status().done, 2);
+    let (a, b) = (s.queue().item(&fake.slots_submitted()[0]).unwrap(), s.queue().item(&fake.slots_submitted()[1]).unwrap());
+
+    fake.state().generation = GEN_B;
+    s.apply(PresolverCommand::SourceChanged);
+    let status = s.status();
+    assert_eq!((status.pending, status.done, status.tier_done), (ALL, 0, [0, 0, 0]), "stale slots count as pending until rebound");
+
+    fake.state().exists.extend([game_of(&a, GEN_B), game_of(&b, GEN_B)]);
+    s.step();
+    assert_eq!(s.wait_hint(), Duration::ZERO);
+    s.step();
+    assert_eq!(s.wait_hint(), Duration::ZERO);
+    assert_eq!(s.status().done, 2, "both found on disk under the new generation");
+    assert_eq!(fake.submitted().len(), 2, "found, not solved again");
+    s.step();
+    assert_eq!(fake.submitted().len(), 3);
+    assert_eq!(s.wait_hint(), Duration::from_millis(TICK_MS), "a running job is polled once per tick");
+}
+
+/// Ruling S8: the whole ~32 MB file is rewritten on each save, so saves happen only when the queue
+/// changed, and -- except for a pause, a resume, a generation change and shutdown, which are saved at
+/// once -- at most once per `CHECKPOINT_MS`. A launch is never saved on its own: opening refunds an
+/// in-flight attempt, so a saved launch and an unsaved one reopen identically. Measured here with
+/// every slot bound, against the plan's save after every launch and every outcome.
+#[test]
+fn saves_are_checkpointed_on_state_changes_and_their_volume_is_measured() {
+    let tmp = TempDir::new("sched-volume");
+    let dir = tmp.path();
+    {
+        let mut q = open_at(dir, &FakeClock::new(0, UNIX));
+        q.set_generation(GEN_A);
+        for item in slots(&q, dir).into_values() {
+            let (key, spr) = prepared(&item, &hex(&GEN_A));
+            q.bind(&item.identity_hex(), &key, spr);
+        }
+        q.save().unwrap();
+    }
+    let size = std::fs::metadata(queue::queue_path(dir)).unwrap().len();
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    fake.state().durable = true;
+    let (mut s, _live) = scheduler(dir, &fake);
+    const JOBS: u64 = 24;
+    const SOLVE_MS: u64 = 27_000; // the i16 worst-board p50 of spec section 10.5
+    tick(&mut s, &fake, 29_999);
+    for _ in 0..JOBS {
+        tick(&mut s, &fake, 1);
+        fake.script([finished()]);
+        tick(&mut s, &fake, SOLVE_MS);
+    }
+    assert_eq!(s.status().done, JOBS as u32);
+    let elapsed = fake.clock.mono();
+    let run = s.save_stats();
+    assert!(run.saves >= 1 && run.saves <= elapsed / CHECKPOINT_MS, "{} saves in {elapsed} ms: at most one per checkpoint", run.saves);
+    assert_eq!(run.failures, 0);
+    assert!(run.bytes >= run.saves * (size - 1_000), "every save rewrites the whole file (a done game is 3 bytes shorter than a pending one)");
+
+    s.apply(PresolverCommand::Pause);
+    let paused = s.save_stats();
+    assert_eq!(paused.saves, run.saves + 1, "a pause is saved at once");
+    for _ in 0..10 {
+        tick(&mut s, &fake, CHECKPOINT_MS);
+    }
+    s.shutdown();
+    assert_eq!(s.save_stats(), paused, "an unchanged queue is never rewritten, not even at shutdown");
+
+    let plan = 2 * JOBS * size; // the plan's save after every launch and every outcome
+    let tier_one_checkpoints = 7_020 * SOLVE_MS / CHECKPOINT_MS;
+    eprintln!(
+        "queue.json with every slot bound: {size} bytes; {JOBS} jobs over {elapsed} ms: {} saves, {} bytes \
+         (the plan's policy: {} saves, {plan} bytes); tier 1 (7,020 jobs x {SOLVE_MS} ms) projects to at most \
+         {tier_one_checkpoints} checkpoint saves, {} bytes (plan: {} saves, {} bytes)",
+        run.saves,
+        run.bytes,
+        2 * JOBS,
+        tier_one_checkpoints * size,
+        2 * 7_020,
+        2 * 7_020 * size
+    );
+    assert!(run.bytes * 4 < plan, "checkpointing writes a fraction of the plan's volume");
+}
+
+/// Ruling S8: a save that fails is counted and reported, the in-memory queue keeps the change, and
+/// the save is retried at the next checkpoint -- never dropped with `let _ = queue.save()`.
+#[test]
+fn a_failed_save_is_reported_and_retried_never_ignored() {
+    let tmp = TempDir::new("sched-save-error");
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    let (mut s, _live) = scheduler(tmp.path(), &fake);
+    let path = queue::queue_path(tmp.path());
+    std::fs::create_dir(&path).unwrap(); // queue.json is a directory: every publication fails
+    s.apply(PresolverCommand::Pause);
+    assert_eq!((s.save_stats().saves, s.save_stats().failures), (0, 1), "the failure is counted, not ignored");
+    assert!(s.status().paused, "the in-memory queue keeps the change");
+    tick(&mut s, &fake, CHECKPOINT_MS - 1);
+    assert_eq!(s.save_stats().failures, 1, "the retry waits for the next checkpoint");
+    std::fs::remove_dir(&path).unwrap();
+    tick(&mut s, &fake, 1);
+    assert_eq!((s.save_stats().saves, s.save_stats().failures), (1, 1), "and then succeeds");
+    assert!(saved(tmp.path()).paused);
+}
+
+/// Task 14 left the reconciliation cadence and chunking to this task (its report, F4 OQ4): the
+/// startup sweep and each periodic one decide at most `RECONCILE_CHUNK` games per idle iteration, so
+/// commands are handled between chunks; a pause stops it like any background work; the games whose
+/// entries were evicted are demoted, the others stay done; and a sweep starts again every
+/// `RECONCILE_PERIOD_MS`.
+#[test]
+fn reconciliation_runs_in_chunks_between_commands_and_again_periodically() {
+    let tmp = TempDir::new("sched-sweep");
+    let dir = tmp.path();
+    let n = 2 * RECONCILE_CHUNK + RECONCILE_CHUNK / 2;
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    let mut games = BTreeSet::new();
+    {
+        let mut q = open_at(dir, &FakeClock::new(0, UNIX));
+        q.set_generation(GEN_A);
+        for (i, id) in q.sweep_order()[..n].to_vec().iter().enumerate() {
+            let item = q.item(id).unwrap();
+            let (key, spr) = prepared(&item, &hex(&GEN_A));
+            q.bind(id, &key, spr);
+            q.record_launch(id);
+            q.record_done(id);
+            games.insert(game_of(&item, GEN_A));
+            if i % 2 == 0 {
+                fake.state().exists.insert(game_of(&item, GEN_A)); // the odd ones were evicted
+            }
+        }
+        q.save().unwrap();
+    }
+    let asked = |fake: &Fake| fake.state().asked.iter().filter(|b| games.contains(&b.identity)).count();
+    let (mut s, _live) = scheduler(dir, &fake);
+    assert!(s.reconciling(), "a sweep starts with the scheduler");
+    assert_eq!(s.status().done, n as u32);
+    tick(&mut s, &fake, 29_999);
+    assert_eq!(asked(&fake), 0, "nothing runs before the idle gate");
+    tick(&mut s, &fake, 1); // launches the first pending slot, then reconciles one chunk
+    assert_eq!(fake.submitted().len(), 1);
+    assert_eq!(asked(&fake), RECONCILE_CHUNK);
+    s.apply(PresolverCommand::Pause);
+    s.step();
+    assert_eq!(asked(&fake), RECONCILE_CHUNK, "a paused scheduler reconciles nothing either");
+    s.apply(PresolverCommand::Resume);
+    tick(&mut s, &fake, 30_000);
+    assert_eq!(asked(&fake), 2 * RECONCILE_CHUNK);
+    tick(&mut s, &fake, 1);
+    assert_eq!(asked(&fake), n);
+    assert!(!s.reconciling(), "the sweep is complete");
+    assert_eq!(s.status().done, (n / 2) as u32, "the evicted half is demoted, the rest stays done");
+    tick(&mut s, &fake, 1);
+    assert_eq!(asked(&fake), n, "each game once per sweep");
+
+    tick(&mut s, &fake, RECONCILE_PERIOD_MS);
+    assert!(s.reconciling(), "a new sweep starts every RECONCILE_PERIOD_MS");
+    tick(&mut s, &fake, 1);
+    assert_eq!(asked(&fake), n + RECONCILE_CHUNK);
+}
+
+/// A queue with nothing to launch is not rescanned every tick -- with every slot bound, a scan that
+/// finds nothing reads all 42,120 slots (about 36 ms in a release build): the scheduler asks again
+/// once the queue changes, or after `RESCAN_MS`.
+#[test]
+fn an_exhausted_queue_is_rescanned_after_a_change_or_every_rescan_ms() {
+    let tmp = TempDir::new("sched-rescan");
+    let dir = tmp.path();
+    {
+        let mut q = open_at(dir, &FakeClock::new(0, UNIX));
+        q.set_generation(GEN_A);
+        for item in slots(&q, dir).into_values() {
+            let (key, spr) = prepared(&item, &hex(&GEN_A));
+            q.bind(&item.identity_hex(), &key, spr);
+        }
+        q.reconcile(&|_| true);
+        q.save().unwrap();
+    }
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    fake.state().exists_everywhere = true;
+    let (mut s, _live) = scheduler(dir, &fake);
+    assert_eq!(s.status().done, ALL);
+    tick(&mut s, &fake, 30_000);
+    assert_eq!(s.pending_scans(), 1, "the first idle iteration looks for work");
+    for _ in 0..3 {
+        tick(&mut s, &fake, 1);
+    }
+    assert_eq!(s.pending_scans(), 1, "nothing changed: no rescan");
+    tick(&mut s, &fake, RESCAN_MS);
+    assert_eq!(s.pending_scans(), 2, "RESCAN_MS later it looks again (a retry may have come due)");
+    fake.state().generation = GEN_B;
+    s.apply(PresolverCommand::SourceChanged);
+    s.step();
+    assert_eq!(s.pending_scans(), 3, "a change is looked at in the next iteration");
+    assert_eq!(fake.state().asked.last().map(|b| b.generation), Some(GEN_B), "and the first stale slot is prepared again");
+}
+
+/// While iterations follow back to back (`wait_hint` zero), the thread publishes a status at most
+/// once per `BUSY_PUBLISH_MS` of queue-clock time -- a publication after a change recounts every
+/// slot (about 24 ms in a release build) -- and after every iteration otherwise.
+#[test]
+fn back_to_back_iterations_publish_at_most_once_per_busy_publish_ms() {
+    let tmp = TempDir::new("sched-publish");
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    fake.state().exists_everywhere = true; // every slot is found on disk: back-to-back iterations
+    let (mut s, _live) = scheduler(tmp.path(), &fake);
+    assert!(s.should_publish(), "the first status is published");
+    tick(&mut s, &fake, 30_000);
+    assert_eq!(s.wait_hint(), Duration::ZERO);
+    assert!(s.should_publish(), "a busy stretch publishes once ...");
+    for _ in 0..5 {
+        s.step();
+        assert_eq!(s.wait_hint(), Duration::ZERO);
+        assert!(!s.should_publish(), "... and then waits BUSY_PUBLISH_MS");
+    }
+    tick(&mut s, &fake, BUSY_PUBLISH_MS);
+    assert!(s.should_publish());
+    assert_eq!(s.status().done, 7, "seven slots found on disk so far");
+    fake.state().exists_everywhere = false;
+    s.step(); // the next slot is solved: its job runs, and the thread waits a tick again
+    assert_eq!(fake.submitted().len(), 1);
+    assert_eq!(s.wait_hint(), Duration::from_millis(TICK_MS));
+    assert!(s.should_publish());
+    s.step();
+    assert!(s.should_publish(), "every iteration publishes while the thread waits a tick between them");
+}
+
+/// Waits for the fake executor's next event matching `wanted`. The budget only cuts a hang short;
+/// it never paces the test.
+fn wait_for(events: &mpsc::Receiver<Event>, wanted: impl Fn(&Event) -> bool) -> Event {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(event) if wanted(&event) => return event,
+            Ok(_) => {}
+            Err(e) => panic!("the presolver thread never produced the expected event: {e}"),
+        }
+    }
+}
+
+/// Waits until the published status satisfies `cond`, re-reading it after each publication.
+fn wait_status(p: &Presolver, events: &mpsc::Receiver<Event>, cond: impl Fn(&PresolverStatus) -> bool) -> PresolverStatus {
+    loop {
+        let status = p.status();
+        if cond(&status) {
+            return status;
+        }
+        wait_for(events, |e| *e == Event::Published);
+    }
+}
+
+/// The `presolver` thread end to end: it runs on the executor's clock, admission sets the running
+/// job's cancel flag before `notify_live_request` returns, the thread then cancels it, pause and
+/// resume reach the published status, and shutdown (twice) joins the thread after saving the
+/// refunded attempt.
+#[test]
+fn the_presolver_thread_preempts_at_admission_and_shuts_down_cleanly() {
+    let tmp = TempDir::new("thread-preempt");
+    let (tx, events) = mpsc::channel();
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    fake.state().events = Some(tx);
+    let presolver = Presolver::start(tmp.path().to_path_buf(), Box::new(fake.clone()));
+    wait_status(&presolver, &events, |s| s.tier_total == [7_020, 14_040, 21_060]); // the queue is open
+    fake.clock.advance(30_000);
+    let Event::Submitted(job) = wait_for(&events, |e| matches!(e, Event::Submitted(_))) else { unreachable!() };
+    let flag = fake.submitted()[0].2.clone();
+
+    presolver.notify_live_request();
+    assert!(flag.load(Ordering::SeqCst), "admission sets the job's cancel flag before notify_live_request returns");
+    wait_for(&events, |e| *e == Event::Cancelled(job));
+    let status = wait_status(&presolver, &events, |s| s.running.is_none());
+    assert_eq!(status.pending, ALL);
+    presolver.pause();
+    wait_status(&presolver, &events, |s| s.paused);
+    presolver.resume();
+    wait_status(&presolver, &events, |s| !s.paused);
+    presolver.shutdown();
+    presolver.join_for_shutdown();
+    presolver.shutdown();
+    presolver.join_for_shutdown(); // a repeated shutdown is a no-op
+
+    assert_eq!(fake.submitted().len(), 1, "the idle gate held after the live request");
+    let file = saved(tmp.path());
+    let game = &file.games[&file.items[&fake.slots_submitted()[0]].game.unwrap().identity_hex()];
+    assert_eq!((&game.status, game.attempts), (&TaskStatus::Pending, 0), "the refunded attempt was saved at shutdown");
+}
+
+/// F09 on the presolver's side: no handle call waits for the presolver thread, even while that
+/// thread is blocked inside the executor; and a live request that arrives while a job is being
+/// prepared stops it before submission.
+#[test]
+fn handle_calls_return_while_the_thread_is_blocked_and_a_live_request_stops_the_launch() {
+    let tmp = TempDir::new("thread-blocked");
+    let (tx, events) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    fake.state().events = Some(tx);
+    fake.state().gate = Some(gate);
+    let presolver = Arc::new(Presolver::start(tmp.path().to_path_buf(), Box::new(fake.clone())));
+    wait_status(&presolver, &events, |s| s.tier_total == [7_020, 14_040, 21_060]);
+    fake.clock.advance(30_000);
+    wait_for(&events, |e| *e == Event::Preparing); // the thread is now blocked inside `prepare`
+
+    let (done, returned) = mpsc::channel();
+    let handle = Arc::clone(&presolver);
+    std::thread::spawn(move || {
+        let _ = handle.status();
+        handle.pause();
+        handle.resume();
+        handle.notify_hand(true);
+        handle.notify_hand(false);
+        handle.notify_live_request();
+        handle.notify_source_changed();
+        done.send(()).unwrap();
+    });
+    returned.recv_timeout(Duration::from_secs(120)).expect("every handle call returns while the presolver thread is blocked");
+    release.send(()).unwrap();
+    presolver.shutdown();
+    presolver.join_for_shutdown();
+    assert!(fake.submitted().is_empty(), "the live request that arrived during preparation stopped the launch");
+}
+
+/// The scheduler over all of tier 1 (7,020 jobs): each slot is launched exactly once, in sweep
+/// order, tier 2 starts only after tier 1, and nothing is saved until shutdown within one
+/// checkpoint interval.
+#[test]
+#[cfg_attr(not(feature = "exhaustive"), ignore = "enable the exhaustive feature for the full tier-1 run")]
+fn the_scheduler_completes_tier_one_in_sweep_order_exactly_once() {
+    let tmp = TempDir::new("sched-tier-one");
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    fake.state().durable = true;
+    let (mut s, _live) = scheduler(tmp.path(), &fake);
+    tick(&mut s, &fake, 29_999);
+    for _ in 0..7_020 {
+        fake.script([finished()]);
+        tick(&mut s, &fake, 1);
+    }
+    let order = s.queue().sweep_order()[..7_020].to_vec();
+    assert_eq!(fake.slots_submitted(), order, "every tier-1 slot once, in sweep order");
+    assert_eq!(s.queue().tier_counts().0, [7_020, 0, 0]);
+    assert_eq!(s.queue().cursor(), [1, 0, 0]);
+    tick(&mut s, &fake, 1);
+    assert!(is(&s.queue().item(fake.slots_submitted().last().unwrap()).unwrap(), &tier(2)[0], &canonical_flops_ordered()[0]));
+    assert_eq!(s.save_stats().saves, 0, "no checkpoint within one interval");
+    s.shutdown();
+    assert_eq!(s.save_stats().saves, 1);
+}
