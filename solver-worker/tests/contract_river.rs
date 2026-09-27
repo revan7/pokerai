@@ -62,7 +62,7 @@ fn ev_convention_non_root_payoffs() {
     let mut w = Worker::spawn(4); ready(&w);
     let lock = fixture_lines("lock_river");
     w.send(&lock[0]);
-    // Spec deviation recorded by the brief (§13.2 names AA; on Qs Jd 7h 3c 2d three queens beat aces): OOP QQ and 66.
+    // Spec §13.2 requires OOP QQ and 66; each OOP QQ combo blocks every IP QQ combo. (The brief's original AA wording was corrected before this task; historical only.)
     let oop = vec1326(&[(ci("Qc", "Qd"), 1.0), (ci("Qc", "Qh"), 1.0), (ci("Qd", "Qh"), 1.0), (ci("6c", "6d"), 1.0), (ci("6c", "6h"), 1.0), (ci("6c", "6s"), 1.0), (ci("6d", "6h"), 1.0), (ci("6d", "6s"), 1.0), (ci("6h", "6s"), 1.0)]);
     w.send(&edit(&lock[1], |v| { v["id"] = json!("80"); v["oop_range"] = json!(oop); }));
     let r = result_of(&w, "80");
