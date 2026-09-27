@@ -402,3 +402,53 @@ def records() -> list:
     assert len(rows) == 50
     verify_hero_support(rows)
     return rows
+
+
+# --- Task 19: freeze the fifty fixture files + manifest ---
+
+# The 22 supported (numeric-EV release subset) ids, always 001..022 by inventory order (see
+# `supported_records`/`records` above) -- `supported_baseline` equals this today (baseline model
+# revision 0, spec 13.5/14.4); the two lists diverge only if a future model revision changes which
+# of the 22 clears the release bar without changing which records are numeric at all.
+_SUPPORTED_IDS = [f"{n:03}" for n in range(1, 23)]
+
+
+def write_e2e(root: Path) -> None:
+    """Writes `fixtures/hands/e2e/001.json`..`050.json` and `manifest.json` from `records()`.
+    Byte-stable across calls: fixed key order (`sort_keys=True`), fixed separators (`json.dumps`'
+    default `", "`/`": "` under `indent=2`), trailing newline. Regenerating and rewriting is the
+    only way these files change -- never hand-edited."""
+    root.mkdir(parents=True, exist_ok=True)
+    rows = records()
+    assert len(rows) == 50
+    hashes = {}
+    for i, row in enumerate(rows, 1):
+        row["id"] = f"{i:03}"
+        raw = (json.dumps(row, sort_keys=True, indent=2) + "\n").encode()
+        (root / f"{i:03}.json").write_bytes(raw)
+        hashes[f"{i:03}.json"] = hashlib.sha256(raw).hexdigest()
+    manifest = {
+        "version": 1,
+        "synthetic": True,
+        "supported_ids": _SUPPORTED_IDS,
+        "supported_baseline": _SUPPORTED_IDS,
+        "sha256": hashes,
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+
+
+def check_e2e(root: Path) -> None:
+    """Regenerates `records()` in memory and compares bytes against the committed files; a
+    difference is an error, never a silent rewrite (standing ruling: fixtures are committed data,
+    regenerated only by the generator)."""
+    rows = records()
+    for i, row in enumerate(rows, 1):
+        row["id"] = f"{i:03}"
+        expected = (json.dumps(row, sort_keys=True, indent=2) + "\n").encode()
+        actual = (root / f"{i:03}.json").read_bytes()
+        if actual != expected:
+            raise SystemExit(f"fixtures/hands/e2e/{i:03}.json differs from the generator")
+    manifest = json.loads((root / "manifest.json").read_text())
+    for name, digest in manifest["sha256"].items():
+        if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
+            raise SystemExit(f"manifest hash mismatch for {name}")

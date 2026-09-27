@@ -1,0 +1,154 @@
+{
+  "button": 0,
+  "class": "multiway_side_pot",
+  "config": {
+    "bb_chips": 100,
+    "flop_budget_s": 10,
+    "rake": {
+      "cap_mchips": 50000,
+      "no_flop_no_drop": true,
+      "rate": 0.05
+    },
+    "sb_chips": 50,
+    "straddle": null,
+    "target_bp": 50,
+    "threads": 16
+  },
+  "dealt": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "events": [
+    {
+      "action": {
+        "kind": "raise",
+        "to": 250
+      },
+      "seat": 3,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "seat": 4,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "seat": 5,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "call"
+      },
+      "seat": 0,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "seat": 1,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "call"
+      },
+      "seat": 2,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "cards": "Kh7d2c",
+      "type": "board"
+    },
+    {
+      "action": {
+        "kind": "bet",
+        "to": 100
+      },
+      "seat": 2,
+      "street": "flop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "allin",
+        "to": 50
+      },
+      "seat": 3,
+      "street": "flop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "call"
+      },
+      "seat": 0,
+      "street": "flop",
+      "type": "action"
+    },
+    {
+      "cards": "Kh7d2c4d",
+      "type": "board"
+    },
+    {
+      "action": {
+        "kind": "bet",
+        "to": 100
+      },
+      "seat": 2,
+      "street": "turn",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "call"
+      },
+      "seat": 0,
+      "street": "turn",
+      "type": "action"
+    },
+    {
+      "cards": "Kh7d2c4d2s",
+      "type": "board"
+    }
+  ],
+  "expected": {
+    "coverage": "Unsupported",
+    "flop_miss_accuracy": null,
+    "numeric_ev": false,
+    "required_reasons": [
+      "ChartRounded",
+      "RakeProfileMapped"
+    ],
+    "unsupported": "MultiwayEv"
+  },
+  "fault": null,
+  "hero": 2,
+  "hero_cards": "6s6h",
+  "id": "030",
+  "stacks": [
+    10000,
+    10000,
+    10000,
+    300,
+    10000,
+    10000
+  ],
+  "version": 1
+}

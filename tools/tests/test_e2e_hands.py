@@ -15,15 +15,15 @@ from fractions import Fraction
 from pathlib import Path
 
 import pytest
-from pokerkit import Mode, NoLimitTexasHoldem
 
 import e2e_hands
 from chart_ingest import class_names
 from chart_sources import history_key
-from e2e_hands import FAULTS, records
-from gen_fixtures import AUTOMATIONS, DECK, SpecReopen, _deal, legal_triple, spec_may_aggress
+from e2e_hands import FAULTS, records, write_e2e, check_e2e
+from gen_fixtures import replay_record
 
 REPO = Path(__file__).resolve().parents[2]
+ROOT = REPO / "fixtures/hands/e2e"
 PC, RC = "pokercoaching_100", "rangeconverter_200"
 
 SPECIAL_EXPECTATIONS = {
@@ -250,93 +250,17 @@ def test_guard_accepts_all_fifty_records():
 
 # --- I2: every event history is legal, replayed through PokerKit ---
 
-STREET_INDEX = {"preflop": 0, "flop": 1, "turn": 2, "river": 3}
-
-
-def _pokerkit_replay(record: dict):
-    """Replay one record's complete event history through PokerKit (the plan-1 oracle), reusing
-    `gen_fixtures`' automations, deal wrapper, legal-action triple and spec-4.3 reopening tracker.
-    Fails on any illegal action (a wager outside PokerKit's [min_to, max_to], a check facing a bet,
-    an all-in that is not the whole stack, a fold with nothing owed, the wrong actor or street, a
-    board dealt mid-street) and on any PokerKit/spec reopening divergence. Returns the state after
-    the last event and the PokerKit ring (SB first, button last)."""
-    cfg = record["config"]
-    button = record["button"]
-    ring = [s for s in ((button + k) % 6 for k in range(1, 7)) if s in record["dealt"]]
-    n = len(ring)
-    straddle = cfg["straddle"]
-    blinds = [cfg["sb_chips"], cfg["bb_chips"]] + ([straddle] if straddle else [])
-    blinds += [0] * (n - len(blinds))
-    state = NoLimitTexasHoldem.create_state(
-        AUTOMATIONS, False, 0, blinds, cfg["bb_chips"], [record["stacks"][s] for s in ring], n,
-        mode=Mode.CASH_GAME)
-    hero_index = ring.index(record["hero"])
-    used = {record["hero_cards"][:2], record["hero_cards"][2:]} | set(_board_cards(record))
-    spare = [c for c in DECK if c not in used]
-    for i in range(n):
-        _deal(state.deal_hole, record["hero_cards"] if i == hero_index else spare.pop() + spare.pop())
-    assert "".join(repr(c) for c in state.hole_cards[hero_index]) == record["hero_cards"]
-    if straddle:
-        # the first full raise over a straddle is one straddle (min open 2S), as in gen_fixtures
-        state.completion_betting_or_raising_amount = straddle
-    reopen = SpecReopen(n, straddle or cfg["bb_chips"], max(state.bets))
-    board_so_far = ""
-    for k, e in enumerate(record["events"]):
-        where = f"record {record['id']} event {k} {e}"
-        if e["type"] == "board":
-            assert state.actor_index is None and state.can_deal_board(), where
-            assert e["cards"].startswith(board_so_far), where
-            new = e["cards"][len(board_so_far):]
-            assert len(new) == (6 if not board_so_far else 2), where
-            _deal(state.deal_board, new)
-            reopen.start_street(cfg["bb_chips"], 0)
-            board_so_far = e["cards"]
-            continue
-        i = state.actor_index
-        assert i is not None and ring[i] == e["seat"], where
-        assert state.street_index == STREET_INDEX[e["street"]], where
-        legal = legal_triple(state)
-        assert (legal["raise"] is not None) == spec_may_aggress(state, reopen, i), f"reopening divergence at {where}"
-        kind, to = e["action"]["kind"], e["action"].get("to")
-        facing = max(state.bets)
-        aggression = None
-        if kind == "fold":
-            assert to is None and legal["fold"], f"illegal fold at {where}: {legal}"
-            state.fold()
-        elif kind == "check":
-            assert to is None and legal["check_or_call"] == {"cost": 0}, f"illegal check at {where}: {legal}"
-            state.check_or_call()
-        elif kind == "call":
-            cc = legal["check_or_call"]
-            assert to is None and cc is not None and cc["cost"] > 0, f"illegal call at {where}: {legal}"
-            state.check_or_call()
-        elif kind in ("bet", "raise"):
-            assert (facing == 0) == (kind == "bet"), f"{kind} while facing {facing} at {where}"
-            rz = legal["raise"]
-            assert rz is not None and rz["min_to"] <= to < rz["max_to"], f"illegal {kind} to {to} at {where}: {legal}"
-            state.complete_bet_or_raise_to(to)
-            aggression = to
-        elif kind == "allin":
-            assert to == state.bets[i] + state.stacks[i], f"all-in to {to} is not the whole stack at {where}"
-            if to > facing:
-                assert legal["raise"] is not None and legal["raise"]["max_to"] == to, f"illegal all-in at {where}: {legal}"
-                state.complete_bet_or_raise_to(to)
-                aggression = to
-            else:
-                cc = legal["check_or_call"]
-                assert cc is not None and cc["cost"] == state.stacks[i], f"illegal all-in call at {where}: {legal}"
-                state.check_or_call()
-        else:
-            pytest.fail(f"unknown action kind at {where}")
-        reopen.acted(i, aggression)
-    return state, ring
+# The replay itself (PokerKit oracle, deal wrapper, legal-action triple, spec-4.3 reopening
+# tracker) lives in `gen_fixtures.replay_record` (plan 4 Task 19) -- lifted from what used to be a
+# private, test-only copy here, so there is exactly one PokerKit replay implementation.
 
 
 def test_every_record_replays_legally_through_pokerkit():
     for r in records():
-        state, ring = _pokerkit_replay(r)
-        assert state.status and state.actor_index is not None, r["id"]
-        assert ring[state.actor_index] == r["hero"], (r["id"], ring[state.actor_index], r["hero"])
+        trace = replay_record(r)
+        assert trace.legal_at_every_step, r["id"]
+        assert trace.state.status and trace.final_actor is not None, r["id"]
+        assert trace.final_actor == r["hero"], (r["id"], trace.final_actor, r["hero"])
 
 
 def test_opening_flop_bet_of_the_projection_records_is_one_big_blind():
@@ -356,7 +280,8 @@ def test_admitted_projection_numbers_reproduce_in_pokerkit():
     rows = {r["id"]: r for r in records()}
     for record_id, (folded, dead, cost, min_to) in PROJECTION_NUMBERS.items():
         r = rows[record_id]
-        state, _ = _pokerkit_replay(r)
+        trace = replay_record(r)
+        state = trace.state
         flop_folds = [e for e in r["events"]
                       if e["type"] == "action" and e["street"] == "flop" and e["action"]["kind"] == "fold"]
         assert len(flop_folds) == folded, record_id
@@ -364,6 +289,13 @@ def test_admitted_projection_numbers_reproduce_in_pokerkit():
         assert sum(b for b, live in zip(state.bets, state.statuses) if not live) == dead, record_id
         assert state.checking_or_calling_amount == cost, record_id
         assert state.min_completion_betting_or_raising_to_amount == min_to, record_id
+
+
+def test_every_record_replays_legally_in_pokerkit():
+    for row in records():
+        trace = replay_record(row)
+        assert trace.legal_at_every_step, row["id"]
+        assert trace.final_actor == row["hero"] or row["expected"]["unsupported"], row["id"]
 
 
 # --- I3: per-record lock mapping for every supported record and the four straddle records ---
@@ -511,3 +443,44 @@ def test_records_are_deterministic_and_independent_across_calls():
     first[0]["expected"]["required_reasons"].append("X")
     assert "X" not in second[0]["expected"]["required_reasons"]
     assert "X" not in first[1]["expected"]["required_reasons"]
+
+
+# --- Task 19: freezing the fifty fixture files + manifest ---
+
+
+def test_generated_bytes_are_stable():
+    first = {p.name: p.read_bytes() for p in sorted(ROOT.glob("*.json"))}
+    write_e2e(ROOT)
+    second = {p.name: p.read_bytes() for p in sorted(ROOT.glob("*.json"))}
+    assert first == second
+    manifest = json.loads((ROOT / "manifest.json").read_text())
+    assert len(manifest["sha256"]) == 50
+    assert manifest["supported_ids"] == [f"{n:03}" for n in range(1, 23)]
+    assert manifest["supported_baseline"] == manifest["supported_ids"]
+
+
+def test_check_e2e_passes_after_write_and_flags_a_tamper():
+    write_e2e(ROOT)
+    check_e2e(ROOT)  # no error: freshly written bytes match the generator exactly
+    path = ROOT / "001.json"
+    original = path.read_bytes()
+    try:
+        path.write_bytes(original + b" ")
+        with pytest.raises(SystemExit):
+            check_e2e(ROOT)
+    finally:
+        path.write_bytes(original)
+
+
+def test_check_e2e_flags_a_manifest_hash_mismatch():
+    write_e2e(ROOT)
+    manifest_path = ROOT / "manifest.json"
+    original = manifest_path.read_text()
+    try:
+        manifest = json.loads(original)
+        manifest["sha256"]["001.json"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+        with pytest.raises(SystemExit):
+            check_e2e(ROOT)
+    finally:
+        manifest_path.write_text(original)

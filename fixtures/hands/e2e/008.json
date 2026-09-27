@@ -1,0 +1,120 @@
+{
+  "button": 0,
+  "class": "hu_flop_srp",
+  "config": {
+    "bb_chips": 100,
+    "flop_budget_s": 10,
+    "rake": {
+      "cap_mchips": 50000,
+      "no_flop_no_drop": true,
+      "rate": 0.05
+    },
+    "sb_chips": 50,
+    "straddle": null,
+    "target_bp": 50,
+    "threads": 16
+  },
+  "dealt": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "events": [
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "seat": 3,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "seat": 4,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "raise",
+        "to": 250
+      },
+      "seat": 5,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "seat": 0,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "fold"
+      },
+      "seat": 1,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "call"
+      },
+      "seat": 2,
+      "street": "preflop",
+      "type": "action"
+    },
+    {
+      "cards": "Kh7d2c",
+      "type": "board"
+    },
+    {
+      "action": {
+        "kind": "check"
+      },
+      "seat": 2,
+      "street": "flop",
+      "type": "action"
+    },
+    {
+      "action": {
+        "kind": "bet",
+        "to": 401
+      },
+      "seat": 5,
+      "street": "flop",
+      "type": "action"
+    }
+  ],
+  "expected": {
+    "coverage": "Approximate",
+    "flop_miss_accuracy": "raw_target_or_DeadlineBestSoFar",
+    "numeric_ev": true,
+    "required_reasons": [
+      "ChartRounded",
+      "RakeProfileMapped"
+    ],
+    "unsupported": null
+  },
+  "fault": null,
+  "hero": 2,
+  "hero_cards": "6s6h",
+  "id": "008",
+  "stacks": [
+    20000,
+    20000,
+    20000,
+    20000,
+    20000,
+    20000
+  ],
+  "version": 1
+}
