@@ -4,7 +4,12 @@
 //!
 //! Time. Nothing here reads or waits on wall time. `FakeClock` moves only when a test (or `FakeWorker`, whose waiting
 //! is what moves it) moves it, only forward, and every move wakes every thread blocked in `Clock::wait_until` (the
-//! watchdog, say) through one condition variable.
+//! watchdog, say) through one condition variable; a test that holds the clock keeps them there until it releases it.
+//!
+//! Acknowledgements (ruling 20-I2). A test synchronizes with other threads by waiting for what they acknowledge, never
+//! by yielding, spinning or sleeping: the clock acknowledges a thread's registration in `wait_until`
+//! (`FakeClock::wait_for_waiter`) and holds waiters at a boundary (`hold`/`release`), and a `RecordingSink` made by
+//! `notifying` acknowledges each emission to its `Recorder` (`Recorder::wait_for`).
 //!
 //! The scripted worker. `FakeWorker` answers `WorkerLink` from a script of `FakeReply` items taken in order. The
 //! script is the worker's timeline: its output (`Ack`, `Progress`, `Result`), faulty lines (`Malformed`,
@@ -84,45 +89,106 @@ use std::time::Duration;
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> { m.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) }
 
 /// The engine's `Clock` under a test's control, in milliseconds from 0. Monotonic: it never moves back.
-pub struct FakeClock { now: Mutex<u64>, cv: Condvar }
+///
+/// Acknowledgements (ruling 20-I2). A test synchronizes with the threads that wait on the clock through the clock
+/// itself, never through wall time, sleeps or yield loops. `wait_for_waiter(t)` returns once a thread is blocked in
+/// `wait_until(t)` (its registration), and `waiting` lists what the blocked threads wait for. `hold` keeps every waiter
+/// inside `wait_until`, even when its time has come, until `release`: a test can then act between a clock move and a
+/// waiter's processing of that boundary, in an order it chooses. What a waiter does once past a boundary is
+/// acknowledged by what it does next: its registration for its next time, or its own thread's seam (the watchdog's
+/// `wait_for_ended_threads`, say).
+pub struct FakeClock { state: Mutex<ClockState>, cv: Condvar }
+
+struct ClockState {
+    now: u64,
+    /// The time each thread blocked in `wait_until` waits for, one entry per thread.
+    waiting: Vec<u64>,
+    /// `hold`: no waiter leaves `wait_until` until `release`.
+    held: bool,
+}
 
 impl FakeClock {
-    pub fn new() -> Arc<FakeClock> { Arc::new(FakeClock { now: Mutex::new(0), cv: Condvar::new() }) }
+    pub fn new() -> Arc<FakeClock> {
+        Arc::new(FakeClock { state: Mutex::new(ClockState { now: 0, waiting: Vec::new(), held: false }), cv: Condvar::new() })
+    }
 
-    /// Moves the clock forward by `ms` and wakes every waiter.
+    /// Moves the clock forward by `ms` and wakes every waiter (a held one stays inside `wait_until`).
     pub fn advance_ms(&self, ms: u64) {
-        let mut now = lock(&self.now);
-        let next = now.checked_add(ms).unwrap_or_else(|| panic!("FakeClock::advance_ms({ms}) overflows u64 from {}", *now));
-        *now = next;
+        let mut s = lock(&self.state);
+        let next = s.now.checked_add(ms).unwrap_or_else(|| panic!("FakeClock::advance_ms({ms}) overflows u64 from {}", s.now));
+        s.now = next;
         self.cv.notify_all();
     }
 
-    /// Sets the clock to `t_ms` and wakes every waiter. A `t_ms` before the current time panics: the clock is monotonic.
+    /// Sets the clock to `t_ms` and wakes every waiter (a held one stays inside `wait_until`). A `t_ms` before the current
+    /// time panics: the clock is monotonic.
     pub fn set_ms(&self, t_ms: u64) {
-        let mut now = lock(&self.now);
-        assert!(t_ms >= *now, "FakeClock::set_ms({t_ms}) would move the clock back from {}: the clock is monotonic", *now);
-        *now = t_ms;
+        let mut s = lock(&self.state);
+        assert!(t_ms >= s.now, "FakeClock::set_ms({t_ms}) would move the clock back from {}: the clock is monotonic", s.now);
+        s.now = t_ms;
         self.cv.notify_all();
     }
 
     /// Moves the clock to `t_ms` unless it is already there or past it (a test thread may drive it too).
     fn advance_to(&self, t_ms: u64) {
-        let mut now = lock(&self.now);
-        if t_ms > *now {
-            *now = t_ms;
+        let mut s = lock(&self.state);
+        if t_ms > s.now {
+            s.now = t_ms;
             self.cv.notify_all();
         }
+    }
+
+    /// From now until `release`, no thread leaves `wait_until`, whatever the time: one whose time has come, or comes
+    /// with a later move, or had already come when it called, stays blocked (and listed in `waiting`). Holding a held
+    /// clock panics.
+    pub fn hold(&self) {
+        let mut s = lock(&self.state);
+        assert!(!s.held, "FakeClock::hold: the clock is already held");
+        s.held = true;
+    }
+
+    /// Ends a `hold`: every waiter whose time has come leaves `wait_until`. Releasing a clock that is not held panics.
+    pub fn release(&self) {
+        let mut s = lock(&self.state);
+        assert!(s.held, "FakeClock::release: the clock is not held");
+        s.held = false;
+        self.cv.notify_all();
+    }
+
+    /// Blocks, on the clock's condition variable and never on wall time, until a thread is blocked in `wait_until(t_ms)`.
+    /// A thread that returns from `wait_until` at once (its time already come, the clock not held) never registers.
+    pub fn wait_for_waiter(&self, t_ms: u64) {
+        let mut s = lock(&self.state);
+        while !s.waiting.contains(&t_ms) {
+            s = self.cv.wait(s).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// The times the threads blocked in `wait_until` wait for, in ascending order, one entry per thread.
+    pub fn waiting(&self) -> Vec<u64> {
+        let mut waiting = lock(&self.state).waiting.clone();
+        waiting.sort_unstable();
+        waiting
     }
 }
 
 impl Clock for FakeClock {
-    fn now_ms(&self) -> u64 { *lock(&self.now) }
-    /// Blocks on the condition variable, never on wall time, until some other thread moves the clock to `t_ms`.
+    fn now_ms(&self) -> u64 { lock(&self.state).now }
+    /// Blocks on the condition variable, never on wall time, until some other thread moves the clock to `t_ms` and the
+    /// clock is not held. A thread that blocks is listed in `waiting` until it returns; its registration wakes
+    /// `wait_for_waiter`.
     fn wait_until(&self, t_ms: u64) {
-        let mut now = lock(&self.now);
-        while *now < t_ms {
-            now = self.cv.wait(now).unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut s = lock(&self.state);
+        if s.now >= t_ms && !s.held {
+            return;
         }
+        s.waiting.push(t_ms);
+        self.cv.notify_all();
+        while s.now < t_ms || s.held {
+            s = self.cv.wait(s).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        let me = s.waiting.iter().position(|&w| w == t_ms).expect("a blocked waiter stays listed until it returns");
+        s.waiting.swap_remove(me);
     }
 }
 
@@ -628,14 +694,21 @@ impl WorkerLink for FakeWorker {
 #[derive(Debug, Clone)]
 pub struct Recorded { pub at_ms: u64, pub kills: u32, pub event: RecommendationEvent }
 
-/// An `EventSink` that records every event with the fake time and the fake worker's kill count at emission.
-pub struct RecordingSink { clock: Arc<dyn Clock>, state: Option<Arc<Mutex<FakeState>>>, pub events: Arc<Mutex<Vec<Recorded>>> }
+/// An `EventSink` that records every event with the fake time and the fake worker's kill count at emission, and
+/// notifies its `Recorder` of each one.
+pub struct RecordingSink { clock: Arc<dyn Clock>, state: Option<Arc<Mutex<FakeState>>>, pub events: Arc<Mutex<Vec<Recorded>>>, recorded: Arc<Condvar> }
 
 impl RecordingSink {
     /// The sink and a handle on what it records; `state` is the fake worker's, when kill counts matter.
     pub fn new(clock: Arc<dyn Clock>, state: Option<Arc<Mutex<FakeState>>>) -> (RecordingSink, Arc<Mutex<Vec<Recorded>>>) {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        (RecordingSink { clock, state, events: events.clone() }, events)
+        let (sink, recorder) = RecordingSink::notifying(clock, state);
+        (sink, recorder.events)
+    }
+
+    /// The sink and a `Recorder` on what it records, whose waits the sink's emissions acknowledge (ruling 20-I2).
+    pub fn notifying(clock: Arc<dyn Clock>, state: Option<Arc<Mutex<FakeState>>>) -> (RecordingSink, Recorder) {
+        let (events, recorded) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Condvar::new()));
+        (RecordingSink { clock, state, events: events.clone(), recorded: recorded.clone() }, Recorder { events, recorded })
     }
 }
 
@@ -644,7 +717,27 @@ impl EventSink for RecordingSink {
         let kills = self.state.as_ref().map_or(0, |s| lock(s).kills);
         let at_ms = self.clock.now_ms();
         lock(&self.events).push(Recorded { at_ms, kills, event: ev });
+        self.recorded.notify_all();
     }
+}
+
+/// What a `RecordingSink` records, with a wait that each of its emissions acknowledges: `wait_for` blocks on a
+/// condition variable the sink notifies after recording an event, never on wall time or a spin.
+#[derive(Clone)]
+pub struct Recorder { events: Arc<Mutex<Vec<Recorded>>>, recorded: Arc<Condvar> }
+
+impl Recorder {
+    /// Blocks until at least `n` events are recorded, and returns every event recorded by then.
+    pub fn wait_for(&self, n: usize) -> Vec<Recorded> {
+        let mut events = lock(&self.events);
+        while events.len() < n {
+            events = self.recorded.wait(events).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        events.clone()
+    }
+
+    /// Every event recorded so far.
+    pub fn recorded(&self) -> Vec<Recorded> { lock(&self.events).clone() }
 }
 
 /// A valid `StreetSolution` for every decision node of the tree's root street, in materialized order: all combos
@@ -756,6 +849,59 @@ mod tests {
         let waiter = { let c = clock.clone(); std::thread::spawn(move || { c.wait_until(2_500); c.now_ms() }) };
         assert!(w.recv(ms(2_500)).unwrap().is_none());
         assert_eq!(waiter.join().unwrap(), 2_500);
+    }
+
+    /// Ruling 20-I2: a test learns that a thread waits on the clock from the clock (`wait_for_waiter`, `waiting`), and
+    /// `hold` keeps every waiter inside `wait_until` past its time, an already-past time included, until `release`.
+    #[test]
+    fn the_fake_clock_acknowledges_its_waiters_and_holds_them_at_a_boundary() {
+        let clock = FakeClock::new();
+        let first = { let c = clock.clone(); std::thread::spawn(move || { c.wait_until(100); c.now_ms() }) };
+        clock.wait_for_waiter(100);
+        assert_eq!(clock.waiting(), [100]);
+        clock.hold();
+        clock.set_ms(150);
+        assert_eq!(clock.waiting(), [100], "held: the waiter's time has come and it is still inside wait_until");
+        let second = { let c = clock.clone(); std::thread::spawn(move || { c.wait_until(20); c.now_ms() }) };
+        clock.wait_for_waiter(20);
+        assert_eq!(clock.waiting(), [20, 100], "held: a wait for a time already past waits too");
+        clock.set_ms(160);
+        clock.release();
+        assert_eq!((first.join().unwrap(), second.join().unwrap()), (160, 160));
+        assert!(clock.waiting().is_empty(), "a waiter is listed only while it is inside wait_until");
+        clock.wait_until(160); // not held, already there: returns at once
+    }
+
+    #[test]
+    #[should_panic(expected = "already held")]
+    fn holding_a_held_fake_clock_is_a_bug() {
+        let clock = FakeClock::new();
+        clock.hold();
+        clock.hold();
+    }
+
+    #[test]
+    #[should_panic(expected = "not held")]
+    fn releasing_a_fake_clock_that_is_not_held_is_a_bug() {
+        FakeClock::new().release();
+    }
+
+    /// Ruling 20-I2: every emission acknowledges itself to the `Recorder`, which a test waits on instead of spinning.
+    #[test]
+    fn the_notifying_recording_sink_acknowledges_each_emission() {
+        let clock = FakeClock::new();
+        let identity = DecisionIdentity { hand_id: 1, hand_revision: 1, decision_id: 1, config_revision: 0, model_revision: 0 };
+        let event = move |reason: &str| RecommendationEvent::NoDecision { identity: identity.clone(), reason: reason.into() };
+        let (mut sink, recorder) = RecordingSink::notifying(clock.clone(), None);
+        let events = Arc::clone(&sink.events);
+        clock.set_ms(7);
+        let emitted = (event("a"), event("b"));
+        let emitter = { let e = emitted.clone(); std::thread::spawn(move || { sink.emit(e.0); sink.emit(e.1); }) };
+        let got = recorder.wait_for(2);
+        assert_eq!(got.iter().map(|r| (r.at_ms, &r.event)).collect::<Vec<_>>(), [(7, &emitted.0), (7, &emitted.1)]);
+        emitter.join().unwrap();
+        assert_eq!(recorder.recorded().len(), 2);
+        assert_eq!(events.lock().unwrap().len(), 2, "the recorder reads the sink's own `events`");
     }
 
     /// One deadline per call on the fake clock: a delay runs from when a call first reaches it and carries over past a

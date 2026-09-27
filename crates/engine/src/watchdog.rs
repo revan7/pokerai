@@ -1,16 +1,22 @@
 //! The engine's watchdog of spec section 7, independent of the worker client.
 //!
 //! Each `arm` starts one generation, served by its own `watchdog` thread (§3.4) that waits on the injected `Clock`
-//! and on nothing else: no worker, no `engine-main`, no channel. At the street deadline it records a street
-//! violation if no first-attempt terminal has arrived; at `final delivery - 100 ms` it delivers the request's one
-//! `Final`: the retained payload (a `Provisional` or an earlier `best_so_far`) when there is one, else the fallback
-//! `Unsupported{DeadlineExceeded{stage}}` with the stage the request reached by then. The `Final` goes out whatever
-//! the worker is doing, and the cancellation, kill or restart of a busy worker proceeds independently (§7, §12).
+//! and on nothing else: no worker, no `engine-main`, no channel. At the street deadline it records that the live
+//! generation reached it; at `final delivery - 100 ms` it delivers the request's one `Final`: the retained payload (a
+//! `Provisional` or an earlier `best_so_far`) when there is one, else the fallback `Unsupported{DeadlineExceeded{stage}}`
+//! with the stage the request reached by then. The `Final` goes out whatever the worker is doing, and the
+//! cancellation, kill or restart of a busy worker proceeds independently (§7, §12).
+//!
+//! Street deadline. Whether the first attempt met its street deadline is judged from the engine-clock time its
+//! terminal arrived, which the engine publishes in the request's `StreetDeadline`, never from when the watchdog thread
+//! happens to resume (ruling 20-I1): a terminal 1 ms late is a violation even when it is published before the
+//! watchdog wakes, and one on time is not a violation even when it is published after. The watchdog's own record, that
+//! the live generation reached the deadline, decides only while no terminal has been published.
 //!
 //! Generations. Only the most recent generation is live: `arm` retires the one before it, and `disarm` retires the
-//! live one. A retired generation does nothing at its times, not even the street-violation record, and its thread
-//! ends at its next wake-up. The `Clock` has no way to interrupt a wait, so a retired thread still sleeps until its
-//! next deadline (at most the flop's `5 s + flop_budget_s`) before it ends.
+//! live one. A retired generation does nothing at its times, not even its street-deadline record, and its thread ends
+//! at its next wake-up. The `Clock` has no way to interrupt a wait, so a retired thread still sleeps until its next
+//! deadline (at most the flop's `5 s + flop_budget_s`) before it ends.
 //!
 //! One `Final` per request. `delivered` is shared with the engine's own delivery path: whichever side swaps it from
 //! false to true first delivers, and the other stays silent. A request whose `Final` was already delivered is never
@@ -18,8 +24,15 @@
 //!
 //! Locking. Waiting holds no lock. The generation lock is taken to check liveness and, at the fire, held from the
 //! liveness check through the emission, so `arm` and `disarm` are linearized with a fire: once either returns, no
-//! earlier generation emits anything. Lock order: generation, then `retained`, then `stage`, then the sink. A caller
-//! must therefore never call `arm` or `disarm` while holding the sink, `retained` or `stage` lock of an armed request.
+//! earlier generation emits anything. Lock order: generation, then `retained`, then `stage`, then the sink; the
+//! street-deadline state is taken alone or under the generation lock alone, and no other lock is taken while it is
+//! held. A caller must therefore never call `arm` or `disarm` while holding the sink, `retained` or `stage` lock of an
+//! armed request.
+//!
+//! Test seam. With the `testing` feature (or in this crate's unit tests) a `Watchdog` also counts its ended threads, so
+//! a test waits for a fire or a retirement to be over (`wait_for_ended_threads`) instead of yielding or sleeping
+//! (ruling 20-I2), and can see that a fire holds the generation lock (`retirement_would_block`). Nothing of it is
+//! compiled into a build without the feature.
 
 use crate::clock::Clock;
 use crate::EventSink;
@@ -30,12 +43,79 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// The sink of one request's events, shared by `engine-main`, the `fast-path` thread and the watchdog.
 pub type SharedSink = Arc<Mutex<Box<dyn EventSink>>>;
 
+/// The street deadline of one request (§7): `t0 + street budget`, when the first attempt's terminal arrived, and
+/// whether the deadline was met. The engine publishes the terminal's arrival (`terminal_arrived`); the watchdog records
+/// that its live generation reached the deadline. Both write this one coordinated state (ruling 20-I1).
+///
+/// The verdict (`violated`) is judged from the terminal's engine-clock arrival time, never from when a thread runs:
+/// once a terminal is published, the deadline was violated exactly when that terminal arrived after `deadline_ms`
+/// (one arriving at `deadline_ms` is on time), whether it was published before or after the watchdog reached the
+/// deadline, and whether or not that watchdog generation is still live. With no terminal published, the deadline
+/// counts as violated once the live watchdog generation has reached it; a terminal published later with an arrival
+/// at or before the deadline was on time after all, and the verdict then says so.
+pub struct StreetDeadline {
+    deadline_ms: u64,
+    state: Mutex<StreetState>,
+}
+
+struct StreetState {
+    /// The engine-clock time the first attempt's terminal arrived, once published.
+    arrival_ms: Option<u64>,
+    /// The live watchdog generation has reached the deadline.
+    reached: bool,
+}
+
+impl StreetDeadline {
+    /// The street deadline at `deadline_ms` (`Deadlines::street_deadline_ms`), with no terminal and not yet reached.
+    pub fn new(deadline_ms: u64) -> Self {
+        Self { deadline_ms, state: Mutex::new(StreetState { arrival_ms: None, reached: false }) }
+    }
+
+    pub fn deadline_ms(&self) -> u64 {
+        self.deadline_ms
+    }
+
+    /// Publishes `at_ms`, the engine-clock time at which the first attempt's terminal arrived. That is the time read
+    /// when the terminal arrived, not the time of this call: an engine that publishes after further work passes the
+    /// arrival time it kept. The first publication stands; a later one is ignored.
+    pub fn terminal_arrived(&self, at_ms: u64) {
+        let mut s = lock(&self.state);
+        if s.arrival_ms.is_none() {
+            s.arrival_ms = Some(at_ms);
+        }
+    }
+
+    /// The first attempt's terminal's arrival time, once published.
+    pub fn terminal_arrival_ms(&self) -> Option<u64> {
+        lock(&self.state).arrival_ms
+    }
+
+    /// Whether the first attempt's terminal has been published (the plan's boolean `terminal_seen`).
+    pub fn terminal_seen(&self) -> bool {
+        lock(&self.state).arrival_ms.is_some()
+    }
+
+    /// Whether the first attempt missed the street deadline (see the type's doc).
+    pub fn violated(&self) -> bool {
+        let s = lock(&self.state);
+        match s.arrival_ms {
+            Some(at_ms) => at_ms > self.deadline_ms,
+            None => s.reached,
+        }
+    }
+
+    /// The live watchdog generation has reached the deadline.
+    fn reach(&self) {
+        lock(&self.state).reached = true;
+    }
+}
+
 /// One request as the watchdog sees it.
 pub struct Armed {
     /// The decision the `Final` answers.
     pub identity: DecisionIdentity,
-    /// `t0 + street budget`: a first attempt without a terminal by then is a street violation.
-    pub street_deadline_ms: u64,
+    /// `t0 + street budget` with the first-attempt terminal's arrival and the verdict, shared with the engine.
+    pub street_deadline: Arc<StreetDeadline>,
     /// `final delivery - WATCHDOG_LEAD_MS` (`Deadlines::watchdog_fire_ms`).
     pub fire_ms: u64,
     /// A `Provisional` or an earlier `best_so_far` of this decision (plan 4 fills it); taken at the fire.
@@ -47,10 +127,6 @@ pub struct Armed {
     pub sink: SharedSink,
     /// Set by whichever side delivers the request's `Final`.
     pub delivered: Arc<AtomicBool>,
-    /// Set by the engine when the first attempt's terminal arrives.
-    pub terminal_seen: Arc<AtomicBool>,
-    /// Set by the watchdog when the street deadline passed without a first-attempt terminal.
-    pub street_violation: Arc<AtomicBool>,
 }
 
 /// The live generation, and the decision the watchdog last fired for.
@@ -59,24 +135,31 @@ struct Generations {
     fired: Option<DecisionIdentity>,
 }
 
-/// §7: independent of the worker client. At the street deadline it records a violation when no first-attempt terminal
-/// arrived; at `final delivery - 100 ms` it emits `Final` with the retained payload or `DeadlineExceeded`. `disarm`
-/// retires the armed generation; a retired thread wakes at its times and does nothing.
+/// §7: independent of the worker client. At the street deadline it records that the live generation reached it (the
+/// verdict is the `StreetDeadline`'s); at `final delivery - 100 ms` it emits `Final` with the retained payload or
+/// `DeadlineExceeded`. `disarm` retires the armed generation; a retired thread wakes at its times and does nothing.
 pub struct Watchdog {
     clock: Arc<dyn Clock>,
     generations: Arc<Mutex<Generations>>,
+    #[cfg(any(test, feature = "testing"))]
+    ends: Arc<seam::Ends>,
 }
 
 /// The watchdog is the delivery of last resort: a panic elsewhere while one of these locks was held must not stop the
 /// `Final`. Every value behind them stays consistent at every point a panic could interrupt it (a counter, an
-/// `Option` taken or not, a string replaced whole, a sink call).
+/// `Option` taken or not, a string replaced whole, a sink call, a time set once, a flag).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Watchdog {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
-        Self { clock, generations: Arc::new(Mutex::new(Generations { live: 0, fired: None })) }
+        Self {
+            clock,
+            generations: Arc::new(Mutex::new(Generations { live: 0, fired: None })),
+            #[cfg(any(test, feature = "testing"))]
+            ends: Arc::new(seam::Ends::default()),
+        }
     }
 
     /// Starts a new generation for `a`, retiring the previous one, on a thread of its own.
@@ -87,9 +170,9 @@ impl Watchdog {
             a.identity
         );
         assert!(
-            a.street_deadline_ms <= a.fire_ms,
+            a.street_deadline.deadline_ms() <= a.fire_ms,
             "watchdog armed with the street deadline {} ms after its fire time {} ms",
-            a.street_deadline_ms,
+            a.street_deadline.deadline_ms(),
             a.fire_ms
         );
         assert!(
@@ -114,9 +197,16 @@ impl Watchdog {
             g.live
         };
         let (clock, generations) = (self.clock.clone(), self.generations.clone());
+        #[cfg(any(test, feature = "testing"))]
+        let ends = self.ends.clone();
         std::thread::Builder::new()
             .name("watchdog".into())
-            .spawn(move || watch(clock.as_ref(), &generations, generation, a))
+            .spawn(move || {
+                // Counts this thread's end once `watch` has returned (or unwound): after its last action.
+                #[cfg(any(test, feature = "testing"))]
+                let _end = seam::End(&ends);
+                watch(clock.as_ref(), &generations, generation, a)
+            })
             .expect("spawn the watchdog thread");
     }
 
@@ -128,17 +218,66 @@ impl Watchdog {
     }
 }
 
+/// Test seam (ruling 20-I2): acknowledgements a test waits for instead of yielding, spinning or sleeping.
+#[cfg(any(test, feature = "testing"))]
+impl Watchdog {
+    /// Blocks until `n` of this watchdog's generation threads have ended. A thread ends right after its last action:
+    /// the emission of its `Final`, or its return on finding its generation retired or its `Final` already delivered,
+    /// so a test asserts what a fire or a retirement did, or did not do, only after this acknowledgement. It waits on
+    /// a condition variable that each thread's end notifies, never on time.
+    pub fn wait_for_ended_threads(&self, n: u64) {
+        self.ends.wait_for(n);
+    }
+
+    /// Whether `arm` and `disarm` would block now because a thread holds the generation lock, as a fire does from its
+    /// liveness check through its emission. Never true while every generation thread is waiting on the clock.
+    pub fn retirement_would_block(&self) -> bool {
+        matches!(self.generations.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+mod seam {
+    use std::sync::{Condvar, Mutex};
+
+    /// How many generation threads have ended, and the condition variable each end notifies.
+    #[derive(Default)]
+    pub(super) struct Ends {
+        count: Mutex<u64>,
+        ended: Condvar,
+    }
+
+    impl Ends {
+        pub(super) fn wait_for(&self, n: u64) {
+            let mut count = super::lock(&self.count);
+            while *count < n {
+                count = self.ended.wait(count).unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+    }
+
+    /// Counts one ended thread when dropped, on every way out of the thread's body.
+    pub(super) struct End<'a>(pub(super) &'a Ends);
+
+    impl Drop for End<'_> {
+        fn drop(&mut self) {
+            *super::lock(&self.0.count) += 1;
+            self.0.ended.notify_all();
+        }
+    }
+}
+
 /// The body of one generation's thread.
 fn watch(clock: &dyn Clock, generations: &Mutex<Generations>, generation: u64, a: Armed) {
-    clock.wait_until(a.street_deadline_ms);
+    clock.wait_until(a.street_deadline.deadline_ms());
     {
         let g = lock(generations);
         if g.live != generation {
             return;
         }
-        if !a.terminal_seen.load(Ordering::SeqCst) {
-            a.street_violation.store(true, Ordering::SeqCst);
-        }
+        // Only that the live generation reached the deadline: the verdict is judged from the terminal's arrival time
+        // (`StreetDeadline::violated`), not from when this thread resumed.
+        a.street_deadline.reach();
     }
     clock.wait_until(a.fire_ms);
     // Held through the emission: see "Locking" above.
