@@ -5,7 +5,7 @@ use serde_json::Value;
 use solver_worker::extract::NodeSite;
 use solver_worker::job::{self, Checkpoint, Hooks, JobControl, JobOutcome, Op};
 use solver_worker::protocol::{executor_loop_with, handle_line, Proto, Shared, WorkerState};
-use solver_worker::solve_loop::{LoopOutcome, LoopParams, LoopSite};
+use solver_worker::solve_loop::{meets_target, LoopOutcome, LoopParams, LoopSite};
 use solver_worker::writer::Out;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -191,6 +191,19 @@ impl Harness {
 /// A failed assertion never leaves a job held behind it.
 impl Drop for Harness { fn drop(&mut self) { self.barrier.release(); } }
 
+// ---- The target a status is checked against ----
+
+/// Spec 4.4 and §5 step 7's target compliance, restated here independently of the worker, exactly as the engine
+/// evaluates it (ruling 26-Q4): `exploitability_chips / pot <= target_bp / 10_000` as `expl * 10_000 <= target_bp * pot`
+/// in `f64` (both products exact). Follow-up P2.W1: the worker's `ok` means this holds, its `best_so_far` that it does
+/// not; the contract suites check a status against this predicate, never against a threshold narrowed to `f32`.
+pub fn meets_raw_target(exploitability_chips: f32, pot: u32, target_bp: u16) -> bool {
+    f64::from(exploitability_chips) * 10_000.0 <= f64::from(target_bp) * f64::from(pot)
+}
+
+/// The raw target in chips, `pot * target_bp / 10_000`, for diagnostics only: no status is ever decided on it.
+pub fn raw_target_chips(pot: u32, target_bp: u16) -> f64 { f64::from(pot) * f64::from(target_bp) / 10_000.0 }
+
 // ---- In process: one job through the job runner's seam on a fixed solve schedule ----
 
 /// One progress report as the job emitted it: stage, iterations, reported exploitability, memory bytes.
@@ -206,10 +219,11 @@ pub struct Fixed { pub outcome: JobOutcome, pub reports: Vec<Report>, pub measur
 /// P2T16R-I1/I4/I5): exactly `steps` real `solve_step`s, a real `compute_exploitability` after every tenth (§7's
 /// cadence whenever the deadline does not bind, and the V1 generator's), each measurement reported through the job's
 /// progress, every loop site reported to `hooks` immediately before it, and the cancel flag polled where §7's loop
-/// polls it. The outcome's `reached_target` is the last measurement against the request's target (the job's own
-/// arithmetic, `LoopParams::target_chips`), so a caller that needs §7's stop point asserts from `measured` that no
-/// earlier measurement met it. The job runs on a dedicated rayon pool of `threads` threads: a pinned thread count,
-/// as `--threads` pins the spawned worker's. No clock is read and nothing sleeps.
+/// polls it. The outcome's `reached_target` is the last measurement against the request's target by the §7 loop's own
+/// predicate (`solve_loop::meets_target` over `LoopParams::pot` and `LoopParams::target_bp`: spec 4.4's raw comparison,
+/// follow-up P2.W1), so a caller that needs §7's stop point asserts from `measured` that no earlier measurement met it.
+/// The job runs on a dedicated rayon pool of `threads` threads: a pinned thread count, as `--threads` pins the spawned
+/// worker's. No clock is read and nothing sleeps.
 pub fn run_fixed(req: &SolveRequest, threads: usize, steps: u32, hooks: &mut Barrier) -> Fixed {
     assert!(steps > 0 && steps % 10 == 0, "a fixed schedule ends on a measurement: {steps} steps");
     let reports: Arc<Mutex<Vec<Report>>> = Arc::default();
@@ -241,7 +255,7 @@ pub fn run_fixed(req: &SolveRequest, threads: usize, steps: u32, hooks: &mut Bar
                     progress(i + 1, expl);
                 }
             }
-            LoopOutcome { iterations: steps, exploitability: expl, reached_target: expl.is_some_and(|e| e <= params.target_chips), cancelled: false }
+            LoopOutcome { iterations: steps, exploitability: expl, reached_target: expl.is_some_and(|e| meets_target(e, params.pot, params.target_bp)), cancelled: false }
         };
         job::run_scripted(req, None, &mut ctl, hooks, &mut schedule)
     });

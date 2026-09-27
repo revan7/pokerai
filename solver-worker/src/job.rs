@@ -275,8 +275,7 @@ fn run_with(req: &SolveRequest, staged: Option<&[NodeLock]>, ctl: &mut JobContro
 
     // Solving: the §7 loop polls the cancel flag before the first iteration and at every boundary.
     (ctl.progress)(Stage::Solving, 0, None, ms(t0), adm.estimate_bytes);
-    let target_chips = (f64::from(req.pot) * f64::from(req.target_bp) / 10_000.0) as f32;
-    let params = solve_loop::LoopParams { deadline_ms: req.deadline_ms, extraction_margin_ms: req.extraction_margin_ms, target_chips, started: t0 };
+    let params = solve_loop::LoopParams { deadline_ms: req.deadline_ms, extraction_margin_ms: req.extraction_margin_ms, pot: req.pot, target_bp: req.target_bp, started: t0 };
     let cancel = Arc::clone(&ctl.cancel);
     let mut reporter = Reporter::new(req.pot);
     hooks.enter(Op::Solve);
@@ -662,10 +661,10 @@ mod tests {
     #[test]
     fn a_staged_lock_is_applied_counted_and_honoured() {
         let (req, locks) = lock_job();
-        let target = req.pot as f32 * req.target_bp as f32 / 10_000.0;
+        let meets = |e: f32| solve_loop::meets_target(e, req.pot, req.target_bp);
         let sol = match run(&req, Some(&locks), &mut ctl()).outcome {
-            JobOutcome::Ok(s) => { assert!(s.exploitability_chips <= target, "Ok at {} over target {target}", s.exploitability_chips); s }
-            JobOutcome::BestSoFar(s) => { assert!(s.exploitability_chips > target, "BestSoFar at {} within target {target}", s.exploitability_chips); s }
+            JobOutcome::Ok(s) => { assert!(meets(s.exploitability_chips), "Ok at {} over the {}-bp target of the {}-chip pot", s.exploitability_chips, req.target_bp, req.pot); s }
+            JobOutcome::BestSoFar(s) => { assert!(!meets(s.exploitability_chips), "BestSoFar at {} within the {}-bp target of the {}-chip pot", s.exploitability_chips, req.target_bp, req.pot); s }
             other => panic!("{other:?}"),
         };
         validate_solution(&sol, &req.tree.materialized).unwrap();
@@ -707,8 +706,7 @@ mod tests {
         let (mut c, reports) = recording(|_| false);
         let r = run(&req, None, &mut c);
         let sol = match r.outcome { JobOutcome::BestSoFar(s) => s, other => panic!("{other:?}") };
-        let target = req.pot as f32 * req.target_bp as f32 / 10_000.0;
-        assert!(sol.exploitability_chips > target && sol.iterations > 0, "{} chips after {} iterations", sol.exploitability_chips, sol.iterations);
+        assert!(!solve_loop::meets_target(sol.exploitability_chips, req.pot, req.target_bp) && sol.iterations > 0, "{} chips after {} iterations", sol.exploitability_chips, sol.iterations);
         validate_solution(&sol, &req.tree.materialized).unwrap();
         let flop_nodes = req.tree.materialized.iter().filter(|n| n.street == proto::Street::Flop).count();
         assert_eq!((sol.nodes.len(), sol.requested, sol.export.as_str(), sol.locks_applied), (flop_nodes, 0, "street", 0));
@@ -724,16 +722,15 @@ mod tests {
     fn a_non_target_stop_after_real_iterations_is_a_validated_best_so_far() {
         use postflop_solver::{compute_exploitability, solve_step};
         let req = solve_request("river_two_combo", 0);
-        let target = (f64::from(req.pot) * f64::from(req.target_bp) / 10_000.0) as f32;
         let mut measured = None;
         let mut scripted = |game: &PostFlopGame, params: &solve_loop::LoopParams, cancel: &AtomicBool, progress: &mut dyn FnMut(u32, Option<f32>), _at_site: &mut dyn FnMut(LoopSite), _clock: &mut dyn FnMut(f64) -> f64| {
-            assert_eq!(params.target_chips, target);
+            assert_eq!((params.pot, params.target_bp), (req.pot, req.target_bp));
             for i in 0..3 {
                 assert!(!cancel.load(Ordering::SeqCst));
                 solve_step(game, i);
             }
             let e = compute_exploitability(game);
-            assert!(e > target, "three iterations are far from the {target}-chip target: {e}");
+            assert!(!solve_loop::meets_target(e, req.pot, req.target_bp), "three iterations are far from the {}-bp target of the {}-chip pot: {e}", req.target_bp, req.pot);
             measured = Some(e);
             progress(3, Some(e));
             solve_loop::LoopOutcome { iterations: 3, exploitability: Some(e), reached_target: false, cancelled: false }
