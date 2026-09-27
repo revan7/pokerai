@@ -578,6 +578,37 @@ fn a_confirmed_store_above_target_another_board_or_a_corrupt_cell_is_not_done() 
     cache.shutdown();
 }
 
+/// Re-review round 2, N1: `entry_verified` must check the entry it reads back against the *bound*
+/// slot's own normalized identity, not merely whatever identity the caller's `key`/`spr` happen to
+/// compute to. A slot bound to one identity is not completed by a valid, at-target entry that
+/// belongs to a different identity, even when the caller passes that other identity's own key: the
+/// mismatch between `item.game` and the computed identity is not completion.
+#[test]
+fn entry_verified_rejects_an_entry_for_another_identity_than_the_slots_binding() {
+    let (entry, item, mut q, dir) = fixture();
+    let root = dir.path().to_path_buf();
+    let id = item.identity_hex();
+    let (key, spr) = (entry.key.clone(), entry.source.spr);
+
+    let cache = Cache::open(root.clone(), CACHE_QUOTA_BYTES);
+    assert!(cache.store_tracked(&entry).wait(WRITER_BUDGET), "the writer confirms the store");
+    assert!(queue::entry_verified(&root, &item, &key, spr, TARGET_BP), "unbound, the caller's own key reads back valid");
+
+    let mut elsewhere = key.clone();
+    let hash = core_ranges::hash_scaled(&core_ranges::parse_range("KK").unwrap());
+    elsewhere.range_hash_oop = hash;
+    elsewhere.range_hash_ip = hash;
+    assert_ne!(key.scenario_identity(spr), elsewhere.scenario_identity(spr), "a distinct identity on the same board");
+
+    let bound = q.bind(&id, &elsewhere, spr);
+    assert_eq!(bound.game.unwrap().identity, elsewhere.scenario_identity(spr), "the slot is bound to the other identity");
+    assert!(
+        !queue::entry_verified(&root, &bound, &key, spr, TARGET_BP),
+        "a valid entry for another identity must not complete a slot bound elsewhere"
+    );
+    cache.shutdown();
+}
+
 /// Brief step 5 "replace the source bundle hash", and review R1: a new bundle is a new source
 /// generation, under which preparation binds the item to a new normalized identity (the cache key
 /// without its bucket plus the exact SPR). Completion under the old bundle does not carry over,
@@ -765,6 +796,47 @@ fn a_preparation_failure_belongs_to_its_generation() {
     q.save().unwrap();
     let persisted = &saved(dir).items[&id];
     assert_eq!((&persisted.status, persisted.attempts, persisted.last_error.as_deref()), (&TaskStatus::Pending, 0, None));
+}
+
+/// Re-review round 2, N3 (corrected doc/comment): a game's record, including a terminal failure, is
+/// forgotten the moment its last binding is released -- a rebind to another identity (J2 path 1,
+/// covered elsewhere) or, as here, a preparation failure of its own stale slot under a new
+/// generation (J2 path 2). Re-preparation back onto the very same identity afterwards finds a fresh
+/// record, not the terminal one, even though no other slot ever bound elsewhere: the reset is
+/// deliberate and visible, never masked as a survival of the old status.
+#[test]
+fn a_preparation_failure_under_a_new_generation_releases_the_stale_binding_and_resets_its_game() {
+    let tmp = TempDir::new("queue-rebind-reset");
+    let dir = tmp.path();
+    let mut q = open_at(dir, &FakeClock::new(0, UNIX));
+    let item = q.next_pending(0).unwrap();
+    let id = item.identity_hex();
+    let (key_a, spr) = prepared(&item, "chart-a");
+    q.set_generation(GEN_A);
+    q.bind(&id, &key_a, spr);
+    for n in 1..=4_u64 {
+        q.record_launch(&id);
+        q.record_failure(&id, n * 30_000, format!("error {n}"));
+    }
+    assert_eq!(q.item(&id).unwrap().status, TaskStatus::Failed { n: 4 }, "the game is terminal under generation A");
+
+    // The generation change alone leaves the binding in place, only stale; it is the preparation
+    // failure of the now-stale slot that drops it and releases the game (J2 path 2).
+    q.set_generation(GEN_B);
+    q.record_launch(&id);
+    q.record_failure(&id, 0, "chart replay failed".into());
+    q.save().unwrap();
+    assert!(
+        !saved(dir).games.contains_key(&hex(&key_a.scenario_identity(spr))),
+        "the stale binding's release drops the game record entirely"
+    );
+
+    let fresh = q.bind(&id, &key_a, spr);
+    assert_eq!(
+        (fresh.status, fresh.attempts, fresh.last_error),
+        (TaskStatus::Pending, 0, None),
+        "re-preparation onto the same identity finds a fresh record, not the terminal one"
+    );
 }
 
 /// Review R1: `queue.json` persists each prepared slot's normalized identity and each game's exact
@@ -979,11 +1051,30 @@ fn a_retry_deadline_is_persisted_as_absolute_utc_and_waited_out_on_the_monotonic
     q.record_failure(&id, t, "error".into());
     assert_ne!(q.next_pending(t + 29_999).unwrap().identity_hex(), id, "the backoff runs 30 s on the monotonic clock");
     assert_eq!(q.next_pending(t + 30_000).unwrap().identity_hex(), id);
-    // A monotonic reading that runs backwards is a caller bug; it still cannot stall the retry
-    // past one backoff.
-    assert_eq!(q.next_pending(t - 3_600_000).unwrap().identity_hex(), id);
+    // A monotonic reading that runs backwards relative to the anchor `t` is a caller clock
+    // violation, not a silent retry (re-review round 2, N2): see the dedicated panic test below.
     q.save().unwrap();
     assert_eq!(saved(tmp.path()).items[&id].retry_after_unix_ms, UNIX + 30_000, "persisted as UTC, never as the monotonic reading");
+}
+
+/// Re-review round 2, N2: `retry_due` is monotone -- a deadline more than one backoff ahead of
+/// `now_ms` is never silently treated as due -- and loud. Every in-process deadline is set at most
+/// one backoff ahead of the monotonic reading it was anchored at (`record_failure`'s own `now_ms`,
+/// or `open_with_clock`'s restored anchor), so `now_ms` landing more than one backoff behind it can
+/// only mean the caller's clock ran backwards relative to that anchor: a programming error the
+/// clock seam surfaces with an always-on assert, never masks as a due retry.
+#[test]
+#[should_panic(expected = "now_ms ran backwards")]
+fn a_now_ms_that_runs_backwards_past_one_backoff_is_a_loud_caller_clock_violation() {
+    let tmp = TempDir::new("queue-clock-backwards");
+    let t = 5_000_000_000_u64;
+    let mut q = open_at(tmp.path(), &FakeClock::new(t, UNIX));
+    let id = q.next_pending(t).unwrap().identity_hex();
+    q.record_launch(&id);
+    q.record_failure(&id, t, "error".into());
+    // `t` anchored the deadline at t + 30_000; asking at t - 3_600_000 is far more than one
+    // backoff behind it.
+    let _ = q.next_pending(t - 3_600_000);
 }
 
 /// Review R2: a process restarted immediately -- its monotonic clock restarted near zero, the
@@ -1090,34 +1181,52 @@ fn a_monotonic_reading_past_the_millisecond_ceiling_is_refused_loudly() {
 }
 
 /// The largest file the queue can ever publish: every slot bound (under a non-initial generation)
-/// to a game of its own -- so every slot carries a binding and every game a record -- and every
-/// game failed four times with an error far past the stored bound, every character of it needing
-/// a JSON escape. A bound slot keeps no progress of its own and an unbound slot has no game, so no
-/// other state is larger. It still fits the 64 MiB bound, so a save can never be locked out, and
-/// it reopens intact.
+/// to a game of its own -- so every slot carries a binding and every game a record -- each game's
+/// exact SPR at its widest possible representation (re-review round 2, N4: a reduced `u64/u64`
+/// ratio of two consecutive integers, already in lowest terms, rather than the few-digit SPRs
+/// `prepared` hands out elsewhere in this file), and every game failed four times with an error
+/// exactly `LAST_ERROR_MAX_BYTES` long and needing a JSON escape on every byte, so `bounded_error`
+/// has no need to cut it (a cut message loses more to the cut mark than it keeps escaped). A bound
+/// slot keeps no progress of its own and an unbound slot has no game, so no other reachable state
+/// is larger. It still fits the 64 MiB bound, so a save can never be locked out, and it reopens
+/// intact.
 #[test]
 fn the_largest_possible_queue_file_still_fits_the_bound_and_reopens() {
     let tmp = TempDir::new("queue-largest");
     let mut q = open(tmp.path());
     q.set_generation([0xff; 32]);
-    bind_all(&mut q, tmp.path());
+    // Consecutive integers are already coprime, so this is a reduced ratio at the widest possible
+    // `u64` digit count on both sides -- nothing `Rational::new` could store is larger.
+    let worst_spr = Rational::new(u64::MAX, u64::MAX - 1).unwrap();
+    for item in slots(&q, tmp.path()).into_values() {
+        let (key, _) = prepared(&item, "chart-a");
+        q.bind(&item.identity_hex(), &key, worst_spr);
+    }
     let ids: Vec<String> = slots(&q, tmp.path()).into_keys().collect();
-    let worst = "\"\\".repeat(300);
+    let worst_error = "\"".repeat(128) + &"\\".repeat(128);
+    assert_eq!(worst_error.len(), queue::LAST_ERROR_MAX_BYTES, "the worst-case message is exactly the bound, uncut");
     for id in &ids {
         for _ in 0..4 {
             q.record_launch(id);
-            q.record_failure(id, 0, worst.clone());
+            q.record_failure(id, 0, worst_error.clone());
         }
     }
     q.set_paused(true);
     q.save().expect("the worst-case queue file must stay within the bound");
     let len = std::fs::metadata(queue::queue_path(tmp.path())).unwrap().len();
-    assert!(len <= queue::QUEUE_FILE_MAX, "{len} bytes");
+    eprintln!(
+        "the largest possible queue.json measures {len} bytes ({:.1}% of the {}-byte QUEUE_FILE_MAX bound)",
+        100.0 * len as f64 / queue::QUEUE_FILE_MAX as f64,
+        queue::QUEUE_FILE_MAX
+    );
+    assert!(len <= queue::QUEUE_FILE_MAX, "{len} bytes exceeds QUEUE_FILE_MAX ({})", queue::QUEUE_FILE_MAX);
     let file = saved(tmp.path());
     assert_eq!(file.games.len(), ALL as usize, "one game per slot");
     let game = file.items[&ids[0]].game.unwrap().identity;
-    let stored = file.games[&hex(&game)].last_error.clone().unwrap();
-    assert!(stored.len() <= queue::LAST_ERROR_MAX_BYTES && !stored.chars().any(char::is_control), "{stored:?}");
+    let record = &file.games[&hex(&game)];
+    assert_eq!(record.spr, worst_spr, "the widest possible SPR representation is preserved");
+    assert_eq!(record.last_error.as_deref(), Some(worst_error.as_str()), "the maximal message must not be cut");
+    assert!(!record.last_error.as_ref().unwrap().chars().any(char::is_control));
     let reopened = open(tmp.path());
     assert_eq!((reopened.paused(), reopened.status_counts()), (true, (0, 0, ALL)));
 }

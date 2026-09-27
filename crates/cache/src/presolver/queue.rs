@@ -33,11 +33,17 @@
 //! Bindings belong to a source/config *generation*: an opaque fingerprint the caller declares with
 //! `set_generation` (task 16: the active bundle's and configuration's revisions), persisted in the
 //! file. A binding made under another generation is stale -- the slot must be prepared again, and
-//! until then it counts as pending -- but the game it names keeps its record, so re-preparation that
-//! resolves to the same identity finds that game's status again (a terminal failure stays terminal,
-//! a completion stays done), while other ranges, rake or tree are another identity with a fresh
-//! budget. A game record lives exactly as long as some slot is bound to it, which bounds the file at
-//! one game per slot.
+//! until then it counts as pending -- but the game it names keeps its record for as long as some
+//! slot still binds it, so re-preparation that resolves to the same identity while that binding
+//! survives finds that game's status again (a terminal failure stays terminal, a completion stays
+//! done), while other ranges, rake or tree are another identity with a fresh budget. A game's
+//! record, including a terminal failure, is forgotten the moment its last binding is released
+//! (re-review round 2, N3, correcting an earlier overclaim here): a rebind to another identity, or a
+//! failed preparation of its own stale slot (`record_launch` drops a stale binding before charging
+//! anything new). Re-preparation that later lands back on the same identity then starts it over with
+//! a full budget, so each user-initiated generation change can cost up to `MAX_ATTEMPTS` background
+//! launches per game whose last binding it released. A game record lives exactly as long as some
+//! slot is bound to it, which bounds the file at one game per slot.
 //!
 //! A preparation failure has no identity to charge. A launch of a slot that is not bound under the
 //! current generation is charged to the slot's own record, which belongs to that generation:
@@ -88,9 +94,12 @@
 //! wall-clock reading, clamped to `0..=30 s` -- a deadline already reached is due at once, and one
 //! more than a backoff ahead (the wall clock was set back) waits one backoff -- and anchored at the
 //! current monotonic reading. So a restart keeps what remains of a backoff, and no clock change can
-//! stall a retry. As a last guard, an in-process deadline more than one backoff ahead of `now_ms`
-//! (which only a `now_ms` that ran backwards can produce) counts as due. Both deadlines are computed
-//! in `u128` and refused loudly past `RETRY_DEADLINE_MAX_MS`, never saturated.
+//! stall a retry. `retry_due` is monotone (re-review round 2, N2): an in-process deadline is due
+//! exactly when it is at or behind `now_ms`, never a moment sooner. Since every such deadline is set
+//! at most one backoff ahead of the monotonic reading it was anchored at, `now_ms` landing more than
+//! one backoff behind it can only mean the caller's own clock ran backwards relative to that anchor
+//! -- a programming error, surfaced with an always-on assert rather than masked as a due retry. Both
+//! deadlines are computed in `u128` and refused loudly past `RETRY_DEADLINE_MAX_MS`, never saturated.
 //!
 //! ## Verified completion
 //!
@@ -118,11 +127,14 @@
 //!
 //! The file is compact JSON (in version 1, pretty-printing more than doubled a fresh queue: 37.7 MB
 //! against 17.2 MB); the generation, bindings and game keys are lowercase hex strings. Measured: a
-//! fresh queue is 17.7 MB. The largest file the queue can ever publish binds every slot to a game of its own, each
-//! failed four times with a maximal message whose every byte needs a JSON escape (a bound slot
-//! keeps no progress of its own and an unbound slot has no game, so nothing is larger): with
-//! failure messages stored on one line and cut at `LAST_ERROR_MAX_BYTES` (256) it is 54.9 MB, 82%
-//! of the 64 MiB `QUEUE_FILE_MAX` (pinned by a test), so a save can never be locked out.
+//! fresh queue is 17.7 MB. The largest file the queue can ever publish binds every slot to a game of
+//! its own (a bound slot keeps no progress of its own and an unbound slot has no game, so nothing is
+//! larger), each game's exact SPR at its widest possible representation, and each failed four times
+//! with an error message exactly `LAST_ERROR_MAX_BYTES` (256) bytes long and needing a JSON escape on
+//! every byte, so it is stored whole rather than losing bytes to the cut mark (re-review round 2,
+//! N4: a cut message is smaller, not larger): measured, it is 56.5 MB, 84% of the 64 MiB
+//! `QUEUE_FILE_MAX` (pinned by a test constructing this true maximum), so a save can never be locked
+//! out.
 
 use super::scenarios::{canonical_flops_ordered, scenarios, Scenario, CANONICAL_FLOP_COUNT};
 use crate::key::{spr_bucket, KeyFields, Rational};
@@ -352,7 +364,11 @@ pub fn save_queue(path: &Path, file: &QueueFile) -> Result<(), CacheError> {
 /// exists"): whether the cache under `cache_root` holds, for `item`, a validated entry whose
 /// normalized identity is `key.scenario_identity(spr)` and whose raw exploitability meets
 /// `target_bp`. `key` and `spr` are the prepared job's cache key and exact scenario SPR (task 16);
-/// the key must be on the item's canonical flop.
+/// the key must be on the item's canonical flop, and, when `item` is bound under the current
+/// generation (`item.game`), `key`/`spr` must normalize to that same identity (re-review round 2,
+/// N1): a caller passing a mismatched key -- an incomplete generation fingerprint, or reconciling
+/// before the generation is set -- can never read another identity's entry as this slot's
+/// completion, even one that is itself genuinely valid and at target.
 ///
 /// The cell is read back from disk through `crate::storage::read_cell` -- a full decode that
 /// re-runs `validate_entry` on every entry -- so a store that was issued, or even confirmed by the
@@ -365,6 +381,9 @@ pub fn entry_verified(cache_root: &Path, item: &QueueItem, key: &KeyFields, spr:
         return false;
     }
     let identity = key.scenario_identity(spr);
+    if item.game.is_some_and(|binding| binding.identity != identity) {
+        return false;
+    }
     let cell = key.at_bucket(spr_bucket(spr)).digest();
     let Some(found) = crate::storage::read_cell(&crate::storage::entry_path(cache_root, cell)) else {
         return false;
@@ -560,12 +579,27 @@ fn launched(p: Progress) -> bool {
     }
 }
 
-/// An in-process (monotonic) retry deadline is due at `now_ms`. Every such deadline is set at most
-/// one backoff ahead of the monotonic reading it was set at, so one more than a backoff ahead of
-/// `now_ms` means the caller's `now_ms` ran backwards (a caller bug); it is due as well, so no
-/// caller clock can stall a retry past one backoff (module doc).
+/// An in-process (monotonic) retry deadline is due at `now_ms`: monotone, `deadline <= now_ms`, and
+/// nothing else (re-review round 2, N2: a deadline more than one backoff ahead of `now_ms` is never
+/// silently treated as due). Every such deadline is set at most one backoff ahead of the monotonic
+/// reading it was anchored at (`record_failure`'s own `now_ms`, or `open_with_clock`'s restored
+/// anchor), so `now_ms` landing more than one backoff behind a deadline can only mean the caller's
+/// own clock ran backwards relative to that anchor -- a programming error the clock seam (module
+/// doc) makes possible, never a case this queue may treat as a due retry.
+///
+/// # Panics
+/// If `now_ms` is more than `RETRY_BACKOFF_MS` behind `deadline` (always-on): the caller's clock ran
+/// backwards relative to the anchor that set this deadline.
 fn retry_due(deadline: u64, now_ms: u64) -> bool {
-    deadline <= now_ms || deadline - now_ms > RETRY_BACKOFF_MS
+    if deadline <= now_ms {
+        return true;
+    }
+    assert!(
+        deadline - now_ms <= RETRY_BACKOFF_MS,
+        "retry_due: now_ms ran backwards relative to the persisted anchor: now_ms {now_ms} ms is {} ms behind deadline {deadline} ms, more than one RETRY_BACKOFF_MS ({RETRY_BACKOFF_MS} ms) -- a caller clock violation, never treated as a silent retry",
+        deadline - now_ms
+    );
+    false
 }
 
 /// The retry deadline `delay` after the `clock` reading `now_ms`, computed wide.
