@@ -5,10 +5,12 @@ pub mod allin;
 pub mod assemble;
 pub mod bench_support;
 pub mod clock;
+pub mod core;
 pub mod deadline;
 pub mod equity;
 pub mod identity;
 pub mod log;
+pub mod solve;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod tree;
