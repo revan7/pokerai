@@ -3,6 +3,7 @@
 //! the lookup rules that turn a live decision into one source node: prefix reconstruction, depth
 //! bucketing, rake-profile ranking, straddle virtual roles and short-handed mapping (section 8.3).
 
+pub mod branches;
 pub mod depth;
 pub mod envelope;
 pub mod ev;
