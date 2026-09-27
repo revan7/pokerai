@@ -8,6 +8,11 @@ pub mod equity;
 pub mod identity;
 pub mod log;
 pub mod tree;
+pub mod worker;
+
+/// Where the engine delivers a request's `RecommendationEvent`s (spec 3.4: results flow to the UI through a
+/// `Channel<RecommendationEvent>`; tests record them). Called from engine threads, hence `Send`.
+pub trait EventSink: Send { fn emit(&mut self, ev: proto::RecommendationEvent); }
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
