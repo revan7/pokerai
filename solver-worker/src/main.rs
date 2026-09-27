@@ -34,7 +34,8 @@ fn main() {
             Ok(Incoming::Eof) | Err(_) => { handle_eof(&shared); break; }
         }
     }
-    // The writer exits the process (Out::Exit) once the live job, if any, has written its terminal result.
-    // `park` may return spuriously, and returning from `main` would end the process before the writer drains.
+    // The writer exits the process (Out::Exit) once the live job, if any, has written its terminal result, or once
+    // the stop watchdog fires (`protocol::STOP_GRACE`). `park` may return spuriously, and returning from `main` would
+    // end the process before the writer drains.
     loop { std::thread::park(); }
 }
