@@ -18,6 +18,11 @@ sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The crate's own tests and examples link it with the fake clock, fake worker and recording sink (Task 19);
+# dev-dependency features apply only to those test builds, so release consumers never see `testing`.
+engine = { path = ".", features = ["testing"] }
+
 [features]
 # Fake clock, fake worker and recording sink (Task 19). Never enabled by a release consumer.
 testing = []
