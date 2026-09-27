@@ -161,19 +161,75 @@ fn canonical_flop_enumeration_matches_the_frozen_count() {
 // cursor, retries, cancellation, restart, and completion verified by reading the entry back.
 //
 // Every filesystem test uses the shared per-invocation `TempDir` (removed on unwind too). The
-// queue carries all 42,120 (tier, canonical flop, scenario) items, so tests look individual items
-// up in the queue's own saved `queue.json` (`saved`), never in a hand-written copy of it.
+// queue carries all 42,120 (tier, canonical flop, scenario) slots, so tests look individual slots
+// up in the queue's own saved `queue.json` (`saved`), never in a hand-written copy of it, and read
+// a slot's effective progress through `Queue::item`.
+//
+// Fix round 1: progress belongs to the normalized game identity a slot's preparation resolves to
+// (review R1), so a test that completes or reconciles work first binds the slots to identities
+// (`bind`, `bind_all`: `prepared` stands in for task 16's chart replay); and retry deadlines are
+// persisted as UTC and waited out on the monotonic clock (review R2), which tests drive through
+// `FakeClock`.
 // ---------------------------------------------------------------------------------------------
 
 use cache::entry::CacheEntry;
-use cache::key::Rational;
-use cache::presolver::queue::{self, Queue, QueueFile, QueueItem, TaskStatus};
+use cache::key::{KeyFields, Rational};
+use cache::presolver::queue::{self, GameBinding, Queue, QueueClock, QueueFile, QueueItem, TaskStatus};
 use cache::storage;
 use cache::{Cache, CacheError, CACHE_QUOTA_BYTES};
 use proto::Card;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use temp_dir::TempDir;
+
+/// A plausible UTC wall-clock reading (2026-09-21), in Unix milliseconds.
+const UNIX: u64 = 1_790_000_000_000;
+
+/// A settable queue clock (review R2): its monotonic and wall-clock readings move independently,
+/// so a test can restart the monotonic timeline (a new process) or jump the wall clock.
+#[derive(Clone)]
+struct FakeClock {
+    mono: Arc<AtomicU64>,
+    unix: Arc<AtomicU64>,
+}
+
+impl FakeClock {
+    fn new(mono: u64, unix: u64) -> Self {
+        FakeClock { mono: Arc::new(AtomicU64::new(mono)), unix: Arc::new(AtomicU64::new(unix)) }
+    }
+
+    fn set_unix(&self, unix: u64) {
+        self.unix.store(unix, Ordering::SeqCst);
+    }
+}
+
+impl QueueClock for FakeClock {
+    fn monotonic_ms(&self) -> u64 {
+        self.mono.load(Ordering::SeqCst)
+    }
+
+    fn unix_ms(&self) -> u64 {
+        self.unix.load(Ordering::SeqCst)
+    }
+}
+
+/// The queue under `dir`, on `clock`.
+fn open_at(dir: &Path, clock: &FakeClock) -> Queue {
+    Queue::open_with_clock(dir.to_path_buf(), Box::new(clock.clone())).unwrap()
+}
+
+/// Opens a fresh queue on a clock reading (`mono`, `unix`), fails its first item once at `mono`,
+/// saves, and returns the item's identity: a process that recorded a failure and then stopped.
+fn fail_once_and_save(dir: &Path, mono: u64, unix: u64) -> String {
+    let mut q = open_at(dir, &FakeClock::new(mono, unix));
+    let id = q.next_pending(mono).unwrap().identity_hex();
+    q.record_launch(&id);
+    q.record_failure(&id, mono, "error".into());
+    q.save().unwrap();
+    id
+}
 
 /// The pre-solver's target (spec section 10.5: `target_bp` 50, i.e. raw `<= 0.005`).
 const TARGET_BP: u16 = 50;
@@ -210,11 +266,60 @@ fn item_for(q: &Queue, dir: &Path, scenario: &Scenario, board: &[Card]) -> Queue
         .unwrap_or_else(|| panic!("no queue item for {} on {board:?}", scenario.id()))
 }
 
-/// Launches and completes `item`, then advances the cursor -- the scheduler's own sequence.
+/// Every slot of the frozen enumeration, keyed by its identity, from the queue's own saved file.
+fn slots(q: &Queue, dir: &Path) -> BTreeMap<String, QueueItem> {
+    q.save().unwrap();
+    saved(dir).items
+}
+
+/// The support fixture's key, built once: `support::entry()` is a whole cache entry.
+fn fixture_key() -> &'static KeyFields {
+    static KEY: std::sync::OnceLock<KeyFields> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| support::entry().key)
+}
+
+/// Stands in for task 16's preparation of `item` under the chart bundle `source`: the fixture key
+/// moved onto the item's canonical flop, with range hashes derived from the bundle and the
+/// scenario (so every scenario is its own game), and an exact SPR that is not the nominal
+/// `depth_bb : 1`.
+fn prepared(item: &QueueItem, source: &str) -> (KeyFields, Rational) {
+    use sha2::{Digest, Sha256};
+    let mut key = fixture_key().clone();
+    key.canonical_board = item.board.clone();
+    key.spr_bucket = 0;
+    key.range_hash_oop = Sha256::digest(format!("{source}/oop/{}", item.scenario.id())).into();
+    key.range_hash_ip = Sha256::digest(format!("{source}/ip/{}", item.scenario.id())).into();
+    let spr = Rational::new(u64::from(item.scenario.depth_bb) * 2 - 5, 11).unwrap();
+    (key, spr)
+}
+
+/// Binds `item` to the game `prepared` resolves it to under the bundle "chart-a".
+fn bind(q: &mut Queue, item: &QueueItem) -> QueueItem {
+    let (key, spr) = prepared(item, "chart-a");
+    q.bind(&item.identity_hex(), &key, spr)
+}
+
+/// Binds every slot, each to its own game -- task 16's startup preparation of the whole queue.
+fn bind_all(q: &mut Queue, dir: &Path) {
+    for item in slots(q, dir).values() {
+        bind(q, item);
+    }
+}
+
+/// Binds, launches and completes `item`, then advances the cursor -- the scheduler's own sequence.
 fn complete(q: &mut Queue, item: &QueueItem) {
+    bind(q, item);
     q.record_launch(&item.identity_hex());
     q.record_done(&item.identity_hex());
     q.advance_cursor();
+}
+
+/// Two source/config generation fingerprints, as task 16 would compute them.
+const GEN_A: [u8; 32] = [0xa1; 32];
+const GEN_B: [u8; 32] = [0xb2; 32];
+
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The shared fixture entry: its board (`Kh7d2c` canonicalized) is one of the 1,755 canonical
@@ -238,16 +343,18 @@ fn presolver_done_requires_a_valid_entry() {
     assert!(matches!(status,TaskStatus::Done));
 }
 
-/// Brief step 1, verbatim except where the directory comes from: the shared `TempDir` (unique
-/// per call, removed even when an assertion unwinds) replaces the brief's fixed
-/// `pokerai-queue-<pid>` path and its manual create/remove (standing ruling: filesystem tests use
-/// unique temp dirs and clean up).
+/// Brief step 1, verbatim except for two things: the shared `TempDir` (unique per call, removed
+/// even when an assertion unwinds) replaces the brief's fixed `pokerai-queue-<pid>` path and its
+/// manual create/remove (standing ruling: filesystem tests use unique temp dirs and clean up); and
+/// the item is bound to its prepared normalized identity before it is launched (fix round 1,
+/// review R1: completion is recorded against that identity, so an unbound launch cannot complete).
 #[test]
 fn queue_reopens_at_the_saved_cursor_without_repeating_done_work() {
     let tmp=TempDir::new("queue-reopen");
     let dir=tmp.path().to_path_buf();
     let mut q=cache::presolver::queue::Queue::open(dir.clone()).unwrap();
     let first=q.next_pending(0).unwrap();
+    bind(&mut q,&first);
     q.record_launch(&first.identity_hex());q.record_done(&first.identity_hex());
     q.advance_cursor();q.save().unwrap();
     let mut reopened=cache::presolver::queue::Queue::open(dir.clone()).unwrap();
@@ -298,7 +405,9 @@ fn the_rebuilt_queue_is_the_frozen_enumeration_keyed_by_deterministic_identities
     assert_eq!(queue::queue_path(a.path()), a.path().join("queue.json"));
 
     let file: QueueFile = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!((file.version, file.cursor, file.paused), (1, [0, 0, 0], false));
+    assert_eq!((file.version, file.cursor, file.paused), (2, [0, 0, 0], false));
+    assert_eq!(file.generation, queue::INITIAL_GENERATION, "no source/config generation declared yet");
+    assert!(file.games.is_empty(), "no slot is bound to a normalized identity before preparation");
     assert_eq!(file.items.len(), ALL as usize);
     let boards: BTreeSet<Vec<Card>> = canonical_flops_ordered().iter().cloned().collect();
     let ids: BTreeSet<String> = scenarios().iter().map(Scenario::id).collect();
@@ -313,7 +422,7 @@ fn the_rebuilt_queue_is_the_frozen_enumeration_keyed_by_deterministic_identities
         assert!(slots.insert((item.scenario.id(), item.board.clone())), "one item per (scenario, canonical flop)");
         assert_eq!(item.spr, Rational::new(item.scenario.depth_bb as u64, 1).unwrap(), "the nominal scenario SPR");
         assert_eq!(item.status, TaskStatus::Pending);
-        assert_eq!((item.attempts, item.retry_after_unix_ms, item.last_error.as_deref()), (0, 0, None));
+        assert_eq!((item.attempts, item.retry_after_unix_ms, item.last_error.as_deref(), item.game), (0, 0, None, None));
     }
     assert_eq!(slots.len(), 24 * CANONICAL_FLOP_COUNT);
 }
@@ -353,10 +462,9 @@ fn the_queue_walks_boards_with_all_tier_scenarios_and_resumes_at_the_saved_curso
     }
     assert_eq!(reopened.cursor(), [0, 1, 0], "board 0's four tier-1 scenarios are done together");
     assert!(is(&reopened.next_pending(0).unwrap(), &t1[0], &flops[1]));
-    reopened.save().unwrap();
-    let file = saved(tmp.path());
     for id in &done {
-        assert_eq!((&file.items[id].status, file.items[id].attempts), (&TaskStatus::Done, 1), "{id}");
+        let item = reopened.item(id).unwrap();
+        assert_eq!((&item.status, item.attempts), (&TaskStatus::Done, 1), "{id}");
     }
 }
 
@@ -368,6 +476,7 @@ fn a_tier_finishes_before_the_next_and_invalidated_work_is_revisited_first() {
     let tmp = TempDir::new("queue-tiers");
     let flops = canonical_flops_ordered();
     let mut q = open(tmp.path());
+    bind_all(&mut q, tmp.path());
     q.reconcile(&|item| item.scenario.tier == 1);
     assert_eq!(q.tier_counts(), ([7_020, 0, 0], [7_020, 14_040, 21_060]));
     assert!(is(&q.next_pending(0).unwrap(), &tier(2)[0], &flops[0]), "tier 2 starts on board 0 once tier 1 is done");
@@ -393,6 +502,7 @@ fn a_tier_finishes_before_the_next_and_invalidated_work_is_revisited_first() {
 fn the_cursor_stops_at_an_explicit_end_and_never_wraps_back() {
     let tmp = TempDir::new("queue-end");
     let mut q = open(tmp.path());
+    bind_all(&mut q, tmp.path());
     q.reconcile(&|_| true);
     assert_eq!(q.status_counts(), (0, ALL, 0));
     assert!(q.next_pending(0).is_none());
@@ -419,6 +529,7 @@ fn done_is_decided_by_reading_the_entry_back_and_a_deleted_cell_demotes_it() {
     assert!(!queue::entry_verified(&root, &item, &key, spr, TARGET_BP), "nothing is stored yet");
 
     let cache = Cache::open(root.clone(), CACHE_QUOTA_BYTES);
+    q.bind(&id, &key, spr);
     q.record_launch(&id);
     assert!(cache.store_tracked(&entry).wait(WRITER_BUDGET), "the writer confirms the store");
     assert!(queue::entry_verified(&root, &item, &key, spr, TARGET_BP), "the entry reads back valid at target");
@@ -430,9 +541,11 @@ fn done_is_decided_by_reading_the_entry_back_and_a_deleted_cell_demotes_it() {
     assert!(!queue::entry_verified(&root, &item, &key, spr, TARGET_BP));
     q.reconcile(&verified);
     assert_eq!(q.status_counts(), (ALL, 0, 0), "a deleted cell moves Done back to Pending");
-    q.save().unwrap();
-    let demoted = &saved(&root).items[&id];
+    let demoted = q.item(&id).unwrap();
     assert_eq!((&demoted.status, demoted.attempts, demoted.retry_after_unix_ms), (&TaskStatus::Pending, 0, 0));
+    q.save().unwrap();
+    let game = &saved(&root).games[&hex(&key.scenario_identity(spr))];
+    assert_eq!((&game.status, game.attempts, game.retry_after_unix_ms), (&TaskStatus::Pending, 0, 0), "the demotion is the game's");
     cache.shutdown();
 }
 
@@ -448,8 +561,11 @@ fn a_confirmed_store_above_target_another_board_or_a_corrupt_cell_is_not_done() 
     assert!(cache.store_tracked(&entry).wait(WRITER_BUDGET), "the writer confirms the store");
     assert!(!queue::entry_verified(&root, &item, &key, spr, TARGET_BP), "stored, but not at target");
     assert!(queue::entry_verified(&root, &item, &key, spr, 52), "the same entry passes a looser raw target");
+    q.bind(&item.identity_hex(), &key, spr);
     q.reconcile(&|it| it.identity == item.identity && queue::entry_verified(&root, it, &key, spr, TARGET_BP));
     assert_eq!(q.status_counts(), (ALL, 0, 0));
+    q.reconcile(&|it| it.identity == item.identity && queue::entry_verified(&root, it, &key, spr, 52));
+    assert_eq!(q.status_counts(), (ALL - 1, 1, 0), "the predicate does decide the bound game");
 
     let elsewhere = item_for(&q, &root, &tier(1)[0], &canonical_flops_ordered()[0]);
     assert_ne!(elsewhere.board, key.canonical_board);
@@ -462,14 +578,15 @@ fn a_confirmed_store_above_target_another_board_or_a_corrupt_cell_is_not_done() 
     cache.shutdown();
 }
 
-/// Brief step 5 "replace the source bundle hash": new ranges are a new normalized identity (the
-/// cache key without its bucket plus the exact SPR), so completion under the old bundle does not
-/// carry over, while the old bundle's entry stays on disk, untouched, serving only its own
-/// identity.
+/// Brief step 5 "replace the source bundle hash", and review R1: a new bundle is a new source
+/// generation, under which preparation binds the item to a new normalized identity (the cache key
+/// without its bucket plus the exact SPR). Completion under the old bundle does not carry over,
+/// while the old bundle's entry stays on disk, untouched, serving only its own identity.
 #[test]
 fn a_new_source_bundle_is_a_new_identity_and_old_entries_stay_isolated() {
     let (entry, item, mut q, dir) = fixture();
     let root = dir.path().to_path_buf();
+    let id = item.identity_hex();
     let spr = entry.source.spr;
     let old = entry.key.clone();
     let mut new = old.clone();
@@ -481,18 +598,237 @@ fn a_new_source_bundle_is_a_new_identity_and_old_entries_stay_isolated() {
 
     let cache = Cache::open(root.clone(), CACHE_QUOTA_BYTES);
     assert!(cache.store_tracked(&entry).wait(WRITER_BUDGET));
-    let under = |key: &cache::key::KeyFields| {
-        let key = key.clone();
-        let (root, target) = (root.clone(), item.identity);
-        move |it: &QueueItem| it.identity == target && queue::entry_verified(&root, it, &key, spr, TARGET_BP)
+    let under = |key: &KeyFields| {
+        let (key, root) = (key.clone(), root.clone());
+        move |it: &QueueItem| queue::entry_verified(&root, it, &key, spr, TARGET_BP)
     };
+    q.set_generation(GEN_A);
+    q.bind(&id, &old, spr);
     q.reconcile(&under(&old));
     assert_eq!(q.status_counts(), (ALL - 1, 1, 0), "done under the old bundle");
+
+    q.set_generation(GEN_B);
+    assert_eq!(q.status_counts(), (ALL, 0, 0), "under a new generation the item has to be prepared again");
+    let bound = q.bind(&id, &new, spr);
+    assert_eq!(bound.game.map(|g| (g.generation, g.identity)), Some((GEN_B, new.scenario_identity(spr))));
     q.reconcile(&under(&new));
     assert_eq!(q.status_counts(), (ALL, 0, 0), "not done under the new bundle");
     assert!(queue::entry_verified(&root, &item, &old, spr, TARGET_BP), "the old entry still serves its own identity");
     assert_eq!(storage::read_cell(&storage::entry_path(&root, old.digest())).unwrap().entries.len(), 1);
     assert!(!storage::entry_path(&root, new.digest()).exists(), "nothing was written under the new identity");
+    cache.shutdown();
+}
+
+/// Review R1: progress belongs to the normalized game identity, not to a (scenario, flop) slot.
+/// Two slots whose preparation resolves to the same game share one status and one retry budget:
+/// the second is not offered while the first runs the game, it shows the game's failure and its
+/// completion, and one reconciliation of the game demotes both.
+#[test]
+fn two_slots_that_normalize_to_one_game_share_its_status() {
+    let tmp = TempDir::new("queue-shared-game");
+    let dir = tmp.path();
+    let flops = canonical_flops_ordered();
+    let t1 = tier(1);
+    let mut q = open_at(dir, &FakeClock::new(0, UNIX));
+    let a = item_for(&q, dir, &t1[0], &flops[0]);
+    let b = item_for(&q, dir, &t1[1], &flops[0]);
+    let (a_id, b_id) = (a.identity_hex(), b.identity_hex());
+    let (key, spr) = prepared(&a, "chart-a");
+    let game = key.scenario_identity(spr);
+    for slot in [&a_id, &b_id] {
+        let bound = q.bind(slot, &key, spr);
+        assert_eq!(bound.game, Some(GameBinding { generation: queue::INITIAL_GENERATION, identity: game }));
+    }
+
+    assert_eq!(q.next_pending(0).unwrap().identity_hex(), a_id);
+    q.record_launch(&a_id);
+    assert!(is(&q.next_pending(0).unwrap(), &t1[2], &flops[0]), "the shared game is in flight, so b is not offered");
+    q.record_failure(&a_id, 0, "worker error".into());
+    let shared = q.item(&b_id).unwrap();
+    assert_eq!((shared.status, shared.attempts, shared.last_error), (TaskStatus::Failed { n: 1 }, 1, Some("worker error".into())), "b shows the game's failure");
+    assert_eq!(q.status_counts(), (ALL - 2, 0, 2));
+
+    assert_eq!(q.next_pending(30_000).unwrap().identity_hex(), a_id, "one retry for the game");
+    q.record_launch(&a_id);
+    q.record_done(&a_id);
+    assert_eq!(q.item(&b_id).unwrap().status, TaskStatus::Done, "b is complete with its game");
+    assert_eq!(q.status_counts(), (ALL - 2, 2, 0));
+
+    q.save().unwrap();
+    let file = saved(dir);
+    assert_eq!(file.games.len(), 1, "one game record for the two slots");
+    let record = &file.games[&hex(&game)];
+    assert_eq!((&record.status, record.attempts, &record.board, record.spr), (&TaskStatus::Done, 2, &flops[0], spr));
+    for slot in [&a_id, &b_id] {
+        let persisted = &file.items[slot];
+        assert_eq!(persisted.game.map(|g| g.identity), Some(game), "the slot is an index into its game");
+        assert_eq!((&persisted.status, persisted.attempts), (&TaskStatus::Pending, 0), "a bound slot keeps no progress of its own");
+    }
+
+    let mut reopened = open_at(dir, &FakeClock::new(0, UNIX));
+    assert_eq!(reopened.status_counts(), (ALL - 2, 2, 0), "the shared status survives a reopen");
+    let calls = std::cell::Cell::new(0_u32);
+    reopened.reconcile(&|_| {
+        calls.set(calls.get() + 1);
+        false
+    });
+    assert_eq!(calls.get(), 1, "reconciliation decides the game once, not once per slot");
+    assert_eq!(reopened.status_counts(), (ALL, 0, 0), "demoting the game demotes both slots");
+    assert_eq!((reopened.item(&a_id).unwrap().attempts, reopened.item(&b_id).unwrap().attempts), (0, 0));
+}
+
+/// Review R1's failure case: four failed attempts make the game terminal, and it stays terminal
+/// for as long as preparation resolves the slot to that identity -- a generation change alone
+/// does not reset it. Bundle B supplying other ranges is another identity, so the slot starts
+/// afresh with a full budget and bundle A's game goes with its last binding; a rake
+/// (configuration) change is another identity again.
+#[test]
+fn a_terminal_failure_belongs_to_its_identity_and_new_ranges_or_rake_start_afresh() {
+    let tmp = TempDir::new("queue-terminal-identity");
+    let dir = tmp.path();
+    let mut q = open_at(dir, &FakeClock::new(0, UNIX));
+    let item = q.next_pending(0).unwrap();
+    let id = item.identity_hex();
+    let (a_key, spr) = prepared(&item, "chart-a");
+    q.set_generation(GEN_A);
+    q.bind(&id, &a_key, spr);
+    for n in 1..=4_u64 {
+        q.record_launch(&id);
+        q.record_failure(&id, n * 30_000, format!("error {n}"));
+    }
+    assert_eq!(q.item(&id).unwrap().status, TaskStatus::Failed { n: 4 });
+    assert_ne!(q.next_pending(u64::MAX / 2).unwrap().identity_hex(), id, "terminal under bundle A");
+
+    // The same bundle under another generation (a config change that leaves this game's identity
+    // alone) resolves the slot to the same identity: the terminal failure is that game's.
+    q.set_generation([0xc3; 32]);
+    assert_eq!(q.next_pending(0).unwrap().identity_hex(), id, "a new generation prepares the slot again");
+    assert_eq!(q.bind(&id, &a_key, spr).status, TaskStatus::Failed { n: 4 }, "same identity, same terminal status");
+    assert_ne!(q.next_pending(u64::MAX / 2).unwrap().identity_hex(), id);
+
+    // Bundle B supplies usable ranges: a new identity with a full budget.
+    q.set_generation(GEN_B);
+    let (b_key, _) = prepared(&item, "chart-b");
+    let fresh = q.bind(&id, &b_key, spr);
+    assert_eq!((fresh.status, fresh.attempts, fresh.last_error), (TaskStatus::Pending, 0, None));
+    assert_eq!(fresh.game.unwrap().identity, b_key.scenario_identity(spr));
+    assert_eq!(q.next_pending(0).unwrap().identity_hex(), id, "launchable again");
+    q.save().unwrap();
+    let file = saved(dir);
+    assert_eq!(file.generation, GEN_B);
+    assert_eq!(file.games.keys().cloned().collect::<Vec<_>>(), vec![hex(&b_key.scenario_identity(spr))], "bundle A's game went with its last binding");
+
+    // A rake change (configuration) is a new identity too.
+    let mut raked = b_key.clone();
+    raked.rake = cache::key::RakeKey::new(0.10, raked.rake.cap_over_p, raked.rake.collection_rule_version).unwrap();
+    q.set_generation([0xd4; 32]);
+    let other = q.bind(&id, &raked, spr);
+    assert_ne!(other.game.unwrap().identity, b_key.scenario_identity(spr));
+    assert_eq!((other.status, other.attempts), (TaskStatus::Pending, 0));
+}
+
+/// Review R1: a preparation failure has no normalized identity -- the slot could not be prepared --
+/// so it is recorded on the slot and owned by the current generation: a source/config change
+/// invalidates it, even a terminal one, and a later successful preparation clears it.
+#[test]
+fn a_preparation_failure_belongs_to_its_generation() {
+    let tmp = TempDir::new("queue-prep-failure");
+    let dir = tmp.path();
+    let mut q = open_at(dir, &FakeClock::new(0, UNIX));
+    q.set_generation(GEN_A);
+    let first = q.next_pending(0).unwrap();
+    let id = first.identity_hex();
+    for n in 1..=4 {
+        q.record_launch(&id);
+        q.record_failure(&id, 0, format!("missing chart node {n}"));
+    }
+    let stuck = q.item(&id).unwrap();
+    assert_eq!((stuck.status, stuck.game), (TaskStatus::Failed { n: 4 }, None), "a terminal preparation failure, on the slot");
+    assert_ne!(q.next_pending(u64::MAX / 2).unwrap().identity_hex(), id);
+    q.save().unwrap();
+
+    let mut q = open_at(dir, &FakeClock::new(0, UNIX));
+    q.set_generation(GEN_A);
+    assert_eq!(q.item(&id).unwrap().status, TaskStatus::Failed { n: 4 }, "the same generation keeps it");
+    q.set_generation(GEN_B);
+    let reset = q.item(&id).unwrap();
+    assert_eq!((reset.status, reset.attempts, reset.retry_after_unix_ms, reset.last_error), (TaskStatus::Pending, 0, 0, None), "a new generation invalidates it");
+    assert_eq!(q.next_pending(0).unwrap().identity_hex(), id);
+
+    // One more preparation failure, then preparation succeeds: the slot's own failure is over and
+    // it shows its game's progress.
+    q.record_launch(&id);
+    q.record_failure(&id, 0, "transient".into());
+    assert_eq!(q.item(&id).unwrap().status, TaskStatus::Failed { n: 1 });
+    let bound = bind(&mut q, &first);
+    assert_eq!((bound.status, bound.attempts, bound.last_error), (TaskStatus::Pending, 0, None));
+    q.save().unwrap();
+    let persisted = &saved(dir).items[&id];
+    assert_eq!((&persisted.status, persisted.attempts, persisted.last_error.as_deref()), (&TaskStatus::Pending, 0, None));
+}
+
+/// Review R1: `queue.json` persists each prepared slot's normalized identity and each game's exact
+/// SPR -- distinct games under distinct keys, never the nominal `depth_bb : 1` -- and a reopen
+/// keeps every association: an unchanged queue republishes byte-identically.
+#[test]
+fn the_file_persists_normalized_identities_and_exact_sprs_across_a_reopen() {
+    let tmp = TempDir::new("queue-identities");
+    let dir = tmp.path();
+    let flops = canonical_flops_ordered();
+    let mut q = open(dir);
+    q.set_generation(GEN_A);
+    let items: Vec<QueueItem> = [(1, 0), (1, 1), (2, 0)].iter().map(|&(t, s)| item_for(&q, dir, &tier(t)[s], &flops[3])).collect();
+    let mut identities = BTreeSet::new();
+    for item in &items {
+        let (key, spr) = prepared(item, "chart-a");
+        assert_ne!(spr, item.spr, "the exact SPR is not the nominal one");
+        let bound = bind(&mut q, item);
+        assert_eq!(bound.game, Some(GameBinding { generation: GEN_A, identity: key.scenario_identity(spr) }));
+        identities.insert(hex(&key.scenario_identity(spr)));
+    }
+    assert_eq!(identities.len(), 3, "three slots, three games");
+    q.save().unwrap();
+    let bytes = std::fs::read(queue::queue_path(dir)).unwrap();
+    let file = saved(dir);
+    assert_eq!(file.games.keys().cloned().collect::<BTreeSet<_>>(), identities);
+    for item in &items {
+        let (key, spr) = prepared(item, "chart-a");
+        let game = &file.games[&hex(&key.scenario_identity(spr))];
+        assert_eq!((&game.board, game.spr, &game.status), (&item.board, spr, &TaskStatus::Pending));
+        assert_eq!(file.items[&item.identity_hex()].game.map(|g| g.identity), Some(key.scenario_identity(spr)));
+    }
+    open(dir).save().unwrap();
+    assert_eq!(std::fs::read(queue::queue_path(dir)).unwrap(), bytes, "a reopen keeps every association");
+    let reopened = open(dir);
+    assert_eq!(reopened.generation(), GEN_A);
+    for item in &items {
+        assert_eq!(reopened.item(&item.identity_hex()).unwrap().game, q.item(&item.identity_hex()).unwrap().game);
+    }
+}
+
+/// Review R1: completion is decided per normalized identity. Reconciliation consults only slots
+/// bound under the current generation -- an unbound slot has no identity to check -- and a freshly
+/// bound slot is decided on its own with `reconcile_item`, before any solve is launched for it.
+#[test]
+fn reconciliation_decides_bound_identities_only() {
+    let (entry, item, mut q, dir) = fixture();
+    let root = dir.path().to_path_buf();
+    let (key, spr) = (entry.key.clone(), entry.source.spr);
+    let id = item.identity_hex();
+    let cache = Cache::open(root.clone(), CACHE_QUOTA_BYTES);
+    assert!(cache.store_tracked(&entry).wait(WRITER_BUDGET));
+
+    let calls = std::cell::Cell::new(0_u32);
+    q.reconcile(&|_| {
+        calls.set(calls.get() + 1);
+        true
+    });
+    assert_eq!((calls.get(), q.status_counts()), (0, (ALL, 0, 0)), "no slot is bound: nothing to decide");
+
+    let bound = q.bind(&id, &key, spr);
+    q.reconcile_item(&id, queue::entry_verified(&root, &bound, &key, spr, TARGET_BP));
+    assert_eq!(q.item(&id).unwrap().status, TaskStatus::Done, "found on disk: done without a solve");
+    assert_eq!(q.status_counts(), (ALL - 1, 1, 0), "and nothing else changed");
     cache.shutdown();
 }
 
@@ -510,6 +846,7 @@ fn a_crash_around_the_entry_rename_or_the_queue_save_never_marks_done() {
     let bytes = storage::encode(&storage::Cell { entries: vec![entry.clone()] }).unwrap();
 
     // 1. Killed before the rename: only write_atomic's fsynced temp sibling exists.
+    q.bind(&id, &key, spr);
     q.record_launch(&id);
     q.save().unwrap();
     std::fs::create_dir_all(cell.parent().unwrap()).unwrap();
@@ -519,8 +856,7 @@ fn a_crash_around_the_entry_rename_or_the_queue_save_never_marks_done() {
     assert_eq!(restarted.status_counts(), (ALL, 0, 0));
     restarted.reconcile(&verified);
     assert_eq!(restarted.status_counts(), (ALL, 0, 0), "a temp file is not a stored entry");
-    restarted.save().unwrap();
-    let refunded = &saved(&root).items[&id];
+    let refunded = restarted.item(&id).unwrap();
     assert_eq!((&refunded.status, refunded.attempts), (&TaskStatus::Pending, 0), "the interrupted launch is refunded");
 
     // 2. Killed after the rename, before the queue save: queue.json still says "launched".
@@ -534,25 +870,33 @@ fn a_crash_around_the_entry_rename_or_the_queue_save_never_marks_done() {
     assert_eq!(restarted.status_counts(), (ALL - 1, 1, 0), "Done only because the entry reads back valid at target");
 
     // 3. Killed in the middle of the queue save: a torn queue.json is rejected and rebuilt, and
-    //    completion comes back from the cache, not from the torn file.
+    //    completion comes back from the cache, not from the torn file -- once preparation has
+    //    bound the item to its identity again (the rebuilt queue knows no identity).
     restarted.save().unwrap();
     let whole = std::fs::read(queue::queue_path(&root)).unwrap();
     std::fs::write(queue::queue_path(&root), &whole[..whole.len() / 2]).unwrap();
     let mut rebuilt = open(&root);
     assert_eq!((rebuilt.cursor(), rebuilt.status_counts()), ([0, 0, 0], (ALL, 0, 0)));
     rebuilt.reconcile(&verified);
+    assert_eq!(rebuilt.status_counts(), (ALL, 0, 0), "no identity is bound yet");
+    rebuilt.bind(&id, &key, spr);
+    rebuilt.reconcile(&verified);
     assert_eq!(rebuilt.status_counts(), (ALL - 1, 1, 0));
 }
 
 /// Brief step 5: failures 1, 2 and 3 retry after 30 s; the fourth failure is terminal, and stays
-/// terminal across a restart.
+/// terminal across a restart. Each retry deadline is persisted as the absolute UTC time of the
+/// failure plus the backoff (review R2).
 #[test]
 fn failed_attempts_one_to_three_retry_after_thirty_seconds_and_the_fourth_is_terminal() {
     let tmp = TempDir::new("queue-retry");
-    let mut q = open(tmp.path());
-    let id = q.next_pending(0).unwrap().identity_hex();
-    let mut now = 1_000_000_u64;
+    let start = 1_000_000_u64;
+    let clock = FakeClock::new(start, UNIX);
+    let mut q = open_at(tmp.path(), &clock);
+    let id = q.next_pending(start).unwrap().identity_hex();
+    let mut now = start;
     for n in 1..=3_u8 {
+        clock.set_unix(UNIX + (now - start));
         assert_eq!(q.next_pending(now).unwrap().identity_hex(), id, "attempt {n} is the earliest launchable item");
         q.record_launch(&id);
         q.record_failure(&id, now, format!("worker error {n}"));
@@ -560,7 +904,8 @@ fn failed_attempts_one_to_three_retry_after_thirty_seconds_and_the_fourth_is_ter
         assert_ne!(q.next_pending(now + 29_999).unwrap().identity_hex(), id, "failure {n} waits 30 s");
         let due = q.next_pending(now + 30_000).unwrap();
         assert_eq!(due.identity_hex(), id, "failure {n} retries at 30 s");
-        assert_eq!((due.status, due.attempts, due.retry_after_unix_ms), (TaskStatus::Failed { n }, n, now + 30_000));
+        let utc = UNIX + (now - start) + 30_000;
+        assert_eq!((due.status, due.attempts, due.retry_after_unix_ms), (TaskStatus::Failed { n }, n, utc), "failure {n}: persisted as UTC");
         assert_eq!(due.last_error, Some(format!("worker error {n}")));
         now += 30_000;
     }
@@ -572,7 +917,7 @@ fn failed_attempts_one_to_three_retry_after_thirty_seconds_and_the_fourth_is_ter
     q.save().unwrap();
     let terminal = &saved(tmp.path()).items[&id];
     assert_eq!((&terminal.status, terminal.attempts, terminal.retry_after_unix_ms), (&TaskStatus::Failed { n: 4 }, 4, u64::MAX));
-    let reopened = open(tmp.path());
+    let reopened = open_at(tmp.path(), &FakeClock::new(0, UNIX + 86_400_000));
     assert_eq!(reopened.status_counts(), (ALL - 1, 0, 1));
     assert_ne!(reopened.next_pending(u64::MAX).unwrap().identity_hex(), id);
 }
@@ -582,7 +927,8 @@ fn failed_attempts_one_to_three_retry_after_thirty_seconds_and_the_fourth_is_ter
 #[test]
 fn cancellation_and_restart_do_not_burn_retries() {
     let tmp = TempDir::new("queue-cancel");
-    let mut q = open(tmp.path());
+    let clock = FakeClock::new(0, UNIX);
+    let mut q = open_at(tmp.path(), &clock);
     let id = q.next_pending(0).unwrap().identity_hex();
 
     q.record_launch(&id);
@@ -602,7 +948,9 @@ fn cancellation_and_restart_do_not_burn_retries() {
     q.record_launch(&id);
     q.save().unwrap(); // persisted before launch; then the process dies mid-solve
     drop(q);
-    let mut q = open(tmp.path());
+    // The new process starts after the retry was due: its monotonic clock restarts at 777.
+    let mut now = 777_u64;
+    let mut q = open_at(tmp.path(), &FakeClock::new(now, UNIX + 30_000 + 5));
     let again = q.next_pending(now).unwrap();
     assert_eq!((again.identity_hex(), again.status, again.attempts), (id.clone(), TaskStatus::Failed { n: 1 }, 1), "a restart refunds the interrupted retry");
 
@@ -618,58 +966,142 @@ fn cancellation_and_restart_do_not_burn_retries() {
     assert_eq!((&item.status, item.attempts), (&TaskStatus::Failed { n: 4 }, 4));
 }
 
-/// The backoff runs on the caller's monotonic clock; a persisted deadline cannot stall the queue
-/// by more than one backoff when the clock jumps backwards or restarts near zero.
+/// Review R2: the persisted retry deadline is an absolute UTC time -- the wall clock at the
+/// failure plus the backoff -- whatever the caller's monotonic reading was; the in-process wait
+/// runs on the monotonic clock.
 #[test]
-fn a_clock_jump_or_a_restart_cannot_stall_a_retry_beyond_thirty_seconds() {
-    let tmp = TempDir::new("queue-clock");
-    let mut q = open(tmp.path());
-    let id = q.next_pending(0).unwrap().identity_hex();
+fn a_retry_deadline_is_persisted_as_absolute_utc_and_waited_out_on_the_monotonic_clock() {
+    let tmp = TempDir::new("queue-utc");
     let t = 5_000_000_000_u64;
+    let mut q = open_at(tmp.path(), &FakeClock::new(t, UNIX));
+    let id = q.next_pending(t).unwrap().identity_hex();
     q.record_launch(&id);
     q.record_failure(&id, t, "error".into());
-    assert_ne!(q.next_pending(t + 29_999).unwrap().identity_hex(), id);
+    assert_ne!(q.next_pending(t + 29_999).unwrap().identity_hex(), id, "the backoff runs 30 s on the monotonic clock");
     assert_eq!(q.next_pending(t + 30_000).unwrap().identity_hex(), id);
-    assert_eq!(q.next_pending(t - 3_600_000).unwrap().identity_hex(), id, "a clock that jumped back an hour does not wait an hour");
+    // A monotonic reading that runs backwards is a caller bug; it still cannot stall the retry
+    // past one backoff.
+    assert_eq!(q.next_pending(t - 3_600_000).unwrap().identity_hex(), id);
     q.save().unwrap();
-    let reopened = open(tmp.path());
-    assert_eq!(reopened.next_pending(12).unwrap().identity_hex(), id, "a restarted monotonic clock does not wait for the old deadline");
-    assert_ne!(reopened.next_pending(t + 1).unwrap().identity_hex(), id, "a deadline within one backoff is honoured");
+    assert_eq!(saved(tmp.path()).items[&id].retry_after_unix_ms, UNIX + 30_000, "persisted as UTC, never as the monotonic reading");
 }
 
-/// The retry deadline is computed wide and checked against the millisecond ceiling: exactly at
-/// the ceiling it is stored and reloads; one past it is refused loudly, never saturated.
+/// Review R2: a process restarted immediately -- its monotonic clock restarted near zero, the
+/// wall clock 5 s after the failure -- waits out the 25 s of backoff that remain, instead of
+/// retrying at once.
+#[test]
+fn an_immediate_restart_keeps_the_remaining_backoff() {
+    let tmp = TempDir::new("queue-restart-wait");
+    let id = fail_once_and_save(tmp.path(), 5_000_000_000, UNIX);
+    let q = open_at(tmp.path(), &FakeClock::new(12, UNIX + 5_000));
+    assert_ne!(q.next_pending(12).unwrap().identity_hex(), id, "no immediate retry after a restart");
+    assert_ne!(q.next_pending(12 + 24_999).unwrap().identity_hex(), id, "25 s of the backoff remain");
+    assert_eq!(q.next_pending(12 + 25_000).unwrap().identity_hex(), id);
+}
+
+/// Review R2: a persisted deadline the wall clock has already reached is due as soon as the
+/// queue reopens.
+#[test]
+fn a_persisted_deadline_already_reached_is_due_at_restart() {
+    let tmp = TempDir::new("queue-restart-due");
+    let id = fail_once_and_save(tmp.path(), 5_000_000_000, UNIX);
+    for unix in [UNIX + 30_000, UNIX + 30_000 + 3_600_000] {
+        let q = open_at(tmp.path(), &FakeClock::new(12, unix));
+        assert_eq!(q.next_pending(12).unwrap().identity_hex(), id, "wall clock {unix}: the deadline has passed");
+    }
+}
+
+/// Review R2: a persisted deadline more than one backoff ahead of the wall clock (the clock was
+/// set back an hour while the app was closed) waits one full backoff and no longer: the queue
+/// never stalls on it.
+#[test]
+fn a_persisted_deadline_far_ahead_of_the_wall_clock_waits_one_backoff_at_most() {
+    let tmp = TempDir::new("queue-restart-clamp");
+    let id = fail_once_and_save(tmp.path(), 5_000_000_000, UNIX);
+    let q = open_at(tmp.path(), &FakeClock::new(12, UNIX - 3_600_000));
+    assert_ne!(q.next_pending(12 + 29_999).unwrap().identity_hex(), id, "clamped to one backoff, not dropped");
+    assert_eq!(q.next_pending(12 + 30_000).unwrap().identity_hex(), id, "and never more than one backoff");
+}
+
+/// Review R2: once a wait is established in-process -- by a failure, or by reopening -- a
+/// wall-clock jump in either direction does not change it.
+#[test]
+fn wall_clock_jumps_leave_an_established_wait_alone() {
+    let tmp = TempDir::new("queue-wall-jump");
+    let clock = FakeClock::new(1_000, UNIX);
+    let mut q = open_at(tmp.path(), &clock);
+    let id = q.next_pending(1_000).unwrap().identity_hex();
+    q.record_launch(&id);
+    q.record_failure(&id, 1_000, "error".into());
+    for jump in [UNIX + 3_600_000, UNIX - 3_600_000] {
+        clock.set_unix(jump);
+        assert_ne!(q.next_pending(30_999).unwrap().identity_hex(), id, "wall clock {jump}: still waiting");
+        assert_eq!(q.next_pending(31_000).unwrap().identity_hex(), id, "wall clock {jump}: due on the monotonic clock");
+    }
+    q.save().unwrap();
+    drop(q);
+
+    // Reopened 10 s after the failure: 20 s remain, anchored at monotonic 50.
+    let reopened = FakeClock::new(50, UNIX + 10_000);
+    let q = open_at(tmp.path(), &reopened);
+    for jump in [UNIX + 10_000 + 3_600_000, UNIX + 10_000 - 3_600_000] {
+        reopened.set_unix(jump);
+        assert_ne!(q.next_pending(20_049).unwrap().identity_hex(), id, "wall clock {jump}: the restored wait stands");
+        assert_eq!(q.next_pending(20_050).unwrap().identity_hex(), id, "wall clock {jump}: due when the restored wait ends");
+    }
+}
+
+/// The persisted UTC deadline is computed wide and checked against the millisecond ceiling:
+/// exactly at the ceiling it is stored and reloads; one past it is refused loudly, never
+/// saturated.
 #[test]
 fn a_retry_deadline_at_the_millisecond_ceiling_is_kept() {
     let tmp = TempDir::new("queue-ceiling");
-    let mut q = open(tmp.path());
+    let clock = FakeClock::new(0, queue::RETRY_DEADLINE_MAX_MS - 30_000);
+    let mut q = open_at(tmp.path(), &clock);
     let id = q.next_pending(0).unwrap().identity_hex();
     q.record_launch(&id);
-    q.record_failure(&id, queue::RETRY_DEADLINE_MAX_MS - 30_000, "error".into());
+    q.record_failure(&id, 0, "error".into());
     q.save().unwrap();
     assert_eq!(saved(tmp.path()).items[&id].retry_after_unix_ms, i64::MAX as u64);
-    assert_eq!(open(tmp.path()).status_counts(), (ALL - 1, 0, 1), "the ceiling itself reloads");
+    assert_eq!(open_at(tmp.path(), &clock).status_counts(), (ALL - 1, 0, 1), "the ceiling itself reloads");
 }
 
 #[test]
 #[should_panic(expected = "retry deadline")]
 fn a_retry_deadline_past_the_millisecond_ceiling_is_refused_loudly() {
     let tmp = TempDir::new("queue-past-ceiling");
-    let mut q = open(tmp.path());
+    let mut q = open_at(tmp.path(), &FakeClock::new(0, queue::RETRY_DEADLINE_MAX_MS - 29_999));
+    let id = q.next_pending(0).unwrap().identity_hex();
+    q.record_launch(&id);
+    q.record_failure(&id, 0, "error".into());
+}
+
+/// The in-process (monotonic) deadline has the same ceiling: a monotonic reading that would
+/// overflow it is refused loudly too.
+#[test]
+#[should_panic(expected = "retry deadline")]
+fn a_monotonic_reading_past_the_millisecond_ceiling_is_refused_loudly() {
+    let tmp = TempDir::new("queue-past-ceiling-mono");
+    let mut q = open_at(tmp.path(), &FakeClock::new(0, UNIX));
     let id = q.next_pending(0).unwrap().identity_hex();
     q.record_launch(&id);
     q.record_failure(&id, queue::RETRY_DEADLINE_MAX_MS - 29_999, "error".into());
 }
 
-/// Every item failing four times with an error far past the stored bound, every character of it
-/// needing a JSON escape, is the largest file the queue can ever publish: it still fits the
-/// 64 MiB bound, so a save can never be locked out, and it reopens intact.
+/// The largest file the queue can ever publish: every slot bound (under a non-initial generation)
+/// to a game of its own -- so every slot carries a binding and every game a record -- and every
+/// game failed four times with an error far past the stored bound, every character of it needing
+/// a JSON escape. A bound slot keeps no progress of its own and an unbound slot has no game, so no
+/// other state is larger. It still fits the 64 MiB bound, so a save can never be locked out, and
+/// it reopens intact.
 #[test]
 fn the_largest_possible_queue_file_still_fits_the_bound_and_reopens() {
     let tmp = TempDir::new("queue-largest");
     let mut q = open(tmp.path());
-    q.save().unwrap();
-    let ids: Vec<String> = saved(tmp.path()).items.into_keys().collect();
+    q.set_generation([0xff; 32]);
+    bind_all(&mut q, tmp.path());
+    let ids: Vec<String> = slots(&q, tmp.path()).into_keys().collect();
     let worst = "\"\\".repeat(300);
     for id in &ids {
         for _ in 0..4 {
@@ -682,7 +1114,9 @@ fn the_largest_possible_queue_file_still_fits_the_bound_and_reopens() {
     let len = std::fs::metadata(queue::queue_path(tmp.path())).unwrap().len();
     assert!(len <= queue::QUEUE_FILE_MAX, "{len} bytes");
     let file = saved(tmp.path());
-    let stored = file.items[&ids[0]].last_error.clone().unwrap();
+    assert_eq!(file.games.len(), ALL as usize, "one game per slot");
+    let game = file.items[&ids[0]].game.unwrap().identity;
+    let stored = file.games[&hex(&game)].last_error.clone().unwrap();
     assert!(stored.len() <= queue::LAST_ERROR_MAX_BYTES && !stored.chars().any(char::is_control), "{stored:?}");
     let reopened = open(tmp.path());
     assert_eq!((reopened.paused(), reopened.status_counts()), (true, (0, 0, ALL)));
@@ -724,13 +1158,17 @@ fn a_corrupt_truncated_or_tampered_queue_file_is_rebuilt_never_partially_trusted
     let progress = |q: &Queue| (q.cursor(), q.paused(), q.status_counts());
     assert_eq!(progress(&open(tmp.path())), ([0, 0, 2], true, (ALL - 2, 1, 1)), "the untampered file keeps its progress");
 
-    /// The items a tampering case may reach: one done, one failed (attempt 1, retry due at 30 s)
-    /// and one untouched pending item, plus values guaranteed to differ from the pending item's.
+    /// The records a tampering case may reach: one done item (bound to its game, whose record is
+    /// `game`), one failed item (an unbound preparation failure: attempt 1, retry due) and one
+    /// untouched pending item, plus values guaranteed to differ from the pending item's and from
+    /// the game's.
     struct Keys {
         done: String,
         failed: String,
         pending: String,
+        game: String,
         other_board: Value,
+        other_game_board: Value,
         other_depth: u64,
     }
     let value: Value = serde_json::from_slice(&good).unwrap();
@@ -738,24 +1176,61 @@ fn a_corrupt_truncated_or_tampered_queue_file_is_rebuilt_never_partially_trusted
     let pending = value["items"].as_object().unwrap().keys().find(|k| **k != done && **k != failed).unwrap().clone();
     let pending_board: Vec<Card> = serde_json::from_value(value["items"][&pending]["board"].clone()).unwrap();
     let other_board = serde_json::to_value(canonical_flops_ordered().iter().find(|b| **b != pending_board).unwrap()).unwrap();
+    let other_game_board = serde_json::to_value(canonical_flops_ordered().iter().find(|b| **b != first.board).unwrap()).unwrap();
     let other_depth = value["items"][&pending]["scenario"]["depth_bb"].as_u64().unwrap() + 1;
-    let keys = Keys { done, failed, pending, other_board, other_depth };
+    let game = value["items"][&done]["game"]["identity"].as_str().unwrap().to_owned();
+    assert_eq!(value["games"].as_object().unwrap().keys().collect::<Vec<_>>(), vec![&game], "the done item's game is the one game");
+    let keys = Keys { done, failed, pending, game, other_board, other_game_board, other_depth };
 
     let untouched = serde_json::to_vec(&value).unwrap();
     std::fs::write(&path, &untouched).unwrap();
     assert_eq!(progress(&open(tmp.path())), ([0, 0, 2], true, (ALL - 2, 1, 1)), "the harness's own re-encoding is accepted");
+    let mut regenerated = value.clone();
+    regenerated["generation"] = json!("11".repeat(32));
+    std::fs::write(&path, serde_json::to_vec(&regenerated).unwrap()).unwrap();
+    assert_eq!(progress(&open(tmp.path())), ([0, 0, 2], true, (ALL - 1, 0, 1)), "another generation is valid: its bindings are stale");
 
     let text = String::from_utf8(untouched.clone()).unwrap();
     let entry = format!("\"{}\":{}", keys.done, serde_json::to_string(&value["items"][&keys.done]).unwrap());
     let duplicated = text.replacen("\"items\":{", &format!("\"items\":{{{entry},"), 1);
+    let record = format!("\"{}\":{}", keys.game, serde_json::to_string(&value["games"][&keys.game]).unwrap());
+    let duplicated_game = text.replacen("\"games\":{", &format!("\"games\":{{{record},"), 1);
     let raw: Vec<(&str, Vec<u8>)> = vec![
         ("truncated", good[..good.len() / 2].to_vec()),
         ("empty", Vec::new()),
         ("not JSON", b"queue".to_vec()),
         ("a duplicated key", duplicated.into_bytes()),
+        ("a duplicated game key", duplicated_game.into_bytes()),
     ];
     let edits: Vec<(&str, fn(&mut Value, &Keys))> = vec![
-        ("version 2", |v, _| v["version"] = json!(2)),
+        ("version 1", |v, _| v["version"] = json!(1)),
+        ("version 3", |v, _| v["version"] = json!(3)),
+        ("an uppercase generation", |v, _| v["generation"] = json!("AB".repeat(32))),
+        ("a short generation", |v, _| v["generation"] = json!("ab")),
+        ("a bound item with a status of its own", |v, k| v["items"][&k.done]["status"] = json!("done")),
+        ("a bound item with an attempt of its own", |v, k| v["items"][&k.done]["attempts"] = json!(1)),
+        ("a binding to a missing game", |v, k| drop(v["games"].as_object_mut().unwrap().remove(&k.game))),
+        ("a binding with a short identity", |v, k| v["items"][&k.done]["game"]["identity"] = json!("00")),
+        ("an unknown binding field", |v, k| v["items"][&k.done]["game"]["note"] = json!("x")),
+        ("an unreferenced game", |v, k| {
+            let record = v["games"][&k.game].clone();
+            v["games"].as_object_mut().unwrap().insert("ab".repeat(32), record);
+        }),
+        ("a game on another board", |v, k| v["games"][&k.game]["board"] = k.other_game_board.clone()),
+        ("a game with a zero SPR", |v, k| v["games"][&k.game]["spr"] = json!({"num": 0, "den": 1})),
+        ("a game done with an error", |v, k| v["games"][&k.game]["last_error"] = json!("error")),
+        ("a game done with five attempts", |v, k| v["games"][&k.game]["attempts"] = json!(5)),
+        ("an unknown game field", |v, k| v["games"][&k.game]["note"] = json!("x")),
+        ("a game in flight behind a stale binding", |v, k| {
+            v["generation"] = json!("11".repeat(32));
+            v["games"][&k.game]["status"] = json!("pending");
+            v["games"][&k.game]["attempts"] = json!(1);
+        }),
+        ("a game and an item in flight", |v, k| {
+            v["games"][&k.game]["status"] = json!("pending");
+            v["games"][&k.game]["attempts"] = json!(1);
+            v["items"][&k.failed]["attempts"] = json!(2);
+        }),
         ("cursor past tier 1's four scenarios", |v, _| v["cursor"] = json!([0, 0, 4])),
         ("cursor in a fourth tier", |v, _| v["cursor"] = json!([3, 0, 0])),
         ("cursor past the last flop", |v, _| v["cursor"] = json!([0, 1755, 0])),
@@ -819,22 +1294,32 @@ fn a_corrupt_truncated_or_tampered_queue_file_is_rebuilt_never_partially_trusted
 #[test]
 fn save_refuses_a_queue_file_that_would_not_reopen() {
     let tmp = TempDir::new("queue-save-validate");
-    let q = open(tmp.path());
+    let mut q = open(tmp.path());
+    let bound = q.next_pending(0).unwrap();
+    bind(&mut q, &bound);
     q.save().unwrap();
     let path = queue::queue_path(tmp.path());
     let before = std::fs::read(&path).unwrap();
     let file = saved(tmp.path());
-    let key = file.items.keys().next().unwrap().clone();
-    let cases: [(&str, Box<dyn Fn(&mut QueueFile)>); 6] = [
-        ("version 2", Box::new(|f| f.version = 2)),
+    let key = file.items.keys().find(|k| **k != bound.identity_hex()).unwrap().clone();
+    let (slot, game) = (bound.identity_hex(), file.games.keys().next().unwrap().clone());
+    let (game2, game3) = (game.clone(), game.clone());
+    let cases: [(&str, Box<dyn Fn(&mut QueueFile)>); 9] = [
+        ("version 1", Box::new(|f| f.version = 1)),
         ("cursor", Box::new(|f| f.cursor = [0, 0, 4])),
         ("a missing item", Box::new(|f| drop(f.items.pop_first()))),
-        ("failed with n 0", Box::new(|f| f.items.values_mut().next().unwrap().status = TaskStatus::Failed { n: 0 })),
+        ("failed with n 0", Box::new(move |f| f.items.get_mut(&key).unwrap().status = TaskStatus::Failed { n: 0 })),
         ("a moved board", Box::new(|f| f.items.values_mut().next().unwrap().board.reverse())),
         ("a key that is not its identity", Box::new(move |f| {
-            let item = f.items.remove(&key).unwrap();
+            let item = f.items.remove(&slot).unwrap();
             f.items.insert("00".repeat(32), item);
         })),
+        ("a binding to a missing game", Box::new(move |f| drop(f.games.remove(&game)))),
+        ("an unreferenced game", Box::new(move |f| {
+            let record = f.games[&game2].clone();
+            f.games.insert("ab".repeat(32), record);
+        })),
+        ("a game on another board", Box::new(move |f| f.games.get_mut(&game3).unwrap().board.reverse())),
     ];
     for (why, mutate) in cases {
         let mut bad = file.clone();
@@ -888,4 +1373,60 @@ fn an_unknown_identity_is_refused() {
     let tmp = TempDir::new("queue-unknown");
     let mut q = open(tmp.path());
     q.record_launch(&"00".repeat(32));
+}
+
+/// Review R1: completion is recorded against a normalized game identity, so a launch whose slot
+/// has none bound under the current generation (a preparation that failed) can only fail or be
+/// cancelled.
+#[test]
+#[should_panic(expected = "normalized game identity")]
+fn completing_a_launch_with_no_bound_identity_is_refused() {
+    let tmp = TempDir::new("queue-done-unbound");
+    let mut q = open(tmp.path());
+    let id = q.next_pending(0).unwrap().identity_hex();
+    q.record_launch(&id);
+    q.record_done(&id);
+}
+
+#[test]
+#[should_panic(expected = "canonical flop")]
+fn binding_a_key_on_another_board_is_refused() {
+    let tmp = TempDir::new("queue-bind-board");
+    let mut q = open(tmp.path());
+    let first = q.next_pending(0).unwrap();
+    let (mut key, spr) = prepared(&first, "chart-a");
+    key.canonical_board = canonical_flops_ordered()[1].clone();
+    q.bind(&first.identity_hex(), &key, spr);
+}
+
+#[test]
+#[should_panic(expected = "in flight")]
+fn rebinding_the_item_in_flight_is_refused() {
+    let tmp = TempDir::new("queue-bind-in-flight");
+    let mut q = open(tmp.path());
+    let first = q.next_pending(0).unwrap();
+    bind(&mut q, &first);
+    q.record_launch(&first.identity_hex());
+    let (key, spr) = prepared(&first, "chart-b");
+    q.bind(&first.identity_hex(), &key, spr);
+}
+
+#[test]
+#[should_panic(expected = "in flight")]
+fn changing_the_generation_while_a_job_is_in_flight_is_refused() {
+    let tmp = TempDir::new("queue-generation-in-flight");
+    let mut q = open(tmp.path());
+    let first = q.next_pending(0).unwrap();
+    bind(&mut q, &first);
+    q.record_launch(&first.identity_hex());
+    q.set_generation(GEN_B);
+}
+
+#[test]
+#[should_panic(expected = "no normalized identity")]
+fn reconciling_an_unbound_item_is_refused() {
+    let tmp = TempDir::new("queue-reconcile-unbound");
+    let mut q = open(tmp.path());
+    let id = q.next_pending(0).unwrap().identity_hex();
+    q.reconcile_item(&id, true);
 }
