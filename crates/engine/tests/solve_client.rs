@@ -366,7 +366,7 @@ fn a_worker_exit_and_an_unconfirmed_end_restart_the_worker() {
 // send, the first terminal's arrival. Time still comes only from the fake clock; the links and the clock below only
 // decide when the client observes what the scripted worker wrote. ---
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The engine clock as a busy engine thread sees it: the fake clock, except that once `per_read_ms` is set, every
 /// reading costs that much engine time (the reading is returned, then the clock moves on). It models the client's own
@@ -586,4 +586,61 @@ fn the_first_terminal_arrival_is_published_at_receipt_and_kept_through_every_out
         let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
         assert_eq!((out.first_terminal_ms, r.plan.street_deadline.terminal_arrival_ms(), out.street_violation), (None, None, violated), "{case}: {:?}", out.terminal);
     }
+}
+
+// --- Fix round 2 (re-review P2T22-N1): the pre-send expiry check sends nothing once the watchdog's fire has come. ---
+
+/// A clock that models a suspend landing between `worker_deadline_ms`'s reading (`run_solve`, right after
+/// `ready_for_requests`) and the pre-send expiry check `run_attempt` makes immediately before the send
+/// (`solve.rs:279`). Once armed (by `ArmsOnReady::ready()`, called as the worker's `ready` is checked, one reading
+/// before `worker_deadline_ms`'s), it counts the readings taken through it: the first is the fake clock's own (so the
+/// request is still built and reaches the send, as it would without a suspend), and on the second it jumps the fake
+/// clock to `fire_ms` before returning it — the pre-send check's reading.
+struct ArmedClock { fake: Arc<FakeClock>, armed: Arc<AtomicBool>, fire_ms: u64, readings_since_armed: AtomicU64 }
+impl Clock for ArmedClock {
+    fn now_ms(&self) -> u64 {
+        if self.armed.load(Ordering::SeqCst) && self.readings_since_armed.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+            self.fake.set_ms(self.fire_ms);
+        }
+        self.fake.now_ms()
+    }
+    fn wait_until(&self, t_ms: u64) { self.fake.wait_until(t_ms) }
+}
+
+/// The scripted worker behind a link whose `ready()` arms `ArmedClock`.
+struct ArmsOnReady { inner: Box<dyn WorkerLink>, armed: Arc<AtomicBool> }
+impl WorkerLink for ArmsOnReady {
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError> { self.inner.send(msg) }
+    fn recv(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> { self.inner.recv(timeout) }
+    fn restart(&mut self) -> Result<(), WorkerLinkError> { self.inner.restart() }
+    fn kill(&mut self) { self.inner.kill() }
+    fn ready(&self) -> Option<&Ready> { self.armed.store(true, Ordering::SeqCst); self.inner.ready() }
+}
+
+/// P2T22-N1 (re-review 1, `task-22-rereview-1.md`): the pre-send `ended_at` check (`solve.rs:279`) also ends the
+/// attempt `DeadlinePassed`, sending nothing, once the watchdog's fire has come by then — reachable exactly in the
+/// suspend scenario spec 7 names, a mutation or a stalled thread landing between the tree being built and the request
+/// being sent. Reducing that check to identity only (mutant MC of the re-review) left the committed suite green,
+/// since nothing forced the pre-send reading itself to observe the fire: this test does, with a clock that jumps to
+/// `watchdog_fire_ms()` exactly on that reading (armed as the worker's `ready` is checked, one reading before it, so
+/// `worker_deadline_ms` still sees room for an attempt and the flow reaches the send). Nothing reaches the worker, no
+/// progress is forwarded, nothing is killed or restarted, and no arrival is published to the street deadline: the same
+/// `DeadlineExceeded{"building"}` the loop's own top would have declared a moment later, had anything been sent.
+#[test]
+fn a_request_expired_while_prepared_is_never_sent() {
+    let mut r = rig(Street::River, vec![]);
+    let identity = r.core.identity.clone();
+    let armed = Arc::new(AtomicBool::new(false));
+    let clock: Arc<dyn Clock> = Arc::new(ArmedClock {
+        fake: r.clock.clone(), armed: armed.clone(), fire_ms: r.plan.deadlines.watchdog_fire_ms(), readings_since_armed: AtomicU64::new(0),
+    });
+    let (worker, state) = FakeWorker::scripted(r.clock.clone(), identity.clone(), vec![ack(), ok_for(Street::River, "river_std_v1", 0.3)]);
+    let link = ArmsOnReady { inner: worker, armed };
+    r.core = EngineCore::new(Box::new(link), clock, identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log")));
+    r.state = state;
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!(
+        (out.terminal, solves(&r.state).is_empty(), kills_and_restarts(&r.state), out.restarts, out.first_terminal_ms, r.plan.street_deadline.terminal_arrival_ms()),
+        (deadline_exceeded("building"), true, (0, 0), 0, None, None),
+    );
 }
