@@ -154,13 +154,41 @@ fn size_distance(to: u32, source_to_bb_x1000: u32, unit: u32) -> u64 {
 /// choice is deterministic even for two source sizes less than a chip apart. `PreflopStep::AllIn`
 /// carries no size and is never a size match.
 fn menu_size(menu: &[PreflopStep], to: u32, unit: u32) -> Option<u32> {
-    menu.iter()
-        .filter_map(|s| match s {
-            PreflopStep::Raise { to_bb_x1000 } => Some(*to_bb_x1000),
-            _ => None,
-        })
-        .filter(|&s| size_matches(to, s, unit))
-        .min_by_key(|&s| (size_distance(to, s, unit), s))
+    menu_step_index(menu, &Action::Raise { to }, unit).map(|i| match menu[i] {
+        PreflopStep::Raise { to_bb_x1000 } => to_bb_x1000,
+        ref other => unreachable!("menu_step_index resolves a raise onto a Raise step, not {other:?}"),
+    })
+}
+
+/// The position in one source node's `menu` of the step a live chip `action` is (spec section
+/// 8.3's size rule; P3.T13): `Fold`, `Check` and `Call` are their like-named step; a `Bet` or
+/// `Raise` is the closest `Raise` size within [`size_matches`]'s half-chip tolerance, ties to the
+/// smaller size -- the same resolution the key walk below applies to every historical wager, so an
+/// action on the menu here is the step a key built from it carries; an `AllIn` is the `AllIn` step
+/// (the source's all-in, which expands to the actor's own maximum). `None` when the node offers no
+/// such step: an off-menu wager, which section 8.4 translates, or a non-wager this node does not
+/// list, for which the node has no likelihood at all.
+///
+/// # Panics
+/// Panics (in every build profile) on a zero unit, through [`size_matches`].
+pub fn menu_step_index(menu: &[PreflopStep], action: &Action, unit: u32) -> Option<usize> {
+    let like = |step: PreflopStep| menu.iter().position(|s| *s == step);
+    match action {
+        Action::Fold => like(PreflopStep::Fold),
+        Action::Check => like(PreflopStep::Check),
+        Action::Call => like(PreflopStep::Call),
+        Action::AllIn { .. } => like(PreflopStep::AllIn),
+        Action::Bet { to } | Action::Raise { to } => menu
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| match s {
+                PreflopStep::Raise { to_bb_x1000 } => Some((i, *to_bb_x1000)),
+                _ => None,
+            })
+            .filter(|&(_, s)| size_matches(*to, s, unit))
+            .min_by_key(|&(_, s)| (size_distance(*to, s, unit), s))
+            .map(|(i, _)| i),
+    }
 }
 
 /// The observed preflop prefix as source steps under the (possibly virtual) roles, with each raise
@@ -211,10 +239,17 @@ struct ResolvedHistory {
 /// has no node at that prefix, so no menu exists to resolve against) the remaining raises are
 /// recorded at their own converted size and no further lookup is attempted.
 ///
+/// `steps` is the chip history the key is built from: the observed preflop prefix for
+/// [`PreflopStore::query`], or a replay branch's translated history for
+/// [`PreflopStore::query_history`] (P3.T13). A translated wager is a menu action the replay took
+/// from an expanded node -- the source size rounded to the chip -- so it resolves back onto that
+/// source size here, which a thousandth conversion of the rounded chips would not (7.5 chips round
+/// to 8, and 8 chips convert to 2667, not the source's 2500).
+///
 /// `Err` is the one condition that is neither a match nor an off-menu branch: a raise whose size
 /// has no representation in the source-key domain at all (R4).
 fn resolve_against_source(
-    prefix: &HandState,
+    steps: &[(Seat, Action)],
     roles: &[(Seat, Position)],
     mapped: bool,
     unit: u32,
@@ -225,9 +260,9 @@ fn resolve_against_source(
 ) -> Result<ResolvedHistory, UnsupportedReason> {
     let mut history = short.to_vec();
     let mut off_menu: Option<String> = None;
-    for a in prefix.actions.iter().filter(|a| a.street == Street::Preflop) {
-        let role = roles.iter().find(|(s, _)| *s == a.seat).expect("dealt seat").1;
-        let step = match a.action {
+    for &(seat, action) in steps {
+        let role = roles.iter().find(|(s, _)| *s == seat).expect("dealt seat").1;
+        let step = match action {
             Action::Fold => PreflopStep::Fold,
             Action::Check => PreflopStep::Check,
             Action::Call => PreflopStep::Call,
@@ -248,8 +283,8 @@ fn resolve_against_source(
                     None => {
                         if off_menu.is_none() {
                             off_menu = Some(match node {
-                                Some(_) => format!("seat {}'s raise to {to} chips is not a size the source offers at that node", a.seat.0),
-                                None => format!("the source has no node before seat {}'s raise, so its sizes cannot be resolved", a.seat.0),
+                                Some(_) => format!("seat {}'s raise to {to} chips is not a size the source offers at that node", seat.0),
+                                None => format!("the source has no node before seat {}'s raise, so its sizes cannot be resolved", seat.0),
                             });
                         }
                         PreflopStep::Raise {
@@ -273,6 +308,33 @@ impl PreflopStore {
     /// whether or not they are on record, and identical before and after any later action --
     /// eligibility, depth and roles are all taken at the prefix.
     pub fn query(&self, cfg: &HandConfig, state: &HandState, prefix_len: usize) -> PreflopAnswer {
+        self.answer_for(cfg, state, prefix_len, None)
+    }
+
+    /// [`PreflopStore::query`] with one substitution (P3.T13, spec section 8.4's history branches):
+    /// the node history is `history` -- a replay branch's translated history, each translated wager
+    /// replaced by its mapped menu action -- instead of the observed prefix's own actions.
+    ///
+    /// Everything else is the observed prefix's, exactly as `query` computes it: the actor, the
+    /// eligible seats, the depth bucket, the rake profile, the physical and virtual roles, the
+    /// short-handed folds, the selected bundle, the source unit, the actor's actual chip maximum
+    /// for `AllIn`, and every mapping reason (section 8.3 is hindsight-free, and actual money is
+    /// never rewritten). A branch that translated villain's raise to menu size A therefore looks up
+    /// the next actor's node under A. Each wager in `history` is resolved against the selected
+    /// source's own menus exactly as the observed prefix's are (see `resolve_against_source`), so
+    /// a chip-rounded menu action finds the source size it came from.
+    ///
+    /// `history` must follow the observed prefix actor by actor (one entry per preflop action of the
+    /// prefix, same seats in the same order): a translated history differs from the observed one only
+    /// in its wager sizes. Anything else is a typed `UnsupportedHistory` answer, never a lookup of a
+    /// different decision.
+    pub fn query_history(&self, cfg: &HandConfig, state: &HandState, prefix_len: usize, history: &[(Seat, Action)]) -> PreflopAnswer {
+        self.answer_for(cfg, state, prefix_len, Some(history))
+    }
+
+    /// The shared body of [`PreflopStore::query`] (`history == None`: the observed prefix) and
+    /// [`PreflopStore::query_history`] (`Some`: a branch's translated history).
+    fn answer_for(&self, cfg: &HandConfig, state: &HandState, prefix_len: usize, history: Option<&[(Seat, Action)]>) -> PreflopAnswer {
         let mut answer = PreflopAnswer::empty();
         // Screened on `state` before `prefix_state`, which cannot re-derive a postflop action with
         // the board cleared (it asserts instead); the reason reported is the same either way.
@@ -366,10 +428,32 @@ impl PreflopStore {
         if !short.is_empty() {
             answer.reasons.push(ApproxReason::ShortHandedMapped { dealt: prefix.dealt.len() as u8 });
         }
+        // The chip history the key is built from: the observed prefix, or (P3.T13) a branch's
+        // translated history, which must follow the observed prefix actor by actor.
+        let observed: Vec<(Seat, Action)> =
+            prefix.actions.iter().filter(|a| a.street == Street::Preflop).map(|a| (a.seat, a.action)).collect();
+        let steps: &[(Seat, Action)] = match history {
+            None => &observed,
+            Some(translated) => {
+                let follows = translated.len() == observed.len()
+                    && translated.iter().zip(&observed).all(|((seat, _), (actual, _))| seat == actual);
+                if !follows {
+                    answer.unsupported = Some(UnsupportedReason::UnsupportedHistory {
+                        reason: format!(
+                            "a translated history by seats {:?} does not follow the observed prefix's actors {:?}",
+                            translated.iter().map(|(s, _)| s.0).collect::<Vec<_>>(),
+                            observed.iter().map(|(s, _)| s.0).collect::<Vec<_>>()
+                        ),
+                    });
+                    return answer;
+                }
+                translated
+            }
+        };
         // Every wager is resolved against the selected source's own menus before it can enter the
         // key (R3); the mapping reasons above are already recorded, because reasons accumulate even
         // when the history itself turns out not to be answerable.
-        let resolved = match resolve_against_source(&prefix, &roles, mapped, unit, &short, candidate.as_ref(), used, info) {
+        let resolved = match resolve_against_source(steps, &roles, mapped, unit, &short, candidate.as_ref(), used, info) {
             Ok(resolved) => resolved,
             Err(reason) => {
                 answer.unsupported = Some(reason);
@@ -403,6 +487,23 @@ impl PreflopStore {
         // it (section 8.3, "Missing nodes stay missing").
         match candidate.lookup(&key) {
             Some(node) => {
+                // P3.T13: the node found must be this actor's decision. The source's turn order
+                // follows the key's history, and an all-in in that history (a live raise translated
+                // to the source's all-in, or a live all-in call the source records as a plain call)
+                // can make it name a different seat than the one acting at this prefix. That node
+                // holds no likelihood for this actor, so the actor has no node here -- reported
+                // missing, with a marker that keeps the key from equalling a real node key.
+                let role = roles.iter().find(|(s, _)| *s == actor).expect("the actor is a dealt seat").1;
+                let acting_as = virtual_position(role, mapped);
+                if node.actor != acting_as {
+                    answer.key = format!(
+                        "{} [actor mismatch: the node there is {:?}'s decision, seat {} acts as {acting_as:?}]",
+                        answer.key, node.actor, actor.0
+                    );
+                    answer.notes.push(format!("the source's node at this history belongs to {:?}", node.actor));
+                    answer.unsupported = Some(UnsupportedReason::MissingPreflopNode { key: answer.key.clone() });
+                    return answer;
+                }
                 // The actor's actual chip maximum (P3.T9): committed-this-street plus what
                 // remains, never the source's own declared depth -- a live stack shallower or
                 // deeper than the source's acquired depth still expands `AllIn` to what this
@@ -430,10 +531,12 @@ impl PreflopStore {
 /// Nothing here is persisted.
 ///
 /// An entry is keyed by everything a mapping depends on within a run: the hand identity and
-/// revision, the config revision, the dealt seats and their starting stacks, the prefix length, and
-/// the prefix's own chip history -- which is what makes a *branch-translated* history a distinct
-/// entry, since a driver exploring a translated branch passes a state whose recorded actions are
-/// that branch. A caller must not reuse one invocation across two different stores.
+/// revision, the config revision, the dealt seats and their starting stacks, the prefix length, the
+/// prefix's own chip history and -- for [`PreflopInvocation::answer_history`] (P3.T13) -- the
+/// branch-translated history the node was looked up under. That last component is what makes two
+/// history branches at the same observed prefix distinct entries; no final-hand state (later folds,
+/// the board) is part of any key. A caller must not reuse one invocation across two different
+/// stores.
 #[derive(Debug, Default)]
 pub struct PreflopInvocation {
     entries: HashMap<MappingKey, PreflopAnswer>,
@@ -450,6 +553,9 @@ struct MappingKey {
     dealt: Vec<Seat>,
     stacks_start: Vec<u32>,
     history: Vec<(Seat, Action)>,
+    /// `None` for [`PreflopStore::query`] (the observed prefix is the node history); `Some` for
+    /// [`PreflopStore::query_history`], holding the translated history.
+    translated: Option<Vec<(Seat, Action)>>,
 }
 
 impl PreflopInvocation {
@@ -466,6 +572,31 @@ impl PreflopInvocation {
         state: &HandState,
         prefix_len: usize,
     ) -> PreflopAnswer {
+        self.memoized(store, cfg, state, prefix_len, None)
+    }
+
+    /// [`PreflopStore::query_history`]'s answer for this observed prefix index and translated
+    /// history, computed once per distinct pair within this invocation (P3.T13). The returned
+    /// answer is identical to calling `store.query_history` directly.
+    pub fn answer_history(
+        &mut self,
+        store: &PreflopStore,
+        cfg: &HandConfig,
+        state: &HandState,
+        prefix_len: usize,
+        history: &[(Seat, Action)],
+    ) -> PreflopAnswer {
+        self.memoized(store, cfg, state, prefix_len, Some(history))
+    }
+
+    fn memoized(
+        &mut self,
+        store: &PreflopStore,
+        cfg: &HandConfig,
+        state: &HandState,
+        prefix_len: usize,
+        translated: Option<&[(Seat, Action)]>,
+    ) -> PreflopAnswer {
         self.lookups += 1;
         let key = MappingKey {
             hand_id: state.hand_id,
@@ -480,17 +611,22 @@ impl PreflopInvocation {
                 .take(prefix_len.min(state.actions.len()))
                 .map(|a| (a.seat, a.action))
                 .collect(),
+            translated: translated.map(<[(Seat, Action)]>::to_vec),
         };
         if let Some(cached) = self.entries.get(&key) {
             self.hits += 1;
             return cached.clone();
         }
-        let answer = store.query(cfg, state, prefix_len);
+        let answer = match translated {
+            None => store.query(cfg, state, prefix_len),
+            Some(history) => store.query_history(cfg, state, prefix_len, history),
+        };
         self.entries.insert(key, answer.clone());
         answer
     }
 
-    /// Calls made to [`PreflopInvocation::answer`] in this run.
+    /// Calls made to [`PreflopInvocation::answer`] and [`PreflopInvocation::answer_history`] in
+    /// this run.
     pub fn lookups(&self) -> u64 {
         self.lookups
     }
@@ -514,5 +650,81 @@ impl PreflopInvocation {
         self.entries.clear();
         self.lookups = 0;
         self.hits = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envelope::{EvReference, SourceKind};
+    use core_model::state::BeginHand;
+
+    /// A test double whose every lookup returns a node that is the UTG position's decision --
+    /// the shape a source's turn order produces when its history's all-ins differ from the live
+    /// hand's. The committed synthetic fixture holds no such history.
+    struct UtgEverywhere {
+        info: BundleInfo,
+    }
+
+    impl PreflopSource for UtgEverywhere {
+        fn bundle_info(&self) -> &BundleInfo {
+            &self.info
+        }
+        fn lookup(&self, _key: &PreflopNodeKey) -> Option<PreflopNode> {
+            Some(PreflopNode {
+                actor: Position::Utg,
+                actions: vec![PreflopStep::Fold, PreflopStep::Call],
+                probs: vec![vec![1.0, 0.0]; 169],
+                ev_source_sb: None,
+                unreachable: [false; 169],
+                committed_by_actor_sb: 0.0,
+                fold_wide_verified: false,
+            })
+        }
+        fn nodes_have_no_ev(&self) -> bool {
+            true
+        }
+    }
+
+    /// P3.T13: a node found at the key's history that is another position's decision is not this
+    /// actor's node -- `MissingPreflopNode` with a marked key, on the observed and the translated
+    /// path alike, and never an expanded node whose likelihoods belong to someone else.
+    #[test]
+    fn a_node_that_is_another_positions_decision_is_missing_for_this_actor() {
+        let info = BundleInfo {
+            bundle_id: "utg_everywhere".into(),
+            source: SourceKind::PokerDataJson,
+            depth_bb: 100,
+            depths: vec![100],
+            source_blinds: [0.5, 1.0],
+            rake_profile: "test".into(),
+            rake: None,
+            straddle: false,
+            version: 2,
+            game: "nl".into(),
+            ev_unit: "source_sb".into(),
+            ev_reference: EvReference::Unverified,
+            license_note: "test".into(),
+            accuracy: "unverified".into(),
+            sha256: String::new(),
+        };
+        let store = PreflopStore::from_sources(vec![Box::new(UtgEverywhere { info })]);
+        let cfg = HandConfig { config_revision: 1, sb_chips: 1, bb_chips: 2, straddle: None, rake: proto::Rake::TimeCharge, chip_label: "$1".into() };
+        let root = core_model::begin_hand(
+            &cfg,
+            BeginHand { hand_id: 1, button: Seat(5), hero: Seat(0), dealt: (0..6).map(Seat).collect(), stacks_start: vec![200; 6], hero_cards: None },
+        )
+        .expect("a six-max table");
+        // Control: UTG (seat 2) acts at the root, and the node is UTG's.
+        let at_root = store.query(&cfg, &root, 0);
+        assert!(at_root.node.is_some() && at_root.expanded.is_some(), "{at_root:?}");
+        // After UTG folds the HJ seat acts, but the node the double returns is still UTG's.
+        let folded = core_model::apply_action(&root, Action::Fold).expect("UTG folds");
+        let answer = store.query(&cfg, &folded, 1);
+        assert!(answer.node.is_none() && answer.expanded.is_none(), "{answer:?}");
+        assert!(answer.key.contains("actor mismatch") && answer.key.contains("Utg") && answer.key.contains("Hj"), "{}", answer.key);
+        assert_eq!(answer.unsupported, Some(UnsupportedReason::MissingPreflopNode { key: answer.key.clone() }));
+        assert_eq!(answer.actor, Some(Seat(3)));
+        assert_eq!(store.query_history(&cfg, &folded, 1, &[(Seat(2), Action::Fold)]), answer, "the translated path agrees");
     }
 }
