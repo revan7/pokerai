@@ -11,6 +11,47 @@ pub fn prepared_range(text: &str, board: &[Card]) -> Result<Range1326, String> {
 /// Total weight of a range, for report and sanity checks.
 pub fn range_mass(r: &Range1326) -> f32 { core_ranges::mass(r) }
 
+/// Spec 4.5 `SolveRequest.spot`: the lowercase sha256 hex of the structural identity of the game `req` solves, the
+/// string a staged lock is matched against. Two requests that solve the same game get the same identity, and every input
+/// that makes two games differ enters it:
+/// - the §4.6 `tree_signature` of `req.tree` at `req.pot` (rules version, template, root street, nominal menus,
+///   thresholds, wager cap, inserted sizes as reduced rationals of the root pot);
+/// - the chip scale the signature deliberately leaves out, which fixes the realized tree: `pot`, `stack_oop` and
+///   `stack_ip` (two spots that differ only in their stacks, such as a 100bb and a 200bb spot on one board, are
+///   different games with different all-in nodes), and the rake (`rake_rate` bits, `-0.0` read as `0.0`, and
+///   `rake_cap_mchips`);
+/// - the board's card ids in order, and the §2 scaled hashes of `oop_range` then `ip_range`.
+///
+/// Solve parameters are not the game and never enter it: `id`, `spot` itself, `history` (the requested node),
+/// `target_bp`, `deadline_ms`, `extraction_margin_ms`, `memory_limit_bytes`, `background`. The preimage is
+/// domain-tagged and every part is fixed-width except the board, whose length is written first.
+///
+/// Plan 2 Task 22's listing sketches `engine::solve::spot_hash(tree, pot, board, ranges)` without the stacks and the
+/// rake, which would give the two spots above one identity; `bench` reaches this helper through the façade so it never
+/// depends on `core-*` (§3.2).
+///
+/// Panics as `tree_signature` does (a zero pot, an inserted path that does not resolve): both are engine bugs.
+pub fn spot_identity(req: &proto::worker::SolveRequest) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"pokerai/solve-spot/v1\0");
+    h.update(crate::tree::tree_signature(&req.tree, req.pot).as_bytes());
+    for chips in [req.pot, req.stack_oop, req.stack_ip] {
+        h.update(chips.to_le_bytes());
+    }
+    let rake_rate = if req.rake_rate == 0.0 { 0.0f32 } else { req.rake_rate };
+    h.update(rake_rate.to_bits().to_le_bytes());
+    h.update(req.rake_cap_mchips.to_le_bytes());
+    let board_len = u8::try_from(req.board.len()).expect("a board has at most five cards");
+    h.update([board_len]);
+    for card in &req.board {
+        h.update([card.0]);
+    }
+    h.update(core_ranges::hash_scaled(&req.oop_range));
+    h.update(core_ranges::hash_scaled(&req.ip_range));
+    hex::encode(h.finalize())
+}
+
 // --- Task 17: the frozen chart provenance/source lock (`bench/spots/sources.json`) ---
 //
 // `tools/chart_sources.py::freeze_sources` writes this shape from the committed chart bundles.

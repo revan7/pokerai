@@ -9,3 +9,8 @@ proto = { path = "../proto" }
 engine = { path = "../engine" }
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# The runner's tests drive `run_spot`/`cancel_latency` with the engine's scripted worker and fake clock (Task 19).
+# A dev-dependency feature applies only to test and example builds, so the `bench` binary never links `engine::testing`.
+engine = { path = "../engine", features = ["testing"] }
