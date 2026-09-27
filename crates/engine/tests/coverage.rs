@@ -59,6 +59,38 @@ fn coverage_classification_golden() {
     assert_eq!(cases.iter().map(|(k, v)| (k.to_string(), v.clone())).collect::<Vec<_>>(), expected);
 }
 
+/// §2/§6: the initial six-seat hand, before any action, is hero's preflop decision when hero is UTG (first to
+/// act after the blinds) with known hero cards. This pins the dispatch order in `classify` — the preflop check
+/// must fire before the unconditional multiway count, since all six seats are still unfolded at the very start
+/// (P2T24-M1).
+#[test]
+fn initial_six_seat_hand_with_hero_utg_is_preflop() {
+    let aa = Some([c("Ah"), c("Ad")]);
+    let initial = hand(&six([1000; 6]), B, UTG, aa);
+    assert!(matches!(classify(&initial), Classification::Preflop), "{:?}", classify(&initial));
+}
+
+/// §10.2: a genuine HU street root that fails to replay against its own stored `Derived` is an engine defect —
+/// `Unsupported(EngineError { retryable: false, .. })` — never `UnsupportedHistory`. Mutating only the stored
+/// `derived.pot` by one chip leaves the action history itself replayable (`core_model::derive`, `classify`'s
+/// first line, recomputes fresh from `state.actions` and does not consult the stored field), so this exercises
+/// `street_root`'s own replay-equality check (`core-model/src/street_root.rs:184`, `sim.derived() != *d`)
+/// failing at step 0, and the `RootError::Inconsistent { step }` mapping at `coverage.rs:65` (P2T24-M1).
+#[test]
+fn inconsistent_stored_derived_is_a_non_retryable_engine_error() {
+    let aa = Some([c("Ah"), c("Ad")]);
+    let hu = board(&play(&fold3(hand(&six([1000; 6]), B, BB, aa)), &[r(30), Action::Fold, Action::Call]), "Kh 7d 2c");
+    let mut broken = hu.clone();
+    broken.derived.pot += 1;
+    match classify(&broken) {
+        Classification::Unsupported(UnsupportedReason::EngineError { retryable, message }) => {
+            assert!(!retryable);
+            assert_eq!(message, "street root does not replay at step 0");
+        }
+        other => panic!("expected a non-retryable EngineError, got {other:?}"),
+    }
+}
+
 /// `Derived`'s per-seat vectors are indexed by `Seat.0` (proto), not by a seat's position in `dealt`: on a gapped
 /// three-handed table (seats 1, 3, 5; button 5, so SB = 1, BB = 3) the two lookups disagree, and hero facing a flop
 /// shove must be a HU decision facing an all-in whichever opponent shoved.
