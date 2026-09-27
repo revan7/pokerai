@@ -11,6 +11,10 @@ them through the real engine -- both depend on this schema staying exactly what 
 """
 import hashlib
 import json
+import os
+import subprocess
+import sys
+from copy import deepcopy
 from fractions import Fraction
 from pathlib import Path
 
@@ -298,6 +302,136 @@ def test_every_record_replays_legally_in_pokerkit():
         assert trace.final_actor == row["hero"] or row["expected"]["unsupported"], row["id"]
 
 
+# --- Task 19 fix round 1 (I4): an independent accounting model compared with PokerKit ---
+#
+# `replay_record` keeps its own ledger (posts and straddle, wagers, street and hand commitments,
+# stacks, collected and total pot, actor, dealt board) and asserts it equals PokerKit's state
+# after the posts and after every event. The expectations below are derived by hand from each
+# record's events, independently of both the ledger and PokerKit.
+
+
+def _copied(record_id: str) -> dict:
+    return deepcopy(next(r for r in records() if r["id"] == record_id))
+
+
+def test_replay_compares_the_accounting_after_the_posts_and_every_event():
+    for r in records():
+        assert replay_record(r).states_compared == len(r["events"]) + 1, r["id"]
+
+
+# Seats BTN0 SB1 BB2 UTG3 HJ4 CO5. "street" is the uncollected street commitment per seat.
+_ZERO = {seat: 0 for seat in range(6)}
+FINAL_ACCOUNTING = {
+    # Straddle 1/2/4, 200 chips each: posts 1+2+4; HJ raises to 10, CO/BTN/SB/BB fold, the
+    # straddler calls 10; collected 1 + 2 + 10 + 10 = 23; UTG (hero) first to act on the flop.
+    "023": {"actor": 3, "stacks": {0: 200, 1: 199, 2: 198, 3: 190, 4: 190, 5: 200},
+            "street": _ZERO, "collected": 23, "total": 23, "board": "Kh7d2c"},
+    # Projection (paid): preflop collects 50 + 3 x 250 = 800; on the flop BB has 500 out, UTG's
+    # 100 is dead (folded, still uncollected) and BTN (hero) faces 500 with 300 in.
+    "022": {"actor": 0, "stacks": {0: 9450, 1: 9950, 2: 9250, 3: 9650, 4: 10000, 5: 10000},
+            "street": {0: 300, 1: 0, 2: 500, 3: 100, 4: 0, 5: 0}, "collected": 800, "total": 1700,
+            "board": "Kh7d2c"},
+    # Third all-in: UTG (250 chips) all-in preflop, BTN and BB call, SB's 50 dead: 800.
+    "029": {"actor": 2, "stacks": {0: 9750, 1: 9950, 2: 9750, 3: 0, 4: 10000, 5: 10000},
+            "street": _ZERO, "collected": 800, "total": 800, "board": "Kh7d2c"},
+    # Side pot with a short all-in: UTG (300) raises to 250 preflop (800 collected), then calls
+    # BB's 100 flop bet all-in for 50 and BTN calls 100 (1050, nothing uncalled), turn 100/100
+    # (1250); river dealt, BB to act.
+    "030": {"actor": 2, "stacks": {0: 9550, 1: 9950, 2: 9550, 3: 0, 4: 10000, 5: 10000},
+            "street": _ZERO, "collected": 1250, "total": 1250, "board": "Kh7d2c4d2s"},
+}
+
+
+@pytest.mark.parametrize("record_id", sorted(FINAL_ACCOUNTING))
+def test_replay_accounting_matches_hand_derived_numbers(record_id):
+    want = FINAL_ACCOUNTING[record_id]
+    r = _copied(record_id)
+    view = replay_record(r).ledger.view()
+    start = {seat: r["stacks"][seat] for seat in range(6)}
+    assert view["actor"] == want["actor"] == r["hero"]
+    assert view["stacks"] == want["stacks"]
+    assert view["street commitments"] == want["street"]
+    assert view["hand commitments"] == {s: start[s] - want["stacks"][s] for s in range(6)}
+    assert view["collected pot"] == want["collected"]
+    assert view["total pot"] == want["total"] == want["collected"] + sum(want["street"].values())
+    assert view["board"] == want["board"]
+    assert sum(want["stacks"].values()) + want["total"] == sum(start.values())
+
+
+def test_replay_returns_the_uncalled_wager_at_a_street_collection():
+    # A private variant of 030 (never frozen): BTN folds to UTG's 50 all-in call of BB's 100 flop
+    # bet, so 50 of BB's bet is uncalled and goes back to BB when the flop is collected.
+    r = _copied("030")
+    r["events"] = r["events"][:9] + [{"type": "action", "seat": 0, "street": "flop", "action": {"kind": "fold"}}]
+    trace = replay_record(r)
+    view = trace.ledger.view()
+    assert trace.final_actor is None and view["actor"] is None
+    assert view["stacks"] == {0: 9750, 1: 9950, 2: 9700, 3: 0, 4: 10000, 5: 10000}
+    assert view["street commitments"] == _ZERO
+    assert view["collected pot"] == view["total pot"] == 800 + 50 + 50
+
+
+def test_replay_rejects_a_record_whose_all_in_amount_is_not_the_whole_stack():
+    # UTG's short all-in call (030 event 8) states a post-event commitment of 50: its whole stack.
+    for wrong in (49, 51):
+        r = _copied("030")
+        r["events"][8]["action"]["to"] = wrong
+        with pytest.raises(AssertionError, match=r"record 030 event 8 "):
+            replay_record(r)
+
+
+@pytest.mark.parametrize("record_id, index, cards, dup", [
+    ("009", 10, "Kh7d2c6s", "6s"),   # the turn repeats one of hero's hole cards
+    ("009", 6, "KhKh2c", "Kh"),      # the flop repeats its own card
+], ids=["hero-card", "board-card"])
+def test_replay_rejects_a_record_whose_board_repeats_a_dealt_card(record_id, index, cards, dup):
+    r = _copied(record_id)
+    r["events"][index]["cards"] = cards
+    with pytest.raises(AssertionError, match=rf"record {record_id} event {index} .*{dup} is already dealt"):
+        replay_record(r)
+
+
+def _diverge_after(monkeypatch, event: dict, corrupt) -> None:
+    """Make the model diverge from PokerKit right after `event` is applied (`corrupt(ledger, j)`,
+    `j` = the event seat's player index): the next comparison must reject the replay."""
+    import gen_fixtures
+
+    apply = gen_fixtures.Ledger.apply
+
+    def diverging(ledger, e, where):
+        apply(ledger, e, where)
+        if e is event:
+            corrupt(ledger, ledger.ring.index(e["seat"]) if "seat" in e else None)
+
+    monkeypatch.setattr(gen_fixtures.Ledger, "apply", diverging)
+
+
+def _one_chip_back_to_the_stack(ledger, j):
+    ledger.bets[j] -= 1
+    ledger.committed[j] -= 1
+    ledger.stacks[j] += 1
+
+
+def _one_chip_more_collected(ledger, j):
+    ledger.collected += 1
+
+
+def _another_turn_card(ledger, j):
+    ledger.board = ledger.board[:-2] + "4c"
+
+
+@pytest.mark.parametrize("record_id, index, corrupt, field", [
+    ("030", 8, _one_chip_back_to_the_stack, "stacks"),        # a short all-in call's amount
+    ("030", 9, _one_chip_more_collected, "collected pot"),    # the flop collection
+    ("009", 10, _another_turn_card, "board"),                 # a dealt board
+], ids=["post-event-amount", "street-collection", "board"])
+def test_replay_rejects_a_model_that_diverges_from_pokerkit(monkeypatch, record_id, index, corrupt, field):
+    r = _copied(record_id)
+    _diverge_after(monkeypatch, r["events"][index], corrupt)
+    with pytest.raises(AssertionError, match=rf"record {record_id} event {index} .*: {field} differ"):
+        replay_record(r)
+
+
 # --- I3: per-record lock mapping for every supported record and the four straddle records ---
 
 BTN_OPEN = ["", "F", "FF", "FFF", "FFFR", "FFFRF"]      # UTG/HJ/CO fold, BTN opens, SB folds, BB calls
@@ -446,41 +580,175 @@ def test_records_are_deterministic_and_independent_across_calls():
 
 
 # --- Task 19: freezing the fifty fixture files + manifest ---
+#
+# Fix round 1 (review I1-I3): every frozen file, manifest included, comes from one pure serializer
+# (`e2e_hands.canonical_json_bytes`: UTF-8, LF, one trailing newline) through
+# `e2e_hands.e2e_files()`. Exactly one test reads the committed directory, and only reads it; every
+# test that writes or tampers works on its own `tmp_path` freeze, so no test can repair, rewrite or
+# corrupt `fixtures/hands/e2e` (or race the Rust loader reading it).
+
+FROZEN_NAMES = [f"{n:03}.json" for n in range(1, 51)] + ["manifest.json"]
+SUPPORTED_IDS = [f"{n:03}" for n in range(1, 23)]
+TOOLS = REPO / "tools"
 
 
-def test_generated_bytes_are_stable():
-    first = {p.name: p.read_bytes() for p in sorted(ROOT.glob("*.json"))}
-    write_e2e(ROOT)
-    second = {p.name: p.read_bytes() for p in sorted(ROOT.glob("*.json"))}
-    assert first == second
-    manifest = json.loads((ROOT / "manifest.json").read_text())
+def _snapshot(root: Path) -> dict:
+    return {p.name: p.read_bytes() for p in sorted(root.iterdir())}
+
+
+def test_committed_e2e_freeze_matches_in_memory_regeneration():
+    """The one committed-artifact test, read-only: the exact inventory, then every frozen file
+    byte for byte (fresh-checkout LF bytes) against in-memory regeneration. A missing file, a
+    stray file or a CR byte fails; nothing is written, so a failure is never repaired here."""
+    assert sorted(p.name for p in ROOT.iterdir()) == FROZEN_NAMES
+    expected = e2e_hands.e2e_files()
+    assert list(expected) == FROZEN_NAMES
+    for name in FROZEN_NAMES:
+        raw = (ROOT / name).read_bytes()
+        assert b"\r" not in raw, f"{name} contains CR bytes; the freeze is LF"
+        assert raw == expected[name], f"{name} differs from in-memory regeneration"
+    manifest = json.loads((ROOT / "manifest.json").read_bytes())
     assert len(manifest["sha256"]) == 50
-    assert manifest["supported_ids"] == [f"{n:03}" for n in range(1, 23)]
+    assert manifest["supported_ids"] == SUPPORTED_IDS
+    assert manifest["supported_baseline"] == manifest["supported_ids"]
+    check_e2e(ROOT)  # the CLI's check agrees, and it only reads
+
+
+def test_e2e_files_are_canonical_lf_utf8_json():
+    files = e2e_hands.e2e_files()
+    assert list(files) == FROZEN_NAMES
+    for name, raw in files.items():
+        assert raw.endswith(b"\n") and not raw.endswith(b"\n\n"), name
+        assert b"\r" not in raw, name
+        text = raw.decode("utf-8")
+        assert text == json.dumps(json.loads(text), sort_keys=True, indent=2) + "\n", name
+        assert e2e_hands.canonical_json_bytes(json.loads(raw)) == raw, name
+    for row, name in zip(records(), FROZEN_NAMES):
+        assert json.loads(files[name]) == row, name
+    assert json.loads(files["manifest.json"]) == {
+        "version": 1,
+        "synthetic": True,
+        "supported_ids": SUPPORTED_IDS,
+        "supported_baseline": SUPPORTED_IDS,
+        "sha256": {name: hashlib.sha256(files[name]).hexdigest() for name in FROZEN_NAMES[:50]},
+    }
+
+
+_WRITE_IN_A_FRESH_PROCESS = (
+    "import sys\nfrom pathlib import Path\nimport e2e_hands\ne2e_hands.write_e2e(Path(sys.argv[1]))\n"
+)
+
+
+def test_generated_bytes_are_stable(tmp_path):
+    """Brief Step 1, on private directories: repeated generation -- over its own output in this
+    process, and in a fresh interpreter with a different hash seed -- writes exactly the LF bytes
+    of in-memory regeneration (a text-mode write would put CR bytes into the manifest on Windows)."""
+    expected = e2e_hands.e2e_files()
+    here, fresh = tmp_path / "here", tmp_path / "fresh"
+    write_e2e(here)
+    assert _snapshot(here) == expected
+    write_e2e(here)
+    assert _snapshot(here) == expected
+    env = {**os.environ, "PYTHONHASHSEED": "20260927"}
+    subprocess.run([sys.executable, "-W", "error", "-c", _WRITE_IN_A_FRESH_PROCESS, str(fresh)],
+                   cwd=TOOLS, env=env, check=True)
+    assert _snapshot(fresh) == expected
+    manifest = json.loads((here / "manifest.json").read_bytes())
+    assert len(manifest["sha256"]) == 50
+    assert manifest["supported_ids"] == SUPPORTED_IDS
     assert manifest["supported_baseline"] == manifest["supported_ids"]
 
 
-def test_check_e2e_passes_after_write_and_flags_a_tamper():
-    write_e2e(ROOT)
-    check_e2e(ROOT)  # no error: freshly written bytes match the generator exactly
-    path = ROOT / "001.json"
-    original = path.read_bytes()
-    try:
-        path.write_bytes(original + b" ")
-        with pytest.raises(SystemExit):
-            check_e2e(ROOT)
-    finally:
-        path.write_bytes(original)
+@pytest.fixture
+def freeze(tmp_path) -> Path:
+    """A private, freshly written freeze for tests that tamper with it."""
+    root = tmp_path / "e2e"
+    write_e2e(root)
+    return root
 
 
-def test_check_e2e_flags_a_manifest_hash_mismatch():
-    write_e2e(ROOT)
-    manifest_path = ROOT / "manifest.json"
-    original = manifest_path.read_text()
-    try:
-        manifest = json.loads(original)
-        manifest["sha256"]["001.json"] = "0" * 64
-        manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
-        with pytest.raises(SystemExit):
-            check_e2e(ROOT)
-    finally:
-        manifest_path.write_text(original)
+def _rewrite_manifest(root: Path, edit) -> None:
+    manifest = json.loads((root / "manifest.json").read_bytes())
+    edit(manifest)
+    (root / "manifest.json").write_bytes(e2e_hands.canonical_json_bytes(manifest))
+
+
+def _assert_check_fails(root: Path, pattern: str) -> None:
+    before = _snapshot(root)
+    with pytest.raises(SystemExit, match=pattern):
+        check_e2e(root)
+    assert _snapshot(root) == before, "check_e2e must never write"
+
+
+def test_check_e2e_passes_on_a_fresh_freeze_and_never_writes(freeze):
+    before = _snapshot(freeze)
+    check_e2e(freeze)
+    assert _snapshot(freeze) == before
+
+
+def test_check_e2e_flags_a_tampered_hand_file(freeze):
+    path = freeze / "001.json"
+    path.write_bytes(path.read_bytes() + b" ")
+    _assert_check_fails(freeze, r"001\.json differs from the generator")
+
+
+def test_check_e2e_flags_a_crlf_hand_file(freeze):
+    path = freeze / "007.json"
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+    _assert_check_fails(freeze, r"007\.json differs from the generator \(it contains CR bytes; the freeze is LF\)")
+
+
+def test_check_e2e_flags_a_missing_hand_file(freeze):
+    (freeze / "002.json").unlink()
+    _assert_check_fails(freeze, r"002\.json is missing")
+
+
+def test_check_e2e_flags_a_missing_manifest(freeze):
+    (freeze / "manifest.json").unlink()
+    _assert_check_fails(freeze, r"manifest\.json is missing")
+
+
+def test_check_e2e_flags_a_file_outside_the_freeze(freeze):
+    (freeze / "051.json").write_bytes(b"{}\n")
+    _assert_check_fails(freeze, r"051\.json is not part of the freeze")
+
+
+@pytest.mark.parametrize("edit, pattern", [
+    (lambda m: m["sha256"].pop("017.json"),
+     r"manifest\.json: sha256 lacks 1 of 50 entries: \['017\.json'\]"),
+    (lambda m: m["sha256"].clear(),
+     r"manifest\.json: sha256 lacks 50 of 50 entries: \['001\.json', '002\.json', .*'050\.json'\]"),
+    (lambda m: m["sha256"].update({"051.json": "0" * 64}),
+     r"manifest\.json: sha256 has unexpected entries \['051\.json'\]"),
+    (lambda m: m["sha256"].update({"001.json": "0" * 64}),
+     r"manifest\.json: sha256\['001\.json'\] is '0{64}', expected [0-9a-f]{64}"),
+    (lambda m: m["supported_ids"].pop(),
+     r"manifest\.json: supported_ids is \['001', .*'021'\], expected \['001', .*'022'\]"),
+    (lambda m: m.update(supported_baseline=SUPPORTED_IDS[:-1] + ["023"]),
+     r"manifest\.json: supported_baseline is \[.*'023'\], expected \[.*'022'\]"),
+    (lambda m: m.update(version=2), r"manifest\.json: version is 2, expected 1"),
+    (lambda m: m.update(version=True), r"manifest\.json: version is True, expected 1"),
+    (lambda m: m.update(synthetic=False), r"manifest\.json: synthetic is False, expected True"),
+    (lambda m: m.pop("supported_baseline"), r"manifest\.json: supported_baseline is missing"),
+    (lambda m: m.update(note="x"), r"manifest\.json: unexpected keys \['note'\]"),
+], ids=["missing-hash", "empty-hash-map", "extra-hash", "mismatched-digest", "altered-supported-ids",
+        "altered-baseline-ids", "version", "version-bool", "synthetic", "missing-baseline", "extra-key"])
+def test_check_e2e_flags_manifest_content(freeze, edit, pattern):
+    _rewrite_manifest(freeze, edit)
+    _assert_check_fails(freeze, pattern)
+
+
+@pytest.mark.parametrize("drift, pattern", [
+    (lambda raw: raw.replace(b"\n", b"\r\n"), r"\(it contains CR bytes; the freeze is LF\)"),
+    (lambda raw: raw[:-1], ""),
+    (lambda raw: raw + b"\n", ""),
+    (lambda raw: (json.dumps(json.loads(raw), sort_keys=True, indent=4) + "\n").encode(), ""),
+    (lambda raw: (json.dumps(dict(reversed(json.loads(raw).items())), indent=2) + "\n").encode(), ""),
+], ids=["crlf", "no-trailing-newline", "extra-newline", "indent-4", "key-order"])
+def test_check_e2e_flags_manifest_only_byte_drift(freeze, drift, pattern):
+    path = freeze / "manifest.json"
+    raw = path.read_bytes()
+    drifted = drift(raw)
+    assert drifted != raw and json.loads(drifted) == json.loads(raw)  # same content, other bytes
+    path.write_bytes(drifted)
+    _assert_check_fails(freeze, r"manifest\.json: bytes differ from the generator although its content matches ?" + pattern)
