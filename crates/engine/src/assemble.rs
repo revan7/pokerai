@@ -1,6 +1,6 @@
 //! Result assembly (spec sections 4.4, 5, 6 and 8.4): the one place a `Recommendation` is put
-//! together from a solved node, a coverage label and the equity summary, and the one headline rule
-//! every path uses (plan 3 extends the call sites, never adds a second entry point).
+//! together from a solved node or known masses, a coverage label and the equity summary, and the
+//! one headline rule every path uses (plan 3 extends the call sites, never adds a second entry point).
 //!
 //! Standing rules carried here:
 //! * reasons accumulate across source, replay, cache and solve, without duplicates, and are never
@@ -68,8 +68,8 @@ pub fn accumulate(base: Coverage, more: Vec<ApproxReason>) -> Coverage {
 /// The comparison is raw, never on rounded basis points (spec 4.4), and exact: it is evaluated as
 /// `exploitability * 10_000 <= target_bp * pot` in `f64`, where both products are exact (an `f32`
 /// significand times 10^4 needs at most 38 bits, `u16 * u32` at most 48). `reached_bp` is display
-/// only; a value above `u16::MAX` bp (655.35 times the pot) is shown as `u16::MAX`, and no
-/// comparison ever reads it.
+/// only; a value above `u16::MAX` bp (6.5535 times the pot, or 655.35%) is shown as `u16::MAX`,
+/// and no comparison ever reads it.
 ///
 /// # Panics
 /// If `pot` is 0 or `exploitability_chips` is not finite and non-negative (the worker's result is
@@ -193,7 +193,8 @@ pub fn hero_reach(nodes: &[NodeStrategy], ordinal_paths: &[OrdinalPath], request
 
 /// Spec 4.4's range-level mix: action frequencies over hero's public range at the node, weighted by
 /// `reach`, over the combos available at the node. All zeros when no available combo has reach
-/// (`final_from_solution` then shows no mix and says why).
+/// (`final_from_solution` still shows it, since the field is present whenever a node strategy exists,
+/// and adds a note that hero's range has no reach there, so the zeros are never read as a strategy).
 ///
 /// # Panics
 /// If the node or `reach` is malformed (see `check_node`, `check_reach`).
@@ -273,12 +274,12 @@ pub fn final_from_solution(ctx: &AssemblyCtx, node: &NodeStrategy, reach: &[f32]
     check_node("final_from_solution", 0, node);
     check_reach("final_from_solution", reach);
 
-    let mix = if (0..COMBOS).any(|k| node.available[k] && reach[k] > 0.0) {
-        Some(range_mix(node, reach))
-    } else {
-        assumptions.notes.push("range mix unavailable: hero's public range has no reach at this node".into());
-        None
-    };
+    // Spec 4.4: present whenever a node strategy exists (ruling 26-I2), zeros included; a zero mix is
+    // disclosed as such and never presented as a normalized strategy.
+    let mix = Some(range_mix(node, reach));
+    if !(0..COMBOS).any(|k| node.available[k] && reach[k] > 0.0) {
+        assumptions.notes.push("range mix is all zeros: hero's public range has no reach at this node, so it is not a strategy".into());
+    }
 
     if !(node.available[c] && reach[c] > 0.0) {
         let actions = node.actions.iter().map(|a| ActionAdvice { action: map_to_legal(a, &ctx.legal).unwrap_or(*a), frequency: None, ev_bb: None, unavailable: Some(Unavailable::HeroOutOfSupport), headline: false }).collect();
@@ -319,6 +320,79 @@ pub fn final_from_solution(ctx: &AssemblyCtx, node: &NodeStrategy, reach: &[f32]
     base(ctx, Phase::Final, accumulate(coverage, vec![]), actions, 0.0, mix, assumptions)
 }
 
+/// Hero's advice as the known mass per action over hero's posterior (spec 4.4 and 8.4): the
+/// assembly's own input type for a decision that may leave part of the posterior without a strategy
+/// (a node present in only some positive-posterior branches, the residual, a stopped branch). It
+/// carries the advice fields of `core_preflop::MixedNode` (P3.T16) one for one; that type's
+/// `unsupported` verdict is not a known mass and stays outside this input, and the engine does not
+/// depend on `core-preflop` before P3.T17.
+///
+/// - `actions`: every action with its known `frequency`; `ev_bb` only over complete branch support.
+/// - `unresolved_mass`: the posterior no node covers, so `sum(frequency) + unresolved_mass = 1`.
+/// - `range_mix`: the range-level mix as the source computed it.
+/// - `reasons`: the source's reasons (`BranchResidual` whenever `unresolved_mass > 0`).
+/// - `notes`: the source's notes, among them the rendered share "x% of the posterior has no
+///   strategy" whenever `unresolved_mass > 0`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KnownMass {
+    pub actions: Vec<ActionAdvice>,
+    pub unresolved_mass: f32,
+    pub range_mix: Option<Vec<(Action, f32)>>,
+    pub reasons: Vec<ApproxReason>,
+    pub notes: Vec<String>,
+}
+
+/// How far `sum(frequency) + unresolved_mass` may sit from 1: every share was narrowed from `f64` to
+/// `f32` once (at most half an `f32` ulp, about 3e-8, each), so this admits any practical menu width
+/// and still catches a dropped or duplicated action.
+const KNOWN_MASS_TOLERANCE: f64 = 1e-5;
+
+/// Spec 4.4 rule 3's rendering of the unresolved share, "x% of the posterior has no strategy", with
+/// `x` at one decimal as the source writes it.
+const UNRESOLVED_SHARE_NOTE: &str = "% of the posterior has no strategy";
+
+/// Whether `note` renders `unresolved_mass` as the share note: its percentage matches the mass to the
+/// one-decimal display rounding (0.05 points) plus the `f32` narrowing of the mass.
+fn renders_unresolved_share(note: &str, unresolved_mass: f32) -> bool {
+    note.strip_suffix(UNRESOLVED_SHARE_NOTE)
+        .and_then(|pct| pct.parse::<f64>().ok())
+        .is_some_and(|pct| (pct - 100.0 * f64::from(unresolved_mass)).abs() <= 0.05 + 1e-4)
+}
+
+/// The `Final` for known masses (spec 4.4 and 8.4): the known frequencies exactly as given, never
+/// renormalized, `unresolved_mass` as given, the source's range mix, reasons (accumulated onto
+/// `coverage`) and notes, and the spec 4.4 headline from the one [`headline`] rule, which gives no
+/// headline of any kind while `unresolved_mass > 0`; the share itself is displayed through its note.
+///
+/// # Panics
+/// If `coverage` is `Unsupported` (an `Unsupported` outcome is not a known mass), an action has no
+/// frequency, the masses are outside `[0, 1]` or `sum(frequency) + unresolved_mass` is not 1 (within
+/// `KNOWN_MASS_TOLERANCE`), or `unresolved_mass > 0` and no note renders that share (spec 4.4 rule 3:
+/// the known frequencies are never shown as a complete recommendation).
+pub fn final_from_known_mass(ctx: &AssemblyCtx, known: KnownMass, coverage: Coverage, source: HeadlineSource, mut assumptions: Assumptions) -> Recommendation {
+    if let Coverage::Unsupported { reason, .. } = &coverage {
+        panic!("final_from_known_mass: known masses are Exact or Approximate, got Unsupported {{ {reason:?} }}");
+    }
+    let KnownMass { mut actions, unresolved_mass, range_mix, reasons, notes } = known;
+    assert!(unresolved_mass.is_finite() && (0.0..=1.0).contains(&unresolved_mass), "final_from_known_mass: unresolved mass {unresolved_mass} is outside [0, 1]");
+    let mut total = f64::from(unresolved_mass);
+    for (i, a) in actions.iter().enumerate() {
+        let f = a.frequency.unwrap_or_else(|| panic!("final_from_known_mass: action {i} ({:?}) has no known frequency", a.action));
+        assert!(f.is_finite() && (0.0..=1.0).contains(&f), "final_from_known_mass: action {i} ({:?}) has frequency {f} outside [0, 1]", a.action);
+        total += f64::from(f);
+    }
+    assert!((total - 1.0).abs() <= KNOWN_MASS_TOLERANCE, "final_from_known_mass: the known frequencies and the unresolved mass sum to {total}, not 1");
+    for n in notes {
+        if !assumptions.notes.contains(&n) { assumptions.notes.push(n); }
+    }
+    if unresolved_mass > 0.0 {
+        assert!(assumptions.notes.iter().any(|n| renders_unresolved_share(n, unresolved_mass)),
+            "final_from_known_mass: no note renders the unresolved share {unresolved_mass} as \"x{UNRESOLVED_SHARE_NOTE}\": {:?}", assumptions.notes);
+    }
+    if let Some(label) = headline(&mut actions, unresolved_mass, source) { assumptions.notes.push(format!("headline: {label}")); }
+    base(ctx, Phase::Final, accumulate(coverage, reasons), actions, unresolved_mass, range_mix, assumptions)
+}
+
 /// A `Final` with no strategy (spec 6: equity where computable, the visible reason): the legal menu,
 /// each entry `NotEvaluated`, and the reasons accumulated so far kept in `partial`, deduplicated.
 pub fn unsupported(ctx: &AssemblyCtx, reason: UnsupportedReason, partial: Vec<ApproxReason>, assumptions: Assumptions) -> Recommendation {
@@ -345,7 +419,14 @@ fn settled(a: &Availability) -> u8 {
 /// that arrived earlier. Per seat, an estimate replaces the displayed one only when it is at least as
 /// settled, so a `Ready` estimate is never replaced by a `Pending` one (nor by an `Unavailable` one),
 /// and an `Unavailable` answer is never reset to `Pending`. A seat not yet shown is added.
-/// `per_pot_shares` is replaced when the event carries any.
+///
+/// `per_pot_shares` follows the same rule, estimate by estimate: pots are matched by `pot_index` and
+/// the shares within a pot by seat. A pot or seat the event omits keeps what is displayed; a pot not
+/// yet shown is added after the ones shown, with its own population text.
+///
+/// # Panics
+/// If the event's shares for a displayed pot are over a different `population` than the displayed
+/// ones (naming the pot): one pot's shares always describe one population.
 pub fn merge_equity(rec: &mut Recommendation, eq: &EquitySummary) {
     fn merge(dst: &mut Vec<(Seat, EquityEstimate)>, src: &[(Seat, EquityEstimate)]) {
         for (seat, est) in src {
@@ -359,5 +440,14 @@ pub fn merge_equity(rec: &mut Recommendation, eq: &EquitySummary) {
     }
     merge(&mut rec.equity.hero_combo_vs_each, &eq.hero_combo_vs_each);
     merge(&mut rec.equity.hero_range_vs_each, &eq.hero_range_vs_each);
-    if !eq.per_pot_shares.is_empty() { rec.equity.per_pot_shares = eq.per_pot_shares.clone(); }
+    for pot in &eq.per_pot_shares {
+        match rec.equity.per_pot_shares.iter_mut().find(|p| p.pot_index == pot.pot_index) {
+            Some(shown) => {
+                assert!(shown.population == pot.population,
+                    "merge_equity: pot {} is shown over the population {:?}, the event's shares for it are over {:?}", pot.pot_index, shown.population, pot.population);
+                merge(&mut shown.shares, &pot.shares);
+            }
+            None => rec.equity.per_pot_shares.push(pot.clone()),
+        }
+    }
 }
