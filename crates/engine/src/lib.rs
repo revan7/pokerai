@@ -11,6 +11,8 @@ pub mod deadline;
 pub mod equity;
 pub mod identity;
 pub mod log;
+pub mod ranges;
+pub mod snapshots;
 pub mod solve;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

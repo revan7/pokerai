@@ -1,13 +1,15 @@
 //! The state `engine-main` owns (spec 3.4): the worker link, the clock every deadline is measured on, the decision
 //! identity, the watchdog, the decision log, the request-id counter, the memory limit and the furthest stage the live
-//! request has reached. Task 27 adds the snapshot store, the game config and the range source.
+//! request has reached, and (Task 27) the snapshot store, the game config and the range source.
 
 use crate::clock::Clock;
 use crate::identity::IdentityState;
 use crate::log::DecisionLog;
+use crate::ranges::{ExplicitRanges, RangeSource};
+use crate::snapshots::SnapshotStore;
 use crate::watchdog::Watchdog;
 use crate::worker::link::WorkerLink;
-use proto::DecisionIdentity;
+use proto::{DecisionIdentity, GameConfig, Rake, SolverPrefs};
 use std::sync::{Arc, Mutex};
 
 /// §10.3: the engine's default `memory_limit_bytes` on every `solve` (10 GiB).
@@ -24,7 +26,9 @@ fn stage_rank(s: &str) -> u8 {
     }
 }
 
-/// State owned by `engine-main` (§3.4). Task 27 adds the snapshot store, the game config and the range source.
+/// State owned by `engine-main` (§3.4). The snapshot store, the game config and the range source (Task 27) are each
+/// behind an `Arc<Mutex<_>>` shared with `Engine`, so a settings command or a hand mutation never waits for a running
+/// request to release the `EngineCore` lock (§3.4: commands never block).
 pub struct EngineCore {
     pub worker: Box<dyn WorkerLink>,
     pub clock: Arc<dyn Clock>,
@@ -38,6 +42,12 @@ pub struct EngineCore {
     /// The furthest stage the live request has reached, shared with the watchdog (`watchdog::Armed::stage`), which
     /// reports it in `Unsupported{DeadlineExceeded{stage}}`.
     pub stage: Arc<Mutex<String>>,
+    /// Shared with `Engine` so a mutation can invalidate snapshots without waiting for a running request.
+    pub snapshots: Arc<Mutex<SnapshotStore>>,
+    /// Read once, as a snapshot, at the start of each request.
+    pub config: Arc<Mutex<GameConfig>>,
+    /// The only root-range provider (`RangeSource::ranges_at_root`); plan 3 installs its replay-backed source here.
+    pub range_source: Arc<Mutex<Box<dyn RangeSource>>>,
 }
 
 impl EngineCore {
@@ -52,6 +62,9 @@ impl EngineCore {
             next_request_id: 1,
             memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
             stage: Arc::new(Mutex::new("fast".into())),
+            snapshots: Arc::new(Mutex::new(SnapshotStore::new())),
+            config: Arc::new(Mutex::new(GameConfig { config_revision: 0, chip_label: "$1".into(), sb_chips: 5, bb_chips: 10, straddle: None, rake: Rake::TimeCharge, seats: vec![], solver: SolverPrefs { threads: 16, target_bp: 50, flop_budget_s: 10 } })),
+            range_source: Arc::new(Mutex::new(Box::new(ExplicitRanges { oop: None, ip: None }))),
         }
     }
 
@@ -86,6 +99,15 @@ impl EngineCore {
 
     pub fn stage(&self) -> String {
         self.stage.lock().unwrap().clone()
+    }
+
+    /// A snapshot of the session config; `serve_request` takes one per request so a mid-request change is ignored.
+    pub fn config(&self) -> GameConfig {
+        self.config.lock().unwrap().clone()
+    }
+
+    pub fn set_config(&self, cfg: GameConfig) {
+        *self.config.lock().unwrap() = cfg;
     }
 }
 
@@ -131,6 +153,24 @@ mod tests {
         assert!(c.identity_active(&id));
         c.identity.lock().unwrap().mutate();
         assert!(!c.identity_active(&id));
+    }
+
+    /// Task 27: `config()` is a snapshot (a later `set_config` never reaches a copy already taken) and the config handle
+    /// is shared (a clone held by `Engine` sees what the core stores); the snapshot store starts empty.
+    #[test]
+    fn config_is_a_snapshot_and_the_config_handle_is_shared() {
+        let c = core();
+        let before = c.config();
+        assert_eq!((before.config_revision, before.bb_chips, before.solver.target_bp, before.solver.flop_budget_s), (0, 10, 50, 10));
+        let shared = c.config.clone();
+        let mut next = before.clone();
+        next.config_revision = 4;
+        next.bb_chips = 20;
+        c.set_config(next.clone());
+        assert_eq!(before.config_revision, 0, "an earlier snapshot is never changed by set_config");
+        assert_eq!(c.config(), next);
+        assert_eq!(*shared.lock().unwrap(), next, "a clone of the handle sees the new config");
+        assert!(c.snapshots.lock().unwrap().for_hand(1).is_empty());
     }
 
     #[test]
