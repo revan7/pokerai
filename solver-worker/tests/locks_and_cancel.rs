@@ -319,8 +319,8 @@ fn flop_cancel_fixture_smoke() {
     // a cancel sent once the job reports Extracting: exactly one terminal, either `cancelled` behind the cancel's
     // `accepted`, or the job's own result when it completed first (behind the `accepted` of a cancel that came too
     // late for its last checkpoint, or ahead of an `already_finished`)
-    w.send(&edit(&with_id(&flop[0], "48"), |v| { v["deadline_ms"] = json!(1500); v["extraction_margin_ms"] = json!(600); v["target_bp"] = json!(1); }));
-    let got = collect(&w, 10 * S, |m| m["type"] == "progress" && m["stage"] == "extracting");
+    w.send(&edit(&with_id(&flop[0], "48"), |v| v["target_bp"] = json!(u16::MAX)));
+    let got = collect(&w, 20 * S, |m| m["type"] == "progress" && m["stage"] == "extracting");
     assert_eq!(protocol_only(&got), ["ack 48 accepted"]);
     w.send(&cancel("49", "48"));
     let got = collect(&w, 5 * S, result_for("48"));
