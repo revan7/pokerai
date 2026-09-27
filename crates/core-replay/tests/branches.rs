@@ -1315,3 +1315,277 @@ fn cap_branches_keeps_merged_support_at_one_unit_beside_representable_live_reach
     bs.push(last_unit_branch(5, f64::from_bits(1), 0.02));
     check_last_unit_cap(bs, 4, f64::from_bits(1));
 }
+
+// ---------------------------------------------------------------------------------------------
+// P3.T13 fix round 1 (task-13-review.md R3, ruling 13-R3): the batch split. One observed action
+// expands the complete pre-action generation in ONE call, each input branch with its own choice
+// (kept, stopped, retained on the menu, or split over its own menu), so ids are allocated and
+// parents remapped once against that whole generation -- never by chained whole-list calls, whose
+// later compaction treats an earlier parent's new children as branches from outside the generation
+// and drops their parent links. `split_action` stays the common-menu wrapper.
+// ---------------------------------------------------------------------------------------------
+
+use core_replay::{split_batch, BatchSplit, BranchChoice};
+
+/// `(id, parent)` of every output branch, in output order.
+fn ids_and_parents(bs: &[HistoryBranch]) -> Vec<(u8, Option<u8>)> {
+    bs.iter().map(|b| (b.id, b.parent)).collect()
+}
+
+/// Every seat's marginal must be exactly the Bayesian identity's: for these batches, whose
+/// likelihoods are 1 wherever they are used, the output marginal equals the input marginal.
+fn assert_marginals_unchanged(input: &[HistoryBranch], out: &[HistoryBranch]) {
+    for seat in [Seat(0), Seat(1)] {
+        let (a, z) = (marginal(input, seat), marginal(out, seat));
+        for (c, (x, y)) in a.iter().zip(&z).enumerate() {
+            assert!((x - y).abs() <= 1e-15, "seat {seat:?} combo {c}: marginal moved from {x} to {y}");
+        }
+    }
+}
+
+/// Every field of a branch, masses as bits, for bit-identity comparisons.
+type BranchBits = (u8, Option<u8>, Option<Seat>, Vec<(Seat, Action)>, u64, bool, Option<String>, Vec<(Seat, Option<String>, Vec<u64>)>);
+
+fn fingerprint_bits(b: &HistoryBranch) -> BranchBits {
+    (
+        b.id,
+        b.parent,
+        b.split_by,
+        b.translated.clone(),
+        b.q.to_bits(),
+        b.residual,
+        b.stopped.clone(),
+        b.seats.iter().map(|s| (s.seat, s.node.clone(), s.mass.iter().map(|w| w.to_bits()).collect())).collect(),
+    )
+}
+
+/// The review's probe (R3): live input ids 252 and 253, two supported choices each. One
+/// generation holds 2 input ids and 4 children, which overflows the `u8` id space from 254, so the
+/// generation is compacted ONCE: 252 -> 0, 253 -> 1, and the children follow as 2..5 with their
+/// parents' compacted ids. Chained whole-list calls gave `[(1, None), (2, None), (3, Some(0)),
+/// (4, Some(0))]` here: the second call compacted and dropped the first parent's links.
+#[test]
+fn split_batch_allocates_one_generation_at_the_overflow_boundary() {
+    let actor = Seat(0);
+    let input = vec![tagged(252, None, 0.2, 252), tagged(253, None, 0.2, 253)];
+    let plan = vec![BranchChoice::Split(even_split()), BranchChoice::Split(even_split())];
+    let out: BatchSplit = split_batch(&input, actor, &plan);
+    assert_eq!(ids_and_parents(&out.branches), vec![(2, Some(0)), (3, Some(0)), (4, Some(1)), (5, Some(1))]);
+    assert_eq!(out.origin, vec![(0, Some(0)), (0, Some(1)), (1, Some(0)), (1, Some(1))]);
+    assert!(out.applying && out.supported);
+    for (b, (parent_tag, choice)) in out.branches.iter().zip([(252, 50), (252, 100), (253, 50), (253, 100)]) {
+        assert_eq!(b.split_by, Some(actor));
+        assert_eq!(b.translated, vec![(Seat(1), Action::Raise { to: parent_tag }), (actor, Action::Raise { to: choice })]);
+        assert_eq!(b.q, 0.1, "q = .2 * f .5 * M 1");
+    }
+    assert_marginals_unchanged(&input, &out.branches);
+
+    // One below the boundary nothing is compacted: 250/251's children take 252..255 exactly.
+    let input = vec![tagged(250, None, 0.2, 250), tagged(251, None, 0.2, 251)];
+    let out = split_batch(&input, actor, &plan);
+    assert_eq!(ids_and_parents(&out.branches), vec![(252, Some(250)), (253, Some(250)), (254, Some(251)), (255, Some(251))]);
+    // One above it the whole generation is compacted, still once.
+    let input = vec![tagged(251, None, 0.2, 251), tagged(252, None, 0.2, 252)];
+    let out = split_batch(&input, actor, &plan);
+    assert_eq!(ids_and_parents(&out.branches), vec![(2, Some(0)), (3, Some(0)), (4, Some(1)), (5, Some(1))]);
+}
+
+/// R3 at the overflow boundary with retained and frozen branches in the same generation: a
+/// branch retained on the menu (id 250, stale parent 240), a stopped branch (id 251, parent 250)
+/// and two splitting parents (252, 253). The whole pre-action generation `[250, 251, 252, 253]` is
+/// compacted once to `0..3`: the retained branch keeps its slot (0) and loses the stale reference,
+/// the stopped branch keeps its slot (1) and its parent link now names 0, and the children follow
+/// as 4..7 naming their parents' slots 2 and 3. Every marginal is unchanged (likelihood 1).
+#[test]
+fn split_batch_remaps_retained_and_frozen_branches_with_the_generation() {
+    let actor = Seat(0);
+    let input = vec![
+        tagged(250, Some(240), 0.2, 250),
+        tagged_stopped(251, Some(250), 0.1, 251),
+        tagged(252, None, 0.2, 252),
+        tagged(253, None, 0.2, 253),
+    ];
+    let plan = vec![
+        BranchChoice::Retain { action: Action::Call, p: vec![1.0; 1326] },
+        BranchChoice::Keep,
+        BranchChoice::Split(even_split()),
+        BranchChoice::Split(even_split()),
+    ];
+    let out = split_batch(&input, actor, &plan);
+    assert_eq!(
+        ids_and_parents(&out.branches),
+        vec![(0, None), (1, Some(0)), (4, Some(2)), (5, Some(2)), (6, Some(3)), (7, Some(3))]
+    );
+    assert_eq!(out.origin, vec![(0, None), (1, None), (2, Some(0)), (2, Some(1)), (3, Some(0)), (3, Some(1))]);
+    let retained = &out.branches[0];
+    assert_eq!(retained.translated, vec![(Seat(1), Action::Raise { to: 250 }), (actor, Action::Call)], "retained on the menu: the action is appended");
+    assert_eq!((retained.q, retained.split_by, retained.stopped.clone()), (0.2, None, None));
+    let stopped = &out.branches[1];
+    assert_eq!(stopped.stopped, Some("missing node K251".into()));
+    assert_eq!(stopped.translated, vec![(Seat(1), Action::Raise { to: 251 })], "a kept branch is copied through unchanged");
+    assert_marginals_unchanged(&input, &out.branches);
+}
+
+/// R3 with a different menu per parent (spec section 8.4: each branch's own node): parent 0
+/// splits over two sizes with its own likelihoods and frequencies, parent 1 is clamped to one size
+/// of a different menu, and parent 2 is retained on the menu. Every conditioned branch is
+/// bit-identical to `condition` applied to that parent with that choice, the ids are allocated once
+/// after the whole generation (children 3, 4, 5; the retained branch keeps 2), and the actor's
+/// marginal is the Bayesian identity `sum_k q_k w_k[c] * (sum_X f_X P_X[c])` of section 8.4.
+#[test]
+fn split_batch_applies_each_parents_own_menu_in_one_generation() {
+    let actor = Seat(0);
+    let pattern = |seed: usize| -> Vec<f64> { (0..1326).map(|c| ((c * (seed + 3) + seed) % 11) as f64 / 10.0).collect() };
+    let mut input = vec![tagged(0, None, 0.5, 10), tagged(1, None, 0.3, 11), tagged(2, None, 0.2, 12)];
+    // Non-uniform actor masses with equal totals across branches (the section 8.4 invariant).
+    for (k, b) in input.iter_mut().enumerate() {
+        for (c, w) in b.seats[0].mass.iter_mut().enumerate() {
+            *w = if (c + k) % 2 == 0 { 1.5 } else { 0.5 };
+        }
+    }
+    let (p0a, p0b, p1, p2) = (pattern(1), pattern(2), pattern(3), pattern(4));
+    let plan = vec![
+        BranchChoice::Split(vec![(Action::Raise { to: 60 }, 0.4, p0a.clone()), (Action::Raise { to: 90 }, 0.6, p0b.clone())]),
+        BranchChoice::Split(vec![(Action::Raise { to: 80 }, 1.0, p1.clone())]),
+        BranchChoice::Retain { action: Action::Call, p: p2.clone() },
+    ];
+    let out = split_batch(&input, actor, &plan);
+    assert_eq!(ids_and_parents(&out.branches), vec![(3, Some(0)), (4, Some(0)), (5, Some(1)), (2, None)]);
+    assert_eq!(out.origin, vec![(0, Some(0)), (0, Some(1)), (1, Some(0)), (2, None)]);
+
+    let expected = [
+        condition(&input[0], actor, &p0a, 0.4).unwrap(),
+        condition(&input[0], actor, &p0b, 0.6).unwrap(),
+        condition(&input[1], actor, &p1, 1.0).unwrap(),
+        condition(&input[2], actor, &p2, 1.0).unwrap(),
+    ];
+    for (b, e) in out.branches.iter().zip(&expected) {
+        assert_eq!(b.q.to_bits(), e.q.to_bits(), "branch {}: q is condition's", b.id);
+        for (s, t) in b.seats.iter().zip(&e.seats) {
+            assert_eq!(
+                s.mass.iter().map(|w| w.to_bits()).collect::<Vec<_>>(),
+                t.mass.iter().map(|w| w.to_bits()).collect::<Vec<_>>(),
+                "branch {} seat {:?}: masses are condition's",
+                b.id,
+                s.seat
+            );
+        }
+    }
+
+    let r = marginal(&out.branches, actor);
+    for c in 0..1326 {
+        let w = |k: usize| input[k].q * input[k].seats[0].mass[c];
+        let want = w(0) * (0.4 * p0a[c] + 0.6 * p0b[c]) + w(1) * p1[c] + w(2) * p2[c];
+        assert!((r[c] - want).abs() <= 1e-12 * want, "combo {c}: marginal {} != {want}", r[c]);
+    }
+    // Another seat's masses are copied, so its marginal falls through q alone.
+    let h = marginal(&out.branches, Seat(1));
+    let total_q: f64 = out.branches.iter().map(|b| b.q).sum();
+    for (c, x) in h.iter().enumerate() {
+        assert!((x - total_q).abs() <= 1e-15, "combo {c}: seat 1's marginal {x} is the total q {total_q}");
+    }
+}
+
+/// R3's zero-support removals and stops in the same pass: a residual and a stopped branch are
+/// kept bit-identical with their ids; a live branch told to stop keeps its q and masses, records
+/// its cause and loses every node; a retained branch with `M = 0` is removed; a split parent with
+/// one zero-support choice keeps only the other child; a split parent whose every choice has
+/// `M = 0` is removed. The removed ids stay part of the generation, so the one child takes id 9.
+#[test]
+fn split_batch_keeps_stops_and_removes_zero_support_in_one_pass() {
+    let actor = Seat(0);
+    let mut residual = tagged_residual(7, None, 0.05);
+    residual.seats[0].mass[5] = 0.25;
+    let mut live_stop = tagged(4, Some(1), 0.1, 4);
+    live_stop.seats[1].node = Some("next node".into());
+    let input = vec![
+        residual,
+        tagged_stopped(3, None, 0.1, 3),
+        live_stop,
+        tagged(5, None, 0.1, 5),
+        tagged(6, Some(2), 0.2, 6),
+        tagged(8, None, 0.1, 8),
+    ];
+    let zero = vec![0.0; 1326];
+    let plan = vec![
+        BranchChoice::Keep,
+        BranchChoice::Keep,
+        BranchChoice::Stop("missing node K4".into()),
+        BranchChoice::Retain { action: Action::Call, p: zero.clone() },
+        BranchChoice::Split(vec![(Action::Raise { to: 50 }, 0.5, zero.clone()), (Action::Raise { to: 100 }, 0.5, vec![1.0; 1326])]),
+        BranchChoice::Split(vec![(Action::Raise { to: 50 }, 0.5, zero.clone()), (Action::Raise { to: 100 }, 0.5, zero.clone())]),
+    ];
+    let out = split_batch(&input, actor, &plan);
+    assert!(out.applying && out.supported);
+    assert_eq!(ids_and_parents(&out.branches), vec![(7, None), (3, None), (4, Some(1)), (9, Some(6))]);
+    assert_eq!(out.origin, vec![(0, None), (1, None), (2, None), (4, Some(1))]);
+    for (b, z) in out.branches.iter().zip(&input).take(2) {
+        assert_eq!(fingerprint_bits(b), fingerprint_bits(z), "branch {} is kept bit-identical", z.id);
+    }
+    let stopped = &out.branches[2];
+    assert_eq!(stopped.stopped, Some("missing node K4".into()));
+    assert!(stopped.seats.iter().all(|s| s.node.is_none()), "a stopped branch has no node for any seat");
+    assert_eq!((stopped.q, stopped.translated.clone()), (0.1, vec![(Seat(1), Action::Raise { to: 4 })]));
+    assert!(stopped.seats.iter().all(|s| s.mass == vec![1.0; 1326]));
+    let child = &out.branches[3];
+    assert_eq!((child.q, child.split_by), (0.1, Some(actor)));
+    assert_eq!(child.translated, vec![(Seat(1), Action::Raise { to: 6 }), (actor, Action::Raise { to: 100 })]);
+
+    // Every applying branch without support: nothing applied survives; the caller rejects.
+    let plan = vec![
+        BranchChoice::Keep,
+        BranchChoice::Keep,
+        BranchChoice::Stop("missing node K4".into()),
+        BranchChoice::Retain { action: Action::Call, p: zero.clone() },
+        BranchChoice::Split(vec![(Action::Raise { to: 50 }, 1.0, zero.clone())]),
+        BranchChoice::Keep,
+    ];
+    let out = split_batch(&input, actor, &plan);
+    assert!(out.applying && !out.supported);
+    assert_eq!(ids_and_parents(&out.branches), vec![(7, None), (3, None), (4, Some(1)), (8, None)]);
+    // Nothing applying at all (every branch kept or stopped) is not a rejection either way.
+    let plan = vec![BranchChoice::Keep, BranchChoice::Keep, BranchChoice::Stop("x".into()), BranchChoice::Keep, BranchChoice::Keep, BranchChoice::Keep];
+    let out = split_batch(&input, actor, &plan);
+    assert!(!out.applying && !out.supported);
+    assert_eq!(out.branches.len(), 6);
+}
+
+/// `split_action` is the common-menu wrapper: every live branch splits over the same menu and
+/// every frozen branch is kept -- bit-identical to the batch with that plan.
+#[test]
+fn split_action_is_the_common_menu_batch() {
+    let actor = Seat(0);
+    let input = vec![tagged(251, None, 0.2, 251), tagged_stopped(20, Some(12), 0.1, 20), tagged(252, None, 0.2, 252), tagged_residual(5, Some(1), 0.05)];
+    let plan: Vec<BranchChoice> = input
+        .iter()
+        .map(|b| if b.residual || b.stopped.is_some() { BranchChoice::Keep } else { BranchChoice::Split(even_split()) })
+        .collect();
+    let wrapped = split_action(&input, actor, &even_split());
+    let batch = split_batch(&input, actor, &plan);
+    assert_eq!(wrapped.iter().map(fingerprint_bits).collect::<Vec<_>>(), batch.branches.iter().map(fingerprint_bits).collect::<Vec<_>>());
+}
+
+/// The old-to-new id map is built from the whole input generation, so its ids must be distinct.
+#[test]
+#[should_panic(expected = "split_batch: branch id 3 appears more than once in the input generation")]
+fn split_batch_rejects_duplicate_input_ids() {
+    let input = vec![tagged(3, None, 0.2, 1), tagged_stopped(3, None, 0.1, 2)];
+    split_batch(&input, Seat(0), &[BranchChoice::Split(even_split()), BranchChoice::Keep]);
+}
+
+/// A frozen branch (residual or stopped) is never conditioned, stopped again or split: only `Keep`
+/// applies to it, and anything else is a caller error, not a silent copy.
+#[test]
+#[should_panic(expected = "split_batch: branch 7 is frozen")]
+fn split_batch_rejects_a_choice_for_a_frozen_branch() {
+    let input = vec![tagged_residual(7, None, 0.05)];
+    split_batch(&input, Seat(0), &[BranchChoice::Retain { action: Action::Call, p: vec![1.0; 1326] }]);
+}
+
+/// One choice per input branch.
+#[test]
+#[should_panic(expected = "split_batch: 1 choices for 2 input branches")]
+fn split_batch_rejects_a_plan_of_the_wrong_length() {
+    let input = vec![tagged(1, None, 0.2, 1), tagged(2, None, 0.2, 2)];
+    split_batch(&input, Seat(0), &[BranchChoice::Keep]);
+}

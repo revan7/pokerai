@@ -16,7 +16,9 @@ use proto::{Action, ApproxReason, Seat, Street};
 /// Stops branch `b` for the rest of the current street (spec section 9.3): records `cause`
 /// ("missing node <key>", or why the next action could not be mapped) and clears every seat's
 /// node. `q` and every mass are left exactly as they are -- a stopped branch is frozen, which
-/// [`condition`] and [`split_action`] then honour for every later action of the street.
+/// [`condition`], [`split_action`] and [`split_batch`] then honour for every later action of the
+/// street. It is the same stop [`BranchChoice::Stop`] applies inside a batch; the replay walk calls
+/// it directly only on a rejected (zero-support) update, which keeps the pre-action list.
 pub fn stop_branch(b: &mut HistoryBranch, cause: String) {
     b.stopped = Some(cause);
     for s in &mut b.seats {

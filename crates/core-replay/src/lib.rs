@@ -8,7 +8,8 @@ pub mod branches;
 pub mod preflop;
 pub mod snapshot;
 pub use branches::*; // SeatMass, HistoryBranch, initial, marginal, posterior, condition, rescale, range_output,
-                     // cap_branches, split_action, residual_reason, stop_branch, missing_reason, zero_reason
+                     // cap_branches, split_action, split_batch, BranchChoice, BatchSplit, residual_reason,
+                     // stop_branch, missing_reason, zero_reason
 pub use preflop::*; // ReplayInput, ReplayOutput, replay, walk_preflop, apply_preflop_action, query_translated,
                     // board_mask, block_and_rescale, publish
 pub use snapshot::*; // SnapshotKey, SnapshotProvenance, StreetSnapshot

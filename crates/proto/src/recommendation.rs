@@ -22,6 +22,11 @@ pub struct DecisionIdentity { pub hand_id: u64, pub hand_revision: u32, pub deci
 /// fields keep the exact same `with = "crate::numeric::..."` codecs, which (Task:
 /// P4.T2-followup) now branch on `is_human_readable()` themselves, so reusing them here is
 /// already bincode-correct with no further change.
+///
+/// `BetTranslation.deviation` is spec 8.4's `d = min(|s - A|, |s - B|)`, a distance between pot
+/// fractions: non-negative and finite, with no upper bound (a 100 bb open shove against a lone
+/// 2.5 bb menu size is `d = 39`), so both mirrors carry it with the `non_negative` codec, never the
+/// `[0, 1]` `probability` one (P3.T13 fix round 1, ruling 13-R4).
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[cfg_attr(feature = "typescript", ts(tag = "kind"))]
@@ -58,7 +63,7 @@ enum ApproxReasonJson {
         seat: Seat,
         #[serde(with = "crate::numeric::finite")] observed_pct: f32,
         #[serde(with = "crate::numeric::mapped_sizes")] mapped: Vec<(f32, f32)>,
-        #[serde(with = "crate::numeric::probability")] deviation: f32,
+        #[serde(with = "crate::numeric::non_negative")] deviation: f32,
         prominent: bool,
     },
     DepthBucket { seat: Seat, #[serde(with = "crate::numeric::finite")] actual_bb: f32, used_bb: u16, prominent: bool },
@@ -84,7 +89,7 @@ enum ApproxReasonBincode {
         seat: Seat,
         #[serde(with = "crate::numeric::finite")] observed_pct: f32,
         #[serde(with = "crate::numeric::mapped_sizes")] mapped: Vec<(f32, f32)>,
-        #[serde(with = "crate::numeric::probability")] deviation: f32,
+        #[serde(with = "crate::numeric::non_negative")] deviation: f32,
         prominent: bool,
     },
     DepthBucket { seat: Seat, #[serde(with = "crate::numeric::finite")] actual_bb: f32, used_bb: u16, prominent: bool },
