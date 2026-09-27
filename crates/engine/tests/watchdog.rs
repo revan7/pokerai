@@ -14,7 +14,7 @@
 
 use engine::deadline::Deadlines;
 use engine::testing::{FakeClock, Recorder, RecordingSink, ACK_LIVENESS};
-use engine::watchdog::{Armed, SharedSink, StreetDeadline, Watchdog};
+use engine::watchdog::{Armed, Fired, SharedSink, StreetDeadline, Watchdog};
 use proto::{Coverage, DecisionIdentity, EquitySummary, Phase, Recommendation, RecommendationEvent, Street, UnsupportedReason};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -33,8 +33,8 @@ fn armed(sink: SharedSink, stage: &str) -> (Armed, Arc<AtomicBool>, Arc<StreetDe
     let d = Deadlines::for_request(0, Street::River, 10);
     let (delivered, street) = (Arc::new(AtomicBool::new(false)), Arc::new(StreetDeadline::new(d.street_deadline_ms)));
     let a = Armed { identity: identity(), street_deadline: street.clone(), fire_ms: d.watchdog_fire_ms(),
-        retained: Arc::new(Mutex::new(None)), fallback: fallback(), stage: Arc::new(Mutex::new(stage.to_string())),
-        sink, delivered: delivered.clone() };
+        retained: Arc::new(Mutex::new(None)), fallback: Arc::new(Mutex::new(fallback())), stage: Arc::new(Mutex::new(stage.to_string())),
+        sink, delivered: delivered.clone(), fired: Arc::default() };
     (a, delivered, street)
 }
 fn recording(clock: &Arc<FakeClock>) -> (SharedSink, Recorder) {
@@ -94,6 +94,37 @@ fn watchdog_emits_final_at_delivery_minus_100ms() {
     }
     assert!(delivered.load(Ordering::SeqCst));
     assert!(street.violated(), "no terminal was seen by the street deadline");
+}
+
+/// Ruling 28-I6: the fallback is read at the fire, so what the engine wrote into it after arming (here an inherited
+/// reason and the ranges used) is what the watchdog's `Final` carries. Ruling 28-I2: the fire records that `Final`, and
+/// the time it was emitted at, for the engine's decision log.
+#[test]
+fn the_fire_delivers_the_fallback_as_last_refreshed_and_records_it() {
+    let clock = FakeClock::new();
+    let (sink, events) = recording(&clock);
+    let wd = watchdog(&clock);
+    let (a, _delivered, _street) = armed(sink, "solving");
+    let (slot, fired) = (a.fallback.clone(), a.fired.clone());
+    wd.arm(a);
+    let reason = proto::ApproxReason::UnconditionedCurrentStreet;
+    {
+        let mut refreshed = slot.lock().unwrap();
+        refreshed.coverage = Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage: String::new() }, partial: vec![reason.clone()] };
+        refreshed.assumptions.ranges_used = vec![(proto::Seat(2), "AA".into(), 6.0)];
+    }
+    clock.set_ms(14_900);
+    ended(&wd, 1);
+    let ev = events.recorded();
+    assert_eq!(ev.len(), 1);
+    match &ev[0].event {
+        RecommendationEvent::Final(r) => {
+            assert_eq!(r.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage: "solving".into() }, partial: vec![reason] });
+            assert_eq!(r.assumptions.ranges_used, vec![(proto::Seat(2), "AA".to_string(), 6.0)]);
+            assert_eq!(*fired.lock().unwrap(), Some(Fired { at_ms: 14_900, rec: r.clone() }), "the fire records the Final it emitted, and when");
+        }
+        e => panic!("{e:?}"),
+    }
 }
 
 #[test]
@@ -257,12 +288,14 @@ fn watchdog_never_delivers_a_final_the_engine_already_delivered() {
     let (sink, events) = recording(&clock);
     let wd = watchdog(&clock);
     let (a, delivered, street) = armed(sink, "extracting");
+    let fired = a.fired.clone();
     wd.arm(a);
     street.terminal_arrived(0);
     delivered.store(true, Ordering::SeqCst); // the engine's own Final claimed the delivery first
     clock.set_ms(20_000);
     ended(&wd, 1); // the fire found the delivery claimed and ended
     assert!(events.recorded().is_empty(), "one Final per request: the watchdog does not deliver a second");
+    assert!(fired.lock().unwrap().is_none(), "nothing delivered, nothing recorded");
 }
 
 #[test]
@@ -298,7 +331,7 @@ fn arming_a_request_after_its_fire_is_a_bug() {
     clock.set_ms(14_900);
     events.wait_for(1);
     // the same request (its shared state) armed again after the watchdog fired for it
-    wd.arm(Armed { identity: identity(), street_deadline: street, fire_ms: 29_900, retained, fallback: fallback(), stage, sink, delivered });
+    wd.arm(Armed { identity: identity(), street_deadline: street, fire_ms: 29_900, retained, fallback: Arc::new(Mutex::new(fallback())), stage, sink, delivered, fired: Arc::default() });
 }
 
 #[test]
@@ -320,8 +353,8 @@ fn arming_an_identity_after_the_watchdog_fired_for_it_is_a_bug() {
 fn arming_with_another_decisions_fallback_is_a_bug() {
     let clock = FakeClock::new();
     let (sink, _events) = recording(&clock);
-    let (mut a, _, _) = armed(sink, "solving");
-    a.fallback.identity.decision_id = 2;
+    let (a, _, _) = armed(sink, "solving");
+    a.fallback.lock().unwrap().identity.decision_id = 2;
     Watchdog::new(clock.clone()).arm(a);
 }
 
@@ -330,8 +363,8 @@ fn arming_with_another_decisions_fallback_is_a_bug() {
 fn arming_with_a_fallback_that_is_not_deadline_exceeded_is_a_bug() {
     let clock = FakeClock::new();
     let (sink, _events) = recording(&clock);
-    let (mut a, _, _) = armed(sink, "solving");
-    a.fallback.coverage = Coverage::Exact;
+    let (a, _, _) = armed(sink, "solving");
+    a.fallback.lock().unwrap().coverage = Coverage::Exact;
     Watchdog::new(clock.clone()).arm(a);
 }
 

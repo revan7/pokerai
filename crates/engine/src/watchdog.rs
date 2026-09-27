@@ -24,10 +24,14 @@
 //!
 //! Locking. Waiting holds no lock. The generation lock is taken to check liveness and, at the fire, held from the
 //! liveness check through the emission, so `arm` and `disarm` are linearized with a fire: once either returns, no
-//! earlier generation emits anything. Lock order: generation, then `retained`, then `stage`, then the sink; the
-//! street-deadline state is taken alone or under the generation lock alone, and no other lock is taken while it is
-//! held. A caller must therefore never call `arm` or `disarm` while holding the sink, `retained` or `stage` lock of an
-//! armed request.
+//! earlier generation emits anything. Lock order: generation, then `retained`, then `fallback`, then `stage`, then
+//! `fired`, then the sink; the street-deadline state is taken alone or under the generation lock alone, and no other
+//! lock is taken while it is held. A caller must therefore never call `arm` or `disarm` while holding the sink,
+//! `retained`, `fallback`, `stage` or `fired` lock of an armed request.
+//!
+//! What was delivered. A fire records the `Final` it emits, and the engine-clock time it read just before, in the
+//! request's `fired` slot, under the generation lock and before the emission: once `disarm` returns, the engine finds
+//! there the `Final` the watchdog delivered, to log it as the request's (ruling 28-I2).
 //!
 //! Test seam. With the `testing` feature (or in this crate's unit tests) a `Watchdog` also counts its ended threads, so
 //! a test waits for a fire or a retirement to be over (`wait_for_ended_threads`) instead of yielding or sleeping
@@ -121,12 +125,23 @@ pub struct Armed {
     /// A `Provisional` or an earlier `best_so_far` of this decision (plan 4 fills it); taken at the fire.
     pub retained: Arc<Mutex<Option<Recommendation>>>,
     /// `Unsupported{DeadlineExceeded{stage}}` for this decision, with the equity so far; the stage is filled in at the fire.
-    pub fallback: Recommendation,
+    /// Shared so the engine can refresh it as the request learns more (the range source's reasons, the assumptions:
+    /// ruling 28-I6); read at the fire. The engine keeps it this decision's `DeadlineExceeded` fallback, as `arm` checks.
+    pub fallback: Arc<Mutex<Recommendation>>,
     /// The furthest stage the request has reached (`EngineCore::stage`).
     pub stage: Arc<Mutex<String>>,
     pub sink: SharedSink,
     /// Set by whichever side delivers the request's `Final`.
     pub delivered: Arc<AtomicBool>,
+    /// The `Final` this watchdog delivered and when (ruling 28-I2); empty unless it fired and delivered.
+    pub fired: Arc<Mutex<Option<Fired>>>,
+}
+
+/// The `Final` a fire delivered and the engine-clock time read immediately before its emission.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fired {
+    pub at_ms: u64,
+    pub rec: Recommendation,
 }
 
 /// The live generation, and the decision the watchdog last fired for.
@@ -169,23 +184,27 @@ impl Watchdog {
             "watchdog armed for decision {:?} after its Final was delivered",
             a.identity
         );
+        assert!(lock(&a.fired).is_none(), "watchdog armed for decision {:?} with a Final already recorded as delivered", a.identity);
         assert!(
             a.street_deadline.deadline_ms() <= a.fire_ms,
             "watchdog armed with the street deadline {} ms after its fire time {} ms",
             a.street_deadline.deadline_ms(),
             a.fire_ms
         );
-        assert!(
-            a.fallback.identity == a.identity,
-            "watchdog armed for decision {:?} with the fallback of decision {:?}",
-            a.identity,
-            a.fallback.identity
-        );
-        assert!(
-            matches!(a.fallback.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { .. }, .. }),
-            "watchdog fallback must be Unsupported{{DeadlineExceeded}}, got {:?}",
-            a.fallback.coverage
-        );
+        {
+            let fallback = lock(&a.fallback);
+            assert!(
+                fallback.identity == a.identity,
+                "watchdog armed for decision {:?} with the fallback of decision {:?}",
+                a.identity,
+                fallback.identity
+            );
+            assert!(
+                matches!(fallback.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { .. }, .. }),
+                "watchdog fallback must be Unsupported{{DeadlineExceeded}}, got {:?}",
+                fallback.coverage
+            );
+        }
         let generation = {
             let mut g = lock(&self.generations);
             assert!(
@@ -286,11 +305,13 @@ fn watch(clock: &dyn Clock, generations: &Mutex<Generations>, generation: u64, a
         return;
     }
     g.fired = Some(a.identity.clone());
-    let mut rec = lock(&a.retained).take().unwrap_or_else(|| a.fallback.clone());
+    let mut rec = lock(&a.retained).take().unwrap_or_else(|| lock(&a.fallback).clone());
     rec.phase = Phase::Final;
     if let Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage }, .. } = &mut rec.coverage {
         *stage = lock(&a.stage).clone();
     }
+    // Recorded before the emission, under the generation lock: see "What was delivered" above.
+    *lock(&a.fired) = Some(Fired { at_ms: clock.now_ms(), rec: rec.clone() });
     lock(&a.sink).emit(RecommendationEvent::Final(rec));
     drop(g);
 }
