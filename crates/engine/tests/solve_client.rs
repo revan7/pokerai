@@ -214,8 +214,10 @@ fn the_street_verdict_follows_the_terminal_arrival_time() {
         let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
         assert_eq!((out.terminal, out.street_violation, r.clock.now_ms()), (Terminal::Ok, violated, delay), "terminal at {delay} ms");
     }
-    // no terminal: the worker hangs, the attempt ends at the hang bound (sent 0 + 1 850 + 150 + 500 = 2 500 ms)
+    // no terminal: the worker hangs, the attempt ends at the hang bound (sent 0 + 1 850 + 150 + 500 = 2 500 ms); one
+    // attempt only (Task 23: the `_min` retry would run on to the watchdog's fire, as its own test shows)
     let mut r = rig(Street::River, vec![ack(), FakeReply::Hang]);
+    r.plan.retry_template_id = None;
     let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
     assert!(out.street_violation && r.clock.now_ms() == 2_500);
 }
@@ -225,8 +227,10 @@ fn the_street_verdict_follows_the_terminal_arrival_time() {
 /// `Final` goes out independently, §7).
 #[test]
 fn receives_never_outlast_the_hang_bound_or_the_watchdog_fire() {
-    // a hung worker: the attempt ends exactly at the hang bound and the worker is restarted
+    // a hung worker: the attempt ends exactly at the hang bound and the worker is restarted (one attempt only: Task 23's
+    // `_min` retry is `a_retry_cut_by_the_watchdog_fire_leaves_the_cleanup_to_the_delivery`)
     let mut r = rig(Street::River, vec![ack(), FakeReply::Hang]);
+    r.plan.retry_template_id = None;
     let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
     let (message, retryable) = failed_engine_error(&out.terminal);
     assert!(message.contains("no terminal result") && retryable, "{message}");
@@ -268,25 +272,30 @@ fn a_rejected_solve_ends_at_once_and_stale_acks_free_nothing() {
     assert_eq!((r.clock.now_ms(), solves(&r.state).len(), out.restarts, kills_and_restarts(&r.state)), (0, 1, 0, (0, 0)));
 }
 
-/// A link whose `ready` the client refuses: any request, receive, kill or restart on it is a test failure.
+/// A link whose `ready` the client refuses: any request, receive, kill or restart on it is a test failure. With no
+/// `ready` at all (no live worker) the client relaunches it once (Task 23), and that relaunch fails.
 struct NoWork(Option<Ready>);
 impl WorkerLink for NoWork {
     fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError> { panic!("a request reached a worker whose ready was refused: {msg:?}") }
     fn recv(&mut self, _timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> { panic!("the client waited on a worker whose ready was refused") }
-    fn restart(&mut self) -> Result<(), WorkerLinkError> { panic!("the client restarted a worker whose ready was refused") }
+    fn restart(&mut self) -> Result<(), WorkerLinkError> {
+        assert!(self.0.is_none(), "the client restarted a worker whose ready was refused");
+        Err(WorkerLinkError::Spawn("no worker could be launched".into()))
+    }
     fn kill(&mut self) { panic!("the client killed a worker whose ready was refused") }
     fn ready(&self) -> Option<&Ready> { self.0.as_ref() }
 }
 
 /// §4.5/§12: the worker's `ready` is validated before any request, and a refused solve starts no work: no request, no
-/// wait, no restart. A version, commit or AVX2 mismatch is a non-retryable `EngineError`; no live worker is retryable.
+/// wait, no restart. A version, commit or AVX2 mismatch is a non-retryable `EngineError`; no live worker is retryable
+/// (Task 23: after the one relaunch it gets has failed).
 #[test]
 fn ready_is_validated_before_any_request() {
     let mut no_avx2 = FakeWorker::default_ready();
     no_avx2.build_features = vec!["sse4.2".into()];
     let mut old_proto = FakeWorker::default_ready();
     old_proto.proto_version = 2;
-    for (ready, fragment, retryable) in [(Some(no_avx2), "AVX2", false), (Some(old_proto), "proto_version 2", false), (None, "no live worker", true)] {
+    for (ready, fragment, retryable, restarts) in [(Some(no_avx2), "AVX2", false, 0), (Some(old_proto), "proto_version 2", false, 0), (None, "no live worker", true, 1)] {
         let mut r = rig(Street::River, vec![]);
         let log = DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log"));
         let identity = r.core.identity.clone();
@@ -294,7 +303,7 @@ fn ready_is_validated_before_any_request() {
         let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
         let (message, got_retryable) = failed_engine_error(&out.terminal);
         assert!(message.contains(fragment) && got_retryable == retryable, "{message}");
-        assert_eq!((r.clock.now_ms(), out.restarts), (0, 0));
+        assert_eq!((r.clock.now_ms(), out.restarts), (0, restarts));
     }
     // a deadline that leaves no iteration is refused before the request too (river at 1 650 ms: 200 <= 200)
     let mut r = rig(Street::River, vec![ack(), ok_for(Street::River, "river_std_v1", 0.3)]);
@@ -328,7 +337,7 @@ fn an_invalid_solution_is_refused() {
 
 /// A reply that breaks the protocol (a negative exploitability, a result whose status and payload disagree, a failure
 /// code outside §4.5's list, a solve acked as `staged`) is a protocol error: the worker is restarted (§12) and nothing is
-/// emitted from it.
+/// emitted from it. One attempt only: Task 23's `_min` retry after the restart is its own tests'.
 #[test]
 fn protocol_violations_restart_the_worker() {
     let negative = FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 1, exploitability_chips: Some(-0.5), elapsed_ms: 1 };
@@ -337,6 +346,7 @@ fn protocol_violations_restart_the_worker() {
     for (script, fragment) in [(vec![ack(), negative], "negative"), (vec![ack(), ok_without_solution], "without a solution"),
         (vec![ack(), err("boom", true, None)], "boom"), (vec![staged], "staged")] {
         let mut r = rig(Street::River, script);
+        r.plan.retry_template_id = None;
         let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
         let (message, retryable) = failed_engine_error(&out.terminal);
         assert!(message.starts_with("protocol error") && message.contains(fragment) && retryable, "{message}");
@@ -346,15 +356,18 @@ fn protocol_violations_restart_the_worker() {
 }
 
 /// Worker death (ruling 18): a confirmed exit is `WorkerExit{code}`; an end of stdout whose exit is never confirmed is
-/// not given a code. Both restart the worker (kill, reap, respawn, validate `ready`).
+/// not given a code. Both restart the worker (kill, reap, respawn, validate `ready`). One attempt only: Task 23's `_min`
+/// retry after the restart is `error_codes_retry_policy`'s.
 #[test]
 fn a_worker_exit_and_an_unconfirmed_end_restart_the_worker() {
     let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::Exit { code: 3 }]);
+    r.plan.retry_template_id = None;
     let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
     let (message, retryable) = failed_engine_error(&out.terminal);
     assert!(message.contains("WorkerExit{code: 3}") && retryable, "{message}");
     assert_eq!((out.restarts, kills_and_restarts(&r.state), r.clock.now_ms()), (1, (0, 1), 1));
     let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::Eof, FakeReply::Hang]);
+    r.plan.retry_template_id = None;
     let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
     let (message, retryable) = failed_engine_error(&out.terminal);
     assert!(message.contains("not confirmed") && !message.contains("WorkerExit") && retryable, "{message}");
@@ -462,9 +475,11 @@ fn a_reply_observed_after_expiry_is_neither_forwarded_nor_accepted() {
     let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
     assert_eq!((out.terminal, r.core.stage()), (deadline_exceeded("building"), "building".to_string()));
     assert!(r.events.lock().unwrap().is_empty(), "a progress seen at the fire is never forwarded");
-    // the exact boundary at the hang bound (river: sent at 0, 1 850 + 150 + 500 = 2 500 ms; the fire is at 14 900 ms)
+    // the exact boundary at the hang bound (river: sent at 0, 1 850 + 150 + 500 = 2 500 ms; the fire is at 14 900 ms),
+    // for the one attempt (Task 23: after the hang a `_min` retry would run on to the fire)
     for (seen_at, accepted) in [(2_499u64, true), (2_500, false)] {
         let mut r = stalled_rig(vec![ack(), result()], is_result, Some(seen_at), 0);
+        r.plan.retry_template_id = None;
         let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
         if accepted {
             assert_eq!((out.terminal, out.street_violation, out.restarts), (Terminal::Ok, true, 0), "result seen at {seen_at} ms");
@@ -643,4 +658,273 @@ fn a_request_expired_while_prepared_is_never_sent() {
         (out.terminal, solves(&r.state).is_empty(), kills_and_restarts(&r.state), out.restarts, out.first_terminal_ms, r.plan.street_deadline.terminal_arrival_ms()),
         (deadline_exceeded("building"), true, (0, 0), 0, None, None),
     );
+}
+
+#[test]
+fn superseded_request_cancels_then_kills_after_1_5s() {
+    // the mutation lands 100 ms after the ack; the client cancels, waits 1.5 s for result{cancelled}, then kills
+    let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: 100 }, FakeReply::InvalidateIdentity, FakeReply::Hang]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert!(matches!(out.terminal, Terminal::Failed(UnsupportedReason::EngineError { ref message, .. }) if message.contains("superseded")));
+    let s = r.state.lock().unwrap();
+    assert_eq!((s.cancels.len(), s.kills, s.restarts), (1, 1, 1));
+    assert!(r.clock.now_ms() >= 100 + 1500);
+    assert!(r.events.lock().unwrap().is_empty());   // nothing is emitted for a superseded identity
+}
+
+#[test]
+fn heartbeat_failure_restarts_and_retries_min() {
+    // Progress at t = 1200 ms, then nothing for 5 s: at t = 6200 the heartbeat fires, the worker is killed and
+    // respawned, and one retry with turn_min_v1 is admitted. 6200 is past the 6 s turn budget and the first attempt
+    // never produced a terminal, so the street was violated even though the retry succeeds.
+    let mut r = rig(Street::Turn, vec![ack(), FakeReply::Delay { ms: 1200 },
+        FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 1, exploitability_chips: None, elapsed_ms: 1 },
+        FakeReply::Delay { ms: 5100 }, FakeReply::Hang, ack(), ok_for(Street::Turn, "turn_min_v1", 0.4)]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!((out.terminal.clone(), out.template_used.as_str(), out.restarts), (Terminal::Ok, "turn_min_v1", 1));
+    let sent = solves(&r.state);
+    assert_eq!((sent.len(), sent[1].tree.template_id.as_str()), (2, "turn_min_v1"));
+    assert_eq!(r.clock.now_ms(), 6_200);
+    // the retry gets only the time remaining to final delivery, minus the delivery and pipe margins
+    assert_eq!(sent[1].deadline_ms, 15_000 - 6_200 - 150);
+    assert!(out.street_violation, "no first-attempt terminal arrived before t0 + 6 s");
+}
+
+#[test]
+fn error_codes_retry_policy() {
+    // tree_too_large twice: TreeTooLarge with the retry's estimate
+    let mut r = rig(Street::Turn, vec![ack(), err("tree_too_large", false, Some(9_000_000_000)), ack(), err("tree_too_large", false, Some(3_000_000_000))]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert!(matches!(out.terminal, Terminal::Failed(UnsupportedReason::TreeTooLarge { estimate_bytes: 3_000_000_000 })));
+    assert_eq!(solves(&r.state).len(), 2);
+    assert!(!out.street_violation, "the first attempt produced a terminal well inside the 6 s budget");
+    // no_iteration: not retried on the same template, the _min template is tried
+    let mut r = rig(Street::Turn, vec![ack(), err("no_iteration", false, None), ack(), ok_for(Street::Turn, "turn_min_v1", 0.4)]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!((out.terminal, out.template_used.as_str(), out.restarts), (Terminal::Ok, "turn_min_v1", 0));
+    // tree_mismatch: never retried, non-retryable EngineError, exactly one solve
+    let mut r = rig(Street::River, vec![ack(), err("tree_mismatch", false, None)]);
+    assert!(matches!(run_solve(&mut r.core, &r.input, &r.plan, &r.sink).terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: false, .. })));
+    assert_eq!(solves(&r.state).len(), 1);
+    // worker exit: restart and retry with _min; a second failure is a retryable EngineError
+    let mut r = rig(Street::River, vec![ack(), FakeReply::Eof, ack(), FakeReply::Eof]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert!(matches!(out.terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: true, .. })));
+    assert_eq!((out.restarts, r.state.lock().unwrap().restarts), (2, 2));
+    // a rejected ack (busy) frees nothing by itself: the outcome is a retryable EngineError and no result was accepted
+    let mut r = rig(Street::River, vec![FakeReply::Ack { id: IdRef::Last, status: AckStatus::Rejected, reason: Some("busy".into()) }]);
+    assert!(matches!(run_solve(&mut r.core, &r.input, &r.plan, &r.sink).terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: true, .. })));
+}
+
+// --- Task 23 beyond the brief's three tests: one behaviour per test for the parts of the resilience policy they do not
+// reach (the cancel's bound and its one confirmation, the relaunch of a missing worker and the ready revalidation after
+// a restart, retry admission at its boundary, what a retry keeps and what it never sends). Every wait is on the fake
+// clock; nothing sleeps or spins. ---
+
+/// §7/§12 cancel-then-kill, exactly. The client observes the mutation at 101 ms (`InvalidateIdentity, Delay { ms: 1 }`
+/// ends that receive) and cancels the superseded solve at once, with a request id of its own. Only that solve's
+/// `result{cancelled}` confirms the cancel: the worker is then left running, nothing killed. Anything else read in the
+/// window is discarded, a late reply of the job included (§4.5: a completion racing a cancel never also yields
+/// `cancelled`), and the worker is killed and restarted exactly `CANCEL_KILL_MS` after the cancel. A cancel the link
+/// cannot send (the worker has exited) is answered by a restart at once. Nothing is emitted for the superseded decision.
+#[test]
+fn a_cancel_is_confirmed_only_by_result_cancelled_else_the_worker_is_killed_1_5s_after_it() {
+    let superseded_at_101 = |tail: Vec<FakeReply>| [vec![ack(), FakeReply::Delay { ms: 100 }, FakeReply::InvalidateIdentity, FakeReply::Delay { ms: 1 }], tail].concat();
+    let cancelled = FakeReply::Result { id: IdRef::Last, status: ResultStatus::Cancelled, solution: None, error: None, elapsed_ms: 200 };
+    let cancel_ack = FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None };
+    // (case, script after the mutation, whether a cancel was sent, kills, restarts, the clock at return)
+    let cases = [
+        ("no reply", vec![FakeReply::Hang], true, 1u32, 1u32, 1_601u64),
+        ("result{cancelled} at 301 ms", vec![cancel_ack, FakeReply::Delay { ms: 200 }, cancelled, FakeReply::Hang], true, 0, 0, 301),
+        ("the job's late ok", vec![ok_for(Street::River, "river_std_v1", 0.3), FakeReply::Hang], true, 1, 1, 1_601),
+        ("the worker has exited", vec![FakeReply::Exit { code: 3 }], false, 0, 1, 101),
+    ];
+    for (case, tail, cancel_sent, kills, restarts, now) in cases {
+        let mut r = rig(Street::River, superseded_at_101(tail));
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        let (message, retryable) = failed_engine_error(&out.terminal);
+        assert!(message.contains("superseded") && !retryable && out.solution.is_none(), "{case}: {message}");
+        assert!(r.events.lock().unwrap().is_empty(), "{case}: nothing is emitted for a superseded decision");
+        let solve_id = solves(&r.state)[0].id.clone();
+        let s = r.state.lock().unwrap();
+        let cancel = s.sent.iter().find_map(|m| if let EngineMessage::Cancel { id, target } = m { Some((id.clone(), target.clone())) } else { None });
+        assert_eq!(cancel.is_some(), cancel_sent, "{case}");
+        if let Some((id, target)) = cancel { assert!(target == solve_id && id != solve_id, "{case}: cancel {id} of {target}, solve {solve_id}"); }
+        assert_eq!((s.kills, s.restarts, u32::from(out.restarts), r.clock.now_ms()), (kills, restarts, restarts, now), "{case}");
+    }
+}
+
+/// A link over the scripted worker whose relaunched worker writes `relaunched` as its `ready` (a rebuilt binary without
+/// AVX2, say): what the engine sees after any restart.
+struct RelaunchedAs { inner: Box<dyn WorkerLink>, relaunched: Ready, restarted: bool }
+impl WorkerLink for RelaunchedAs {
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError> { self.inner.send(msg) }
+    fn recv(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> { self.inner.recv(timeout) }
+    fn restart(&mut self) -> Result<(), WorkerLinkError> { self.restarted = true; self.inner.restart() }
+    fn kill(&mut self) { self.inner.kill() }
+    fn ready(&self) -> Option<&Ready> { if self.restarted { self.inner.ready().map(|_| &self.relaunched) } else { self.inner.ready() } }
+}
+fn without_avx2() -> Ready { let mut r = FakeWorker::default_ready(); r.build_features = vec!["sse4.2".into()]; r }
+
+/// Decision 4 (review P2T22R): a request that finds no live worker (killed, or left without one by a restart that
+/// failed) relaunches it once before anything is sent and validates the relaunched worker's `ready`. Relaunched, the
+/// solve goes ahead; a relaunch that fails ends it with a retryable `EngineError` naming the failure; a relaunched
+/// worker whose `ready` is refused (no AVX2, spec 3.6/3.7) ends it with the non-retryable version mismatch of §12.
+#[test]
+fn a_missing_worker_is_relaunched_once_before_the_request() {
+    let mut r = rig(Street::River, vec![ack(), ok_for(Street::River, "river_std_v1", 0.3)]);
+    r.core.worker.kill();
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!((out.terminal, out.restarts, kills_and_restarts(&r.state), solves(&r.state).len()), (Terminal::Ok, 1, (1, 1), 1));
+
+    let mut r = rig(Street::River, vec![FakeReply::SpawnFails("solver-worker.exe did not become ready".into())]);
+    r.core.worker.kill();
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    let (message, retryable) = failed_engine_error(&out.terminal);
+    assert!(message.contains("no live worker") && message.contains("did not become ready") && retryable, "{message}");
+    assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len(), r.clock.now_ms()), (1, (1, 1), 0, 0));
+    assert!(r.core.worker.ready().is_none(), "no live worker is left; the next request tries again");
+
+    let mut r = rig(Street::River, vec![]);
+    let identity = r.core.identity.clone();
+    let (mut worker, state) = FakeWorker::scripted(r.clock.clone(), identity.clone(), vec![ack(), ok_for(Street::River, "river_std_v1", 0.3)]);
+    worker.kill();
+    let link = RelaunchedAs { inner: worker, relaunched: without_avx2(), restarted: false };
+    r.core = EngineCore::new(Box::new(link), r.clock.clone(), identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log")));
+    r.state = state;
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    let (message, retryable) = failed_engine_error(&out.terminal);
+    assert!(message.contains("worker/proto version mismatch") && message.contains("AVX2") && !retryable, "{message}");
+    assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len()), (1, (1, 1), 0));
+}
+
+/// Decision 4 mid-request: after a failed attempt, a restart that fails leaves no live worker and ends the solve with a
+/// retryable `EngineError` naming both causes (no retry is sent; the next request relaunches the worker), and a restarted
+/// worker whose `ready` is refused ends it with the non-retryable version mismatch, never a retry on it.
+#[test]
+fn a_failed_restart_or_a_refused_ready_after_a_restart_ends_the_solve() {
+    let exits = || vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::Exit { code: 3 }];
+    let mut r = rig(Street::River, [exits(), vec![FakeReply::SpawnFails("solver-worker.exe did not become ready".into())]].concat());
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    let (message, retryable) = failed_engine_error(&out.terminal);
+    assert!(message.contains("WorkerExit{code: 3}") && message.contains("did not become ready") && retryable, "{message}");
+    assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len(), r.clock.now_ms()), (1, (0, 1), 1, 1));
+    assert!(r.core.worker.ready().is_none());
+
+    let mut r = rig(Street::River, vec![]);
+    let identity = r.core.identity.clone();
+    let (worker, state) = FakeWorker::scripted(r.clock.clone(), identity.clone(), [exits(), vec![ack(), ok_for(Street::River, "river_min_v1", 0.3)]].concat());
+    let link = RelaunchedAs { inner: worker, relaunched: without_avx2(), restarted: false };
+    r.core = EngineCore::new(Box::new(link), r.clock.clone(), identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log")));
+    r.state = state;
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    let (message, retryable) = failed_engine_error(&out.terminal);
+    assert!(message.contains("worker/proto version mismatch") && message.contains("AVX2") && !retryable, "{message}");
+    assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len()), (1, (0, 1), 1));
+}
+
+/// §7 retry admission (decision 5): the `_min` retry is admitted only if what is left until final delivery covers the
+/// template's p95 (the street budget until plan 4's bench matrix exists) plus the delivery, pipe and extraction margins,
+/// and it gets only what is left until final delivery less the delivery and pipe margins. River with final delivery at
+/// 4 s: 2 000 + 100 + 50 + 200 fits from 1 650 ms, not from 1 651 ms. Without a `_min` template there is no retry.
+#[test]
+fn the_min_retry_is_admitted_only_when_its_p95_and_the_margins_fit() {
+    let short_final = Deadlines { t0_ms: 0, street_deadline_ms: 2_000, final_delivery_ms: 4_000, extraction_margin_ms: 200 };
+    for (at, admitted) in [(1_650u64, true), (1_651, false)] {
+        let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: at }, err("no_iteration", false, None), ack(), ok_for(Street::River, "river_min_v1", 0.3)]);
+        set_deadlines(&mut r.plan, short_final);
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        let sent = solves(&r.state);
+        if admitted {
+            assert_eq!((out.terminal, out.template_used.as_str(), sent.len()), (Terminal::Ok, "river_min_v1", 2), "no_iteration at {at} ms");
+            assert_eq!((sent[1].deadline_ms, sent[1].tree.template_id.as_str()), (4_000 - 1_650 - 150, "river_min_v1"));
+        } else {
+            assert_eq!((out.terminal, out.template_used.as_str(), sent.len()), (deadline_exceeded("solving"), "river_std_v1", 1), "no_iteration at {at} ms");
+        }
+    }
+    let mut r = rig(Street::River, vec![ack(), err("no_iteration", false, None), ack(), ok_for(Street::River, "river_min_v1", 0.3)]);
+    r.plan.retry_template_id = None;
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!((out.terminal, solves(&r.state).len()), (deadline_exceeded("solving"), 1));
+}
+
+/// Decisions 2 and 5: a retry never rewinds the reported stage (`set_stage` only advances), and never replaces the first
+/// attempt's terminal: `first_terminal_ms` and the street deadline's published arrival stay attempt 0's, or stay `None`
+/// when attempt 0 had none, however the retry ends; the street verdict is judged from them (ruling 20-I1).
+#[test]
+fn a_retry_keeps_the_furthest_stage_and_the_first_attempts_terminal() {
+    let extracting = FakeReply::Progress { id: IdRef::Last, stage: Stage::Extracting, iterations: 40, exploitability_chips: Some(0.4), elapsed_ms: 1 };
+    let mut r = rig(Street::River, vec![ack(), extracting, FakeReply::Delay { ms: 300 }, err("tree_too_large", false, Some(9_000_000_000)),
+        FakeReply::Delay { ms: 400 }, ack(), ok_for(Street::River, "river_min_v1", 0.3)]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!((out.terminal, out.template_used.as_str(), r.core.stage(), r.clock.now_ms()), (Terminal::Ok, "river_min_v1", "extracting".to_string(), 700));
+    assert_eq!((out.first_terminal_ms, r.plan.street_deadline.terminal_arrival_ms(), out.street_violation), (Some(300), Some(300), false));
+    // attempt 0 has no terminal (the worker exits at 1 ms); the retry's terminal, at 2 501 ms, is never published
+    let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::Exit { code: 3 }, ack(), FakeReply::Delay { ms: 2_500 }, ok_for(Street::River, "river_min_v1", 0.3)]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!((out.terminal, out.restarts, r.clock.now_ms()), (Terminal::Ok, 1, 2_501));
+    assert_eq!((out.first_terminal_ms, r.plan.street_deadline.terminal_arrival_ms(), out.street_violation), (None, None, true));
+}
+
+/// §12 heartbeat: only while the worker reports `Solving`, measured from its last `progress` (each resets it). No
+/// progress for 5 s after one at 4 999 ms ends the attempt at 9 999 ms, not at 5 000 ms; silence in `Building` or after
+/// `Extracting` is bounded by the attempt's hang bound alone. River with the street deadline at 14 s (hang bound
+/// 14 500 ms, fire 14 900 ms), so no retry fits after either failure (the street budget, 14 s, is the p95 proxy).
+#[test]
+fn the_heartbeat_runs_only_while_solving_from_the_last_progress() {
+    let progress = |stage| FakeReply::Progress { id: IdRef::Last, stage, iterations: 1, exploitability_chips: None, elapsed_ms: 1 };
+    let long = Deadlines { t0_ms: 0, street_deadline_ms: 14_000, final_delivery_ms: 15_000, extraction_margin_ms: 200 };
+    let cases = [
+        (vec![ack(), progress(Stage::Solving), FakeReply::Delay { ms: 4_999 }, progress(Stage::Solving), FakeReply::Hang], "heartbeat", 9_999u64),
+        (vec![ack(), progress(Stage::Solving), FakeReply::Delay { ms: 4_999 }, progress(Stage::Extracting), FakeReply::Hang], "no terminal result", 14_500),
+        (vec![ack(), progress(Stage::Building), FakeReply::Hang], "no terminal result", 14_500),
+    ];
+    for (script, fragment, ended_ms) in cases {
+        let mut r = rig(Street::River, script);
+        set_deadlines(&mut r.plan, long);
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        let (message, retryable) = failed_engine_error(&out.terminal);
+        assert!(message.contains(fragment) && retryable, "{message}");
+        assert_eq!((r.clock.now_ms(), out.restarts, kills_and_restarts(&r.state), solves(&r.state).len()), (ended_ms, 1, (0, 1), 1), "{fragment}");
+    }
+}
+
+/// A link over the scripted worker through which a mutation arrives while the worker is restarted.
+struct MutatesOnRestart { inner: Box<dyn WorkerLink>, identity: Arc<Mutex<IdentityState>> }
+impl WorkerLink for MutatesOnRestart {
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError> { self.inner.send(msg) }
+    fn recv(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> { self.inner.recv(timeout) }
+    fn restart(&mut self) -> Result<(), WorkerLinkError> { let restarted = self.inner.restart(); self.identity.lock().unwrap().cancel_active(); restarted }
+    fn kill(&mut self) { self.inner.kill() }
+    fn ready(&self) -> Option<&Ready> { self.inner.ready() }
+}
+
+/// Decision 3 for the retry (ruling 22-I2): a decision superseded while the worker is restarted after a failed attempt
+/// starts no retry. Nothing more is sent, and since nothing was sent there is nothing to cancel or kill.
+#[test]
+fn a_decision_superseded_before_the_retry_is_sent_starts_no_retry() {
+    let mut r = rig(Street::River, vec![]);
+    let identity = r.core.identity.clone();
+    let (worker, state) = FakeWorker::scripted(r.clock.clone(), identity.clone(), vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::Exit { code: 3 }, ack(), ok_for(Street::River, "river_min_v1", 0.3)]);
+    r.core = EngineCore::new(Box::new(MutatesOnRestart { inner: worker, identity: identity.clone() }), r.clock.clone(), identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log")));
+    r.state = state;
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    let (message, retryable) = failed_engine_error(&out.terminal);
+    assert!(message.contains("superseded") && !retryable, "{message}");
+    let s = r.state.lock().unwrap();
+    assert_eq!((s.sent.len(), s.cancels.len(), s.kills, s.restarts, out.restarts, r.clock.now_ms()), (1, 0, 0, 1, 1, 1));
+}
+
+/// A worker that never answers (plan 2 Task 29's case (a) at the client): the first attempt hangs to its bound, the
+/// worker is restarted and the `_min` retry is sent with what is left until final delivery; it runs on to the watchdog's
+/// fire, where it ends `DeadlineExceeded` with the furthest stage. The client neither kills nor restarts anything then:
+/// the watchdog delivers the `Final`, and the cleanup after it is `serve_request`'s (Task 28).
+#[test]
+fn a_retry_cut_by_the_watchdog_fire_leaves_the_cleanup_to_the_delivery() {
+    let mut r = rig(Street::River, vec![ack(), FakeReply::Hang]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    let sent = solves(&r.state);
+    assert_eq!((out.terminal, out.template_used.as_str(), r.clock.now_ms()), (deadline_exceeded("building"), "river_min_v1", 14_900));
+    assert_eq!((sent.len(), sent[1].deadline_ms, out.restarts, kills_and_restarts(&r.state)), (2, 15_000 - 2_500 - 150, 1, (0, 1)));
+    assert!(out.street_violation && out.first_terminal_ms.is_none());
 }
