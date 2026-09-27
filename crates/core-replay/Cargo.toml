@@ -1,0 +1,13 @@
+[package]
+name = "core-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+proto = { path = "../proto" }
+core-model = { path = "../core-model" }
+core-ranges = { path = "../core-ranges" }
+core-preflop = { path = "../core-preflop" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
