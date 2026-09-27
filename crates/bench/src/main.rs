@@ -185,7 +185,7 @@ fn run_metadata(started: String, exe: &std::path::Path, ready: &proto::worker::R
         spots: format!(
             "{} spots from {} (templates {}; range source {})",
             suite.spots.len(),
-            suite_path.display(),
+            display_forward_slash(suite_path),
             distinct(suite.spots.iter().map(|s| s.template_id.clone()).collect()),
             distinct(suite.spots.iter().map(|s| s.range_source.clone()).collect())
         ),
@@ -250,6 +250,12 @@ fn worker_binary_identity(exe: &std::path::Path) -> String {
         "{} ({file}); compiler identity not reported by the worker; V1 selection record docs/bench/worker-toolchain.json at run time: {selection}",
         exe.display()
     )
+}
+
+/// A path's display form with backslashes normalized to forward slashes, so a report line generated
+/// from a `PathBuf::join` reads the same whether it ran on Windows or on a Unix path already using `/`.
+fn display_forward_slash(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 /// The CPU name from a `reg query ... /v ProcessorNameString` listing: the text after `REG_SZ` on the
@@ -378,5 +384,13 @@ mod tests {
         for bad in ["2026-9-10", "2026-09-10x", "20260910", "2026/09/10", "", "2026-13-01", "2026-09-32"] {
             assert!(!is_iso_date(bad), "{bad:?}");
         }
+    }
+
+    // ---- N3: the generated `spots:` line uses one separator form, regardless of the platform's own ----
+
+    #[test]
+    fn a_windows_style_suite_path_displays_with_forward_slashes() {
+        assert_eq!(display_forward_slash(std::path::Path::new(r"bench\spots\river_std.json")), "bench/spots/river_std.json");
+        assert_eq!(display_forward_slash(std::path::Path::new("bench/spots/river_std.json")), "bench/spots/river_std.json");
     }
 }
