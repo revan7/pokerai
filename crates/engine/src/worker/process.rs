@@ -2,7 +2,8 @@
 //!
 //! One live process at a time, with three threads of its own (§3.4):
 //! - `worker-stdin` writes the queued request lines in order, so `send` never blocks on a worker that stopped
-//!   reading; a failed write ends the thread and the next `send` reports the process's state.
+//!   reading; a failed write ends the thread and the next `send` reports the process's state at once: `send` never
+//!   waits, its budget for confirming an exit is zero (one non-blocking poll).
 //! - `worker-stdout` reads bounded lines (`read_line`: at most `MAX_RESULT_LINE` bytes counting the LF, the worker's
 //!   own convention for both of its limits), decodes each into a `WorkerMessage` and queues it for `recv`. A line that
 //!   is too long, not UTF-8 or not a message is queued as an error and reading goes on at the next line: a fault is
@@ -53,9 +54,6 @@ pub const STDERR_RING: usize = 64 << 10;
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// §4.5: a launch that does not reach a valid `ready` is retried once.
 pub const START_ATTEMPTS: u32 = 2;
-/// Liveness bound on confirming the exit of a process whose stdin writer has failed, in `send` (which has no caller
-/// budget). `recv` never uses it: it confirms an exit only within its caller's remaining budget.
-const EXIT_CONFIRM: Duration = Duration::from_secs(2);
 /// Liveness bound on reaping a terminated child; termination is immediate, the bound only keeps `kill` from blocking.
 const REAP: Duration = Duration::from_secs(10);
 /// Liveness bound on the stderr drain after the child is gone (the pipe is at EOF by then).
@@ -193,9 +191,11 @@ impl WorkerLink for ProcessWorker {
         let Some(live) = self.live.as_mut() else { return Err(WorkerLinkError::Eof) };
         if let Some(code) = live.exit { return Err(WorkerLinkError::Exit { code }); }
         if let Ok(Some(st)) = live.child.try_wait() { return Err(WorkerLinkError::Exit { code: exit_code(st) }); }
-        // The writer thread only ends at a failed write: the process is gone or going. Not recorded in `exit`, which
-        // `recv` sets only once it has read every line the process wrote.
-        live.stdin.send(line).map_err(|_| match wait_for_exit(&mut live.child, EXIT_CONFIRM) { Some(st) => WorkerLinkError::Exit { code: exit_code(st) }, None => WorkerLinkError::Eof })
+        // The writer thread only ends at a failed write: the process closed its stdin, so it is exiting or lives on
+        // without reading. `send`'s budget for confirming that is zero: one poll, `Exit{code}` if the process has
+        // exited, else `Eof`. Neither is recorded in `exit`, which `recv` sets only once it has read every line the
+        // process wrote; `recv` confirms an exit this poll missed, within its own budget.
+        live.stdin.send(line).map_err(|_| match live.child.try_wait() { Ok(Some(st)) => WorkerLinkError::Exit { code: exit_code(st) }, _ => WorkerLinkError::Eof })
     }
     fn recv(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> {
         match self.recv_any(timeout)? {
@@ -564,11 +564,19 @@ mod stand_in_tests {
     }
 
     /// A silent process is killed at the startup timeout and retried once (the stand-in never writes, so the outcome
-    /// does not depend on the timeout's length; the seam only shortens the test). The engine's own account is exact:
-    /// two attempts, both timed out. The stand-ins' launch count is only an upper bound here: a stand-in killed at the
-    /// timeout may not yet have run its first line (cmd.exe start-up has exceeded 300 ms on a loaded machine), so an
-    /// exact count would test the machine's speed, not the link. The other tests' counts are decided by what their
-    /// stand-ins write after that line, so they stay exact.
+    /// does not depend on the timeout's length; the seam only shortens the test).
+    ///
+    /// The link's count is exact and is what the message asserts. `start` launches at most `START_ATTEMPTS` times,
+    /// and every failed launch is killed and reaped before the next, so there is neither a third launch nor overlap.
+    /// The message carries one "no ready within 300 ms" per launch, i.e. per process that was spawned and lived to
+    /// the timeout.
+    ///
+    /// The stand-ins' own count (`launches.txt`) is only an upper bound, a race in the observation, not in the link.
+    /// Each stand-in counts itself with its first batch line, so the file counts stand-ins whose cmd.exe got that far
+    /// before the kill, not processes the link started. On a loaded machine cmd.exe start-up has exceeded 300 ms,
+    /// leaving 1. Seen with temporary diagnostics: two spawned pids, both killed and reaped, one line, empty stderr.
+    /// With a 20 ms seam: two pids and zero lines in 10 of 10 runs. The other tests' counts stay exact, because what
+    /// decides their outcome is written by their stand-ins after that first line.
     #[test]
     fn a_silent_process_times_out_twice() {
         let s = StandIn::new("silent", &[WAIT.into()]);
@@ -633,20 +641,93 @@ mod stand_in_tests {
         panic!("2,000 receives of {SHORT:?} saw nothing");
     }
 
-    /// A link around the live stand-in `s` whose stdout is a pipe the TEST holds the write end of, built as `launch`
-    /// builds one (job, three threads) minus the `ready` exchange: the test ends stdout by dropping the writer, while
-    /// the child lives on, as a process that closes its stdout does. The stand-in's own stdout goes nowhere.
-    fn link_with_test_stdout(s: &StandIn) -> (ProcessWorker, io::PipeWriter) {
-        let (reader, writer) = io::pipe().unwrap();
+    /// The stand-in `s` with piped stdin and stderr and the given stdout.
+    fn spawn_stand_in(s: &StandIn, stdout: Stdio) -> Child {
         let mut cmd = Command::new(&s.script);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped()).stdout(stdout).stderr(Stdio::piped());
         no_console_window(&mut cmd);
-        let mut child = cmd.spawn().unwrap();
+        cmd.spawn().unwrap()
+    }
+
+    /// A link around `child`, built as `launch` builds one (job, the three threads) minus the `ready` exchange, with
+    /// the stdin sink and the stdout source the test chooses.
+    fn link_around(s: &StandIn, mut child: Child, stdin: impl Write + Send + 'static, stdout: impl Read + Send + 'static) -> ProcessWorker {
         let job = job_object::assign(&child).unwrap();
         let ring = Arc::new(Mutex::new(VecDeque::new()));
-        let (stdin, lines, stderr_done) = start_threads(child.stdin.take().unwrap(), reader, child.stderr.take().unwrap(), ring.clone()).unwrap();
+        let (stdin, lines, stderr_done) = start_threads(stdin, stdout, child.stderr.take().unwrap(), ring.clone()).unwrap();
         let live = Live { child, stdin, lines, stderr_done, _job: job, exit: None };
-        (ProcessWorker { exe: s.script.clone(), threads: 4, startup: STARTUP_TIMEOUT, live: Some(live), ready: Some(valid()), stderr: ring, restarts: 0 }, writer)
+        ProcessWorker { exe: s.script.clone(), threads: 4, startup: STARTUP_TIMEOUT, live: Some(live), ready: Some(valid()), stderr: ring, restarts: 0 }
+    }
+
+    /// A link around the live stand-in `s` whose stdout is a pipe the TEST holds the write end of: the test ends
+    /// stdout by dropping the writer, while the child lives on, as a process that closes its stdout does. The
+    /// stand-in's own stdout goes nowhere; its stdin is the link's.
+    fn link_with_test_stdout(s: &StandIn) -> (ProcessWorker, io::PipeWriter) {
+        let (reader, writer) = io::pipe().unwrap();
+        let mut child = spawn_stand_in(s, Stdio::null());
+        let stdin = child.stdin.take().unwrap();
+        (link_around(s, child, stdin, reader), writer)
+    }
+
+    /// The link's stdin in `link_with_test_stdin`: the write end of a pipe whose read end the test holds. `_released`
+    /// disconnects when the link's writer thread lets go of it, which is only after that thread's request queue is
+    /// closed (`pump_stdin`'s `for` loop owns the queue and is left before its `stdin` parameter drops), so from then
+    /// on `send` finds the writer gone.
+    struct TestStdin { pipe: io::PipeWriter, _released: Sender<()> }
+    impl Write for TestStdin {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> { self.pipe.write(buf) }
+        fn flush(&mut self) -> io::Result<()> { self.pipe.flush() }
+    }
+
+    /// A link around the live stand-in `s` whose stdin is a pipe the TEST holds the read end of: the test breaks the
+    /// link's stdin by dropping that reader, while the child lives on, as a process that closes its stdin does. The
+    /// child's own stdin is returned as the barrier (`set /p` returns once it is written to); its stdout is the
+    /// link's, so its exit ends the link's stdout.
+    fn link_with_test_stdin(s: &StandIn) -> (ProcessWorker, io::PipeReader, std::process::ChildStdin, Receiver<()>) {
+        let (reader, writer) = io::pipe().unwrap();
+        let (released_tx, released) = channel();
+        let mut child = spawn_stand_in(s, Stdio::piped());
+        let barrier = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        (link_around(s, child, TestStdin { pipe: writer, _released: released_tx }, stdout), reader, barrier, released)
+    }
+
+    /// `send`, asserting it returned within its budget: zero (one poll of the process), plus the allowance.
+    fn send_timed(w: &mut ProcessWorker, id: &str) -> Result<(), WorkerLinkError> {
+        let t = Instant::now();
+        let got = w.send(&EngineMessage::Shutdown { id: id.into() });
+        let took = t.elapsed();
+        assert!(took <= ALLOWANCE, "send took {took:?} and returned {got:?}");
+        got
+    }
+
+    /// 18-Q1: `send` never waits for the worker. The link's stdin breaks while the child lives on, blocked on its own
+    /// stdin (the barrier). The writer thread ends at its first failed write, and the test waits for it to let go of
+    /// the pipe (a barrier with a liveness bound, not a sleep). Every `send` after that returns at once with an
+    /// unconfirmed `Eof`, which is not kept: once the child is released and exits, `recv` confirms `Exit{5}`, and
+    /// `send` answers that confirmed exit too.
+    #[test]
+    fn a_broken_stdin_is_reported_by_send_at_once_and_an_unconfirmed_exit_is_not_kept() {
+        let s = StandIn::new("stdin-breaks-first", &[WAIT.into(), "exit /b 5".into()]);
+        let (mut w, stdin_reader, mut barrier, released) = link_with_test_stdin(&s);
+        // The pipe carries requests until the test breaks it.
+        send_timed(&mut w, "1").unwrap();
+        let mut reader = BufReader::new(stdin_reader);
+        let mut first = Vec::new();
+        reader.read_until(b'\n', &mut first).unwrap();
+        assert_eq!(first, encode_request(&EngineMessage::Shutdown { id: "1".into() }).unwrap());
+        drop(reader); // the link's stdin is broken; the child is still blocked on `set /p`
+        send_timed(&mut w, "2").unwrap(); // queued: the writer thread's write of it fails, and the thread ends
+        assert_eq!(released.recv_timeout(Duration::from_secs(10)), Err(RecvTimeoutError::Disconnected), "the writer thread let go of the broken pipe");
+        assert!(matches!(send_timed(&mut w, "3"), Err(WorkerLinkError::Eof)), "a writer gone with the exit unconfirmed is Eof");
+        assert!(w.live.as_mut().unwrap().child.try_wait().unwrap().is_none(), "the child is alive: the Eof was rightly unconfirmed");
+        assert!(matches!(send_timed(&mut w, "4"), Err(WorkerLinkError::Eof)), "still unconfirmed, still at once");
+        // Release the barrier: the stand-in reads the line and exits 5; its stdout (the link's) ends with it.
+        barrier.write_all(b"go\r\n").unwrap();
+        drop(barrier);
+        // `recv` confirms the exit (10 s is a liveness bound; the child exits at once), and `send` then answers it.
+        match w.recv(Duration::from_secs(10)) { Err(WorkerLinkError::Exit { code: 5 }) => {}, other => panic!("expected the confirmed exit 5, got {other:?}") }
+        assert!(matches!(send_timed(&mut w, "5"), Err(WorkerLinkError::Exit { code: 5 })));
     }
 
     /// I1: one deadline governs the whole receive, exit confirmation included. Stdout ends while the child lives on,
@@ -673,19 +754,22 @@ mod stand_in_tests {
         assert!(matches!(w.send(&EngineMessage::Shutdown { id: "3".into() }), Err(WorkerLinkError::Exit { code: 5 })));
     }
 
-    /// Normal exits keep their confirmed codes (0 after `shutdown`, 3 the worker's writer fault), and a short budget
-    /// is enough once the process has exited: the test waits for the exit itself (the barrier), then every 10 ms
-    /// receive returns within its budget and the end of stdout is the confirmed `Exit{code}`, kept afterwards.
+    /// Normal exits keep their confirmed codes (0 after `shutdown`, 3 the worker's writer fault) through both calls,
+    /// each within its budget once the process has exited: the test waits for the exit itself (the barrier), then
+    /// `send` (budget zero) answers the confirmed `Exit{code}`, every 10 ms receive returns within its budget, the end
+    /// of stdout is the confirmed `Exit{code}`, and both calls keep answering it.
     #[test]
-    fn a_normal_exit_is_confirmed_with_its_code_within_a_short_receive_budget() {
+    fn a_normal_exit_is_confirmed_with_its_code_by_send_and_recv_within_their_budgets() {
         for code in [0, 3] {
             let s = StandIn::new(&format!("normal-exit-{code}"), &[echo_ready(valid()), WAIT.into(), format!("exit /b {code}")]);
             let mut w = ProcessWorker::spawn_with(&s.script, 4, STARTUP_TIMEOUT).unwrap();
             w.send(&EngineMessage::Shutdown { id: "1".into() }).unwrap(); // releases `set /p`
             let st = w.live.as_mut().unwrap().child.wait().unwrap();
             assert_eq!(st.code(), Some(code), "the stand-in exited");
+            assert!(matches!(send_timed(&mut w, "2"), Err(WorkerLinkError::Exit { code: c }) if c == code), "code {code}: send confirms the exit");
             match next_short(&mut w) { Err(WorkerLinkError::Exit { code: c }) if c == code => {}, other => panic!("code {code}: expected the confirmed exit, got {other:?}") }
             assert!(matches!(recv_short(&mut w), Err(WorkerLinkError::Exit { code: c }) if c == code), "code {code}: the confirmed exit is kept");
+            assert!(matches!(send_timed(&mut w, "3"), Err(WorkerLinkError::Exit { code: c }) if c == code), "code {code}: and send answers it");
         }
     }
 }
