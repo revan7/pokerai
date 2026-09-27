@@ -1044,13 +1044,15 @@ fn cap_branches_keeps_support_that_exists_only_in_overflow() {
     }
 }
 
-/// R3's rejection side: a merged mass whose exact weighted average is below the smallest positive
-/// `f64` (weight `2^-1074` merged into a residual of weight .5, mass .2: 0.4 of the smallest
-/// positive value) is unrepresentable support, not zero support -- rejected with a named
-/// assertion, as `condition` and `marginal` do, never left as a silent zero.
+/// R3's former rejection side, now kept at the floor (ruling 12-N1d, fix round 5). The case is a
+/// merged mass whose exact weighted average is below the smallest positive `f64`: weight
+/// `2^-1074` with mass .2 merged into a residual of weight .5, an average of 0.4 of the smallest
+/// positive value. That is unrepresentable support, not zero support. It is never left as a silent
+/// zero, and it is no longer rejected either: the residual keeps it at one representable unit.
+/// This input's own combo-0 marginal (`.2 * 2^-1074`) is already unrepresentable before the cap,
+/// so the before/after marginal check (N1b) does not apply to it.
 #[test]
-#[should_panic(expected = "cap_branches: residual seat Seat(0) mass[0] underflowed to 0 despite a positive branch weight and mass on some merged branch")]
-fn cap_branches_rejects_an_unrepresentable_merged_support() {
+fn cap_branches_keeps_an_unrepresentable_merged_support_at_one_unit() {
     let tiny = f64::from_bits(1);
     let branch = |id: u8, q: f64, m0: f64| {
         let mut mass = vec![1.0; 1326];
@@ -1072,6 +1074,11 @@ fn cap_branches_rejects_an_unrepresentable_merged_support() {
     residual.residual = true;
     bs.push(residual);
     cap_branches(&mut bs);
+    assert_eq!(bs.iter().filter(|b| !b.residual).count(), 4);
+    let r = bs.iter().find(|b| b.residual).expect("the existing residual absorbs the overflow");
+    assert_eq!((r.id, r.q), (5, 0.5));
+    assert_eq!(r.seats[0].mass[0], tiny, "the merged support is kept at one representable unit");
+    assert!(r.seats[0].mass[1..].iter().all(|&w| w == 1.0), "every other residual mass is unchanged");
 }
 
 /// With normalized weights a merge whose every weight is zero has no average to take (`0 / 0`);
@@ -1137,4 +1144,174 @@ fn cap_branches_merges_huge_masses_without_overflow() {
     let expected1 = (q4 * 5e300 + q5 * 6e300) / (q4 + q5);
     assert!(r.seats[0].mass[0].is_finite() && (r.seats[0].mass[0] / 1e300 - 1.0).abs() < 1e-12, "{}", r.seats[0].mass[0]);
     assert!(r.seats[0].mass[1].is_finite() && (r.seats[0].mass[1] / expected1 - 1.0).abs() < 1e-12, "{}", r.seats[0].mass[1]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// P3.T12 fix round 2 (task-12-rereview-1.md N1, ruling 12-N1): at the last subnormal unit the
+// correctly rounded residual mass can make the residual's own marginal product `q_R' * mass`
+// round to zero although the pre-cap marginal was the representable `5e-324`. The merge raises
+// such a mass by one representable step, so the cap never accepts a state that the next
+// `marginal`/`rescale` rejects.
+// ---------------------------------------------------------------------------------------------
+
+/// A one-seat branch with weight `q`, combo-0 mass `m0`, combo-1 mass `1 - m0` and mass 1 on
+/// every other combo, so every branch built here has the same per-seat total (the equal-total
+/// invariant).
+fn last_unit_branch(id: u8, q: f64, m0: f64) -> HistoryBranch {
+    let mut mass = vec![1.0; 1326];
+    mass[0] = m0;
+    mass[1] = 1.0 - m0;
+    HistoryBranch {
+        id,
+        parent: None,
+        split_by: None,
+        translated: vec![],
+        q,
+        residual: false,
+        stopped: None,
+        seats: vec![SeatMass { seat: Seat(0), node: None, mass }],
+    }
+}
+
+/// N1 shared check: the pre-cap combo-0 marginal is the representable `5e-324` and (some of) its
+/// support is merged by the cap. The cap must accept, give the residual combo-0 mass `expected_mass`
+/// (stepped above the correctly rounded average, which alone would round the marginal to zero), keep
+/// every marginal (combo 0 bit-equal and positive), and leave a list that `rescale` accepts with
+/// combo 0 still positive and reported as `f32::MIN_POSITIVE` at the output boundary.
+fn check_last_unit_cap(mut bs: Vec<HistoryBranch>, residual_id: u8, expected_mass: f64) {
+    let seat = Seat(0);
+    let before = marginal(&bs, seat);
+    assert_eq!(before[0], f64::from_bits(1), "the pre-cap combo-0 marginal is the representable 5e-324");
+
+    cap_branches(&mut bs);
+    assert_eq!(bs.iter().filter(|b| !b.residual).count(), 4);
+    let residual = bs.iter().find(|b| b.residual).expect("the cap leaves one residual");
+    assert_eq!(residual.id, residual_id);
+    let after = marginal(&bs, seat);
+    assert!(after[0] > 0.0, "combo 0 lost its only (merged) support across the cap");
+    assert_eq!(after[0], before[0], "combo-0 marginal");
+    assert_eq!(residual.seats[0].mass[0], expected_mass, "residual combo-0 mass");
+    for (c, (a, z)) in before.iter().zip(&after).enumerate() {
+        assert!((a - z).abs() <= 1e-12, "combo {c}: marginal moved from {a} to {z} across cap_branches");
+    }
+
+    let mut logs = vec![0.0; 6];
+    rescale(&mut bs, &mut logs);
+    assert!(logs[0].is_finite(), "log_reach {}", logs[0]);
+    let rescaled = marginal(&bs, seat);
+    assert!(rescaled[0] > 0.0, "combo 0 lost its support in the rescale after the cap");
+    assert_eq!(range_output(&rescaled).0[0], f32::MIN_POSITIVE, "positive reach stays positive at the output");
+}
+
+/// N1 (the re-review's reproduction): four live branches (`q = .1`, combo-0 mass 0), one overflow
+/// branch (`q = 2^-1074`, combo-0 mass .55) and an existing residual (`q = .4`, combo-0 mass 0).
+/// The correctly rounded average is `1.375 * 2^-1074 -> 2^-1074`, and `.4 * 2^-1074` rounds to 0;
+/// one step up (`2 * 2^-1074`, the old pairwise formula's value) keeps `.8 * 2^-1074 -> 5e-324`.
+#[test]
+fn cap_branches_keeps_the_residual_marginal_positive_at_the_last_subnormal_unit() {
+    let mut bs: Vec<HistoryBranch> = (0..4u8).map(|id| last_unit_branch(id, 0.1, 0.0)).collect();
+    bs.push(last_unit_branch(4, f64::from_bits(1), 0.55));
+    let mut residual = last_unit_branch(5, 0.4, 0.0);
+    residual.residual = true;
+    bs.push(residual);
+    check_last_unit_cap(bs, 5, f64::from_bits(2));
+}
+
+/// N1 grid case with the residual **created** by the cap: four live branches (`q = .1`, combo-0
+/// mass 0); the first overflow branch (`q = .095`, combo-0 mass 0) becomes the residual, and two
+/// more overflow branches (`q = 2^-1074` each, combo-0 masses .3 and .21) merge into it. The
+/// pre-cap combo-0 marginal is `.51 * 2^-1074 -> 5e-324`; the correctly rounded average
+/// `5.37 * 2^-1074 -> 5 * 2^-1074` gives `.475 * 2^-1074 -> 0`, so the mass steps to
+/// `6 * 2^-1074` (`.57 * 2^-1074 -> 5e-324`).
+#[test]
+fn cap_branches_keeps_a_created_residual_marginal_positive_at_the_last_subnormal_unit() {
+    let mut bs: Vec<HistoryBranch> = (0..4u8).map(|id| last_unit_branch(id, 0.1, 0.0)).collect();
+    bs.push(last_unit_branch(4, 0.095, 0.0));
+    bs.push(last_unit_branch(5, f64::from_bits(1), 0.3));
+    bs.push(last_unit_branch(6, f64::from_bits(1), 0.21));
+    check_last_unit_cap(bs, 4, f64::from_bits(6));
+}
+
+// ---------------------------------------------------------------------------------------------
+// P3.T12 fix round 3 (ruling 12-N1b): `cap_branches` compares every seat's pre-cap marginal with
+// its post-cap marginal, combo by combo. Where the pre-cap value is positive and the post-cap one
+// is zero, it steps the residual's mass up one representable unit at a time (at most 8 steps),
+// and rejects the cap if that cannot restore it, so no accepted cap panics in `marginal` later.
+// ---------------------------------------------------------------------------------------------
+
+/// N1b (the round-2 report's reproduction): the pre-cap combo-0 marginal is positive only because
+/// a live branch's share (`.18 * 2^-1074`) and the merged share (`.35 * 2^-1074`) add up to
+/// `.53 * 2^-1074 -> 5e-324`. Neither share is representable alone, so the round-2 residual-only
+/// check does not fire: the created residual (`q = .15`) gets the correctly rounded average
+/// `2.33 -> 2` units, and the post-cap sum `.18 + .30 = .48` units rounds to 0. One step (3 units,
+/// `.18 + .45 = .63`) restores it.
+#[test]
+fn cap_branches_keeps_a_live_plus_merged_marginal_positive() {
+    let mut bs: Vec<HistoryBranch> = (0..3u8).map(|id| last_unit_branch(id, 0.2, 0.0)).collect();
+    bs.push(last_unit_branch(3, 0.18, f64::from_bits(1)));
+    bs.push(last_unit_branch(4, 0.15, 0.0));
+    bs.push(last_unit_branch(5, f64::from_bits(1), 0.35));
+    check_last_unit_cap(bs, 4, f64::from_bits(3));
+}
+
+/// N1b rejection: the cap returns its list in id order, so a list that arrives out of order is
+/// summed in a different order after the cap. Here the combo-0 terms of `marginal`'s scaled
+/// accumulation are `T = 2^-375` (the half-unit tie: `.5 * 2^-1074`, branch 0) and two halves of
+/// `T`'s ulp (branches 1 and 2, `q = 2^-54`, mass `2^-1074`). In input order (1, 2, 0) the two
+/// halves add first and lift the sum above the tie, so the pre-cap marginal is `5e-324`. In id
+/// order (0, 1, 2) each half rounds away to even, so the post-cap sum is exactly the tie and
+/// rounds to 0. The residual's weight (`2^-60`) is so small that 8 steps of its combo-0 mass add at
+/// most `8 * 2^-434 < 2^-428`, which cannot move the sum off the tie, so the cap must reject
+/// through its named assertion, never hand back a list whose next `marginal` panics.
+#[test]
+#[should_panic(expected = "cap_branches: seat Seat(0) combo 0 marginal underflowed to 0 across the cap despite the positive pre-cap marginal")]
+fn cap_branches_rejects_a_marginal_that_residual_steps_cannot_restore() {
+    let tiny = f64::from_bits(1);
+    let mut residual = last_unit_branch(3, 2f64.powi(-60), 0.0);
+    residual.residual = true;
+    let mut bs = vec![
+        last_unit_branch(1, 2f64.powi(-54), tiny),
+        last_unit_branch(2, 2f64.powi(-54), tiny),
+        last_unit_branch(0, 0.5, tiny),
+        residual,
+    ];
+    assert_eq!(marginal(&bs, Seat(0))[0], tiny, "the pre-cap combo-0 marginal is the representable 5e-324");
+    cap_branches(&mut bs);
+    let _ = marginal(&bs, Seat(0));
+}
+
+/// Ruling 12-N1c (fix round 4): the unavoidable-support-loss assert runs after the N1b stepping.
+/// Taken from the round-3 live-plus-merged sweep, where the cap rejected it: live `q = .2, .2, .2,
+/// .16` (the `.16` branch with combo-0 mass `3 * 2^-1074`, a live share of `.48` units), a created
+/// residual (`q = .15`, combo-0 mass 0) and one merged branch (`q = 2^-1074`, combo-0 mass .06).
+/// The merged average `.06 / .15 = .4` units rounds to 0, but the pre-cap marginal `.48 + .06 = .54`
+/// units is the representable `5e-324`, and the post-cap `.48` units rounds to 0. One N1b step
+/// (residual mass `2^-1074`, share `.15`, sum `.63` units) restores both the marginal and the
+/// residual's support, so the cap must accept. Since fix round 5 (ruling 12-N1d), the merge's
+/// one-unit floor reaches the same mass before any stepping, and the post-cap sum is already
+/// positive, so no step is taken.
+#[test]
+fn cap_branches_steps_a_lost_merged_support_back_before_rejecting() {
+    let mut bs: Vec<HistoryBranch> = (0..3u8).map(|id| last_unit_branch(id, 0.2, 0.0)).collect();
+    bs.push(last_unit_branch(3, 0.16, f64::from_bits(3)));
+    bs.push(last_unit_branch(4, 0.15, 0.0));
+    bs.push(last_unit_branch(5, f64::from_bits(1), 0.06));
+    check_last_unit_cap(bs, 4, f64::from_bits(1));
+}
+
+/// Ruling 12-N1d (fix round 5): a merged support whose average rounds to zero is kept at one
+/// representable unit instead of rejecting the cap. This case comes from the round-4 sweep's
+/// rejected set (`ql .17, k 3, qr .05, j 1, m .02`). Live `q = .2, .2, .2, .17` (the `.17` branch
+/// with combo-0 mass `3 * 2^-1074`, a live share of `.51` units, representable on its own), a
+/// created residual (`q = .05`, combo-0 mass 0) and one merged branch (`q = 2^-1074`, combo-0 mass
+/// .02). The merged average `.02 / .05 = .4` units rounds to 0. The post-cap marginal is already
+/// positive from the live share, so N1b never steps. The residual mass becomes `2^-1074` (share
+/// `.05` units), and the post-cap sum `.56` units stays `5e-324`.
+#[test]
+fn cap_branches_keeps_merged_support_at_one_unit_beside_representable_live_reach() {
+    let mut bs: Vec<HistoryBranch> = (0..3u8).map(|id| last_unit_branch(id, 0.2, 0.0)).collect();
+    bs.push(last_unit_branch(3, 0.17, f64::from_bits(3)));
+    bs.push(last_unit_branch(4, 0.05, 0.0));
+    bs.push(last_unit_branch(5, f64::from_bits(1), 0.02));
+    check_last_unit_cap(bs, 4, f64::from_bits(1));
 }

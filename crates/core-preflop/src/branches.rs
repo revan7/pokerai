@@ -404,7 +404,8 @@ pub fn range_output(r: &[f64]) -> Range1326 {
 /// marginal `r_S[c] = sum_k q_k * w_{S,k}[c]` unchanged: the merged terms are regrouped, never
 /// dropped or renormalized away. It is evaluated with normalized weights `q_i / q_R'` (see
 /// [`merge_into_residual`]), never through the products `q_i * w_i[c]`, so a combo whose only
-/// support lies in the merged branches keeps a representable positive mass. A stopped branch
+/// support lies in the merged branches keeps a representable positive mass, and a positive pre-cap
+/// marginal keeps a positive residual product `q_R' * w_R'[c]`. A stopped branch
 /// (spec section 9.3, `stopped: Some(reason)`) is not otherwise distinguished from a live one
 /// here -- it keeps its rank by `q` and can itself be merged into the residual on a later
 /// overflow, at which point its `stopped` reason is dropped (the residual carries no reason of its
@@ -416,14 +417,27 @@ pub fn range_output(r: &[f64]) -> Range1326 {
 /// the residual last (if any); `bs` is otherwise unchanged when there are 4 or fewer live branches
 /// (nothing overflows).
 ///
+/// Every seat's marginal is then compared, combo by combo, before and after the cap (ruling
+/// 12-N1b, [`restore_positive_marginals`]). A combo whose pre-cap marginal is positive but whose
+/// post-cap marginal is zero gets its residual mass raised one representable step at a time, at
+/// most [`MAX_RESIDUAL_STEPS`] times. If that does not restore it, the cap is rejected. An
+/// accepted cap therefore never leaves a positive reach that the next [`marginal`] or [`rescale`]
+/// rejects. A supported merged combo whose average rounded to zero keeps its support at one
+/// representable unit, `f64::from_bits(1)` (ruling 12-N1d; see [`merge_into_residual`]), rather
+/// than being lost. Only after the stepping does the terminal support check run
+/// ([`check_support_kept`], ruling 12-N1c); after the floor it is unreachable through the merge.
+///
 /// # Panics
 /// Always, if more than one input branch is already marked residual, any branch's weight is not a
 /// finite value in `[0, 1]`, any seat's masses are not 1326 finite non-negative values, a merged
 /// branch's seats do not line up with the residual's, a merged residual mass is not finite and
-/// non-negative, a positively supported merged mass underflows to zero (there is no
-/// positive-reach threshold, so an unrepresentable average is an error rather than a silent
-/// zero), or the total `q` across every branch moves by more than [`MASS_TOLERANCE`] (relative)
-/// across the cap -- the merge only ever regroups existing mass, never creates or drops it.
+/// non-negative, the residual's product `q_R' * w_R'[c]` stays zero where the pre-cap contribution
+/// of the residual and merged branches was positive, a seat's positive pre-cap marginal is still
+/// zero after the cap and [`MAX_RESIDUAL_STEPS`] steps of the residual's mass, a positively
+/// supported merged mass is not positive after that stepping (the terminal support check; the
+/// one-unit floor keeps it unreachable through the merge), or the total `q` across
+/// every branch moves by more than [`MASS_TOLERANCE`] (relative) across the cap -- the merge only
+/// ever regroups existing mass, never creates or drops it.
 pub fn cap_branches(bs: &mut Vec<HistoryBranch>) {
     for b in bs.iter() {
         validate_branch_weight(b, "cap_branches");
@@ -434,6 +448,17 @@ pub fn cap_branches(bs: &mut Vec<HistoryBranch>) {
     let residual_count = bs.iter().filter(|b| b.residual).count();
     assert!(residual_count <= 1, "cap_branches: {residual_count} branches are already marked residual, expected at most 1");
     let before: f64 = bs.iter().map(|b| b.q).sum();
+    // Ruling 12-N1b: every seat's pre-cap marginal, accumulated exactly as `marginal` does, over
+    // the input list in its input order.
+    let mut seats: Vec<Seat> = Vec::new();
+    for b in bs.iter() {
+        for s in &b.seats {
+            if !seats.contains(&s.seat) {
+                seats.push(s.seat);
+            }
+        }
+    }
+    let pre_cap: Vec<Vec<f64>> = seats.iter().map(|&seat| (0..COMBOS).map(|c| marginal_at(bs, seat, c)).collect()).collect();
 
     let mut live = Vec::new();
     let mut residual: Option<HistoryBranch> = None;
@@ -459,9 +484,10 @@ pub fn cap_branches(bs: &mut Vec<HistoryBranch>) {
         });
     }
     let merged: Vec<HistoryBranch> = overflow.collect();
+    let mut lost = Vec::new();
     if let Some(r) = &mut residual {
         if !merged.is_empty() {
-            merge_into_residual(r, &merged);
+            lost = merge_into_residual(r, &merged);
         }
     }
     live.sort_by_key(|b| b.id);
@@ -469,12 +495,80 @@ pub fn cap_branches(bs: &mut Vec<HistoryBranch>) {
     if let Some(r) = residual {
         bs.push(r);
     }
+    restore_positive_marginals(bs, &seats, &pre_cap);
+    check_support_kept(bs, &lost);
 
     let after: f64 = bs.iter().map(|b| b.q).sum();
     assert!(
         (after - before).abs() <= MASS_TOLERANCE * before.max(1.0),
         "cap_branches: total branch weight moved from {before} to {after}, outside MASS_TOLERANCE"
     );
+}
+
+/// The most one-unit steps [`restore_positive_marginals`] applies to one residual mass before it
+/// rejects the cap (ruling 12-N1b).
+const MAX_RESIDUAL_STEPS: u32 = 8;
+
+/// [`marginal`]'s scaled accumulation for one seat and combo, without its checks:
+/// `sum_k (q_k * 2^350) * (w_{S,k}[c] * 2^350) / 2^700` over `bs` in list order, where branches
+/// without the seat contribute nothing. It performs the same operations in the same order as
+/// [`marginal`], so for a list that passes [`marginal`]'s checks the result is bit-identical to
+/// `marginal(bs, seat)[c]`. The caller validates the weights and masses first.
+fn marginal_at(bs: &[HistoryBranch], seat: Seat, c: usize) -> f64 {
+    let scale_half = pow2(350);
+    let mut scaled = 0.0_f64;
+    for b in bs {
+        if let Some(s) = b.seats.iter().find(|s| s.seat == seat) {
+            scaled += (b.q * scale_half) * (s.mass[c] * scale_half);
+        }
+    }
+    scaled / (scale_half * scale_half)
+}
+
+/// The before/after marginal check of [`cap_branches`] (ruling 12-N1b), run on the capped list
+/// `bs`. For each seat in `seats` and each combo whose pre-cap marginal (`pre_cap`, from
+/// [`marginal_at`] over the input list) is positive, the post-cap marginal is recomputed the same
+/// way over `bs`, which is the order [`marginal`] will see. Where it is zero, the residual's mass
+/// for that seat and combo is raised one representable step at a time (`f64::from_bits(bits + 1)`),
+/// at most [`MAX_RESIDUAL_STEPS`] times, until the post-cap marginal is positive.
+///
+/// The post-cap sum can differ from the pre-cap one in two ways:
+/// - the residual's rounded share, which [`merge_into_residual`]'s first-order step and one more
+///   step here cover;
+/// - the order of the sum, since the capped list is in `id` order. At the half-unit rounding tie
+///   this can change the rounded result, and each step adds only `q_R'` times one unit of the
+///   residual's mass, so a tiny residual weight may not restore it.
+///
+/// Rejecting in that last case keeps an accepted cap from ever handing [`marginal`] a positive
+/// pre-cap reach that it would then find at zero.
+///
+/// # Panics
+/// Always, naming the seat, the combo and the pre-cap marginal, if the post-cap marginal is still
+/// zero after the steps, or if there is no residual holding the seat to step.
+fn restore_positive_marginals(bs: &mut [HistoryBranch], seats: &[Seat], pre_cap: &[Vec<f64>]) {
+    let residual = bs.iter().position(|b| b.residual);
+    for (&seat, pre) in seats.iter().zip(pre_cap) {
+        let slot = residual.and_then(|r| bs[r].seats.iter().position(|s| s.seat == seat).map(|i| (r, i)));
+        for (c, &before) in pre.iter().enumerate() {
+            if !(before > 0.0) {
+                continue;
+            }
+            let mut after = marginal_at(bs, seat, c);
+            let mut steps = 0_u32;
+            if let Some((r, i)) = slot {
+                while after == 0.0 && steps < MAX_RESIDUAL_STEPS {
+                    let w = &mut bs[r].seats[i].mass[c];
+                    *w = f64::from_bits(w.to_bits() + 1);
+                    steps += 1;
+                    after = marginal_at(bs, seat, c);
+                }
+            }
+            assert!(
+                after > 0.0,
+                "cap_branches: seat {seat:?} combo {c} marginal underflowed to 0 across the cap despite the positive pre-cap marginal {before} (the residual's mass was raised {steps} of at most {MAX_RESIDUAL_STEPS} representable steps without restoring it; the exact marginal lies at the half-unit rounding boundary of the smallest representable positive f64)"
+            );
+        }
+    }
 }
 
 /// Folds every branch of `merged` into the residual `r` in one step (spec section 8.4):
@@ -488,19 +582,38 @@ pub fn cap_branches(bs: &mut Vec<HistoryBranch>) {
 /// sum -- the same technique as [`marginal`]'s scaled accumulation -- so every term keeps full
 /// precision and only the final result rounds. If that scaled sum overflows (masses above about
 /// `2^673`, far outside a rescaled replay), the unscaled normalized weights are used instead: at
-/// that magnitude no term is anywhere near the underflow range. Whether a combo has support is
+/// that magnitude no term is anywhere near the underflow range. The fallback is not
+/// overflow-proof: with masses near `f64::MAX`, normalized weights that round to a sum just above
+/// 1 can still overflow to infinity, which the finite-value assertion rejects, as it rejected the
+/// old pairwise formula's overflows. Such masses already lie outside [`marginal`]'s own domain,
+/// whose scaled products overflow above about `2^674`. Whether a combo has support is
 /// decided from the operands (`q_i > 0` and `w_i[c] > 0` for some `i`), never from the computed
-/// sum, and a supported combo whose exact average is below the smallest positive `f64` is rejected
-/// with a named assertion, as [`condition`] and [`marginal`] do.
+/// sum. A supported combo whose exact average is below the smallest positive `f64` is not a silent
+/// zero and is not rejected either: it keeps its support at one representable unit,
+/// `f64::from_bits(1)` (ruling 12-N1d). Positive reach is valid at any magnitude, with no
+/// threshold (spec section 9.3), and this overstates the average by at most one unit.
+///
+/// A representable average does not by itself keep the marginal representable: at the last
+/// subnormal unit, the correctly rounded mass times `q_R' < 1` can round to zero while the pre-cap
+/// contribution of the residual and merged branches, `sum_i q_i * w_i[c]` accumulated exactly as
+/// [`marginal`] does, is positive. The mass is then raised by one representable step, which always
+/// suffices (the stepped product is at least that contribution plus `q_R' / 2` subnormal units),
+/// and an always-on assertion checks that the residual's product is positive wherever that
+/// contribution is.
 ///
 /// When every weight is zero the average is undefined, and no term contributes to any marginal:
 /// the residual keeps its own masses (the regroup is exact either way) and weight 0.
 ///
+/// Returns the `(seat index, combo)` pairs of the residual whose merged average underflowed to
+/// zero despite a positive weight and mass on some merged branch, each now held at one unit.
+/// After the N1b stepping, [`cap_branches`] re-checks them with its terminal support assertion
+/// ([`check_support_kept`], ruling 12-N1c).
+///
 /// # Panics
 /// Always, naming the seat and combo, if a merged branch's seats do not line up with the
-/// residual's, a merged mass is not finite and non-negative, or a positively supported merged mass
-/// underflows to zero.
-fn merge_into_residual(r: &mut HistoryBranch, merged: &[HistoryBranch]) {
+/// residual's, a merged mass is not finite and non-negative, or a positive pre-cap marginal
+/// contribution leaves the residual's product `q_R' * mass` at zero after the one-step raise.
+fn merge_into_residual(r: &mut HistoryBranch, merged: &[HistoryBranch]) -> Vec<(usize, usize)> {
     for b in merged {
         assert_eq!(
             r.seats.len(),
@@ -523,35 +636,83 @@ fn merge_into_residual(r: &mut HistoryBranch, merged: &[HistoryBranch]) {
     let total: f64 = weights.iter().sum();
     r.q = total;
     if total == 0.0 {
-        return;
+        return Vec::new();
     }
     let scale = pow2(350);
     let normalized: Vec<f64> = weights.iter().map(|q| q / total).collect();
     let normalized_scaled: Vec<f64> = weights.iter().map(|q| q * scale / total).collect();
+    // `marginal`'s own scaled factors: `(q * 2^350) * (w * 2^350) / 2^700` per term.
+    let weights_scaled: Vec<f64> = weights.iter().map(|q| q * scale).collect();
+    let denom = scale * scale;
+    let residual_product = |mass: f64| (total * scale) * (mass * scale) / denom;
+    let mut lost = Vec::new();
     for index in 0..r.seats.len() {
         let seat = r.seats[index].seat;
         for c in 0..COMBOS {
             let own = r.seats[index].mass[c];
             let masses = std::iter::once(own).chain(merged.iter().map(|b| b.seats[index].mass[c]));
-            let (mut scaled, mut plain, mut supported) = (0.0_f64, 0.0_f64, false);
+            let (mut scaled, mut plain, mut contribution, mut supported) = (0.0_f64, 0.0_f64, 0.0_f64, false);
             for (i, w) in masses.enumerate() {
                 if weights[i] > 0.0 && w > 0.0 {
                     supported = true;
                 }
                 scaled += normalized_scaled[i] * w;
                 plain += normalized[i] * w;
+                contribution += weights_scaled[i] * (w * scale);
             }
-            let mass = if scaled.is_finite() { scaled / scale } else { plain };
+            let mut mass = if scaled.is_finite() { scaled / scale } else { plain };
             assert!(
                 mass.is_finite() && mass >= 0.0,
                 "cap_branches: residual seat {seat:?} mass[{c}] merged to {mass}, not a finite non-negative value"
             );
+            // N1: the pre-cap marginal contribution of the residual plus the merged branches,
+            // exactly as `marginal` accumulates it. Where it is positive but the residual's own
+            // product `q_R' * mass` rounds to zero (a correctly rounded mass at the last subnormal
+            // unit with `q_R' < 1`), one representable step up restores it: the stepped product
+            // is at least `p + q_R' / 2` subnormal units, so it cannot round to zero when `p` did
+            // not.
+            let pre_cap = contribution / denom;
+            if pre_cap > 0.0 && residual_product(mass) == 0.0 {
+                mass = f64::from_bits(mass.to_bits() + 1);
+            }
             assert!(
-                mass > 0.0 || !supported,
-                "cap_branches: residual seat {seat:?} mass[{c}] underflowed to 0 despite a positive branch weight and mass on some merged branch (the exact weighted average is smaller than the smallest representable positive f64)"
+                residual_product(mass) > 0.0 || !(pre_cap > 0.0),
+                "cap_branches: residual seat {seat:?} mass[{c}] = {mass} at weight {total} contributes 0 to the marginal despite the positive pre-cap contribution {pre_cap} of the residual and merged branches"
             );
+            // Ruling 12-N1d: a supported combo whose average rounded to 0 keeps its support at one
+            // representable unit rather than losing it. Positive reach is valid at any magnitude,
+            // with no threshold, and this overstates the average by at most one unit. Ruling 12-N1c:
+            // [`cap_branches`] re-checks these pairs, after the N1b stepping, with the terminal
+            // support assertion.
+            if mass == 0.0 && supported {
+                mass = f64::from_bits(1);
+                lost.push((index, c));
+            }
             r.seats[index].mass[c] = mass;
         }
+    }
+    lost
+}
+
+/// The terminal support check of [`cap_branches`], run after the N1b stepping
+/// ([`restore_positive_marginals`], ruling 12-N1c). `lost` lists the residual's `(seat index,
+/// combo)` pairs whose merged average underflowed to zero despite a positive branch weight and
+/// mass on some merged branch. [`merge_into_residual`] has already held each of them at one unit
+/// (ruling 12-N1d), and stepping only raises masses, so each must hold a positive mass. Through the
+/// merge this check is unreachable; it stays as the invariant's always-on guard.
+///
+/// # Panics
+/// Always, naming the seat and combo, if one of them is not positive: there is no positive-reach
+/// threshold, so lost support is an error rather than a silent zero.
+fn check_support_kept(bs: &[HistoryBranch], lost: &[(usize, usize)]) {
+    let Some(r) = bs.iter().find(|b| b.residual) else { return };
+    for &(index, c) in lost {
+        let s = &r.seats[index];
+        assert!(
+            s.mass[c] > 0.0,
+            "cap_branches: residual seat {:?} mass[{c}] underflowed to 0 despite a positive branch weight and mass on some merged branch (the exact weighted average is smaller than the smallest representable positive f64)",
+            s.seat
+        );
     }
 }
 
