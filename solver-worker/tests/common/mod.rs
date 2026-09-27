@@ -52,5 +52,10 @@ impl Drop for Worker { fn drop(&mut self) { if self.child.try_wait().ok().flatte
 
 pub fn fixture_lines(name: &str) -> Vec<String> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/worker").join(format!("{name}.jsonl"));
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e} (run tools/gen_worker_fixtures.py)", path.display())).lines().filter(|l| !l.trim().is_empty()).map(String::from).collect()
+    let hint = if name.starts_with("basic_") {
+        "run: cargo run --release -p solver-worker --example gen_basic_fixture"
+    } else {
+        "run: tools/gen_worker_fixtures.py"
+    };
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e} ({})", path.display(), hint)).lines().filter(|l| !l.trim().is_empty()).map(String::from).collect()
 }
