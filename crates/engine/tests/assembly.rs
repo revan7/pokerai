@@ -46,6 +46,20 @@ fn recommendation_assembly_golden() {
     let mut v = vec![adv(Action::Fold, Some(0.3), Some(0.0), None), adv(Action::Call, Some(0.5), Some(2.0), None)];
     assert_eq!(headline(&mut v, 0.2, HeadlineSource::Chart), None);
     assert!(v.iter().all(|a| !a.headline));
+    // (3b) the same case at the payload boundary: the known frequencies with the unresolved share
+    // rendered, from the assembly's own known-mass input (see `unresolved_share_input`)
+    let known = unresolved_share_input();
+    let mut rows = known.actions.clone();
+    assert_eq!(headline(&mut rows, 0.0, HeadlineSource::Chart).as_deref(), Some("highest-frequency action, EV incomplete"), "with nothing unresolved these rows would be headlined");
+    let rec3 = final_from_known_mass(&c, known.clone(), Coverage::Exact, HeadlineSource::Chart, engine::assumptions_stub());
+    assert_eq!(rec3.phase, Phase::Final);
+    assert_eq!(rec3.actions, known.actions, "known masses, no EV and the reasons they lack one, no headline flag");
+    assert_eq!(rec3.unresolved_mass, 0.25);
+    assert_eq!(rec3.actions.iter().map(|a| f64::from(a.frequency.unwrap())).sum::<f64>() + f64::from(rec3.unresolved_mass), 1.0);
+    assert!(rec3.assumptions.notes.iter().all(|s| !s.starts_with("headline:")), "{:?}", rec3.assumptions.notes);
+    assert_eq!(rec3.assumptions.notes.iter().filter(|s| *s == "25.0% of the posterior has no strategy").count(), 1, "{:?}", rec3.assumptions.notes);
+    assert_eq!((&rec3.range_mix, &rec3.coverage), (&known.range_mix, &Coverage::Approximate { reasons: known.reasons.clone() }));
+    record.insert("unresolved_share".into(), serde_json::to_value(&rec3).unwrap());
     // reason accumulation: never removed, Exact upgrades to Approximate, Unsupported keeps partial
     let acc = accumulate(Coverage::Approximate { reasons: vec![ApproxReason::ChartRounded] }, vec![ApproxReason::DeadlineBestSoFar { reached_bp: 190, target_bp: 50 }]);
     assert!(matches!(&acc, Coverage::Approximate { reasons } if reasons.len() == 2));
@@ -74,7 +88,60 @@ fn recommendation_assembly_golden() {
     golden::check("recommendation_assembly_golden", &serde_json::Value::Object(record));
 }
 
+/// The golden's unresolved-share input. The assembly does not consume `core_preflop::MixedNode`
+/// in this build (the engine gains `core-preflop` with P3.T17), so this is the assembly's own input
+/// type, `KnownMass`, which carries `MixedNode`'s advice fields one for one. Its values are what
+/// `mix_nodes` returns for hero's combo in this chart spot: branch A (after a villain raise
+/// translated to menu size A) holds 0.75 of hero's posterior and a chart node giving the combo fold /
+/// call / raise 0.25 / 0.25 / 0.5; branch B holds 0.25 and has no node. So each frequency is the
+/// known mass 0.75 times the chart's, no action has an EV (a chart) or full branch support
+/// (`BranchSupportIncomplete { covered_posterior: 0 }`), `unresolved_mass` is 0.25, the reasons are
+/// `ChartRounded` and `BranchResidual` at 25% naming B's key, and the notes are the range mix's
+/// excluded share (hero has not acted since the split, so B holds 0.25 of the public mass) and the
+/// unresolved share. The frequencies, the unresolved mass and both percentages are exact binary
+/// fractions, so `mix_nodes`' `f64` arithmetic produces them exactly; the range mix stands for the
+/// public range's own mix over branch A.
+fn unresolved_share_input() -> KnownMass {
+    let incomplete = || Some(Unavailable::BranchSupportIncomplete { covered_posterior: 0.0 });
+    KnownMass {
+        actions: vec![adv(Action::Fold, Some(0.1875), None, incomplete()), adv(Action::Call, Some(0.1875), None, incomplete()), adv(Action::Raise { to: 150 }, Some(0.375), None, incomplete())],
+        unresolved_mass: 0.25,
+        range_mix: Some(vec![(Action::Fold, 0.5), (Action::Call, 0.25), (Action::Raise { to: 150 }, 0.25)]),
+        reasons: vec![ApproxReason::ChartRounded, ApproxReason::BranchResidual { seat: Seat(3), residual_mass_pct: 25.0, cause: "missing node kB".into() }],
+        notes: vec!["range mix excludes 25.0% of hero's public range mass (no strategy)".into(), "25.0% of the posterior has no strategy".into()],
+    }
+}
+
 // --- Beyond the golden: the rest of the assembly surface ------------------------------------------
+
+#[test]
+#[should_panic(expected = "no note renders")]
+fn a_known_mass_final_refuses_an_unresolved_share_it_cannot_render() {
+    // The share note must state this share: one that names another percentage does not render it.
+    let mut known = unresolved_share_input();
+    known.notes[1] = "2.5% of the posterior has no strategy".into();
+    final_from_known_mass(&ctx(), known, Coverage::Exact, HeadlineSource::Chart, engine::assumptions_stub());
+}
+
+#[test]
+#[should_panic(expected = "sum to")]
+fn a_known_mass_final_refuses_masses_that_do_not_add_up() {
+    // sum(frequency) + unresolved_mass = 1 (spec 4.4): a dropped action is caught, not renormalized.
+    let mut known = unresolved_share_input();
+    known.actions.pop();
+    final_from_known_mass(&ctx(), known, Coverage::Exact, HeadlineSource::Chart, engine::assumptions_stub());
+}
+
+#[test]
+fn a_known_mass_final_without_unresolved_mass_is_headlined_by_the_one_rule() {
+    // With the whole posterior covered the same assembly labels a frequency headline as usual.
+    let rows = vec![adv(Action::Fold, Some(0.25), None, Some(Unavailable::ChartNoEv)), adv(Action::Call, Some(0.25), None, Some(Unavailable::ChartNoEv)), adv(Action::Raise { to: 150 }, Some(0.5), None, Some(Unavailable::ChartNoEv))];
+    let known = KnownMass { actions: rows, unresolved_mass: 0.0, range_mix: Some(vec![(Action::Fold, 0.5), (Action::Call, 0.25), (Action::Raise { to: 150 }, 0.25)]), reasons: vec![ApproxReason::ChartRounded], notes: vec![] };
+    let rec = final_from_known_mass(&ctx(), known, Coverage::Exact, HeadlineSource::Chart, engine::assumptions_stub());
+    assert_eq!(who(&rec.actions), Some(Action::Raise { to: 150 }));
+    assert_eq!(rec.assumptions.notes, vec!["headline: highest-frequency chart action".to_string()]);
+    assert_eq!((rec.unresolved_mass, rec.coverage), (0.0, Coverage::Approximate { reasons: vec![ApproxReason::ChartRounded] }));
+}
 
 fn rows(pairs: &[(usize, &[f32])], width: usize) -> Vec<Vec<f32>> {
     let mut m = vec![vec![0.0; width]; 1326];
@@ -171,14 +238,22 @@ fn a_tree_action_outside_the_legal_intervals_keeps_its_frequency_without_ev() {
 }
 
 #[test]
-fn no_range_mix_when_hero_range_has_no_reach_at_the_node() {
+fn zero_reach_keeps_the_range_mix_present_with_zero_entries_and_the_no_reach_note() {
+    // Spec 4.4: `range_mix` is present whenever a node strategy exists (ruling 26-I2). With no
+    // available combo reached it holds zero entries, and the note says it is not a strategy.
     let c = ctx();
     let other = combo_index(Card::parse("Kh").unwrap(), Card::parse("Kd").unwrap()) as usize;
     let n = node(&[(other, [0.0, 1.0, 0.0], [0.0, 5.0, 0.0])]);
     let rec = final_from_solution(&c, &n, &vec![0.0f32; 1326], Coverage::Approximate { reasons: vec![ApproxReason::ChartRounded] }, empty_assumptions("river_std_v1"));
     assert_eq!(rec.coverage, Coverage::Unsupported { reason: UnsupportedReason::HeroComboOutOfSupport, partial: vec![ApproxReason::ChartRounded] });
-    assert_eq!(rec.range_mix, None);
-    assert!(rec.assumptions.notes.iter().any(|s| s.contains("no reach")), "{:?}", rec.assumptions.notes);
+    assert_eq!(rec.range_mix, Some(vec![(Action::Fold, 0.0), (Action::Call, 0.0), (Action::Raise { to: 150 }, 0.0)]));
+    let no_reach: Vec<&String> = rec.assumptions.notes.iter().filter(|s| s.contains("no reach")).collect();
+    assert_eq!(no_reach.len(), 1, "{:?}", rec.assumptions.notes);
+    assert!(no_reach[0].contains("not a strategy"), "{:?}", no_reach[0]);
+    // A node with reach carries no such note.
+    let reached = final_from_solution(&c, &n, &vec![1.0f32; 1326], Coverage::Exact, empty_assumptions("river_std_v1"));
+    assert_eq!(reached.range_mix.as_ref().unwrap()[1], (Action::Call, 1.0));
+    assert!(reached.assumptions.notes.iter().all(|s| !s.contains("no reach")), "{:?}", reached.assumptions.notes);
 }
 
 #[test]
@@ -196,6 +271,59 @@ fn equity_merge_never_unsettles_an_estimate() {
     // a seat not shown yet is added
     merge_equity(&mut rec, &EquitySummary { hero_combo_vs_each: vec![(Seat(3), est(Availability::Ready, Some(0.7)))], hero_range_vs_each: vec![], per_pot_shares: vec![] });
     assert_eq!(rec.equity.hero_combo_vs_each.len(), 2);
+}
+
+fn est(availability: Availability, value: Option<f32>) -> EquityEstimate { EquityEstimate { method: value.map(|_| EquityMethod::Exact), value, availability } }
+fn gone() -> Availability { Availability::Unavailable { reason: "equity budget exceeded".into() } }
+fn pot(pot_index: u8, shares: Vec<(Seat, EquityEstimate)>) -> PotShares { PotShares { pot_index, population: POT_SHARES_POPULATION.into(), shares } }
+fn only_pots(per_pot_shares: Vec<PotShares>) -> EquitySummary { EquitySummary { hero_combo_vs_each: vec![], hero_range_vs_each: vec![], per_pot_shares } }
+
+#[test]
+fn per_pot_equity_merges_by_pot_and_seat_and_never_unsettles_a_share() {
+    // Ruling 26-I1: a per-pot share is an `EquityEstimate` like the pairwise ones, so the same
+    // ordering holds (Pending never replaces Ready or Unavailable; Unavailable never replaces Ready),
+    // pots match by `pot_index`, shares by seat, and whatever an event omits is kept.
+    let mut rec = unsupported(&ctx(), UnsupportedReason::MultiwayEv { pot_eligible: 3 }, vec![], empty_assumptions(""));
+    merge_equity(&mut rec, &only_pots(vec![
+        pot(0, vec![(Seat(0), est(Availability::Ready, Some(0.61))), (Seat(2), est(Availability::Pending, None)), (Seat(4), est(gone(), None))]),
+        pot(1, vec![(Seat(0), est(Availability::Ready, Some(0.4)))]),
+    ]));
+    let settled = rec.equity.per_pot_shares.clone();
+    assert_eq!(settled.len(), 2);
+    // Ready followed by Pending, and by Unavailable: the Ready share stays.
+    merge_equity(&mut rec, &only_pots(vec![pot(0, vec![(Seat(0), est(Availability::Pending, None))])]));
+    assert_eq!(rec.equity.per_pot_shares, settled);
+    merge_equity(&mut rec, &only_pots(vec![pot(0, vec![(Seat(0), est(gone(), None))]), pot(1, vec![(Seat(0), est(gone(), None))])]));
+    assert_eq!(rec.equity.per_pot_shares, settled);
+    // Unavailable followed by Pending: the Unavailable answer stays.
+    merge_equity(&mut rec, &only_pots(vec![pot(0, vec![(Seat(4), est(Availability::Pending, None))])]));
+    assert_eq!(rec.equity.per_pot_shares, settled);
+    // A subset update: seat 2 of the main pot settles; seat 0 and seat 4 of the main pot and the whole
+    // side pot are kept; a pot not shown yet is added after the ones shown.
+    merge_equity(&mut rec, &only_pots(vec![pot(2, vec![(Seat(4), est(Availability::Pending, None))]), pot(0, vec![(Seat(2), est(Availability::Ready, Some(0.2)))])]));
+    assert_eq!(rec.equity.per_pot_shares, vec![
+        pot(0, vec![(Seat(0), est(Availability::Ready, Some(0.61))), (Seat(2), est(Availability::Ready, Some(0.2))), (Seat(4), est(gone(), None))]),
+        pot(1, vec![(Seat(0), est(Availability::Ready, Some(0.4)))]),
+        pot(2, vec![(Seat(4), est(Availability::Pending, None))]),
+    ]);
+    // A seat not shown yet in a known pot is added to that pot.
+    merge_equity(&mut rec, &only_pots(vec![pot(1, vec![(Seat(5), est(Availability::Ready, Some(0.1)))])]));
+    assert_eq!(rec.equity.per_pot_shares[1], pot(1, vec![(Seat(0), est(Availability::Ready, Some(0.4))), (Seat(5), est(Availability::Ready, Some(0.1)))]));
+    // An event with no per-pot shares leaves every pot as it is.
+    let before = rec.equity.per_pot_shares.clone();
+    merge_equity(&mut rec, &engine::equity::pending_summary(&[Seat(0)]));
+    assert_eq!(rec.equity.per_pot_shares, before);
+}
+
+#[test]
+#[should_panic(expected = "pot 0")]
+fn per_pot_merge_refuses_a_pot_measured_over_another_population() {
+    // A pot's shares all describe one population; a share from another one cannot be merged into it.
+    let mut rec = unsupported(&ctx(), UnsupportedReason::MultiwayEv { pot_eligible: 3 }, vec![], empty_assumptions(""));
+    merge_equity(&mut rec, &only_pots(vec![pot(0, vec![(Seat(0), est(Availability::Pending, None))])]));
+    let mut other = pot(0, vec![(Seat(0), est(Availability::Ready, Some(0.5)))]);
+    other.population = "hero range vs each opponent".into();
+    merge_equity(&mut rec, &only_pots(vec![other]));
 }
 
 #[test]

@@ -161,5 +161,151 @@
       ]
     ],
     "unresolved_mass": 0.0
+  },
+  "unresolved_share": {
+    "actions": [
+      {
+        "action": {
+          "kind": "fold"
+        },
+        "ev_bb": null,
+        "frequency": 0.1875,
+        "headline": false,
+        "unavailable": {
+          "covered_posterior": 0.0,
+          "kind": "BranchSupportIncomplete"
+        }
+      },
+      {
+        "action": {
+          "kind": "call"
+        },
+        "ev_bb": null,
+        "frequency": 0.1875,
+        "headline": false,
+        "unavailable": {
+          "covered_posterior": 0.0,
+          "kind": "BranchSupportIncomplete"
+        }
+      },
+      {
+        "action": {
+          "kind": "raise",
+          "to": 150
+        },
+        "ev_bb": null,
+        "frequency": 0.375,
+        "headline": false,
+        "unavailable": {
+          "covered_posterior": 0.0,
+          "kind": "BranchSupportIncomplete"
+        }
+      }
+    ],
+    "assumptions": {
+      "cache": "miss",
+      "elapsed_ms": 0,
+      "mappings": [],
+      "notes": [
+        "range mix excludes 25.0% of hero's public range mass (no strategy)",
+        "25.0% of the posterior has no strategy"
+      ],
+      "ranges_used": [],
+      "reached_bp": null,
+      "source": "",
+      "source_accuracy": "unverified",
+      "source_granularity": "1326 combos",
+      "target_bp": 50,
+      "template_id": "",
+      "translations": [],
+      "tree_signature": ""
+    },
+    "coverage": {
+      "kind": "Approximate",
+      "reasons": [
+        {
+          "kind": "ChartRounded"
+        },
+        {
+          "cause": "missing node kB",
+          "kind": "BranchResidual",
+          "residual_mass_pct": 25.0,
+          "seat": 3
+        }
+      ]
+    },
+    "equity": {
+      "hero_combo_vs_each": [
+        [
+          0,
+          {
+            "availability": {
+              "kind": "Pending"
+            },
+            "method": null,
+            "value": null
+          }
+        ]
+      ],
+      "hero_range_vs_each": [
+        [
+          0,
+          {
+            "availability": {
+              "kind": "Pending"
+            },
+            "method": null,
+            "value": null
+          }
+        ]
+      ],
+      "per_pot_shares": []
+    },
+    "experimental": null,
+    "exploit": null,
+    "identity": {
+      "config_revision": 1,
+      "decision_id": 1,
+      "hand_id": 1,
+      "hand_revision": 1,
+      "model_revision": 0
+    },
+    "legal": [
+      {
+        "kind": "fold"
+      },
+      {
+        "cost": 50,
+        "kind": "call"
+      },
+      {
+        "kind": "raise",
+        "max_to": 500,
+        "min_to": 100
+      }
+    ],
+    "phase": "final",
+    "range_mix": [
+      [
+        {
+          "kind": "fold"
+        },
+        0.5
+      ],
+      [
+        {
+          "kind": "call"
+        },
+        0.25
+      ],
+      [
+        {
+          "kind": "raise",
+          "to": 150
+        },
+        0.25
+      ]
+    ],
+    "unresolved_mass": 0.25
   }
 }
