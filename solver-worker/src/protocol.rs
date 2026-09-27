@@ -3,25 +3,38 @@
 //! stdout, `crate::writer`). Control reaches a running job only through its `LiveJob::cancel` flag, the
 //! same `Arc` the job polls, so a cancel never waits for the executor. Task 12 provides the shared state,
 //! the bounded line reader, the executor loop and the terminal; Task 13 adds the §4.5 state machine
-//! (admission, ack rules, cancel, shutdown) in `handle_line` / `handle_message` / `handle_eof`.
+//! (admission, ack rules, cancel, shutdown) in `handle_line` / `handle_message` / `handle_eof`; Task 14 adds
+//! lock staging (`stage`) and the staged set's consumption by the next `solve` (`admit`).
 //!
 //! The state machine (a job's own progress moves `Building -> Solving -> Extracting`; its terminal returns the
 //! worker to `Idle`, or leaves it `Stopping`):
 //!
 //! | Message | `Idle` | `Building` / `Solving` / `Extracting` | `Stopping` |
 //! |---|---|---|---|
-//! | `solve` | `duplicate` if its id is remembered as finished; else `precheck`'s reason, or `accepted` -> `Building` | `duplicate` for the live id or a finished id, else `busy` | `stopping` |
+//! | `solve` | `duplicate` if its id is remembered as finished; else `precheck`'s reason, or `accepted` -> `Building`; either way it takes the staged lock set (below) | `duplicate` for the live id or a finished id, else `busy` | `stopping` |
 //! | `cancel` | a finished id: `already_finished`; else `unknown_target` | the live id: `accepted`, the job's flag raised; else as `Idle` | the live id (if any): `accepted`; else as `Idle` |
-//! | `shutdown` | `accepted`, `Exit(0)` -> `Stopping` | `accepted`, the job cancelled -> `Stopping`; `Exit(0)` follows its terminal | `accepted`, nothing else |
-//! | stdin EOF | `Exit(0)` -> `Stopping` | the job cancelled -> `Stopping` | nothing |
-//! | `lock` | `rejected` until Task 14 | `rejected` until Task 14 | `rejected` until Task 14 |
+//! | `shutdown` | `accepted`, `Exit(0)` -> `Stopping` (a staged set discarded) | `accepted`, the job cancelled -> `Stopping`; `Exit(0)` follows its terminal | `accepted`, nothing else |
+//! | stdin EOF | `Exit(0)` -> `Stopping` (a staged set discarded) | the job cancelled -> `Stopping` | nothing |
+//! | `lock` | `locks::validate`'s reason, or `staged` (`replaced: true` iff a set was staged, for any spot) | `solve_in_progress` | `stopping` |
 //!
-//! Every rejection is `ack{rejected, reason}` and changes no state; a line that does not parse is rejected
-//! with the id `lenient_id` recovers. Every decision is a pure function of the request and the state (no clock is
-//! read), taken and acked under one hold of the protocol lock.
+//! Lock staging (§4.5). At most one lock set is staged (`Proto::staged`, with the spot it belongs to), and only
+//! while the worker is `Idle`: a `lock` is refused in any other state, a stop discards the set, and a `solve`
+//! always takes it, so a live job and a staged set never coexist (asserted). The set belongs to exactly one
+//! `solve`, the next one decided: rejected, the set is discarded with it; accepted with another spot, the job ends
+//! `result{error{lock_mismatch}}` at once (§4.5) and the set is discarded; accepted with the same spot, the set is
+//! checked against that solve's `tree.materialized` by the engine's own validator (`proto::worker::validate_locks`,
+//! which needs the tree, so it cannot run at staging), and either goes to the job, which validates it again and
+//! applies it in `Building` (`locks::apply`), or ends the job `lock_mismatch` at once. The job's own end (ok,
+//! error, cancel) is the set's end too: nothing is ever staged again but by a new `lock`.
+//!
+//! Every rejection is `ack{rejected, reason}` and changes no state, with the one exception above: a rejected
+//! `solve` still takes the staged set with it. A line that does not parse is no message at all (not a `solve`): it
+//! is rejected with the id `lenient_id` recovers and changes nothing. Every decision is a pure function of the
+//! request and the state (no clock is read), taken and acked under one hold of the protocol lock.
 use crate::job::{self, JobControl, JobOutcome};
+use crate::locks;
 use crate::writer::Out;
-use proto::worker::{AckStatus, EngineMessage, NodeLock, ResultStatus, SolveRequest, Stage, WorkerMessage, MAX_EXPORTED_NODES};
+use proto::worker::{validate_locks, AckStatus, EngineMessage, NodeLock, ResultStatus, SolveRequest, Stage, WorkerMessage, MAX_EXPORTED_NODES};
 use proto::Street;
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, BufRead};
@@ -35,6 +48,10 @@ use std::time::{Duration, Instant};
 pub use proto::worker::REQUEST_LINE_MAX as MAX_REQUEST_LINE;
 /// How many finished job ids are remembered for `duplicate` and `already_finished` (the oldest is forgotten first).
 const FINISHED_IDS: usize = 4096;
+/// The `lock_mismatch` message of a solve whose spot is not the staged set's (§4.5).
+const OTHER_SPOT: &str = "staged lock belongs to another spot";
+/// The `lock_mismatch` message prefix of a solve of the staged spot whose tree the staged set does not fit.
+const DOES_NOT_FIT: &str = "staged lock does not fit the solve's tree";
 /// §4.5: after `shutdown` or stdin EOF "the process then exits 0 within 2 s". A live job normally ends at its next
 /// cancel checkpoint well inside that (measured: an iteration 0.08-0.3 s, `finalize` 0.2-0.35 s), and its terminal is
 /// followed by `Exit(0)`. If it has not ended after this grace, the stop watchdog queues `Exit(0)` behind whatever is
@@ -230,8 +247,7 @@ fn handle_message_via(shared: &Shared, msg: EngineMessage, publish: &mut dyn FnM
     let mut p = shared.proto.lock().unwrap();
     match msg {
         EngineMessage::Solve(req) => admit(shared, &mut p, req, publish),
-        // Task 14 replaces this arm with lock staging.
-        EngineMessage::Lock { id, .. } => publish(rejection(&id, "lock staging arrives in Task 14")),
+        EngineMessage::Lock { id, spot, locks } => stage(&mut p, &id, spot, locks, publish),
         EngineMessage::Cancel { id, target } => {
             // Only the job named by `target` is ever touched: an unknown or finished target leaves the live job alone.
             let status = match p.live.as_ref().filter(|l| l.id == target) {
@@ -250,10 +266,17 @@ fn handle_message_via(shared: &Shared, msg: EngineMessage, publish: &mut dyn FnM
 
 /// §4.5 admission of a `solve`, tested in the order stopping, duplicate (the live id or a remembered finished id),
 /// busy (`state != Idle`), precheck. Duplicate comes before busy (review M1 of the plan): a duplicate of the live id
-/// implies `state != Idle`, so busy first would make "duplicate" unreachable. A rejection changes nothing. An
-/// admitted job becomes the live job in `Building`, is acked `accepted`, and only then is handed to the executor, so
-/// its ack precedes everything the job produces.
+/// implies `state != Idle`, so busy first would make "duplicate" unreachable. An admitted job becomes the live job
+/// in `Building`, is acked `accepted`, and only then is handed to the executor, so its ack precedes everything the
+/// job produces.
+///
+/// The staged lock set belongs to this solve whatever its fate (module docs), so it is taken before any test: a
+/// rejection discards it (the one state change a rejection ever makes); an admitted job carries it when it is for
+/// this solve's spot and fits its tree, and otherwise ends `lock_mismatch` right after its `accepted` ack, retired
+/// under this same hold of the protocol lock (`retire`) with no job handed over, like a terminal from the executor.
 fn admit(shared: &Shared, p: &mut Proto, req: SolveRequest, publish: &mut dyn FnMut(Out)) {
+    assert!(p.staged.is_none() || p.state == WorkerState::Idle, "a lock set is staged while the worker is {:?}", p.state);
+    let staged = p.staged.take();
     if p.stopping { return publish(rejection(&req.id, "stopping")); }
     if p.live.as_ref().is_some_and(|l| l.id == req.id) || p.finished.contains(&req.id) { return publish(rejection(&req.id, "duplicate")); }
     if p.state != WorkerState::Idle { return publish(rejection(&req.id, "busy")); }
@@ -263,10 +286,33 @@ fn admit(shared: &Shared, p: &mut Proto, req: SolveRequest, publish: &mut dyn Fn
     p.state = WorkerState::Building;
     p.live = Some(LiveJob { id: req.id.clone(), cancel: Arc::clone(&cancel) });
     publish(answer(&req.id, AckStatus::Accepted));
-    // Task 14 consumes `p.staged` here. The executor lives as long as the process, so a closed channel means it died
-    // outside its panic boundary: an accepted job must not be left live with nothing to run it, so control panics,
-    // the process exits non-zero, and the engine synthesizes the terminal (§4.5's process-death exception).
-    shared.jobs.send(Job { req, locks: None, cancel }).expect("the executor thread has stopped");
+    let mismatch = |message: String| JobOutcome::Error(job::error("lock_mismatch", message, false, None));
+    let locks = match staged {
+        None => None,
+        Some((spot, _)) if spot != req.spot => return retire(p, &req.id, mismatch(OTHER_SPOT.into()), 0, publish),
+        Some((_, locks)) => match validate_locks(&locks, &req.tree.materialized) {
+            Ok(_) => Some(locks),
+            Err(e) => return retire(p, &req.id, mismatch(format!("{DOES_NOT_FIT}: {e}")), 0, publish),
+        },
+    };
+    // The executor lives as long as the process, so a closed channel means it died outside its panic boundary: an
+    // accepted job must not be left live with nothing to run it, so control panics, the process exits non-zero, and
+    // the engine synthesizes the terminal (§4.5's process-death exception).
+    shared.jobs.send(Job { req, locks, cancel }).expect("the executor thread has stopped");
+}
+
+/// §4.5 `lock`, tested in the order stopping, not `Idle` (`solve_in_progress`: a lock never reaches, nor waits for,
+/// a live job), the matrix rules (`locks::validate`, the tree-free rules, all of which it shares with the engine's
+/// `proto::worker::validate_locks`, plus actor names, one width per lock and one lock per node). Stopping comes
+/// first as it does for `solve`: a stopping worker, live job or not, never solves again. A rejection changes
+/// nothing, a staged set included. An accepted set replaces any staged one, for any spot (`replaced`).
+fn stage(p: &mut Proto, id: &str, spot: String, locks: Vec<NodeLock>, publish: &mut dyn FnMut(Out)) {
+    if p.stopping { return publish(rejection(id, "stopping")); }
+    if p.state != WorkerState::Idle { return publish(rejection(id, "solve_in_progress")); }
+    assert!(p.live.is_none(), "the worker is Idle with job {:?} live", p.live.as_ref().map(|l| &l.id));
+    if let Err(reason) = locks::validate(&locks) { return publish(rejection(id, reason)); }
+    let replaced = p.staged.replace((spot, locks)).is_some();
+    publish(ack(id, AckStatus::Staged, None, Some(replaced)));
 }
 
 /// §4.5 `Stopping`, on `shutdown` (after its ack) or stdin EOF: nothing more is admitted, a staged lock set is
@@ -313,14 +359,22 @@ fn terminal(shared: &Shared, id: &str, outcome: JobOutcome, elapsed_ms: u32) {
 /// `terminal` with its publication step passed in: `publish` is `shared.out` in production, and a test's
 /// probe that observes the protocol lock and state at the instant each item is published.
 fn terminal_via(shared: &Shared, id: &str, outcome: JobOutcome, elapsed_ms: u32, mut publish: impl FnMut(Out)) {
+    let mut p = shared.proto.lock().unwrap();
+    retire(&mut p, id, outcome, elapsed_ms, &mut publish);
+}
+
+/// The live job `id`'s terminal, under a hold of the protocol lock the caller already has: the executor's
+/// (`terminal_via`), or control's own for a job it ends at admission (`admit`'s `lock_mismatch`).
+fn retire(p: &mut Proto, id: &str, outcome: JobOutcome, elapsed_ms: u32, publish: &mut dyn FnMut(Out)) {
     let (status, solution, error) = match outcome {
         JobOutcome::Ok(s) => (ResultStatus::Ok, Some(s), None), JobOutcome::BestSoFar(s) => (ResultStatus::BestSoFar, Some(s), None),
         JobOutcome::Cancelled => (ResultStatus::Cancelled, None, None), JobOutcome::Error(e) => (ResultStatus::Error, None, Some(e)),
     };
     let result = WorkerMessage::Result { id: id.to_string(), status, elapsed_ms, solution, error };
-    let mut p = shared.proto.lock().unwrap();
     // The executor runs only the job control admitted, and only control's admission makes a job live.
     assert_eq!(p.live.as_ref().map(|l| l.id.as_str()), Some(id), "the job ending is not the live job");
+    // A lock set is staged only while no job is live (module docs), so none can outlive the job that took it.
+    assert!(p.staged.is_none(), "a lock set is staged while job {id} is live");
     p.live = None;
     p.finished.push_back(id.to_string());
     if p.finished.len() > FINISHED_IDS { p.finished.pop_front(); }
@@ -668,9 +722,9 @@ mod tests {
     /// One queued item in comparable form: a message, or `Err(code)` for `Out::Exit(code)`.
     type Item = Result<WorkerMessage, i32>;
     /// Every piece of protocol state: the state, the live job's id and whether its cancel flag is raised, the
-    /// remembered finished ids, whether a lock set is staged, and the stopping flag.
+    /// remembered finished ids, the spot of the staged lock set (if one is staged), and the stopping flag.
     #[derive(Debug, Clone, PartialEq)]
-    struct Snap { state: WorkerState, live: Option<(String, bool)>, finished: Vec<String>, staged: bool, stopping: bool }
+    struct Snap { state: WorkerState, live: Option<(String, bool)>, finished: Vec<String>, staged: Option<String>, stopping: bool }
     impl Control {
         fn queued(&self) -> Vec<Item> { self.out.try_iter().map(|o| match o { Out::Msg(m) => Ok(m), Out::Exit(c) => Err(c) }).collect() }
         fn msg(&self, m: EngineMessage) -> Vec<Item> { handle_message(&self.shared, m); self.queued() }
@@ -679,7 +733,7 @@ mod tests {
         fn handed(&self) -> Vec<Job> { self.jobs.try_iter().collect() }
         fn snap(&self) -> Snap {
             let p = self.shared.proto.lock().unwrap();
-            Snap { state: p.state, live: p.live.as_ref().map(|l| (l.id.clone(), l.cancel.load(Ordering::SeqCst))), finished: p.finished.iter().cloned().collect(), staged: p.staged.is_some(), stopping: p.stopping }
+            Snap { state: p.state, live: p.live.as_ref().map(|l| (l.id.clone(), l.cancel.load(Ordering::SeqCst))), finished: p.finished.iter().cloned().collect(), staged: p.staged.as_ref().map(|(spot, _)| spot.clone()), stopping: p.stopping }
         }
         /// The executor's side of job `id` ending: its terminal, published exactly as in production.
         fn end(&self, id: &str) -> Vec<Item> { terminal(&self.shared, id, JobOutcome::Cancelled, 1); self.queued() }
@@ -704,6 +758,42 @@ mod tests {
     fn running(c: &Control, id: &str) {
         assert_eq!(c.msg(solve("river_two_combo", id)), vec![acked(id, AckStatus::Accepted)]);
         assert_eq!(c.handed().len(), 1);
+    }
+
+    // Task 14: lock staging. `lock_river`'s line 0 stages IP's lock at `[check]` and its line 1 is the solve it
+    // belongs to (the same spot); `river_two_combo` is the same river tree under another spot.
+    /// The lock set of `lock_river`'s line 0.
+    fn river_locks() -> Vec<NodeLock> {
+        match serde_json::from_str::<EngineMessage>(&crate::testutil::fixture_lines("lock_river")[0]).expect("parse lock line") {
+            EngineMessage::Lock { locks, .. } => locks,
+            other => panic!("line 0 of lock_river is not a lock: {other:?}"),
+        }
+    }
+    /// The spot `lock_river`'s lock set belongs to (its line 1's `spot`).
+    fn lock_spot() -> String { solve_request("lock_river", 1).spot }
+    fn lock_with(id: &str, spot: &str, f: impl FnOnce(&mut Vec<NodeLock>)) -> EngineMessage {
+        let mut locks = river_locks();
+        f(&mut locks);
+        EngineMessage::Lock { id: id.into(), spot: spot.into(), locks }
+    }
+    fn river_lock(id: &str, spot: &str) -> EngineMessage { lock_with(id, spot, |_| {}) }
+    /// A lock set `locks::validate` refuses (its first row sums to 0.4), and the reason it gives.
+    fn bad_lock(id: &str) -> EngineMessage { lock_with(id, &lock_spot(), |l| l[0].probs[0] = vec![0.1, 0.3]) }
+    fn bad_lock_reason() -> String {
+        let EngineMessage::Lock { locks, .. } = bad_lock("x") else { unreachable!() };
+        crate::locks::validate(&locks).expect_err("the bad lock is invalid")
+    }
+    /// `lock_river`'s own solve (line 1), under `id`.
+    fn locked_solve(id: &str) -> EngineMessage {
+        let mut r = solve_request("lock_river", 1);
+        r.id = id.into();
+        EngineMessage::Solve(r)
+    }
+    fn staged(id: &str, replaced: bool) -> Item { Ok(WorkerMessage::Ack { id: id.into(), status: AckStatus::Staged, reason: None, replaced: Some(replaced) }) }
+    /// The terminal of an accepted solve whose staged lock set is refused before any work: `lock_mismatch`,
+    /// not retryable, decided without reading a clock (elapsed 0).
+    fn mismatched(id: &str, message: &str) -> Item {
+        Ok(WorkerMessage::Result { id: id.into(), status: ResultStatus::Error, elapsed_ms: 0, solution: None, error: Some(WorkerError { code: "lock_mismatch".into(), message: message.into(), retryable: false, estimate_bytes: None }) })
     }
 
     /// Review M2 of the plan: the ack of a line that is not a valid message carries the sender's id whenever the
@@ -809,9 +899,10 @@ mod tests {
     use proto::MaterializedNode;
 
     #[derive(Clone, Copy, Debug)]
-    enum Start { Idle, Finished9, Live(WorkerState), StoppingIdle, StoppingLive }
+    enum Start { Idle, Finished9, Live(WorkerState), StoppingIdle, StoppingLive, Staged }
     /// A worker in state `s`, reached through the handlers themselves (the executor's progress, which moves a live
-    /// job's state, is played by setting it); the setup's own output is taken off the channels.
+    /// job's state, is played by setting it); the setup's own output is taken off the channels. `Staged` is
+    /// `Finished9` with `lock_river`'s lock set then staged for its own spot.
     fn start(s: Start) -> Control {
         let c = control();
         match s {
@@ -820,6 +911,11 @@ mod tests {
             Start::Live(state) => { running(&c, "11"); c.shared.proto.lock().unwrap().state = state; }
             Start::StoppingIdle => { c.msg(shutdown("0")); }
             Start::StoppingLive => { running(&c, "11"); c.eof(); }
+            Start::Staged => {
+                running(&c, "9");
+                c.end("9");
+                assert_eq!(c.msg(river_lock("8", &lock_spot())), vec![staged("8", false)]);
+            }
         }
         c.queued();
         c.handed();
@@ -840,6 +936,15 @@ mod tests {
         let raised: fn(&mut Snap) = |s| s.live.as_mut().unwrap().1 = true;
         let stopped: fn(&mut Snap) = |s| { s.state = Stopping; s.stopping = true; };
         let stopped_raised: fn(&mut Snap) = |s| { s.state = Stopping; s.stopping = true; s.live.as_mut().unwrap().1 = true; };
+        // Task 14: lock staging and the staged set's consumption
+        let staged_here: fn(&mut Snap) = |s| s.staged = Some(lock_spot());
+        let staged_abcd: fn(&mut Snap) = |s| s.staged = Some("abcd".into());
+        let admitted_with_lock: fn(&mut Snap) = |s| { s.state = Building; s.live = Some(("21".into(), false)); s.staged = None; };
+        let mismatch_retired: fn(&mut Snap) = |s| { s.finished.push("21".into()); s.staged = None; };
+        let discarded: fn(&mut Snap) = |s| s.staged = None;
+        let stopped_discarded: fn(&mut Snap) = |s| { s.state = Stopping; s.stopping = true; s.staged = None; };
+        let bad = bad_lock_reason();
+        let spot = lock_spot();
         let rows: Vec<(&str, Start, In, Vec<Item>, usize, fn(&mut Snap))> = vec![
             ("admit", Start::Idle, In::M(solve("river_two_combo", "21")), vec![acked("21", Accepted)], 1, admitted),
             ("admit after a finished job", Start::Finished9, In::M(solve("river_two_combo", "21")), vec![acked("21", Accepted)], 1, admitted),
@@ -866,7 +971,26 @@ mod tests {
             ("eof, idle", Start::Idle, In::Eof, vec![Err(0)], 0, stopped),
             ("eof, live", Start::Live(Extracting), In::Eof, vec![], 0, stopped_raised),
             ("eof after a stop", Start::StoppingLive, In::Eof, vec![], 0, same),
-            ("lock, until Task 14", Start::Idle, In::M(EngineMessage::Lock { id: "19".into(), spot: "s".into(), locks: vec![] }), vec![refused("19", "lock staging arrives in Task 14")], 0, same),
+            ("lock, idle", Start::Idle, In::M(river_lock("19", &spot)), vec![staged("19", false)], 0, staged_here),
+            ("lock after a finished job", Start::Finished9, In::M(river_lock("19", &spot)), vec![staged("19", false)], 0, staged_here),
+            ("a second lock replaces the staged set, for any spot", Start::Staged, In::M(river_lock("19", "abcd")), vec![staged("19", true)], 0, staged_abcd),
+            ("an invalid lock matrix, idle", Start::Idle, In::M(bad_lock("19")), vec![refused("19", &bad)], 0, same),
+            ("an invalid lock matrix leaves the staged set staged", Start::Staged, In::M(bad_lock("19")), vec![refused("19", &bad)], 0, same),
+            ("lock while building", Start::Live(Building), In::M(river_lock("19", &spot)), vec![refused("19", "solve_in_progress")], 0, same),
+            ("lock while solving", Start::Live(Solving), In::M(river_lock("19", &spot)), vec![refused("19", "solve_in_progress")], 0, same),
+            ("lock while extracting", Start::Live(Extracting), In::M(river_lock("19", &spot)), vec![refused("19", "solve_in_progress")], 0, same),
+            ("lock while solving, before its matrix", Start::Live(Solving), In::M(bad_lock("19")), vec![refused("19", "solve_in_progress")], 0, same),
+            ("lock while stopping, idle", Start::StoppingIdle, In::M(river_lock("19", &spot)), vec![refused("19", "stopping")], 0, same),
+            ("lock while stopping, live", Start::StoppingLive, In::M(river_lock("19", &spot)), vec![refused("19", "stopping")], 0, same),
+            ("lock while stopping, before its matrix", Start::StoppingIdle, In::M(bad_lock("19")), vec![refused("19", "stopping")], 0, same),
+            ("a solve of the staged spot takes the set to its job", Start::Staged, In::M(locked_solve("21")), vec![acked("21", Accepted)], 1, admitted_with_lock),
+            ("a solve of another spot: accepted, lock_mismatch, the set discarded", Start::Staged, In::M(solve("river_two_combo", "21")), vec![acked("21", Accepted), mismatched("21", OTHER_SPOT)], 0, mismatch_retired),
+            ("a solve rejected by precheck discards the staged set", Start::Staged, In::M(unchecked("21")), vec![refused("21", DONK_MISSING)], 0, discarded),
+            ("a duplicate solve discards the staged set", Start::Staged, In::M(locked_solve("9")), vec![refused("9", "duplicate")], 0, discarded),
+            ("a cancel leaves the staged set staged", Start::Staged, In::M(cancel("13", "nope")), vec![acked("13", UnknownTarget)], 0, same),
+            ("a cancel of a finished id leaves the staged set staged", Start::Staged, In::M(cancel("13", "9")), vec![acked("13", AlreadyFinished)], 0, same),
+            ("shutdown discards the staged set", Start::Staged, In::M(shutdown("17")), vec![acked("17", Accepted), Err(0)], 0, stopped_discarded),
+            ("eof discards the staged set", Start::Staged, In::Eof, vec![Err(0)], 0, stopped_discarded),
         ];
         for (label, from, input, want, jobs, change) in rows {
             let c = start(from);
@@ -880,8 +1004,8 @@ mod tests {
         }
     }
 
-    /// An admitted job is handed to the executor with exactly the request it was admitted with, no lock set (until
-    /// Task 14) and the very cancel flag of the live-job record, so a cancel raised through control reaches it.
+    /// An admitted job is handed to the executor with exactly the request it was admitted with, no lock set when
+    /// none is staged, and the very cancel flag of the live-job record, so a cancel raised through control reaches it.
     #[test]
     fn an_admitted_job_carries_the_live_jobs_cancel_flag() {
         let c = control();
@@ -897,6 +1021,99 @@ mod tests {
         assert!(!job.cancel.load(Ordering::SeqCst));
         assert_eq!(c.msg(cancel("22", "21")), vec![acked("22", AckStatus::Accepted)]);
         assert!(job.cancel.load(Ordering::SeqCst), "control's cancel reaches the job");
+    }
+
+    // ---- Task 14: lock staging and its consumption by the next solve ----
+
+    /// A solve of the staged spot hands the staged set to the executor with its job, unchanged, and nothing stays
+    /// staged: the set belongs to exactly this one solve.
+    #[test]
+    fn a_solve_of_the_staged_spot_hands_the_staged_set_to_its_job() {
+        let c = start(Start::Staged);
+        let msg = locked_solve("21");
+        let EngineMessage::Solve(req) = msg.clone() else { unreachable!() };
+        assert_eq!(c.msg(msg), vec![acked("21", AckStatus::Accepted)]);
+        let job = c.handed().pop().expect("a job");
+        assert_eq!((job.req, job.locks), (req, Some(river_locks())));
+        assert_eq!(c.snap().staged, None);
+    }
+
+    /// §4.5: the staged set is consumed by a solve of its own spot. One that does not fit that solve's tree (the
+    /// engine's own `proto::worker::validate_locks` against the solve's `tree.materialized` refuses it: a path that
+    /// names no decision node, another actor, another menu width) cannot be what the engine meant for this solve:
+    /// the solve is accepted and ends `lock_mismatch` at once, with no job handed over, and the set is discarded.
+    #[test]
+    fn a_staged_set_that_does_not_fit_its_solves_tree_is_a_lock_mismatch() {
+        let flop = solve_request("flop_cancel", 0);
+        let edits: [(&str, fn(&mut NodeLock)); 3] = [
+            ("a path that names no decision node", |l| l.path = vec![proto::Action::Bet { to: 50 }]),
+            ("another actor", |l| l.actor = "oop".into()),
+            ("another menu width", |l| for row in l.probs.iter_mut() { row.push(0.0) }),
+        ];
+        for (what, edit) in edits {
+            let c = control();
+            let mut locks = river_locks();
+            edit(&mut locks[0]);
+            crate::locks::validate(&locks).unwrap_or_else(|e| panic!("{what}: a valid matrix at staging: {e}"));
+            let why = proto::worker::validate_locks(&locks, &flop.tree.materialized).expect_err(what);
+            assert_eq!(c.msg(EngineMessage::Lock { id: "20".into(), spot: flop.spot.clone(), locks }), vec![staged("20", false)], "{what}");
+            let got = c.msg(solve("flop_cancel", "21"));
+            assert_eq!(got, vec![acked("21", AckStatus::Accepted), mismatched("21", &format!("{DOES_NOT_FIT}: {why}"))], "{what}");
+            assert_eq!(c.handed().len(), 0, "{what}: no job handed to the executor");
+            assert_eq!(c.snap(), Snap { state: WorkerState::Idle, live: None, finished: vec!["21".into()], staged: None, stopping: false }, "{what}");
+        }
+        // the unedited set fits the flop tree (`[check]` is IP's node there too, with two actions): its job gets it
+        let c = control();
+        assert_eq!(c.msg(river_lock("20", &flop.spot)), vec![staged("20", false)]);
+        assert_eq!(c.msg(solve("flop_cancel", "21")), vec![acked("21", AckStatus::Accepted)]);
+        assert_eq!(c.handed().pop().expect("a job").locks, Some(river_locks()));
+    }
+
+    /// The staged set's lifecycle across a job's three stages, with this test as the executor (deterministic: the
+    /// stage is set by the executor's own progress report, the job ends only when the test ends it). In each stage a
+    /// `lock` is rejected `solve_in_progress` and changes nothing; a cancel is accepted and raises the flag of the job
+    /// that carried the set; the job's single terminal follows, a second cancel is `already_finished`, and the set
+    /// consumed by the cancelled solve is gone: the next solve of the same spot runs with no lock.
+    #[test]
+    fn the_staged_set_is_gone_once_a_cancelled_solve_consumed_it() {
+        for stage in [Stage::Building, Stage::Solving, Stage::Extracting] {
+            let c = control();
+            let spot = lock_spot();
+            assert_eq!(c.msg(river_lock("20", &spot)), vec![staged("20", false)]);
+            assert_eq!(c.msg(locked_solve("21")), vec![acked("21", AckStatus::Accepted)]);
+            let job = c.handed().pop().expect("a job");
+            assert_eq!(job.locks, Some(river_locks()), "{stage:?}");
+            progress_to(c.shared.clone(), "21".into())(stage, 1, None, 5, 7);
+            assert!(matches!(c.queued().as_slice(), [Ok(WorkerMessage::Progress { id, .. })] if id == "21"), "{stage:?}");
+            let during = c.snap();
+            assert_eq!(c.msg(river_lock("22", &spot)), vec![refused("22", "solve_in_progress")], "{stage:?}");
+            assert_eq!(c.snap(), during, "{stage:?}: a rejected lock changes nothing");
+            assert_eq!(c.msg(cancel("23", "21")), vec![acked("23", AckStatus::Accepted)], "{stage:?}");
+            assert!(job.cancel.load(Ordering::SeqCst), "{stage:?}: the job that carried the set is cancelled");
+            assert_eq!(c.end("21"), vec![cancelled("21")], "{stage:?}");
+            assert_eq!(c.msg(cancel("24", "21")), vec![acked("24", AckStatus::AlreadyFinished)], "{stage:?}");
+            assert_eq!(c.msg(locked_solve("25")), vec![acked("25", AckStatus::Accepted)], "{stage:?}");
+            assert_eq!(c.handed().pop().expect("a job").locks, None, "{stage:?}: the consumed set is gone");
+            assert_eq!(c.queued(), vec![], "{stage:?}: exactly one terminal");
+        }
+    }
+
+    /// A `lock_mismatch` decided at admission is published like every terminal: after the `accepted` ack, under the
+    /// same hold of the protocol lock, with the job already retired (its id finished, the worker `Idle`), and no job
+    /// handed to the executor at any point.
+    #[test]
+    fn a_lock_mismatch_is_published_under_the_protocol_lock_with_the_job_retired() {
+        let c = control();
+        assert_eq!(c.msg(river_lock("20", &lock_spot())), vec![staged("20", false)]);
+        let mut log = Vec::new();
+        handle_message_via(&c.shared, solve("river_two_combo", "21"), &mut |o| log.push((seen_now(&c.shared, "21"), c.jobs.try_recv().is_ok(), published(&o))));
+        let want = vec![
+            (Seen::LockHeld, false, format!("{:?}", WorkerMessage::Ack { id: "21".into(), status: AckStatus::Accepted, reason: None, replaced: None })),
+            (Seen::LockHeld, false, "result 21 Error".to_string()),
+        ];
+        assert_eq!(log, want);
+        assert_eq!(seen_now(&c.shared, "21"), Seen::Free(WorkerState::Idle, false, true));
+        assert!(c.queued().is_empty() && c.handed().is_empty());
     }
 
     /// Fix round 1 (review I1): `admit` rejects `rake_rate == 1.0` exactly like the shared wire codec's
@@ -932,10 +1149,10 @@ mod tests {
             c.shared.proto.lock().unwrap().staged = Some(("spot".into(), vec![]));
             let acks = if by_eof { c.eof() } else { c.msg(shutdown("17")) };
             assert_eq!(acks, if by_eof { vec![] } else { vec![acked("17", AckStatus::Accepted)] });
-            assert_eq!(c.snap(), Snap { state: WorkerState::Stopping, live: Some(("11".into(), true)), finished: vec![], staged: false, stopping: true });
+            assert_eq!(c.snap(), Snap { state: WorkerState::Stopping, live: Some(("11".into(), true)), finished: vec![], staged: None, stopping: true });
             assert_eq!(c.msg(solve("river_two_combo", "12")), vec![refused("12", "stopping")]);
             assert_eq!(c.end("11"), vec![cancelled("11"), Err(0)], "the terminal, then the exit");
-            assert_eq!(c.snap(), Snap { state: WorkerState::Stopping, live: None, finished: vec!["11".into()], staged: false, stopping: true });
+            assert_eq!(c.snap(), Snap { state: WorkerState::Stopping, live: None, finished: vec!["11".into()], staged: None, stopping: true });
             assert_eq!(c.msg(cancel("13", "11")), vec![acked("13", AckStatus::AlreadyFinished)]);
         }
     }
@@ -959,7 +1176,7 @@ mod tests {
             let acks = if by_eof { c.eof() } else { c.msg(shutdown("17")) };
             let want = if by_eof { vec![Err(0)] } else { vec![acked("17", AckStatus::Accepted), Err(0)] };
             assert_eq!(acks, want, "by_eof: {by_eof}: exactly an ordered ack/exit");
-            assert_eq!(c.snap(), Snap { state: WorkerState::Stopping, live: Some(("11".into(), true)), finished: vec![], staged: false, stopping: true });
+            assert_eq!(c.snap(), Snap { state: WorkerState::Stopping, live: Some(("11".into(), true)), finished: vec![], staged: None, stopping: true });
         }
     }
 
@@ -995,7 +1212,7 @@ mod tests {
     /// queued). Deterministic, like the terminal's own test: the probe runs at the instant each item is published.
     #[test]
     fn every_ack_is_queued_under_the_protocol_lock() {
-        let rows: [(&str, bool, EngineMessage, usize); 8] = [
+        let rows: [(&str, bool, EngineMessage, usize); 11] = [
             ("cancel accepted", true, cancel("13", "11"), 1),
             ("cancel already_finished", false, cancel("13", "9"), 1),
             ("cancel unknown_target", true, cancel("13", "nope"), 1),
@@ -1004,6 +1221,9 @@ mod tests {
             ("solve rejected by precheck", false, unchecked("21"), 1),
             ("shutdown, live", true, shutdown("17"), 1),
             ("shutdown, idle: the ack, then the exit", false, shutdown("17"), 2),
+            ("lock staged", false, river_lock("19", &lock_spot()), 1),
+            ("lock rejected by its matrix", false, bad_lock("19"), 1),
+            ("lock rejected, solve_in_progress", true, river_lock("19", &lock_spot()), 1),
         ];
         for (label, live, msg, n) in rows {
             let c = control();
