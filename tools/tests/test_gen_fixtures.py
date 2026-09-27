@@ -1,7 +1,7 @@
 import collections
 import json
 
-from gen_fixtures import CONFIGS, generate
+from gen_fixtures import CONFIGS, generate, main
 
 
 def conserved(hand: dict) -> bool:
@@ -89,3 +89,31 @@ def test_pot_layers_follow_core_model_merging():
                 assert a["eligible"] != b["eligible"], f"adjacent equal eligibility must be merged: {pots}"
             merged_cases += 1
     assert merged_cases > 0
+
+
+def test_flat_hands_cli_alias_still_works(tmp_path):
+    """M1 (task-17 fix round): `gen_fixtures.py --out ... --count ... --seed ...`, with no
+    subcommand token, is the exact regeneration command documented at
+    docs/superpowers/plans/2026-09-10-plan-1-foundation.md:3637,3645,5318. Converting the CLI to
+    a subcommand table (Task 17's `sources` subcommand) must not silently break it -- it must
+    still write the same fixtures the explicit `hands` subcommand form does."""
+    flat_out = tmp_path / "flat"
+    assert main(["--out", str(flat_out), "--count", "3", "--seed", "7"]) == 0
+    flat_files = sorted(p.name for p in flat_out.glob("*.json"))
+    assert flat_files == ["h0001.json", "h0002.json", "h0003.json"]
+
+    subcommand_out = tmp_path / "subcommand"
+    assert main(["hands", "--out", str(subcommand_out), "--count", "3", "--seed", "7"]) == 0
+    subcommand_files = sorted(p.name for p in subcommand_out.glob("*.json"))
+    assert flat_files == subcommand_files
+    for name in flat_files:
+        assert (flat_out / name).read_bytes() == (subcommand_out / name).read_bytes()
+
+
+def test_flat_cli_alias_defaults_match_the_hands_subcommand_defaults(tmp_path):
+    """The flat form's `--count`/`--seed` defaults (200/1) must stay identical to the `hands`
+    subcommand's -- the alias only supplies the missing subcommand token, never different
+    defaults."""
+    out = tmp_path / "defaults"
+    assert main(["--out", str(out)]) == 0
+    assert len(list(out.glob("*.json"))) == 200
