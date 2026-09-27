@@ -145,15 +145,10 @@ pub fn condition(b: &HistoryBranch, actor: Seat, p: &[f64], factor: f64) -> Opti
         assert!(pc.is_finite() && (0.0..=1.0).contains(pc), "condition: likelihood[{c}] = {pc} is not a probability in [0, 1]");
     }
     assert!(factor.is_finite() && (0.0..=1.0).contains(&factor), "condition: factor {factor} is not a probability in [0, 1]");
+    validate_branch_weight(b, "condition");
     if b.residual || b.stopped.is_some() {
         return Some(b.clone());
     }
-    assert!(
-        b.q.is_finite() && (0.0..=1.0).contains(&b.q),
-        "condition: branch {} weight q = {} is not a finite value in [0, 1]",
-        b.id,
-        b.q
-    );
     let index = b.seats.iter().position(|s| s.seat == actor)?;
     let w = &b.seats[index].mass;
     check_masses(b, index, "condition");
@@ -161,10 +156,29 @@ pub fn condition(b: &HistoryBranch, actor: Seat, p: &[f64], factor: f64) -> Opti
     if total == 0. {
         return None;
     }
-    let support: f64 = w.iter().zip(p).map(|(w, p)| w * p).sum();
-    if support == 0. || factor == 0. {
+    // R1 fix: accumulate the integrated likelihood with a shared power-of-two scale split across
+    // both factors of every term, so a representable positive support is never lost to a per-term
+    // underflow that a naive term-by-term multiply-then-sum would round to zero before the sum
+    // ever sees it (see the module docs). Zero support is decided from the mass/likelihood
+    // operands themselves -- never from whether the accumulated sum happens to compute to zero.
+    let scale_half = pow2(350);
+    let mut support_scaled = 0.0_f64;
+    let mut any_positive = false;
+    for (w, p) in w.iter().zip(p) {
+        if *w > 0.0 && *p > 0.0 {
+            any_positive = true;
+        }
+        support_scaled += (w * scale_half) * (p * scale_half);
+    }
+    let support = support_scaled / (scale_half * scale_half);
+    if !any_positive || factor == 0. {
         return None;
     }
+    assert!(
+        support > 0.0,
+        "condition: branch {} seat {actor:?} integrated support underflowed to 0 despite a positive mass and likelihood on some combo (the exact product is smaller than the smallest representable positive f64)",
+        b.id
+    );
     let m = support / total;
     assert!(
         m > 0.0 && m <= 1.0,
@@ -198,6 +212,28 @@ pub fn condition(b: &HistoryBranch, actor: Seat, p: &[f64], factor: f64) -> Opti
     Some(child)
 }
 
+/// An exact power of two (`2^e`), built directly from its IEEE-754 bit pattern so the scaled
+/// accumulation in [`condition`] and [`marginal`] never introduces its own rounding error -- only
+/// the caller's real quantities round, never the scale factor itself. Valid for `-1022 <= e <=
+/// 1023` (the normal exponent range); this module only ever calls it with `e = 350`.
+fn pow2(e: i32) -> f64 {
+    f64::from_bits(((e + 1023) as u64) << 52)
+}
+
+/// Asserts that branch `b`'s shared weight `q` is a finite value in `[0, 1]` (spec section 8.4),
+/// naming the branch id and the calling context. Shared by every reader of a branch weight --
+/// [`condition`] (checked before its frozen early return, so a residual or stopped branch is
+/// covered too), [`marginal`], [`posterior`] and [`rescale`] -- so the invariant holds for frozen
+/// branches and every public aggregation, not only a branch actively being conditioned.
+fn validate_branch_weight(b: &HistoryBranch, context: &str) {
+    assert!(
+        b.q.is_finite() && (0.0..=1.0).contains(&b.q),
+        "{context}: branch {} weight q = {} is not a finite value in [0, 1]",
+        b.id,
+        b.q
+    );
+}
+
 /// Asserts that seat entry `index` of branch `b` holds 1326 finite, non-negative masses, naming
 /// the offending combo.
 fn check_masses(b: &HistoryBranch, index: usize, context: &str) {
@@ -212,18 +248,47 @@ fn check_masses(b: &HistoryBranch, index: usize, context: &str) {
 /// and stopped included); branches without the seat contribute nothing.
 ///
 /// # Panics
-/// Always, if a branch holds the seat with other than 1326 masses.
+/// Always, naming the offending branch or combo, if a branch weight is not a finite value in
+/// `[0, 1]`, a branch holds the seat with other than 1326 finite non-negative masses, or a
+/// positive branch weight and mass on some branch underflow to a zero combo marginal that cannot
+/// be represented as a positive `f64` (there is no positive-reach threshold).
 pub fn marginal(bs: &[HistoryBranch], seat: Seat) -> Vec<f64> {
-    let mut out = vec![0.; COMBOS];
+    // R1/R2 fix: validate every branch's weight (including frozen ones) and its masses before
+    // aggregating, and accumulate with the same scaled technique as `condition` so a representable
+    // positive marginal is never lost to a per-branch underflow (see the module docs). Zero is
+    // decided from the branch weight/mass operands, never from whether the accumulated sum happens
+    // to compute to zero.
+    let scale_half = pow2(350);
+    let denom = scale_half * scale_half;
+    let mut scaled = vec![0.0_f64; COMBOS];
+    let mut positive = vec![false; COMBOS];
     for b in bs {
-        if let Some(s) = b.seats.iter().find(|s| s.seat == seat) {
-            assert!(s.mass.len() == COMBOS, "marginal: branch {} seat {seat:?} has {} masses, expected {COMBOS}", b.id, s.mass.len());
-            for (r, w) in out.iter_mut().zip(&s.mass) {
-                *r += b.q * w;
+        validate_branch_weight(b, "marginal");
+        if let Some(index) = b.seats.iter().position(|s| s.seat == seat) {
+            check_masses(b, index, "marginal");
+            let s = &b.seats[index];
+            let q_scaled = b.q * scale_half;
+            for (c, w) in s.mass.iter().enumerate() {
+                if b.q > 0.0 && *w > 0.0 {
+                    positive[c] = true;
+                }
+                scaled[c] += q_scaled * (w * scale_half);
             }
         }
     }
-    out
+    scaled
+        .into_iter()
+        .zip(positive)
+        .enumerate()
+        .map(|(c, (v, pos))| {
+            let out = v / denom;
+            assert!(
+                out > 0.0 || !pos,
+                "marginal: seat {seat:?} combo {c} underflowed to 0 despite a positive branch weight and mass on some branch (the exact product is smaller than the smallest representable positive f64)"
+            );
+            out
+        })
+        .collect()
 }
 
 /// The branch posterior `pi_{S,k}[c] = q_k * w_{S,k}[c] / r_S[c]` of `seat` for combo `c`, one
@@ -231,12 +296,14 @@ pub fn marginal(bs: &[HistoryBranch], seat: Seat) -> Vec<f64> {
 /// has no public mass.
 ///
 /// # Panics
-/// Always, if `c` is not a combo index or a branch lacks the seat.
+/// Always, if `c` is not a combo index, a branch weight is not a finite value in `[0, 1]`, or a
+/// branch lacks the seat (both directly and through [`marginal`]'s own panics).
 pub fn posterior(bs: &[HistoryBranch], seat: Seat, c: usize) -> Vec<f64> {
     assert!(c < COMBOS, "posterior: combo {c} is out of range 0..{COMBOS}");
     let r = marginal(bs, seat)[c];
     bs.iter()
         .map(|b| {
+            validate_branch_weight(b, "posterior");
             if r == 0. {
                 0.
             } else {
@@ -254,15 +321,16 @@ pub fn posterior(bs: &[HistoryBranch], seat: Seat, c: usize) -> Vec<f64> {
 /// is zero everywhere is left untouched.
 ///
 /// # Panics
-/// Always, if the branches do not all hold the same seats in the same order, a marginal entry is
-/// negative or non-finite (a NaN would otherwise be silently skipped by the maximum), `log_reach`
-/// has no entry for a seat, or the rescaled marginal's maximum is not 1 within
-/// [`MASS_TOLERANCE`].
+/// Always, if the branches do not all hold the same seats in the same order, a branch weight is
+/// not a finite value in `[0, 1]`, a marginal entry is negative or non-finite (a NaN would
+/// otherwise be silently skipped by the maximum), `log_reach` has no entry for a seat, or the
+/// rescaled marginal's maximum is not 1 within [`MASS_TOLERANCE`].
 pub fn rescale(bs: &mut [HistoryBranch], logs: &mut [f64]) {
     let seats: Vec<Seat> = bs.first().map(|b| b.seats.iter().map(|s| s.seat).collect()).unwrap_or_default();
     for b in bs.iter() {
         let own: Vec<Seat> = b.seats.iter().map(|s| s.seat).collect();
         assert!(own == seats, "rescale: branch {} holds seats {own:?}, but the first branch holds {seats:?}", b.id);
+        validate_branch_weight(b, "rescale");
     }
     for seat in seats {
         let r = marginal(bs, seat);

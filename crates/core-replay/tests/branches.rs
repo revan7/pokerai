@@ -466,8 +466,11 @@ fn condition_rejects_a_short_likelihood() {
 }
 
 #[test]
-#[should_panic(expected = "rescale: seat Seat(0) marginal[5] = NaN is not a finite non-negative value")]
+#[should_panic(expected = "marginal: branch 0 seat Seat(0) mass[5] = NaN is not a finite non-negative value")]
 fn rescale_rejects_a_nan_mass() {
+    // R2 fix: the individual bad mass is now caught by `marginal`'s own per-branch validation
+    // (called from `rescale`) before the aggregate marginal-entry check below it ever runs --
+    // validating mass inputs before an aggregate check that could hide the invalid component.
     let mut b = two_combos();
     b[0].seats[0].mass[5] = f64::NAN;
     rescale(&mut b, &mut [0.0; 6]);
@@ -487,4 +490,99 @@ fn range_output_rejects_a_negative_weight() {
     let mut r = vec![0.0; 1326];
     r[2] = -1e-3;
     range_output(&r);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fix round 1 (Codex review task-11-review.md, orchestrator ruling): R1 scaled accumulation so a
+// representable positive support/marginal is never lost to underflow, decided from the mass and
+// likelihood operands' positive/zero status rather than the computed sum, with a named assertion
+// when a result truly cannot be represented; R2 branch-weight validation shared by every reader of
+// a branch weight, including frozen branches and the public aggregation/rescale paths.
+// ---------------------------------------------------------------------------------------------
+
+/// R1: a single branch whose mass and likelihood are each representable on their own, but whose
+/// exact product (`1e-300 * 1e-30 = 1e-330`) is smaller than the smallest representable positive
+/// `f64` (`~4.94e-324`), is genuinely unrepresentable support, not impossible support: `condition`
+/// must say so with a named assertion, never silently report `None`.
+#[test]
+#[should_panic(expected = "integrated support underflowed to 0 despite a positive mass and likelihood")]
+fn positive_overlap_is_not_zero_support() {
+    let mut b = core_preflop::branches::initial(&[Seat(0), Seat(1)]);
+    b[0].seats[0].mass.fill(0.0);
+    b[0].seats[0].mass[0] = 1e-300;
+    let mut p = vec![0.0; 1326];
+    p[0] = 1e-30;
+    condition(&b[0], Seat(0), &p, 1.0);
+}
+
+/// R1 (the `condition` analogue of the four-branch marginal case below): four combos whose mass
+/// and likelihood individually underflow to zero when multiplied in isolation, but whose exact sum
+/// is the smallest representable positive `f64`, must come back positive, not `None`.
+#[test]
+fn condition_support_keeps_a_representable_positive_sum() {
+    let tiny = f64::from_bits(1);
+    let mut b = core_preflop::branches::initial(&[Seat(0), Seat(1)]);
+    b[0].seats[0].mass.fill(0.0);
+    for c in 0..4 {
+        b[0].seats[0].mass[c] = 0.25;
+    }
+    let mut p = vec![0.0; 1326];
+    for c in 0..4 {
+        p[c] = tiny;
+    }
+    let child = condition(&b[0], Seat(0), &p, 1.0).expect("a representable positive support must not become None");
+    assert!(
+        child.q > 0.0 && child.q <= tiny * 2.0 && child.q >= tiny * 0.5,
+        "child.q = {} should be within a factor of 2 of {tiny}",
+        child.q
+    );
+}
+
+/// R1 (review's four-branch example): four branches with `q = 0.25`, mass `1` on combo 0 and the
+/// smallest representable positive `f64` on combo 1 -- the exact combo-1 marginal is that same
+/// value (`sum_k 0.25 * tiny = tiny`), even though every individual `q_k * w_k[1]` term underflows
+/// to zero on its own.
+#[test]
+fn marginal_keeps_a_representable_positive_sum() {
+    let tiny = f64::from_bits(1);
+    let v = Seat(0);
+    let branches: Vec<HistoryBranch> = (0..4u8)
+        .map(|id| {
+            let mut br = core_preflop::branches::initial(&[Seat(0)]).remove(0);
+            br.id = id;
+            br.q = 0.25;
+            br.seats[0].mass.fill(0.0);
+            br.seats[0].mass[0] = 1.0;
+            br.seats[0].mass[1] = tiny;
+            br
+        })
+        .collect();
+    let r = marginal(&branches, v);
+    close(r[0], 1.0);
+    assert!(
+        r[1] > 0.0 && r[1] <= tiny * 2.0 && r[1] >= tiny * 0.5,
+        "r[1] = {} (the exact combo-1 marginal, the smallest positive f64) must not be lost to underflow",
+        r[1]
+    );
+}
+
+/// R2: a frozen (residual) branch's `q` is validated too -- an invalid weight is rejected before
+/// the frozen early return would otherwise hand it back unchanged.
+#[test]
+#[should_panic(expected = "condition: branch 0 weight q = 1.5 is not a finite value in [0, 1]")]
+fn frozen_branch_rejects_out_of_domain_weight() {
+    let mut b = two_combos();
+    b[0].residual = true;
+    b[0].q = 1.5;
+    condition(&b[0], Seat(0), &vec![0.5; 1326], 1.0);
+}
+
+/// R2: `rescale` validates every branch's weight before using it, including one that would
+/// otherwise look like it produces a valid unit marginal.
+#[test]
+#[should_panic(expected = "rescale: branch 0 weight q = 2.5 is not a finite value in [0, 1]")]
+fn rescale_rejects_out_of_domain_weight() {
+    let mut b = two_combos();
+    b[0].q = 2.5;
+    rescale(&mut b, &mut vec![0.0; 6]);
 }
