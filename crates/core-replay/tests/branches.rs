@@ -1272,3 +1272,20 @@ fn cap_branches_rejects_a_marginal_that_residual_steps_cannot_restore() {
     cap_branches(&mut bs);
     let _ = marginal(&bs, Seat(0));
 }
+
+/// Ruling 12-N1c (fix round 4): the unavoidable-support-loss assert runs after the N1b stepping.
+/// Taken from the round-3 live-plus-merged sweep, where the cap rejected it: live `q = .2, .2, .2,
+/// .16` (the `.16` branch with combo-0 mass `3 * 2^-1074`, a live share of `.48` units), a created
+/// residual (`q = .15`, combo-0 mass 0) and one merged branch (`q = 2^-1074`, combo-0 mass .06).
+/// The merged average `.06 / .15 = .4` units rounds to 0, but the pre-cap marginal `.48 + .06 = .54`
+/// units is the representable `5e-324`, and the post-cap `.48` units rounds to 0. One N1b step
+/// (residual mass `2^-1074`, share `.15`, sum `.63` units) restores both the marginal and the
+/// residual's support, so the cap must accept.
+#[test]
+fn cap_branches_steps_a_lost_merged_support_back_before_rejecting() {
+    let mut bs: Vec<HistoryBranch> = (0..3u8).map(|id| last_unit_branch(id, 0.2, 0.0)).collect();
+    bs.push(last_unit_branch(3, 0.16, f64::from_bits(3)));
+    bs.push(last_unit_branch(4, 0.15, 0.0));
+    bs.push(last_unit_branch(5, f64::from_bits(1), 0.06));
+    check_last_unit_cap(bs, 4, f64::from_bits(1));
+}
