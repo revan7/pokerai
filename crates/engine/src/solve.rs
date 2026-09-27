@@ -33,7 +33,9 @@
 //! worker, judged like the hang bound (at the top of the loop and on every reply observed). A decision superseded after
 //! its request was sent is cancelled (`cancel_or_kill`): the worker has `CANCEL_KILL_MS` to confirm with the job's
 //! `result{cancelled}`, else it is killed and restarted; one superseded before the send, or after its terminal arrived,
-//! has nothing to cancel. A failed attempt is classified by `classify`: the worker is restarted (kill, reap, respawn) when
+//! has nothing to cancel; one superseded with a link failure in the same receive restarts the worker at once, as
+//! `cancel_or_kill` does for a link failure in its window (ruling 23-N1). A failed attempt is classified by `classify`:
+//! the worker is restarted (kill, reap, respawn) when
 //! it exited, broke the protocol, hung or missed the heartbeat, and its new `ready` is validated again; then, only after
 //! the first attempt, only when the failure allows it and a `_min` template exists, one retry on that template is sent
 //! if §7's admission passes, with only what is left until final delivery. A retry never rewinds the reported stage, and
@@ -210,9 +212,10 @@ enum Watch {
     /// Waiting for this solve's terminal: the attempt's hang bound and, while the worker reports `Solving`, the time the
     /// heartbeat is due (its last `progress` + `HEARTBEAT_MS`).
     Waiting { hang_bound_ms: u64, heartbeat_due_ms: Option<u64> },
-    /// A receive while waiting returned a link failure (an exit, an end of stdout, a faulty line): the worker may still
-    /// be running the job, and the failure is classified as it is unless the decision is gone or the fire has come (the
-    /// hang bound and the heartbeat do not apply to it, P2T23-I1).
+    /// A receive while waiting returned a link failure (an exit, an end of stdout, a faulty line): the failure is
+    /// classified as it is unless the decision is gone or the fire has come (the hang bound and the heartbeat do not
+    /// apply to it, P2T23-I1). A worker whose link failed is never sent a cancel: under a supersession it is restarted
+    /// at once (ruling 23-N1).
     Failed,
     /// This solve's terminal has arrived (within the hang bound, which no longer applies): before a validated success
     /// is exposed.
@@ -222,12 +225,13 @@ enum Watch {
 /// Whether the attempt can no longer act at `now_ms`, and how it ends, checked in this order at the top of the receive
 /// loop, on every receive result the moment the client observes it (a reply or a link failure: ruling 22-I1,
 /// P2T23-I1), before the request is sent and before a validated success is exposed: the decision is no longer active
-/// (ruling 22-I2), and only once sent and before its terminal may the worker still be running its job; the watchdog's
-/// fire has come, and it delivers the `Final` (§7); while waiting, the attempt's hang bound has come, or the heartbeat
-/// is due (§12). `None` while the attempt may go on (or, after a link failure, while that failure stands).
+/// (ruling 22-I2): only while waiting on a live link may the worker still be running its job, and after a link failure
+/// the link has failed (ruling 23-N1); the watchdog's fire has come, and it delivers the `Final` (§7); while waiting,
+/// the attempt's hang bound has come, or the heartbeat is due (§12). `None` while the attempt may go on (or, after a
+/// link failure, while that failure stands).
 fn ended_at(core: &EngineCore, plan: &SolvePlan, now_ms: u64, watch: Watch) -> Option<AttemptEnd> {
     if !core.identity_active(&plan.identity) {
-        return Some(AttemptEnd::Superseded { running: matches!(watch, Watch::Waiting { .. } | Watch::Failed) });
+        return Some(AttemptEnd::Superseded { running: matches!(watch, Watch::Waiting { .. }), link_failed: matches!(watch, Watch::Failed) });
     }
     if now_ms >= plan.deadlines.watchdog_fire_ms() {
         return Some(AttemptEnd::DeadlinePassed);
@@ -281,10 +285,12 @@ pub(crate) enum AttemptEnd {
     Heartbeat,
     /// `ack{rejected}` for this solve: the worker started no work.
     Rejected(String),
-    /// The decision is no longer active. `running`: the request had reached the worker and its terminal had not been
-    /// taken, so the worker may still be running the job, which `run_solve` cancels (`cancel_or_kill`). Before the send,
-    /// or once the terminal arrived, there is nothing to cancel.
-    Superseded { running: bool },
+    /// The decision is no longer active. `running`: the request had reached the worker, its terminal had not been taken
+    /// and the link had not failed, so the worker may still be running the job, which `run_solve` cancels
+    /// (`cancel_or_kill`). `link_failed`: the receive that observed the supersession returned a link failure (an exit,
+    /// an end of stdout, a faulty line), so `run_solve` restarts the worker at once and sends no cancel (§12, ruling
+    /// 23-N1). Before the send, or once the terminal arrived, there is nothing to cancel or restart. Never both.
+    Superseded { running: bool, link_failed: bool },
     /// The watchdog's fire time was reached (a reply observed at or after it included, ruling 22-I1; before the send:
     /// nothing was sent); the watchdog delivers the request's `Final` (§7).
     DeadlinePassed,
@@ -581,10 +587,19 @@ pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, si
             return succeeded(core, t_start, &b, &template, sol, paths, terminal, violated, restarts, first_terminal_ms);
         }
         match end {
-            // A job the worker may still be running is cancelled (§7/§12); before the send nothing was sent, and once
-            // its terminal arrived there is nothing left to cancel.
-            AttemptEnd::Superseded { running } => {
-                if running && cancel_or_kill(core, &req.id) { restarts += 1; }
+            // A worker whose link failed in the receive that observed the supersession is restarted at once and sent no
+            // cancel, as `cancel_or_kill` answers a link failure in its window (§12, ruling 23-N1); a restart that fails
+            // leaves no live worker, which the next request relaunches. A job the worker may still be running on a live
+            // link is cancelled (§7/§12). Before the send nothing was sent, and once its terminal arrived there is
+            // nothing left to cancel.
+            AttemptEnd::Superseded { running, link_failed } => {
+                assert!(!(running && link_failed), "a superseded attempt is either waiting on a live link or has a failed link");
+                if link_failed {
+                    restarts += 1;
+                    let _ = core.worker.restart();
+                } else if running && cancel_or_kill(core, &req.id) {
+                    restarts += 1;
+                }
                 return fail(core, superseded(), &template, restarts, first_terminal_ms);
             }
             // The watchdog delivers the `Final` (§7); the cleanup after it is `serve_request`'s, not the client's.

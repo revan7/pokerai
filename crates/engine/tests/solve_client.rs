@@ -1022,7 +1022,8 @@ impl WorkerLink for StallsOnFailure {
 /// P2T23-I1 for every kind of failure and for identity. A confirmed exit or a faulty line written at 1 ms but observed
 /// at the watchdog's fire ends the attempt `DeadlinePassed` and restarts nothing; observed 1 ms before the fire it is
 /// classified as before (a restart, and no retry fits). A failure that arrives with a mutation is the superseded
-/// decision's: its job is cancelled (then killed), and no worker failure of the live decision is reported.
+/// decision's: no worker failure of the live decision is reported, and the worker is restarted at once, never sent a
+/// cancel (ruling 23-N1; `a_link_failure_under_supersession_restarts_the_worker_at_once`).
 #[test]
 fn a_link_failure_is_judged_by_identity_and_the_fire_before_it_is_classified() {
     for (failure, fragment) in [(FakeReply::Exit { code: 3 }, "WorkerExit{code: 3}"), (FakeReply::Malformed("{\"type\":".into()), "protocol error")] {
@@ -1049,7 +1050,39 @@ fn a_link_failure_is_judged_by_identity_and_the_fire_before_it_is_classified() {
     assert!(message.contains("superseded") && !retryable, "{message}");
     let sent = solves(&r.state).len();
     let s = r.state.lock().unwrap();
-    assert_eq!((sent, s.cancels.len(), s.kills, s.restarts, r.clock.now_ms()), (1, 1, 1, 1, 1 + 1_500));
+    assert_eq!((sent, s.cancels.len(), s.kills, s.restarts, r.clock.now_ms()), (1, 0, 0, 1, 1));
+}
+
+/// Ruling 23-N1 (spec 12: a protocol error or a worker exit is answered by kill, reap, respawn): a link failure observed
+/// in the same receive as a supersession restarts the worker at once, as `cancel_or_kill` does for a link failure in its
+/// window. The outcome stays the superseded decision's, and no cancel is sent: (a) a faulty line, even when the worker
+/// would then confirm a cancel, is restarted at the failure's observation time, 1 ms; (b) an unconfirmed end of stdout,
+/// whose receive spent its whole bound, is restarted at 2 500 ms, with no 1.5 s cancel window after it. Nothing is
+/// emitted for the superseded decision. The live-worker path (cancel, then kill without a confirmation) is
+/// `superseded_request_cancels_then_kills_after_1_5s` and `a_cancel_is_confirmed_only_by_result_cancelled...`.
+#[test]
+fn a_link_failure_under_supersession_restarts_the_worker_at_once() {
+    let cancel_ack = FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None };
+    let cancelled = FakeReply::Result { id: IdRef::Last, status: ResultStatus::Cancelled, solution: None, error: None, elapsed_ms: 200 };
+    let cases = [
+        ("a faulty line", vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::InvalidateIdentity, FakeReply::Malformed("{".into()),
+            cancel_ack, FakeReply::Delay { ms: 200 }, cancelled, FakeReply::Hang], 1u64),
+        ("an unconfirmed end of stdout", vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::InvalidateIdentity, FakeReply::Eof, FakeReply::Hang], 2_500),
+    ];
+    // (case, solves sent, cancels sent, kills, restarts, out.restarts, the clock at return), both cases compared at once
+    let (mut got, mut expected) = (vec![], vec![]);
+    for (case, script, observed_ms) in cases {
+        let mut r = rig(Street::River, script);
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        let (message, retryable) = failed_engine_error(&out.terminal);
+        assert!(message.contains("superseded") && !retryable && out.solution.is_none(), "{case}: {message}");
+        assert!(r.events.lock().unwrap().is_empty(), "{case}: nothing is emitted for a superseded decision");
+        let sent = solves(&r.state).len();
+        let s = r.state.lock().unwrap();
+        got.push((case, sent, s.cancels.len(), s.kills, s.restarts, out.restarts, r.clock.now_ms()));
+        expected.push((case, 1, 0, 0, 1, 1, observed_ms));
+    }
+    assert_eq!(got, expected);
 }
 
 /// P2T23-M1: a protocol error on the first attempt restarts the worker and admits the `_min` retry (§12), which then
