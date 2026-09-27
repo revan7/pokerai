@@ -5,9 +5,9 @@ use std::time::Duration;
 /// is a `Protocol`/`LineTooLong` error the caller answers by restarting the worker (spec 12).
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum WorkerLinkError {
-    /// The worker's stdout closed and its exit was not confirmed within the receiving call's budget, or there is no
-    /// live worker (never started, killed, or a restart that failed). Unlike `Exit`, an unconfirmed end is not final:
-    /// a later `recv` may confirm it (see `WorkerLink::recv`).
+    /// The worker's stdout closed (`recv`) or it stopped taking requests on stdin (`send`), and its exit was not
+    /// confirmed within that call's budget; or there is no live worker (never started, killed, or a restart that
+    /// failed). Unlike `Exit`, an unconfirmed end is not final: a later `recv` may confirm it (see `WorkerLink`).
     #[error("worker stdout closed")] Eof,
     /// A line that is not UTF-8, not a `WorkerMessage`, a `ready` that fails validation, or a message out of place.
     #[error("protocol: {0}")] Protocol(String),
@@ -23,6 +23,15 @@ pub enum WorkerLinkError {
 
 /// The engine's only view of the worker (§3.1): a process in production, a scripted fake in tests.
 pub trait WorkerLink: Send {
+    /// Queues one request line for the worker and returns at once. `send` never waits for the worker: its budget for
+    /// confirming an exit is zero, one non-blocking poll of the process, so a caller's cancellation bound (§7/§12)
+    /// never waits on it.
+    /// - `Ok(())`: queued. Delivery is not confirmed here; the reply (or its absence) arrives through `recv`.
+    /// - `Err(Protocol | LineTooLong)`: the request cannot be written as a valid line (§4.5); nothing was queued.
+    /// - `Err(Exit{code})`: the process has exited, confirmed by that poll or earlier by `recv`.
+    /// - `Err(Eof)`: the worker no longer takes requests (its stdin closed) and the poll did not confirm an exit, or
+    ///   there is no live worker. Never recorded as a confirmed exit: `recv` confirms it later within its own budget,
+    ///   and a caller that cannot wait kills the worker (§12).
     fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError>;
     /// The next message, within `timeout` for the WHOLE call: one monotonic deadline covers waiting for a line and,
     /// once the worker's stdout has ended, confirming its exit. No part of the call waits past it, so a caller that
