@@ -274,6 +274,7 @@ fn a_rejected_solve_ends_at_once_and_stale_acks_free_nothing() {
 
 /// A link whose `ready` the client refuses: any request, receive, kill or restart on it is a test failure. With no
 /// `ready` at all (no live worker) the client relaunches it once (Task 23), and that relaunch fails.
+/// The relaunch failure is not retryable (P2T23-I3).
 struct NoWork(Option<Ready>);
 impl WorkerLink for NoWork {
     fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError> { panic!("a request reached a worker whose ready was refused: {msg:?}") }
@@ -287,15 +288,15 @@ impl WorkerLink for NoWork {
 }
 
 /// §4.5/§12: the worker's `ready` is validated before any request, and a refused solve starts no work: no request, no
-/// wait, no restart. A version, commit or AVX2 mismatch is a non-retryable `EngineError`; no live worker is retryable
-/// (Task 23: after the one relaunch it gets has failed).
+/// wait, no restart. A version, commit or AVX2 mismatch is a non-retryable `EngineError`; so is no live worker once the
+/// one relaunch it gets (Task 23) has failed (P2T23-I3).
 #[test]
 fn ready_is_validated_before_any_request() {
     let mut no_avx2 = FakeWorker::default_ready();
     no_avx2.build_features = vec!["sse4.2".into()];
     let mut old_proto = FakeWorker::default_ready();
     old_proto.proto_version = 2;
-    for (ready, fragment, retryable, restarts) in [(Some(no_avx2), "AVX2", false, 0), (Some(old_proto), "proto_version 2", false, 0), (None, "no live worker", true, 1)] {
+    for (ready, fragment, retryable, restarts) in [(Some(no_avx2), "AVX2", false, 0), (Some(old_proto), "proto_version 2", false, 0), (None, "no live worker", false, 1)] {
         let mut r = rig(Street::River, vec![]);
         let log = DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log"));
         let identity = r.core.identity.clone();
@@ -706,11 +707,13 @@ fn error_codes_retry_policy() {
     let mut r = rig(Street::River, vec![ack(), err("tree_mismatch", false, None)]);
     assert!(matches!(run_solve(&mut r.core, &r.input, &r.plan, &r.sink).terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: false, .. })));
     assert_eq!(solves(&r.state).len(), 1);
-    // worker exit: restart and retry with _min; a second failure is a retryable EngineError
-    let mut r = rig(Street::River, vec![ack(), FakeReply::Eof, ack(), FakeReply::Eof]);
+    // worker exit: restart and retry with _min; a second failure is a retryable EngineError (P2T23-I1: two confirmed
+    // exits, at 1 ms and 2 ms, well before the watchdog's cutoff; an end returned at the cutoff is the watchdog's, see
+    // `an_end_of_stdout_returned_at_the_fire_is_left_to_the_delivery`)
+    let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::Exit { code: 3 }, ack(), FakeReply::Delay { ms: 1 }, FakeReply::Exit { code: 4 }]);
     let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
-    assert!(matches!(out.terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: true, .. })));
-    assert_eq!((out.restarts, r.state.lock().unwrap().restarts), (2, 2));
+    assert!(matches!(out.terminal, Terminal::Failed(UnsupportedReason::EngineError { ref message, retryable: true }) if message.contains("WorkerExit{code: 4}")));
+    assert_eq!((out.restarts, r.state.lock().unwrap().restarts, r.clock.now_ms()), (2, 2, 2));
     // a rejected ack (busy) frees nothing by itself: the outcome is a retryable EngineError and no result was accepted
     let mut r = rig(Street::River, vec![FakeReply::Ack { id: IdRef::Last, status: AckStatus::Rejected, reason: Some("busy".into()) }]);
     assert!(matches!(run_solve(&mut r.core, &r.input, &r.plan, &r.sink).terminal, Terminal::Failed(UnsupportedReason::EngineError { retryable: true, .. })));
@@ -766,10 +769,24 @@ impl WorkerLink for RelaunchedAs {
 }
 fn without_avx2() -> Ready { let mut r = FakeWorker::default_ready(); r.build_features = vec!["sse4.2".into()]; r }
 
+/// A link with no live worker whose restart reports success and still leaves none (a broken link contract): nothing
+/// may be sent to it, waited on or killed.
+struct RestartsToNothing;
+impl WorkerLink for RestartsToNothing {
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError> { panic!("a request reached a link with no live worker: {msg:?}") }
+    fn recv(&mut self, _timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> { panic!("the client waited on a link with no live worker") }
+    fn restart(&mut self) -> Result<(), WorkerLinkError> { Ok(()) }
+    fn kill(&mut self) { panic!("the client killed a link with no live worker") }
+    fn ready(&self) -> Option<&Ready> { None }
+}
+
 /// Decision 4 (review P2T22R): a request that finds no live worker (killed, or left without one by a restart that
 /// failed) relaunches it once before anything is sent and validates the relaunched worker's `ready`. Relaunched, the
-/// solve goes ahead; a relaunch that fails ends it with a retryable `EngineError` naming the failure; a relaunched
-/// worker whose `ready` is refused (no AVX2, spec 3.6/3.7) ends it with the non-retryable version mismatch of §12.
+/// solve goes ahead. A relaunch that fails ends it with a non-retryable `EngineError` naming the failure (P2T23-I3):
+/// both a launch that never became ready and the process link's own refusal of the relaunched worker's `ready`
+/// (`worker::process`, `Spawn("<exe>: ready refused: <reason>")`), which the engine never sees as a `ready`. A relaunched
+/// worker whose `ready` the link reports and the engine refuses (no AVX2, spec 3.6/3.7) ends it with the non-retryable
+/// version mismatch of §12.
 #[test]
 fn a_missing_worker_is_relaunched_once_before_the_request() {
     let mut r = rig(Street::River, vec![ack(), ok_for(Street::River, "river_std_v1", 0.3)]);
@@ -777,13 +794,25 @@ fn a_missing_worker_is_relaunched_once_before_the_request() {
     let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
     assert_eq!((out.terminal, out.restarts, kills_and_restarts(&r.state), solves(&r.state).len()), (Terminal::Ok, 1, (1, 1), 1));
 
-    let mut r = rig(Street::River, vec![FakeReply::SpawnFails("solver-worker.exe did not become ready".into())]);
-    r.core.worker.kill();
+    for spawn_failure in [DID_NOT_BECOME_READY, READY_REFUSED] {
+        let mut r = rig(Street::River, vec![FakeReply::SpawnFails(spawn_failure.into())]);
+        r.core.worker.kill();
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        let (message, retryable) = failed_engine_error(&out.terminal);
+        assert!(message.contains("no live worker") && message.contains(spawn_failure) && !retryable, "{message}");
+        assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len(), r.clock.now_ms()), (1, (1, 1), 0, 0));
+        assert!(r.core.worker.ready().is_none(), "no live worker is left; the next request tries again");
+    }
+
+    // a relaunch that reports success and leaves no live worker is a failed restart too
+    let mut r = rig(Street::River, vec![]);
+    let log = DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log"));
+    let identity = r.core.identity.clone();
+    r.core = EngineCore::new(Box::new(RestartsToNothing), r.clock.clone(), identity, log);
     let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
     let (message, retryable) = failed_engine_error(&out.terminal);
-    assert!(message.contains("no live worker") && message.contains("did not become ready") && retryable, "{message}");
-    assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len(), r.clock.now_ms()), (1, (1, 1), 0, 0));
-    assert!(r.core.worker.ready().is_none(), "no live worker is left; the next request tries again");
+    assert!(message.contains("no live worker") && !retryable, "{message}");
+    assert_eq!((out.restarts, r.clock.now_ms()), (1, 0));
 
     let mut r = rig(Street::River, vec![]);
     let identity = r.core.identity.clone();
@@ -798,18 +827,28 @@ fn a_missing_worker_is_relaunched_once_before_the_request() {
     assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len()), (1, (1, 1), 0));
 }
 
-/// Decision 4 mid-request: after a failed attempt, a restart that fails leaves no live worker and ends the solve with a
-/// retryable `EngineError` naming both causes (no retry is sent; the next request relaunches the worker), and a restarted
-/// worker whose `ready` is refused ends it with the non-retryable version mismatch, never a retry on it.
+/// The process link's failures of a relaunch (`worker::process::ProcessWorker::start`): no launch became ready, or the
+/// relaunched worker's `ready` was refused, which the link reports as `Spawn` after killing that worker (the engine
+/// never sees the refused `ready`).
+const DID_NOT_BECOME_READY: &str = r"D:\PokerAI\solver-worker.exe did not become ready after 2 attempts (attempt 1: spawn: startup timeout; attempt 2: spawn: startup timeout)";
+const READY_REFUSED: &str = r"D:\PokerAI\solver-worker.exe: ready refused: worker built without AVX2";
+
+/// Decision 4 mid-request (P2T23-I3): after a failed attempt, a restart that fails leaves no live worker and ends the
+/// solve with a non-retryable `EngineError` naming both causes, whether no launch became ready or the process link
+/// refused the relaunched worker's `ready` (no retry is sent; the next request relaunches the worker once). A restarted
+/// worker whose `ready` the link reports and the engine refuses ends it with the non-retryable version mismatch, never
+/// a retry on it.
 #[test]
 fn a_failed_restart_or_a_refused_ready_after_a_restart_ends_the_solve() {
     let exits = || vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::Exit { code: 3 }];
-    let mut r = rig(Street::River, [exits(), vec![FakeReply::SpawnFails("solver-worker.exe did not become ready".into())]].concat());
-    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
-    let (message, retryable) = failed_engine_error(&out.terminal);
-    assert!(message.contains("WorkerExit{code: 3}") && message.contains("did not become ready") && retryable, "{message}");
-    assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len(), r.clock.now_ms()), (1, (0, 1), 1, 1));
-    assert!(r.core.worker.ready().is_none());
+    for spawn_failure in [DID_NOT_BECOME_READY, READY_REFUSED] {
+        let mut r = rig(Street::River, [exits(), vec![FakeReply::SpawnFails(spawn_failure.into())]].concat());
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        let (message, retryable) = failed_engine_error(&out.terminal);
+        assert!(message.contains("WorkerExit{code: 3}") && message.contains(spawn_failure) && !retryable, "{message}");
+        assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len(), r.clock.now_ms()), (1, (0, 1), 1, 1));
+        assert!(r.core.worker.ready().is_none());
+    }
 
     let mut r = rig(Street::River, vec![]);
     let identity = r.core.identity.clone();
@@ -927,4 +966,127 @@ fn a_retry_cut_by_the_watchdog_fire_leaves_the_cleanup_to_the_delivery() {
     assert_eq!((out.terminal, out.template_used.as_str(), r.clock.now_ms()), (deadline_exceeded("building"), "river_min_v1", 14_900));
     assert_eq!((sent.len(), sent[1].deadline_ms, out.restarts, kills_and_restarts(&r.state)), (2, 15_000 - 2_500 - 150, 1, (0, 1)));
     assert!(out.street_violation && out.first_terminal_ms.is_none());
+}
+
+// --- Fix round 1 (review P2T23R): expiry and identity on every receive result (P2T23-I1), the cancel bound judged
+// after the receive (P2T23-I2), a failed restart is not retryable (P2T23-I3), the protocol-error retry (P2T23-M1). ---
+
+/// P2T23-I1: identity and the watchdog's cutoff are judged on every receive result, a link failure included, before it
+/// is classified or anything is restarted. An unconfirmed end of stdout spends its whole receive, so it is returned at
+/// the earlier of the hang bound and the fire. Returned at the fire, the attempt ends `DeadlinePassed`: no restart (the
+/// cleanup after the `Final` is `serve_request`'s), no payload, and the first attempt's terminal state as it was.
+/// Returned 1 ms before it, the end is classified as before (`Ended`, a restart).
+#[test]
+fn an_end_of_stdout_returned_at_the_fire_is_left_to_the_delivery() {
+    // the brief's two unconfirmed ends: the first at the hang bound (2 500 ms, restart), the retry's at the fire
+    let mut r = rig(Street::River, vec![ack(), FakeReply::Eof, ack(), FakeReply::Eof]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!((out.terminal, out.solution.is_none(), out.restarts, kills_and_restarts(&r.state), r.clock.now_ms()), (deadline_exceeded("building"), true, 1, (0, 1), 14_900));
+    assert_eq!((out.first_terminal_ms, r.plan.street_deadline.terminal_arrival_ms(), solves(&r.state).len()), (None, None, 2));
+    // the first attempt's terminal arrived (no_iteration at 100 ms): the retry's end at the fire leaves it as it was
+    let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: 100 }, err("no_iteration", false, None), ack(), FakeReply::Eof]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    assert_eq!((out.terminal, out.solution.is_none(), out.restarts, kills_and_restarts(&r.state), r.clock.now_ms()), (deadline_exceeded("building"), true, 0, (0, 0), 14_900));
+    assert_eq!((out.first_terminal_ms, r.plan.street_deadline.terminal_arrival_ms(), out.street_violation), (Some(100), Some(100), false));
+    // the boundary on one attempt: the end is returned at its hang bound, 2 500 ms, with the fire at 2 500 or 2 501 ms
+    for (final_delivery_ms, at_fire) in [(2_600u64, true), (2_601, false)] {
+        let mut r = rig(Street::River, vec![ack(), FakeReply::Eof]);
+        set_deadlines(&mut r.plan, Deadlines { t0_ms: 0, street_deadline_ms: 2_000, final_delivery_ms, extraction_margin_ms: 200 });
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        assert_eq!(r.clock.now_ms(), 2_500, "final delivery at {final_delivery_ms} ms");
+        if at_fire {
+            assert_eq!((out.terminal, out.restarts, kills_and_restarts(&r.state)), (deadline_exceeded("building"), 0, (0, 0)));
+        } else {
+            let (message, retryable) = failed_engine_error(&out.terminal);
+            assert!(message.contains("not confirmed") && retryable, "{message}");
+            assert_eq!((out.restarts, kills_and_restarts(&r.state)), (1, (0, 1)));
+        }
+    }
+}
+
+/// The scripted worker behind a link that loses time between a failure on the pipe and the client: when `recv` is about
+/// to return an error, the fake clock first jumps to `resume_at_ms` (a suspend or a stalled thread).
+struct StallsOnFailure { inner: Box<dyn WorkerLink>, clock: Arc<FakeClock>, resume_at_ms: u64 }
+impl WorkerLink for StallsOnFailure {
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError> { self.inner.send(msg) }
+    fn recv(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> {
+        let got = self.inner.recv(timeout);
+        if got.is_err() { self.clock.set_ms(self.resume_at_ms); }
+        got
+    }
+    fn restart(&mut self) -> Result<(), WorkerLinkError> { self.inner.restart() }
+    fn kill(&mut self) { self.inner.kill() }
+    fn ready(&self) -> Option<&Ready> { self.inner.ready() }
+}
+
+/// P2T23-I1 for every kind of failure and for identity. A confirmed exit or a faulty line written at 1 ms but observed
+/// at the watchdog's fire ends the attempt `DeadlinePassed` and restarts nothing; observed 1 ms before the fire it is
+/// classified as before (a restart, and no retry fits). A failure that arrives with a mutation is the superseded
+/// decision's: its job is cancelled (then killed), and no worker failure of the live decision is reported.
+#[test]
+fn a_link_failure_is_judged_by_identity_and_the_fire_before_it_is_classified() {
+    for (failure, fragment) in [(FakeReply::Exit { code: 3 }, "WorkerExit{code: 3}"), (FakeReply::Malformed("{\"type\":".into()), "protocol error")] {
+        for (seen_at, at_fire) in [(14_900u64, true), (14_899, false)] {
+            let mut r = rig(Street::River, vec![]);
+            let identity = r.core.identity.clone();
+            let (worker, state) = FakeWorker::scripted(r.clock.clone(), identity.clone(), vec![ack(), FakeReply::Delay { ms: 1 }, failure.clone()]);
+            let link = StallsOnFailure { inner: worker, clock: r.clock.clone(), resume_at_ms: seen_at };
+            r.core = EngineCore::new(Box::new(link), r.clock.clone(), identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log")));
+            r.state = state;
+            let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+            if at_fire {
+                assert_eq!((out.terminal, out.restarts, kills_and_restarts(&r.state)), (deadline_exceeded("building"), 0, (0, 0)), "{fragment} seen at {seen_at} ms");
+            } else {
+                let (message, retryable) = failed_engine_error(&out.terminal);
+                assert!(message.contains(fragment) && retryable, "seen at {seen_at} ms: {message}");
+                assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len()), (1, (0, 1), 1), "{fragment} seen at {seen_at} ms");
+            }
+        }
+    }
+    let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::InvalidateIdentity, FakeReply::Malformed("{".into()), FakeReply::Hang]);
+    let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+    let (message, retryable) = failed_engine_error(&out.terminal);
+    assert!(message.contains("superseded") && !retryable, "{message}");
+    let sent = solves(&r.state).len();
+    let s = r.state.lock().unwrap();
+    assert_eq!((sent, s.cancels.len(), s.kills, s.restarts, r.clock.now_ms()), (1, 1, 1, 1, 1 + 1_500));
+}
+
+/// P2T23-M1: a protocol error on the first attempt restarts the worker and admits the `_min` retry (§12), which then
+/// succeeds: two requests, the second on `river_min_v1` with what is left until final delivery less the delivery and
+/// pipe margins, exactly one restart, and nothing of the faulty reply forwarded (a negative exploitability, a line that
+/// is not a message).
+#[test]
+fn a_protocol_error_restarts_the_worker_and_the_min_retry_succeeds() {
+    let negative = FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 1, exploitability_chips: Some(-0.5), elapsed_ms: 1 };
+    for (case, faulty) in [("a negative exploitability", negative), ("a line that is not a message", FakeReply::Malformed("{\"type\":".into()))] {
+        let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: 300 }, faulty, ack(), ok_for(Street::River, "river_min_v1", 0.3)]);
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        let sent = solves(&r.state);
+        assert_eq!((out.terminal, out.template_used.as_str(), out.restarts, kills_and_restarts(&r.state), sent.len()), (Terminal::Ok, "river_min_v1", 1, (0, 1), 2), "{case}");
+        assert_eq!((sent[1].tree.template_id.as_str(), sent[1].deadline_ms, r.clock.now_ms()), ("river_min_v1", 15_000 - 300 - 150, 300), "{case}");
+        assert!(r.events.lock().unwrap().is_empty(), "{case}: nothing of the faulty reply is forwarded");
+    }
+}
+
+fn is_cancelled(m: &WorkerMessage) -> bool { matches!(m, WorkerMessage::Result { status: ResultStatus::Cancelled, .. }) }
+
+/// P2T23-I2: the cancel's 1.5 s bound is judged at the engine-clock time the client observes the confirmation, not by
+/// the bound its receive was given (a suspend, a stalled thread). The job's `result{cancelled}`, written at 301 ms for
+/// a cancel sent at 101 ms, confirms the cancel when observed at 1 600 ms (nothing killed); observed at 1 601 ms, the
+/// bound, it is too late and the worker is killed and restarted. Nothing is emitted for the superseded decision.
+#[test]
+fn a_cancel_confirmation_observed_after_the_bound_is_answered_by_a_kill() {
+    let cancelled = FakeReply::Result { id: IdRef::Last, status: ResultStatus::Cancelled, solution: None, error: None, elapsed_ms: 200 };
+    for (seen_at, confirmed) in [(1_600u64, true), (1_601, false)] {
+        let script = vec![ack(), FakeReply::Delay { ms: 100 }, FakeReply::InvalidateIdentity, FakeReply::Delay { ms: 1 }, FakeReply::Delay { ms: 200 }, cancelled.clone(), FakeReply::Hang];
+        let mut r = stalled_rig(script, is_cancelled, Some(seen_at), 0);
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        let (message, retryable) = failed_engine_error(&out.terminal);
+        assert!(message.contains("superseded") && !retryable, "seen at {seen_at} ms: {message}");
+        assert!(r.events.lock().unwrap().is_empty(), "seen at {seen_at} ms: nothing is emitted for a superseded decision");
+        let cancels = r.state.lock().unwrap().cancels.len();
+        let expected = if confirmed { (0, (0, 0)) } else { (1, (1, 1)) };
+        assert_eq!((cancels, out.restarts, kills_and_restarts(&r.state), r.clock.now_ms()), (1, expected.0, expected.1, seen_at), "confirmation seen at {seen_at} ms");
+    }
 }
