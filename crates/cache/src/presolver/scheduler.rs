@@ -84,19 +84,23 @@
 //! a solve is followed at once by the next (`wait_hint` is zero), so rebinding costs preparations,
 //! not idle ticks.
 //!
-//! ## Saves (ruling S8, refined by ruling 15-R3)
+//! ## Saves (ruling S8, refined by rulings 15-R3 and 15-R3b)
 //!
 //! `queue.json` is rewritten whole (about 32 MB once every slot is bound), so it is saved only when
 //! the queue changed. An outcome the cache cannot reconstruct -- a failure with its attempt count
 //! and absolute retry deadline, whether the worker, the preparation or the submission failed -- is
-//! saved at once, before the scheduler goes on; if that save fails, nothing new is launched until
-//! it succeeds, tried again every `SAVE_RETRY_MS`. A pause, a resume, a generation change and
-//! shutdown are saved at once too. Everything else -- a launch, a completion proven by a verified
-//! entry, a cancellation, reconciliation's verdicts, the cursor -- waits for the next checkpoint,
-//! at most `CHECKPOINT_MS` later: opening the queue refunds an in-flight attempt, so a saved launch
-//! and an unsaved one reopen identically, and what a crash can lose there is re-derived from the
-//! cache by the launch path and reconciliation. A failed save is counted (`SaveStats::failures`),
-//! reported on stderr once per distinct error, kept dirty, and retried.
+//! on disk before the scheduler goes on, as one small record appended to the queue's failure
+//! journal (`Queue::journal_outcome`; the queue module doc, "The failure journal"), never as a
+//! snapshot. If that append fails, nothing new is launched until it succeeds, tried again every
+//! `SAVE_RETRY_MS`, or until a snapshot holding the outcome is saved; a journal that is full is
+//! folded into a snapshot at once instead. A pause, a resume, a generation change and shutdown are
+//! saved at once. Everything else -- a launch, a completion proven by a verified entry, a
+//! cancellation, reconciliation's verdicts, the cursor -- waits for the next checkpoint, at most
+//! `CHECKPOINT_MS` later: opening the queue refunds an in-flight attempt, so a saved launch and an
+//! unsaved one reopen identically, and what a crash can lose there is re-derived from the cache by
+//! the launch path and reconciliation. Every snapshot folds the journal: it holds every record so
+//! far, and the queue empties the journal once it is durable. A failed save is counted
+//! (`SaveStats::failures`), reported on stderr once per distinct error, kept dirty, and retried.
 //!
 //! ## Reconciliation (fix round 1, R1)
 //!
@@ -112,7 +116,7 @@
 //! `tier_done` count only completions verified in this process (by the sweep, the launch path or a
 //! job's own read-back); a persisted `Done` not yet verified counts as pending.
 
-use super::queue::{self, Queue, QueueClock, QueueItem, RETRY_BACKOFF_MS};
+use super::queue::{self, JournalAppend, Queue, QueueClock, QueueItem, RETRY_BACKOFF_MS};
 use crate::entry::CacheEntry;
 use crate::key::{KeyFields, Rational};
 use crate::CacheError;
@@ -141,8 +145,8 @@ pub const NOT_DURABLE: &str = "entry not durable at target";
 /// `next_pending` may offer it again, in queue-clock milliseconds: the standard retry backoff, kept
 /// in memory only (fix round 1, R4).
 pub const NOT_DURABLE_COOLDOWN_MS: u64 = RETRY_BACKOFF_MS;
-/// After the save of an outcome the cache cannot reconstruct failed, how often it is tried again,
-/// in queue-clock milliseconds; nothing new is launched meanwhile (module doc, "Saves").
+/// After the journal write of an outcome the cache cannot reconstruct failed, how often it is tried
+/// again, in queue-clock milliseconds; nothing new is launched meanwhile (module doc, "Saves").
 pub const SAVE_RETRY_MS: u64 = 30_000;
 /// The most notifications the handle's mailbox holds: the latest hand state, the latest
 /// pause/resume state, the source-change and activity signals and the shutdown latch (module doc,
@@ -369,6 +373,12 @@ pub struct SaveStats {
     pub bytes: u64,
     /// Saves that failed (each retried at the next checkpoint).
     pub failures: u64,
+    /// Failure outcomes appended to the failure journal (ruling 15-R3b).
+    pub journal_appends: u64,
+    /// Bytes those appends wrote.
+    pub journal_bytes: u64,
+    /// Journal appends that failed (each retried every `SAVE_RETRY_MS`, launches held meanwhile).
+    pub journal_failures: u64,
 }
 
 /// The job running in the worker.
@@ -428,9 +438,13 @@ pub struct Scheduler {
     /// Slots held back after a completion whose entry did not read back durably, each until the
     /// queue-clock reading given (fix round 1, R4). Runtime-only.
     cooldown: BTreeMap<String, u64>,
-    /// An outcome the cache cannot reconstruct is not on disk yet: its save failed. Nothing new is
-    /// launched until a save succeeds (fix round 1, R3).
-    outcome_unsaved: bool,
+    /// The slot whose failure outcome is not on disk yet: its journal write failed. Nothing new is
+    /// launched until it is written, or a snapshot holding it is saved (rulings 15-R3, 15-R3b).
+    unjournaled: Option<String>,
+    /// When that write was last tried.
+    unjournaled_at: u64,
+    /// The last journal write error reported, so each distinct one is reported once.
+    journal_error: Option<String>,
 }
 
 impl Scheduler {
@@ -469,7 +483,9 @@ impl Scheduler {
             exhausted_at: None,
             published: None,
             cooldown: BTreeMap::new(),
-            outcome_unsaved: false,
+            unjournaled: None,
+            unjournaled_at: now,
+            journal_error: None,
         })
     }
 
@@ -635,14 +651,18 @@ impl Scheduler {
     }
 
     /// The launch path (module doc; ruling S3). Returns whether a slot was taken from the queue.
-    /// Nothing is launched while a failure outcome is not on disk (its save is retried here every
-    /// `SAVE_RETRY_MS`), nor while a sweep has yet to verify a `Done` game before the candidate.
+    /// Nothing is launched while a failure outcome is not on disk (its journal write is retried
+    /// here every `SAVE_RETRY_MS`), nor while a sweep has yet to verify a `Done` game before the
+    /// candidate.
     /// After a scan that found nothing, the queue is scanned again only once it changed or
     /// `RESCAN_MS` has passed.
     fn launch(&mut self) -> bool {
-        if self.outcome_unsaved {
-            self.flush(false);
-            if self.outcome_unsaved {
+        if let Some(slot) = self.unjournaled.clone() {
+            if self.now.saturating_sub(self.unjournaled_at) < SAVE_RETRY_MS {
+                return false;
+            }
+            self.journal_outcome(&slot);
+            if self.unjournaled.is_some() {
                 return false;
             }
         }
@@ -680,7 +700,7 @@ impl Scheduler {
                 self.queue.record_launch(&id);
                 self.queue.record_failure(&id, now, error);
                 self.queue.advance_cursor();
-                self.persist_outcome();
+                self.journal_outcome(&id);
                 return true;
             }
         };
@@ -720,7 +740,7 @@ impl Scheduler {
         }
         self.queue.advance_cursor();
         if refused {
-            self.persist_outcome();
+            self.journal_outcome(&id);
         }
         true
     }
@@ -762,7 +782,7 @@ impl Scheduler {
             JobPoll::Failed(error) => {
                 let now = self.refresh_now();
                 self.queue.record_failure(&active.slot, now, error);
-                self.persist_outcome();
+                self.journal_outcome(&active.slot);
             }
         }
         true
@@ -812,23 +832,43 @@ impl Scheduler {
         }
     }
 
-    /// Saves at once an outcome the cache cannot reconstruct (ruling 15-R3). If the save fails,
-    /// nothing new is launched until a save succeeds (`launch` retries it every `SAVE_RETRY_MS`).
-    fn persist_outcome(&mut self) {
-        self.outcome_unsaved = true;
-        self.flush(true);
+    /// Puts slot `id`'s just-recorded failure outcome on disk before the scheduler goes on
+    /// (rulings 15-R3, 15-R3b): one journal record, or -- when the journal is full -- a snapshot
+    /// that folds it. If neither reaches the disk, nothing new is launched until one does
+    /// (`launch` tries the journal again every `SAVE_RETRY_MS`).
+    fn journal_outcome(&mut self, id: &str) {
+        self.unjournaled_at = self.now;
+        self.unjournaled = Some(id.to_owned());
+        match self.queue.journal_outcome(id) {
+            Ok(JournalAppend::Appended { bytes }) => {
+                self.unjournaled = None;
+                self.stats.journal_appends += 1;
+                self.stats.journal_bytes += bytes;
+                if self.journal_error.take().is_some() {
+                    eprintln!("presolver queue: the failure journal {} is written again", queue::journal_path(&self.root).display());
+                }
+            }
+            Ok(JournalAppend::Full) => self.flush(true), // a saved snapshot holds the outcome
+            Err(error) => {
+                self.stats.journal_failures += 1;
+                let message = error.to_string();
+                if self.journal_error.as_deref() != Some(message.as_str()) {
+                    eprintln!(
+                        "presolver queue: appending to the failure journal {} failed ({message}); nothing new is launched until the failure is on disk (retried every {SAVE_RETRY_MS} ms)",
+                        queue::journal_path(&self.root).display()
+                    );
+                }
+                self.journal_error = Some(message);
+            }
+        }
     }
 
-    /// Saves the queue if it changed: now if `force`, else once `CHECKPOINT_MS` -- or, while an
-    /// outcome is not on disk, `SAVE_RETRY_MS` -- has passed since the last attempt. A failure is
-    /// counted, reported once per distinct error, and left dirty.
+    /// Saves the queue if it changed: now if `force`, else once `CHECKPOINT_MS` has passed since
+    /// the last attempt. The snapshot folds the failure journal, so a saved one also puts an
+    /// unjournaled outcome on disk. A failure is counted, reported once per distinct error, and left
+    /// dirty.
     fn flush(&mut self, force: bool) {
-        if !self.dirty {
-            self.outcome_unsaved = false;
-            return;
-        }
-        let interval = if self.outcome_unsaved { SAVE_RETRY_MS } else { CHECKPOINT_MS };
-        if !force && self.now.saturating_sub(self.last_save) < interval {
+        if !self.dirty || (!force && self.now.saturating_sub(self.last_save) < CHECKPOINT_MS) {
             return;
         }
         self.last_save = self.now;
@@ -836,7 +876,7 @@ impl Scheduler {
         match self.queue.save() {
             Ok(()) => {
                 self.dirty = false;
-                self.outcome_unsaved = false;
+                self.unjournaled = None;
                 self.stats.saves += 1;
                 self.stats.bytes += std::fs::metadata(&path).map_or(0, |m| m.len());
                 if self.save_error.take().is_some() {
@@ -847,17 +887,10 @@ impl Scheduler {
                 self.stats.failures += 1;
                 let message = error.to_string();
                 if self.save_error.as_deref() != Some(message.as_str()) {
-                    if self.outcome_unsaved {
-                        eprintln!(
-                            "presolver queue: saving {} failed ({message}); a failure outcome is not on disk yet, so nothing new is launched until the save succeeds (retried every {SAVE_RETRY_MS} ms)",
-                            path.display()
-                        );
-                    } else {
-                        eprintln!(
-                            "presolver queue: saving {} failed ({message}); the queue keeps its progress in memory and retries at the next checkpoint",
-                            path.display()
-                        );
-                    }
+                    eprintln!(
+                        "presolver queue: saving {} failed ({message}); the queue keeps its progress in memory and retries at the next checkpoint",
+                        path.display()
+                    );
                 }
                 self.save_error = Some(message);
             }

@@ -137,6 +137,37 @@
 //! N4: a cut message is smaller, not larger): measured, it is 56.5 MB, 84% of the 64 MiB
 //! `QUEUE_FILE_MAX` (pinned by a test constructing this true maximum), so a save can never be locked
 //! out.
+//!
+//! ## The failure journal (task 15, ruling 15-R3b)
+//!
+//! Most progress can be re-derived after a crash -- an in-flight launch is refunded on open, and a
+//! completion is re-established from its cache entry -- so the whole-file snapshot above is written
+//! only at checkpoints. A *failure* cannot be re-derived: its attempt count and retry deadline
+//! exist nowhere else. So each failure outcome is appended at once, as one small record, to the
+//! failure journal `queue.journal` beside `queue.json` (`journal_path`, `Queue::journal_outcome`),
+//! and the journal is folded into the next snapshot: `save` publishes a snapshot whose
+//! `journal_seq` names the last record it holds, and only once that snapshot is durable empties
+//! the journal (through `write_atomic`). Opening the queue replays, over the snapshot, every record
+//! after the snapshot's `journal_seq`, so a crash between the snapshot and the emptying -- the
+//! journal still holding records the snapshot already has -- never rolls a later change back.
+//!
+//! A record is one line, `<sha256 hex of the JSON> <JSON>\n`, carrying a strictly increasing
+//! sequence number, the generation, the slot, the game the outcome was charged to (identity,
+//! board and exact SPR) or none for the slot's own record, and that record's progress after the
+//! outcome: its status, attempt count, absolute UTC retry deadline and cause. Replaying one sets
+//! that state -- declaring its generation and binding the slot to its game first if the snapshot
+//! does not already -- so replay is idempotent. Each append is a single write followed by
+//! `sync_data`, record by record: a crash can tear at most the last line. The journal holds at most
+//! `JOURNAL_MAX_BYTES` (read bounded to it; the scheduler folds a full journal into a snapshot
+//! instead of growing it) and a line at most `JOURNAL_RECORD_MAX_BYTES`.
+//!
+//! Replay stops at the last complete, valid record: a torn line, a checksum mismatch, unparsable
+//! JSON, a sequence number that does not increase, a record that does not apply to the queue (an
+//! unknown slot, another board, inconsistent progress), or bytes past the size bound end it, and
+//! that record and everything after it are ignored -- reported once on stderr with the byte
+//! offset and the reason, never a panic -- and cut from the file before the next append, so later
+//! records are never stranded behind a damaged one. If the replayed queue failed `validate` as a
+//! whole, the journal would be ignored entirely in the same way.
 
 use super::scenarios::{canonical_flops_ordered, scenarios, Scenario, CANONICAL_FLOP_COUNT};
 use crate::key::{spr_bucket, KeyFields, Rational};
@@ -145,6 +176,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `QueueFile::version`: the queue's own format, independent of the cache's `schema_version` 3.
 /// Version 2 binds slots to normalized game identities (fix round 1, review R1).
@@ -165,6 +197,14 @@ pub const LAST_ERROR_MAX_BYTES: usize = 256;
 pub const CURSOR_END: [usize; 3] = [2, CANONICAL_FLOP_COUNT, 0];
 /// The generation of a queue no caller has declared one for (`Queue::set_generation`).
 pub const INITIAL_GENERATION: [u8; 32] = [0; 32];
+
+/// The largest failure journal that is read or grown, in bytes (module doc, "The failure
+/// journal"). About 8,000 records: `Queue::journal_outcome` reports a journal that would outgrow it
+/// as full, and the scheduler folds it into a snapshot instead.
+pub const JOURNAL_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// The longest journal line accepted, in bytes: a record with every field at its widest (a
+/// 256-byte error needing a JSON escape on every byte, the widest exact SPR) stays well inside it.
+pub const JOURNAL_RECORD_MAX_BYTES: usize = 2_048;
 
 /// `retry_after_unix_ms` of a terminal failure: never retried.
 const NEVER: u64 = u64::MAX;
@@ -257,6 +297,11 @@ pub struct QueueFile {
     /// The games slots are bound to, keyed by normalized game identity.
     #[serde(deserialize_with = "unique_map")]
     pub games: BTreeMap<String, GameProgress>,
+    /// The sequence number of the last failure-journal record this snapshot already holds (module
+    /// doc, "The failure journal"): reopening replays only the records after it. A file written
+    /// before the journal existed has none: 0.
+    #[serde(default)]
+    pub journal_seq: u64,
 }
 
 /// Decodes a map keyed by identity, refusing a key that occurs twice (JSON objects may repeat a
@@ -345,6 +390,11 @@ pub fn retry_delay(attempts: u8) -> Option<std::time::Duration> {
 /// directory).
 pub fn queue_path(cache_root: &Path) -> PathBuf {
     cache_root.join("queue.json")
+}
+
+/// `queue.journal` in the cache root, beside `queue.json`: the failure journal (module doc).
+pub fn journal_path(cache_root: &Path) -> PathBuf {
+    cache_root.join("queue.journal")
 }
 
 /// Validates `file` exactly as `Queue::open` does, then publishes it atomically as compact JSON
@@ -772,6 +822,247 @@ fn load(path: &Path) -> Result<Option<QueueFile>, String> {
     Ok(Some(file))
 }
 
+// --- the failure journal (ruling 15-R3b) ----------------------------------------------------------
+
+/// What `Queue::journal_outcome` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalAppend {
+    /// The record is on disk: `bytes` were appended and synced.
+    Appended { bytes: u64 },
+    /// The record would take the journal past `JOURNAL_MAX_BYTES`, so nothing was written: the
+    /// caller folds the journal into a snapshot (`Queue::save`), which holds the outcome too.
+    Full,
+}
+
+/// One journal record (module doc, "The failure journal"): the state one outcome left `slot`'s
+/// record in, charged to `game` or, when it is `None`, to the slot's own record.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalRecord {
+    seq: u64,
+    #[serde(with = "hex32")]
+    generation: [u8; 32],
+    slot: String,
+    game: Option<JournalGame>,
+    status: TaskStatus,
+    attempts: u8,
+    retry_after_unix_ms: u64,
+    last_error: Option<String>,
+}
+
+/// The game a journaled outcome was charged to: enough to bind the slot to it and to create its
+/// record if the snapshot predates the binding.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalGame {
+    #[serde(with = "hex32")]
+    identity: [u8; 32],
+    board: Vec<proto::Card>,
+    spr: Rational,
+}
+
+impl JournalRecord {
+    fn progress(&self) -> Progress<'_> {
+        Progress { status: &self.status, attempts: self.attempts, retry_after_unix_ms: self.retry_after_unix_ms, last_error: self.last_error.as_deref() }
+    }
+
+    /// `<sha256 hex of the JSON> <JSON>\n`.
+    fn line(&self) -> Result<Vec<u8>, CacheError> {
+        let json = serde_json::to_vec(self)?;
+        let digest: [u8; 32] = Sha256::digest(&json).into();
+        let mut line = hex(&digest).into_bytes();
+        line.push(b' ');
+        line.extend_from_slice(&json);
+        line.push(b'\n');
+        Ok(line)
+    }
+
+    /// The record on a line (without its line end), or why it is none.
+    fn parse(line: &[u8]) -> Result<JournalRecord, String> {
+        if line.len() >= JOURNAL_RECORD_MAX_BYTES {
+            return Err(format!("a {}-byte line, past JOURNAL_RECORD_MAX_BYTES", line.len() + 1));
+        }
+        let (Some(sum), Some(b' '), Some(json)) = (line.get(..64), line.get(64), line.get(65..)) else {
+            return Err("not a checksummed record".into());
+        };
+        let digest: [u8; 32] = Sha256::digest(json).into();
+        if sum != hex(&digest).as_bytes() {
+            return Err("checksum mismatch".into());
+        }
+        serde_json::from_slice(json).map_err(|e| format!("unparsable record: {e}"))
+    }
+}
+
+/// The journal's complete, checksummed records with strictly increasing sequence numbers, each
+/// with its byte range, in file order; and where and why reading stopped short of the end, if it
+/// did (module doc: replay stops at the last complete, valid record). An absent journal is empty.
+fn read_journal(path: &Path) -> (Vec<(JournalRecord, u64, u64)>, Option<(u64, String)>) {
+    let mut bytes = Vec::new();
+    match std::fs::File::open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(e) => return (Vec::new(), Some((0, format!("unreadable: {e}")))),
+        Ok(f) => {
+            if let Err(e) = f.take(JOURNAL_MAX_BYTES + 1).read_to_end(&mut bytes) {
+                return (Vec::new(), Some((0, format!("unreadable: {e}"))));
+            }
+        }
+    }
+    let past_bound = bytes.len() as u64 > JOURNAL_MAX_BYTES;
+    bytes.truncate(usize::try_from(JOURNAL_MAX_BYTES).expect("JOURNAL_MAX_BYTES fits usize"));
+    let mut records: Vec<(JournalRecord, u64, u64)> = Vec::new();
+    let mut at = 0_usize;
+    while at < bytes.len() {
+        let Some(len) = bytes[at..].iter().position(|&b| b == b'\n') else {
+            let why = if past_bound { "past the JOURNAL_MAX_BYTES bound" } else { "a torn record without its line end" };
+            return (records, Some((at as u64, why.into())));
+        };
+        let record = match JournalRecord::parse(&bytes[at..at + len]) {
+            Ok(record) => record,
+            Err(why) => return (records, Some((at as u64, why))),
+        };
+        if records.last().is_some_and(|(previous, _, _)| record.seq <= previous.seq) {
+            return (records, Some((at as u64, format!("sequence number {} does not increase", record.seq))));
+        }
+        let end = at + len + 1;
+        records.push((record, at as u64, end as u64));
+        at = end;
+    }
+    let stop = past_bound.then(|| (at as u64, "past the JOURNAL_MAX_BYTES bound".to_owned()));
+    (records, stop)
+}
+
+/// Replays, over the snapshot `file`, the journal's records after `file.journal_seq`, stopping at
+/// the first one that does not apply (module doc). Returns the queue file to open -- the snapshot
+/// alone if the replayed file would not `validate` -- and the length of the journal's valid
+/// prefix, where the next record goes. Reports a stop on stderr; never panics.
+fn replay_journal(path: &Path, mut file: QueueFile) -> (QueueFile, u64) {
+    let (records, mut stop) = read_journal(path);
+    if records.is_empty() && stop.is_none() {
+        return (file, 0);
+    }
+    let snapshot = file.clone();
+    let mut refs: BTreeMap<String, u32> = BTreeMap::new();
+    for binding in file.items.values().filter_map(|item| item.game.as_ref()) {
+        *refs.entry(binding.identity_hex()).or_insert(0) += 1;
+    }
+    let base = file.journal_seq;
+    let (mut last, mut valid, mut replayed) = (base, 0, 0_usize);
+    for (record, start, end) in &records {
+        if record.seq > base {
+            if let Err(why) = apply_record(&mut file, &mut refs, record) {
+                stop = Some((*start, format!("record {} does not apply to the queue: {why}", record.seq)));
+                break;
+            }
+            replayed += 1;
+        }
+        last = last.max(record.seq);
+        valid = *end;
+    }
+    file.journal_seq = last;
+    if let Err(e) = validate(&file) {
+        eprintln!(
+            "presolver queue: replaying the journal {} left a queue that does not validate ({e}); the journal is ignored and the snapshot is used as saved",
+            path.display()
+        );
+        return (QueueFile { journal_seq: last, ..snapshot }, 0);
+    }
+    if let Some((at, why)) = stop {
+        eprintln!("presolver queue: journal {} ignored from byte {at} ({why}); {replayed} record(s) replayed before it", path.display());
+    }
+    (file, valid)
+}
+
+/// Sets the state `record` holds on `file` (module doc): declares its generation if the snapshot
+/// predates it, binds the slot to the record's game -- creating that game's record, and dropping a
+/// game no slot binds any more -- or drops the slot's binding when the outcome was the slot's own,
+/// then sets that record's progress. Checks everything first: a record that cannot apply changes
+/// nothing and says why.
+fn apply_record(file: &mut QueueFile, refs: &mut BTreeMap<String, u32>, record: &JournalRecord) -> Result<(), &'static str> {
+    let Some(item) = file.items.get(&record.slot) else { return Err("an unknown slot") };
+    check_progress(record.progress())?;
+    if launched(record.progress()) {
+        return Err("an outcome still in flight");
+    }
+    if let Some(game) = &record.game {
+        if game.board != item.board {
+            return Err("a game on another board than its slot");
+        }
+        if game.spr.num() == 0 {
+            return Err("a game with a zero SPR");
+        }
+        if file.games.get(&hex(&game.identity)).is_some_and(|known| known.board != game.board || known.spr != game.spr) {
+            return Err("a game the queue knows with another board or SPR");
+        }
+    }
+    if record.generation != file.generation {
+        // `Queue::set_generation` ran after the snapshot and before this outcome.
+        file.generation = record.generation;
+        for item in file.items.values_mut() {
+            if !untouched(item.progress()) {
+                item.progress_mut().reset();
+            }
+        }
+    }
+    let previous = file.items[&record.slot].game.map(|binding| binding.identity);
+    let target = match &record.game {
+        Some(game) => {
+            let slot = file.items.get_mut(&record.slot).expect("checked above");
+            slot.progress_mut().reset();
+            slot.game = Some(GameBinding { generation: record.generation, identity: game.identity });
+            let key = hex(&game.identity);
+            if previous != Some(game.identity) {
+                *refs.entry(key.clone()).or_insert(0) += 1;
+                file.games.entry(key.clone()).or_insert_with(|| GameProgress {
+                    board: game.board.clone(),
+                    spr: game.spr,
+                    status: TaskStatus::Pending,
+                    retry_after_unix_ms: 0,
+                    attempts: 0,
+                    last_error: None,
+                });
+            }
+            Rec::Game(key)
+        }
+        None => {
+            file.items.get_mut(&record.slot).expect("checked above").game = None;
+            Rec::Slot(record.slot.clone())
+        }
+    };
+    if let Some(previous) = previous.filter(|previous| record.game.as_ref().map(|game| game.identity) != Some(*previous)) {
+        let game = hex(&previous);
+        if let Some(count) = refs.get_mut(&game) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                refs.remove(&game);
+                file.games.remove(&game);
+            }
+        }
+    }
+    let p = match &target {
+        Rec::Slot(id) => file.items.get_mut(id).expect("checked above").progress_mut(),
+        Rec::Game(game) => file.games.get_mut(game).expect("bound above").progress_mut(),
+    };
+    *p.status = record.status.clone();
+    *p.attempts = record.attempts;
+    *p.retry_after_unix_ms = record.retry_after_unix_ms;
+    *p.last_error = record.last_error.clone();
+    Ok(())
+}
+
+/// Writes `line` at byte `at` of the journal -- first cutting whatever follows the valid prefix,
+/// a torn or ignored tail -- in one write, then syncs it.
+fn append_at(path: &Path, at: u64, line: &[u8]) -> Result<(), CacheError> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(path)?;
+    if f.metadata()?.len() != at {
+        f.set_len(at)?;
+    }
+    f.seek(SeekFrom::Start(at))?;
+    f.write_all(line)?;
+    f.sync_data()?;
+    Ok(())
+}
+
 // --- the queue ---------------------------------------------------------------------------------
 
 /// A progress record: a slot's own (keyed by slot identity) or a game's (keyed by normalized game
@@ -784,6 +1075,11 @@ enum Rec {
 
 pub struct Queue {
     path: PathBuf,
+    /// The failure journal beside `path` (module doc, "The failure journal").
+    journal: PathBuf,
+    /// The length of the journal's valid prefix: where the next record is written, cutting any
+    /// torn or ignored tail first. Zero once a snapshot emptied it.
+    journal_valid: AtomicU64,
     file: QueueFile,
     clock: Box<dyn QueueClock>,
     /// The in-process retry deadline, on the clock's monotonic timeline, of every record failed with
@@ -808,12 +1104,15 @@ impl Queue {
     /// keys, no unknown fields (`validate`). A corrupt or absent file is rebuilt deterministically
     /// from `scenarios()` and `canonical_flops_ordered()`; existing valid cache cells still
     /// establish completion through `bind` and `reconcile`. A launch a dead process left in flight
-    /// gets its attempt back. Each persisted UTC retry deadline is converted, once, into the
-    /// backoff that remains -- clamped to `0..=RETRY_BACKOFF_MS` -- anchored at `clock`'s monotonic
-    /// reading now (module doc, "Retry deadlines and clocks"). Never fails today: every unusable
-    /// file is replaced by the rebuild.
+    /// gets its attempt back. Before any of that, the failure journal's records after the
+    /// snapshot's `journal_seq` are replayed over it (module doc, "The failure journal"). Each
+    /// persisted UTC retry deadline is converted, once, into the backoff that remains -- clamped to
+    /// `0..=RETRY_BACKOFF_MS` -- anchored at `clock`'s monotonic reading now (module doc, "Retry
+    /// deadlines and clocks"). Never fails today: every unusable file is replaced by the rebuild,
+    /// and a damaged journal is replayed up to its last complete, valid record.
     pub fn open_with_clock(cache_root: PathBuf, clock: Box<dyn QueueClock>) -> Result<Queue, CacheError> {
         let path = queue_path(&cache_root);
+        let journal = journal_path(&cache_root);
         let file = match load(&path) {
             Ok(Some(file)) => file,
             Ok(None) => Self::rebuild(),
@@ -822,7 +1121,17 @@ impl Queue {
                 Self::rebuild()
             }
         };
-        let mut queue = Queue { path, file, clock, waits: BTreeMap::new(), refs: BTreeMap::new(), in_flight: None };
+        let (file, valid) = replay_journal(&journal, file);
+        let mut queue = Queue {
+            path,
+            journal,
+            journal_valid: AtomicU64::new(valid),
+            file,
+            clock,
+            waits: BTreeMap::new(),
+            refs: BTreeMap::new(),
+            in_flight: None,
+        };
         let refund = |p: ProgressMut| {
             if launched(p.get()) {
                 *p.attempts = p.attempts.checked_sub(1).expect("a launched record has an attempt");
@@ -852,7 +1161,15 @@ impl Queue {
     fn rebuild() -> QueueFile {
         let frozen = frozen();
         let items = frozen.keys.iter().cloned().zip(frozen.items.iter().cloned()).collect();
-        QueueFile { version: QUEUE_VERSION, cursor: [0, 0, 0], paused: false, generation: INITIAL_GENERATION, items, games: BTreeMap::new() }
+        QueueFile {
+            version: QUEUE_VERSION,
+            cursor: [0, 0, 0],
+            paused: false,
+            generation: INITIAL_GENERATION,
+            items,
+            games: BTreeMap::new(),
+            journal_seq: 0,
+        }
     }
 
     /// Every slot, unbound, `Pending` and unlaunched, in sweep order: tier, then canonical flop,
@@ -931,8 +1248,79 @@ impl Queue {
         &frozen().keys
     }
 
+    /// Publishes the snapshot (`save_queue`), which holds every journal record so far (its
+    /// `journal_seq` names the last), and only then empties the failure journal through
+    /// `write_atomic` (module doc, "The failure journal"). Failing to empty it is reported and
+    /// harmless: the records left are the snapshot's own, never replayed again, and the next
+    /// append goes after them.
+    ///
+    /// # Errors
+    /// Whatever `save_queue` returns; the journal is then left as it was.
     pub fn save(&self) -> Result<(), CacheError> {
-        save_queue(&self.path, &self.file)
+        save_queue(&self.path, &self.file)?;
+        if std::fs::metadata(&self.journal).map_or(0, |m| m.len()) == 0 {
+            self.journal_valid.store(0, Ordering::SeqCst);
+            return Ok(());
+        }
+        match crate::storage::write_atomic(&self.journal, b"") {
+            Ok(()) => self.journal_valid.store(0, Ordering::SeqCst),
+            Err(e) => eprintln!(
+                "presolver queue: emptying the journal {} after a snapshot failed ({e}); its records are already in the snapshot and are not replayed again",
+                self.journal.display()
+            ),
+        }
+        Ok(())
+    }
+
+    /// Appends, and syncs, one failure-journal record holding slot `id`'s record as it stands now
+    /// -- its game's when it is bound under the current generation, else its own -- the moment a
+    /// failure outcome is recorded (ruling 15-R3b; module doc, "The failure journal"). A record
+    /// that would take the journal past `JOURNAL_MAX_BYTES` is not written: `Full` asks the caller
+    /// to fold the journal into a snapshot instead.
+    ///
+    /// # Errors
+    /// Any I/O error: nothing counts as appended, and a partly written line is cut before the next
+    /// append.
+    ///
+    /// # Panics
+    /// If `id` is unknown or a launch is in flight (always-on): an outcome is journaled once it is
+    /// recorded, never while a job runs.
+    pub fn journal_outcome(&mut self, id: &str) -> Result<JournalAppend, CacheError> {
+        if let Some((running, _)) = &self.in_flight {
+            panic!("journal_outcome({id}): {running} is in flight; journal an outcome once it is recorded");
+        }
+        let item = self.slot(id, "journal_outcome");
+        let rec = self.rec_of(id);
+        let game = match &rec {
+            Rec::Game(key) => {
+                let record = &self.file.games[key];
+                let identity = item.game.expect("a slot charged to a game is bound to it").identity;
+                Some(JournalGame { identity, board: record.board.clone(), spr: record.spr })
+            }
+            Rec::Slot(_) => None,
+        };
+        let p = self.progress(&rec);
+        let record = JournalRecord {
+            seq: self.file.journal_seq + 1,
+            generation: self.file.generation,
+            slot: id.to_owned(),
+            game,
+            status: p.status.clone(),
+            attempts: p.attempts,
+            retry_after_unix_ms: p.retry_after_unix_ms,
+            last_error: p.last_error.map(str::to_owned),
+        };
+        let line = record.line()?;
+        assert!(line.len() <= JOURNAL_RECORD_MAX_BYTES, "journal_outcome({id}): a {}-byte record exceeds JOURNAL_RECORD_MAX_BYTES", line.len());
+        let bytes = line.len() as u64;
+        let at = self.journal_valid.load(Ordering::SeqCst);
+        if at + bytes > JOURNAL_MAX_BYTES {
+            return Ok(JournalAppend::Full);
+        }
+        append_at(&self.journal, at, &line)?;
+        self.journal_valid.store(at + bytes, Ordering::SeqCst);
+        self.file.journal_seq = record.seq;
+        Ok(JournalAppend::Appended { bytes })
     }
 
     /// The slot `id` as a view carrying its effective progress (its game's when it is bound under

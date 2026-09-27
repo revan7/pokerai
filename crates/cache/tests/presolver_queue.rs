@@ -1211,8 +1211,18 @@ fn the_largest_possible_queue_file_still_fits_the_bound_and_reopens() {
             q.record_failure(id, 0, worst_error.clone());
         }
     }
+    // Fix round 2 (ruling 15-R3b): the widest failure-journal record -- this game, this SPR, this
+    // message -- stays inside JOURNAL_RECORD_MAX_BYTES even with a 20-digit sequence number.
+    let queue::JournalAppend::Appended { bytes } = q.journal_outcome(&ids[0]).unwrap() else { panic!("an empty journal has room") };
+    let widest = bytes + 19;
+    eprintln!("the widest failure-journal record measures {widest} bytes (JOURNAL_RECORD_MAX_BYTES {})", queue::JOURNAL_RECORD_MAX_BYTES);
+    assert!(widest <= queue::JOURNAL_RECORD_MAX_BYTES as u64);
     q.set_paused(true);
     q.save().expect("the worst-case queue file must stay within the bound");
+    // ... and so does the snapshot with the widest `journal_seq`.
+    let mut widest_file = saved(tmp.path());
+    widest_file.journal_seq = u64::MAX;
+    queue::save_queue(&queue::queue_path(tmp.path()), &widest_file).expect("the worst-case queue file must stay within the bound");
     let len = std::fs::metadata(queue::queue_path(tmp.path())).unwrap().len();
     eprintln!(
         "the largest possible queue.json measures {len} bytes ({:.1}% of the {}-byte QUEUE_FILE_MAX bound)",
@@ -2241,18 +2251,21 @@ fn saves_are_checkpointed_on_state_changes_and_their_volume_is_measured() {
     assert_eq!(run.failures, 0);
     assert!(run.bytes >= run.saves * (size - 1_000), "every save rewrites the whole file (a done game is 3 bytes shorter than a pending one)");
 
-    // Ruling 15-R3: a failure is an outcome the cache cannot reconstruct, saved at once -- one
-    // whole-file save per failure, on top of the checkpoints.
+    // Rulings 15-R3 and 15-R3b: a failure is an outcome the cache cannot reconstruct, on disk at
+    // once -- as one small journal record, not a whole-file save -- and folded into the next
+    // snapshot, which empties the journal.
     fake.script([JobPoll::Failed("worker exited".into())]);
     tick(&mut s, &fake, 1);
     let failed = s.save_stats();
-    assert_eq!(failed.saves, run.saves + 1, "a failure is saved at once, not at the next checkpoint");
-    let per_failure = failed.bytes - run.bytes;
-    assert!(per_failure >= size - 1_000, "a failure costs one whole-file save");
+    assert_eq!((failed.saves, failed.journal_appends), (run.saves, 1), "a failure is journaled at once, with no snapshot");
+    let per_failure = failed.journal_bytes;
+    assert!(per_failure < 1_024, "a failure costs a {per_failure}-byte journal record");
+    assert_eq!(std::fs::metadata(queue::journal_path(dir)).unwrap().len(), per_failure);
 
     s.apply(PresolverCommand::Pause);
     let paused = s.save_stats();
     assert_eq!(paused.saves, failed.saves + 1, "a pause is saved at once");
+    assert_eq!(std::fs::metadata(queue::journal_path(dir)).unwrap().len(), 0, "and the snapshot folds the journal");
     for _ in 0..10 {
         tick(&mut s, &fake, CHECKPOINT_MS);
     }
@@ -2265,7 +2278,7 @@ fn saves_are_checkpointed_on_state_changes_and_their_volume_is_measured() {
         "queue.json with every slot bound: {size} bytes; {JOBS} jobs over {elapsed} ms: {} saves, {} bytes \
          (the plan's policy: {} saves, {plan} bytes); tier 1 (7,020 jobs x {SOLVE_MS} ms) projects to at most \
          {tier_one_checkpoints} checkpoint saves, {} bytes (plan: {} saves, {} bytes); each failure outcome adds \
-         one save at once: {per_failure} bytes",
+         one journal record at once: {per_failure} bytes",
         run.saves,
         run.bytes,
         2 * JOBS,
@@ -2296,12 +2309,13 @@ fn a_failed_save_is_reported_and_retried_never_ignored() {
     assert!(saved(tmp.path()).paused);
 }
 
-/// Fix round 1, R3 (ruling 15-R3), the reviewer's reproduction: an outcome the cache cannot
-/// reconstruct -- a failure, with its attempt count and absolute retry deadline -- is saved before
-/// the scheduler goes on, not at the next checkpoint. The same slot fails four times, 30 s apart;
+/// Fix round 1, R3 (ruling 15-R3), the reviewer's reproduction, through the failure journal (fix
+/// round 2, ruling 15-R3b): an outcome the cache cannot reconstruct -- a failure, with its attempt
+/// count and absolute retry deadline -- is on disk before the scheduler goes on, as one journal
+/// record, with no snapshot between the failures. The same slot fails four times, 30 s apart;
 /// after each failure, a process that starts 10 s later by the wall clock (the old one lost, no
-/// shutdown) finds that failure on disk with the 20 s of backoff that remain, and the fourth as
-/// terminal. Reopened for real without a shutdown, the retry budget is still spent.
+/// shutdown) replays that failure from the journal with the 20 s of backoff that remain, and the
+/// fourth as terminal. Reopened for real without a shutdown, the retry budget is still spent.
 #[test]
 fn every_failure_survives_a_crash_before_the_checkpoint_with_its_remaining_backoff() {
     let tmp = TempDir::new("sched-crash-failures");
@@ -2310,6 +2324,7 @@ fn every_failure_survives_a_crash_before_the_checkpoint_with_its_remaining_backo
     let (mut s, _live) = scheduler(dir, &fake);
     let slot = s.queue().sweep_order()[0].clone();
     for n in 1..=4_u8 {
+        let journaled = journal_len(dir);
         fake.script([JobPoll::Failed("worker exited".into())]);
         tick(&mut s, &fake, queue::RETRY_BACKOFF_MS); // the idle gate, then each retry as it comes due
         assert_eq!(fake.slots_submitted().last(), Some(&slot), "attempt {n} runs the same slot");
@@ -2323,8 +2338,13 @@ fn every_failure_survives_a_crash_before_the_checkpoint_with_its_remaining_backo
         } else {
             assert_eq!(item.retry_after_unix_ms, u64::MAX, "the fourth failure is terminal");
         }
-        assert_eq!(s.save_stats().saves, u64::from(n), "one save per failure, at once (no checkpoint has passed)");
+        let stats = s.save_stats();
+        assert_eq!((stats.saves, stats.journal_appends), (0, u64::from(n)), "one journal record per failure, and no snapshot at all");
+        let record = journal_len(dir) - journaled;
+        assert!(record > 0 && record < 1_024, "failure {n} appended a {record}-byte record");
+        assert!(!queue::queue_path(dir).exists(), "no snapshot has been written");
     }
+    assert_eq!(s.save_stats().journal_bytes, journal_len(dir), "the journal holds exactly what was appended");
     drop(s); // process loss: no shutdown, no forced save
     let restarted = fake.restarted(FakeClock::new(0, UNIX + 120_001));
     let (s, _live) = scheduler(dir, &restarted);
@@ -2332,29 +2352,235 @@ fn every_failure_survives_a_crash_before_the_checkpoint_with_its_remaining_backo
     assert_eq!((after.status, after.attempts), (TaskStatus::Failed { n: 4 }, 4), "all four failures survive: the retry budget stays spent");
 }
 
-/// Fix round 1, R3: when the save of such an outcome fails, nothing new is launched until it is on
-/// disk. The launch path tries the save again every `SAVE_RETRY_MS`, and launches resume once it
-/// succeeds.
+/// Fix round 1, R3, through the journal (fix round 2, ruling 15-R3b): when the journal write of
+/// such an outcome fails, nothing new is launched until it is on disk. The launch path tries the
+/// write again every `SAVE_RETRY_MS`, and launches resume once it succeeds.
 #[test]
-fn a_failure_whose_save_fails_holds_new_launches_until_it_is_saved() {
+fn a_failure_whose_journal_write_fails_holds_new_launches_until_it_is_written() {
     let tmp = TempDir::new("sched-unsaved-failure");
     let dir = tmp.path();
     let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
     let (mut s, _live) = scheduler(dir, &fake);
-    let path = queue::queue_path(dir);
-    std::fs::create_dir(&path).unwrap(); // queue.json is a directory: every publication fails
+    let path = queue::journal_path(dir);
+    std::fs::create_dir(&path).unwrap(); // queue.journal is a directory: every append fails
     fake.script([JobPoll::Failed("worker exited".into())]);
     tick(&mut s, &fake, 30_000);
-    assert_eq!((s.save_stats().saves, s.save_stats().failures), (0, 1), "the failure's save was tried at once");
+    let stats = s.save_stats();
+    assert_eq!((stats.journal_appends, stats.journal_failures, stats.saves), (0, 1, 0), "the failure's journal write was tried at once");
     tick(&mut s, &fake, SAVE_RETRY_MS - 1);
-    assert_eq!((fake.submitted().len(), s.save_stats().failures), (1, 1), "no launch, and no second try, before SAVE_RETRY_MS");
+    assert_eq!((fake.submitted().len(), s.save_stats().journal_failures), (1, 1), "no launch, and no second try, before SAVE_RETRY_MS");
     std::fs::remove_dir(&path).unwrap();
     tick(&mut s, &fake, 1);
-    assert_eq!((s.save_stats().saves, s.save_stats().failures), (1, 1), "the save is tried again, and succeeds");
+    assert_eq!((s.save_stats().journal_appends, s.save_stats().journal_failures), (1, 1), "the write is tried again, and succeeds");
     assert_eq!(fake.submitted().len(), 2, "then launches resume");
-    let file = saved(dir);
-    let game = file.items[&fake.slots_submitted()[0]].game.unwrap().identity_hex();
-    assert_eq!(file.games[&game].status, TaskStatus::Failed { n: 1 }, "the failure is on disk");
+    let slot = &fake.slots_submitted()[0];
+    let crashed = open_at(dir, &FakeClock::new(0, UNIX + 60_000));
+    assert_eq!(crashed.item(slot).unwrap().status, TaskStatus::Failed { n: 1 }, "the failure is on disk");
+}
+
+/// The failure journal's size on disk under the cache root `dir` (0 when it does not exist).
+fn journal_len(dir: &Path) -> u64 {
+    std::fs::metadata(queue::journal_path(dir)).map_or(0, |m| m.len())
+}
+
+/// Fix round 2 (ruling 15-R3b): a sweep of systematic preparation failures -- here 200 slots whose
+/// chart node is missing, back to back -- writes one small journal record per failure, kilobytes
+/// in all, and never a snapshot per failure; and every one of them survives a crash.
+#[test]
+fn a_sweep_of_systematic_preparation_failures_writes_kilobytes_never_a_snapshot_per_failure() {
+    const N: usize = 200;
+    let tmp = TempDir::new("sched-systematic");
+    let dir = tmp.path();
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    let (mut s, _live) = scheduler(dir, &fake);
+    let slots = first_slots(&s, N);
+    fake.state().failing_preparation.extend(slots.iter().map(QueueItem::identity_hex));
+    tick(&mut s, &fake, 30_000);
+    for _ in 1..N {
+        assert_eq!(s.wait_hint(), Duration::ZERO, "each failure is followed at once by the next preparation");
+        s.step();
+    }
+    let stats = s.save_stats();
+    let written = stats.bytes + stats.journal_bytes;
+    eprintln!(
+        "{N} systematic preparation failures wrote {written} bytes to the queue directory: {} journal records, {} bytes ({} bytes each on average), {} snapshots",
+        stats.journal_appends,
+        stats.journal_bytes,
+        stats.journal_bytes / N as u64,
+        stats.saves
+    );
+    assert_eq!((stats.saves, stats.journal_appends), (0, N as u64), "one journal record per failure, never a snapshot");
+    assert!(written <= 200 * 1_024, "{written} bytes: kilobytes, not a snapshot per failure");
+    assert_eq!(journal_len(dir), stats.journal_bytes, "the bytes on disk are the bytes counted");
+    assert!(fake.submitted().is_empty());
+
+    let crashed = open_at(dir, &FakeClock::new(0, UNIX + 40_000));
+    for slot in &slots {
+        let item = crashed.item(&slot.identity_hex()).unwrap();
+        assert_eq!((item.status, item.attempts, item.game), (TaskStatus::Failed { n: 1 }, 1, None), "every failure survives a crash");
+    }
+}
+
+/// Fix round 2 (ruling 15-R3b): the journal is folded into the next snapshot and emptied only
+/// after it; a crash between a journal append and the next snapshot replays the record over the
+/// older snapshot -- attempt count and remaining backoff restored -- and a crash after a snapshot
+/// but before the journal was emptied never replays a record the snapshot already holds over a
+/// later change.
+#[test]
+fn journal_replay_after_a_crash_between_an_append_and_the_next_snapshot() {
+    // A crash after the second failure's append, with the first folded into a checkpoint.
+    let tmp = TempDir::new("sched-journal-replay");
+    let dir = tmp.path();
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    let (mut s, _live) = scheduler(dir, &fake);
+    let slot = s.queue().sweep_order()[0].clone();
+    fake.script([JobPoll::Failed("worker exited".into())]);
+    tick(&mut s, &fake, 30_000); // failure 1: journaled
+    assert!(journal_len(dir) > 0);
+    tick(&mut s, &fake, CHECKPOINT_MS); // the retry runs, and the checkpoint folds the journal
+    assert_eq!(s.save_stats().saves, 1);
+    assert_eq!(journal_len(dir), 0, "the journal is emptied once the snapshot holding it is durable");
+    let snapshot = saved(dir);
+    assert_eq!(snapshot.journal_seq, 1, "the snapshot names the last record it holds");
+    let game = snapshot.items[&slot].game.unwrap().identity_hex();
+    assert_eq!((&snapshot.games[&game].status, snapshot.games[&game].attempts), (&TaskStatus::Failed { n: 1 }, 2), "saved with the retry in flight");
+    fake.script([JobPoll::Failed("worker exited again".into())]);
+    tick(&mut s, &fake, 1); // failure 2: journaled only
+    assert_eq!(s.save_stats().saves, 1, "no snapshot for the second failure");
+    drop(s); // crash
+    let mono = 9_000;
+    let reopened = open_at(dir, &FakeClock::new(mono, fake.clock.unix_ms() + 10_000));
+    let item = reopened.item(&slot).unwrap();
+    assert_eq!(
+        (item.status, item.attempts, item.last_error.as_deref()),
+        (TaskStatus::Failed { n: 2 }, 2, Some("worker exited again")),
+        "the journal record replays over the older snapshot"
+    );
+    let due = |at: u64| reopened.next_pending(at).map(|i| i.identity_hex()) == Some(slot.clone());
+    assert!(!due(mono + 19_999) && due(mono + 20_000), "with the 20 s of backoff that remain");
+
+    // A crash after a checkpoint's snapshot but before the journal was emptied.
+    let tmp = TempDir::new("sched-journal-stale");
+    let dir = tmp.path();
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    fake.state().durable = true;
+    let (mut s, _live) = scheduler(dir, &fake);
+    let slot = s.queue().sweep_order()[0].clone();
+    fake.script([JobPoll::Failed("worker exited".into())]);
+    tick(&mut s, &fake, 30_000); // failure 1: journaled
+    let stale = std::fs::read(queue::journal_path(dir)).unwrap();
+    fake.script([finished()]);
+    tick(&mut s, &fake, 30_000); // the retry completes: Done (a verified completion, not journaled)
+    assert_eq!(s.queue().item(&slot).unwrap().status, TaskStatus::Done);
+    tick(&mut s, &fake, CHECKPOINT_MS); // the checkpoint holds Done and empties the journal
+    assert_eq!((s.save_stats().saves, journal_len(dir)), (1, 0));
+    drop(s);
+    std::fs::write(queue::journal_path(dir), &stale).unwrap(); // as if the emptying never happened
+    let reopened = open_at(dir, &FakeClock::new(0, UNIX + 400_000));
+    assert_eq!(reopened.item(&slot).unwrap().status, TaskStatus::Done, "a record the snapshot already holds is never replayed over a later change");
+}
+
+/// Fix round 2 (ruling 15-R3b): the journal never grows past `JOURNAL_MAX_BYTES`. A failure whose
+/// record would not fit is folded, with everything else, into a snapshot at once -- which empties
+/// the journal -- and survives a crash like any other.
+#[test]
+fn a_full_journal_is_folded_into_a_snapshot_instead_of_growing() {
+    use sha2::{Digest, Sha256};
+    let tmp = TempDir::new("sched-journal-full");
+    let dir = tmp.path();
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    let (mut s, _live) = scheduler(dir, &fake);
+    let first = s.queue().sweep_order()[0].clone();
+    fake.state().failing_preparation.insert(first.clone());
+    tick(&mut s, &fake, 30_000); // one real record, to copy
+    let line = std::fs::read_to_string(queue::journal_path(dir)).unwrap();
+    s.shutdown(); // its snapshot holds the record and empties the journal
+    drop(s);
+
+    // Fill the journal to its bound with records the snapshot already holds (sequence numbers up to
+    // its `journal_seq`): valid, replayed over nothing, but taking up the room.
+    let json: serde_json::Value = serde_json::from_str(line.trim_end().split_once(' ').unwrap().1).unwrap();
+    let mut filler = Vec::new();
+    let mut seq = 0_u64;
+    loop {
+        let mut record = json.clone();
+        record["seq"] = serde_json::json!(seq + 1);
+        let body = serde_json::to_string(&record).unwrap();
+        let next = format!("{} {body}\n", hex(&Sha256::digest(body.as_bytes()).into()));
+        if (filler.len() + next.len()) as u64 > queue::JOURNAL_MAX_BYTES {
+            break;
+        }
+        filler.extend_from_slice(next.as_bytes());
+        seq += 1;
+    }
+    let mut snapshot = saved(dir);
+    snapshot.journal_seq = seq;
+    queue::save_queue(&queue::queue_path(dir), &snapshot).unwrap();
+    std::fs::write(queue::journal_path(dir), &filler).unwrap();
+    assert!(queue::JOURNAL_MAX_BYTES - (filler.len() as u64) < 400, "the room left is smaller than a game's record");
+
+    let restarted = fake.restarted(FakeClock::new(0, UNIX + 100_000));
+    restarted.state().failing_preparation.clear();
+    restarted.state().submit_error = Some("worker unavailable".into());
+    let (mut s, _live) = scheduler(dir, &restarted);
+    tick(&mut s, &restarted, 30_000); // the first slot is prepared and bound; its submission is refused
+    let stats = s.save_stats();
+    assert_eq!((stats.journal_appends, stats.saves), (0, 1), "the record does not fit: a snapshot folds it instead");
+    assert_eq!(journal_len(dir), 0, "and empties the journal");
+    drop(s); // crash
+    let crashed = open_at(dir, &FakeClock::new(0, UNIX + 140_000));
+    let item = crashed.item(&first).unwrap();
+    assert_eq!((item.status, item.attempts, item.game.is_some()), (TaskStatus::Failed { n: 1 }, 1, true), "the failure survives the crash");
+}
+
+/// Fix round 2 (ruling 15-R3b): a torn or corrupt journal is handled deterministically. Replay
+/// stops at the last complete, valid record -- a torn last line, a checksum mismatch or garbage
+/// ends it, and everything from there on is ignored (reported on stderr, never a panic) -- and the
+/// damaged tail is cut before the next append, so a later record is never stranded behind it.
+#[test]
+fn a_torn_or_corrupt_journal_stops_replay_at_the_last_complete_record() {
+    let tmp = TempDir::new("sched-journal-torn");
+    let dir = tmp.path();
+    let fake = Fake::new(FakeClock::new(0, UNIX), GEN_A);
+    let (mut s, _live) = scheduler(dir, &fake);
+    let slots: Vec<String> = first_slots(&s, 4).iter().map(QueueItem::identity_hex).collect();
+    fake.state().failing_preparation.extend(slots.iter().cloned());
+    tick(&mut s, &fake, 30_000);
+    s.step();
+    s.step(); // three preparation failures: three records
+    drop(s);
+    let journal = std::fs::read(queue::journal_path(dir)).unwrap();
+    let lines: Vec<&[u8]> = journal.split_inclusive(|b| *b == b'\n').collect();
+    assert_eq!(lines.len(), 3, "one line per record");
+    let failed = |dir: &Path| -> Vec<bool> {
+        let q = open_at(dir, &FakeClock::new(0, UNIX + 40_000));
+        slots.iter().map(|id| matches!(q.item(id).unwrap().status, TaskStatus::Failed { .. })).collect()
+    };
+    let mut flipped = lines[1].to_vec();
+    flipped[100] ^= 0x01; // inside the JSON: the checksum no longer matches
+    let cases: Vec<(&str, Vec<u8>, Vec<bool>)> = vec![
+        ("intact", journal.clone(), vec![true, true, true, false]),
+        ("a torn last line", [lines[0], lines[1], &lines[2][..lines[2].len() / 2]].concat(), vec![true, true, false, false]),
+        ("a last line without its line end", [lines[0], lines[1], &lines[2][..lines[2].len() - 1]].concat(), vec![true, true, false, false]),
+        ("a corrupt middle record", [lines[0], &flipped[..], lines[2]].concat(), vec![true, false, false, false]),
+        ("a record out of sequence", [lines[0], lines[2], lines[1]].concat(), vec![true, false, true, false]),
+        ("garbage", b"not a journal\n\x00\xff\xfe".to_vec(), vec![false, false, false, false]),
+        ("empty", Vec::new(), vec![false, false, false, false]),
+    ];
+    for (name, bytes, expected) in cases {
+        std::fs::write(queue::journal_path(dir), &bytes).unwrap();
+        assert_eq!(failed(dir), expected, "{name}: replay stops at the last complete, valid record");
+    }
+
+    // A new process on a torn journal: its next record lands after the last valid one and replays.
+    std::fs::write(queue::journal_path(dir), [lines[0], &lines[1][..10]].concat()).unwrap();
+    let restarted = fake.restarted(FakeClock::new(0, UNIX + 100_000));
+    let (mut s, _live) = scheduler(dir, &restarted);
+    tick(&mut s, &restarted, 30_000); // the first slot's retry is due and fails again
+    s.step(); // the second slot (its record was torn off) fails again
+    s.step(); // and the third
+    drop(s);
+    assert_eq!(failed(dir), vec![true, true, true, false], "the torn bytes were cut before the next append");
 }
 
 /// Fix round 1, R3: a preparation failure (charged to the slot's own record) and a refused
@@ -2380,7 +2606,7 @@ fn preparation_and_submission_failures_survive_a_crash_before_the_checkpoint() {
         (TaskStatus::Failed { n: 1 }, 1, Some(game_of(&slots[1], GEN_A))),
         "a refused submission is on disk at once, as the bound game's failure"
     );
-    assert_eq!(s.save_stats().saves, 2);
+    assert_eq!((s.save_stats().saves, s.save_stats().journal_appends), (0, 2), "two journal records, no snapshot");
     assert!(fake.submitted().is_empty());
 }
 
