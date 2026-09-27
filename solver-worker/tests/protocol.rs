@@ -63,6 +63,26 @@ fn protocol_rejections() {
     assert_eq!(w.wait_exit(2 * S), Some(0));
 }
 
+/// Fix round 1 (review I1): the wire codec's domain (`proto::numeric::domain_rake_rate`) is already
+/// half-open at 1, so a `rake_rate` of exactly 1.0 never reaches `precheck` at all -- the deserializer
+/// itself refuses the line as an invalid message, before an `EngineMessage` even exists. This pins that
+/// wire-level rejection (never a silent admission) alongside the direct-handler rejection this same fix
+/// adds at the `precheck` boundary (`admission_rejects_a_rake_rate_of_exactly_one`, protocol.rs).
+#[test]
+fn rake_rate_of_exactly_one_is_rejected_at_the_wire() {
+    let mut w = Worker::spawn(4);
+    assert_eq!(w.recv(5 * S).unwrap()["type"], "ready");
+    let river = fixture_lines("river_two_combo");
+    w.send(&edit(&with_id(&river[0], "50"), |v| v["rake_rate"] = json!(1.0)));
+    let a = ack_of(&w, "50");
+    assert_eq!(a["status"], "rejected");
+    assert!(a["reason"].as_str().unwrap().contains("rake_rate"), "{a}");
+    assert!(w.recv_until(S, |m| m["id"] == "50" && m["type"] != "ack").is_none(), "a rejected request does no work");
+    w.send(r#"{"type":"shutdown","id":"51"}"#);
+    assert_eq!(ack_of(&w, "51")["status"], "accepted");
+    assert_eq!(w.wait_exit(2 * S), Some(0));
+}
+
 // ---- Beyond the brief's test: the spec's river wire example, and a stop with a live job ----
 
 /// §4.5's river wire example replayed from `river_two_combo.jsonl` (solve 41, cancel 42, shutdown 48), reading every

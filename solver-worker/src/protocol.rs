@@ -47,13 +47,26 @@ pub enum WorkerState { Idle, Building, Solving, Extracting, Stopping }
 
 pub struct LiveJob { pub id: String, pub cancel: Arc<AtomicBool> }
 pub struct Job { pub req: SolveRequest, pub locks: Option<Vec<NodeLock>>, pub cancel: Arc<AtomicBool> }
+
+/// `begin_stop`'s watchdog thread creation, as a seam: production always installs `spawn_watchdog`; a
+/// test installs a `fn` that returns `Err` instead, to exercise the recoverable failure path (review I2)
+/// without ever actually exhausting the OS thread scheduler.
+type WatchdogSpawn = fn(Duration, SyncSender<Out>) -> io::Result<std::thread::JoinHandle<()>>;
+/// The real watchdog: sleeps `grace`, then queues `Exit(0)` behind whatever is already queued.
+fn spawn_watchdog(grace: Duration, out: SyncSender<Out>) -> io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name("stop-watchdog".into()).spawn(move || {
+        std::thread::sleep(grace);
+        let _ = out.send(Out::Exit(0));
+    })
+}
+
 /// The protocol state, behind `Shared::proto`. `stop_grace` is how long a stop lets a live job run on before the
 /// watchdog exits the process: `STOP_GRACE` in every worker (`new`); a test lengthens it to observe a stop without
-/// the watchdog.
-pub struct Proto { pub state: WorkerState, pub live: Option<LiveJob>, pub finished: VecDeque<String>, pub staged: Option<(String, Vec<NodeLock>)>, pub stopping: bool, pub stop_grace: Duration }
+/// the watchdog. `watchdog_spawn` is `spawn_watchdog` in every worker; a test replaces it to inject a spawn failure.
+pub struct Proto { pub state: WorkerState, pub live: Option<LiveJob>, pub finished: VecDeque<String>, pub staged: Option<(String, Vec<NodeLock>)>, pub stopping: bool, pub stop_grace: Duration, watchdog_spawn: WatchdogSpawn }
 pub struct Shared { pub proto: Mutex<Proto>, pub out: SyncSender<Out>, pub jobs: Sender<Job> }
 
-impl Proto { pub fn new() -> Self { Self { state: WorkerState::Idle, live: None, finished: VecDeque::new(), staged: None, stopping: false, stop_grace: STOP_GRACE } } }
+impl Proto { pub fn new() -> Self { Self { state: WorkerState::Idle, live: None, finished: VecDeque::new(), staged: None, stopping: false, stop_grace: STOP_GRACE, watchdog_spawn: spawn_watchdog } } }
 impl Default for Proto { fn default() -> Self { Self::new() } }
 
 /// One read from stdin: a complete line (its terminator removed), a line over the limit or a line that is not
@@ -185,7 +198,10 @@ pub fn precheck(req: &SolveRequest) -> Result<(), String> {
     let mut seen = HashSet::new();
     if !(3..=5).contains(&req.board.len()) || !req.board.iter().all(|c| seen.insert(c.0)) { return Err("board must be 3 to 5 distinct cards".into()); }
     if req.pot == 0 || req.stack_oop == 0 || req.stack_ip == 0 { return Err("pot and stacks must be positive".into()); }
-    if !req.rake_rate.is_finite() || req.rake_rate < 0.0 || req.rake_rate > 1.0 { return Err("rake_rate outside [0, 1]".into()); }
+    // Fix round 1 (review I1): half-open at 1, the same domain the shared wire codec enforces
+    // (`proto::numeric::domain_rake_rate`) -- a direct in-process `SolveRequest` must not accept a
+    // value the wire parser would refuse.
+    if !req.rake_rate.is_finite() || req.rake_rate < 0.0 || req.rake_rate >= 1.0 { return Err("rake_rate outside [0, 1)".into()); }
     Ok(())
 }
 
@@ -267,12 +283,16 @@ fn begin_stop(shared: &Shared, p: &mut Proto, publish: &mut dyn FnMut(Out)) {
         None => publish(Out::Exit(0)),
         Some(live) => {
             live.cancel.store(true, Ordering::SeqCst);
-            let (out, grace) = (shared.out.clone(), p.stop_grace);
-            // Best effort: should the thread not start, the job's terminal still exits the process (see above).
-            let _ = std::thread::Builder::new().name("stop-watchdog".into()).spawn(move || {
-                std::thread::sleep(grace);
-                let _ = out.send(Out::Exit(0));
-            });
+            let (out, grace, spawn) = (shared.out.clone(), p.stop_grace, p.watchdog_spawn);
+            // Fix round 1 (review I2): a failed thread spawn is a recoverable control-path error, not
+            // license to drop the exit bound the watchdog exists to provide. Publish `Exit(0)` right now
+            // instead -- through `publish`, so it is queued under this same lock hold, right behind the
+            // ack already published above -- rather than waiting indefinitely on a job that may never
+            // reach a checkpoint, or exiting the process directly while still holding the protocol lock.
+            // The writer still drains everything queued ahead of it; a job that later finishes anyway is
+            // the same process-death exception §4.5 already grants a fired watchdog (the engine
+            // synthesizes any terminal that never arrives).
+            if spawn(grace, out).is_err() { publish(Out::Exit(0)); }
         }
     }
 }
@@ -778,10 +798,12 @@ mod tests {
         assert_eq!(with(&|r| r.pot = 0), err("pot and stacks must be positive"));
         assert_eq!(with(&|r| r.stack_oop = 0), err("pot and stacks must be positive"));
         assert_eq!(with(&|r| r.stack_ip = 0), err("pot and stacks must be positive"));
-        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1e-9, 1.000_001] {
-            assert_eq!(with(&|r| r.rake_rate = bad), err("rake_rate outside [0, 1]"), "{bad}");
+        // Fix round 1 (review I1): the domain is half-open at 1, matching the shared wire codec
+        // (`proto::numeric::domain_rake_rate`), so 1.0 itself is a rejection, not the upper bound.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1e-9, 1.0, 1.000_001] {
+            assert_eq!(with(&|r| r.rake_rate = bad), err("rake_rate outside [0, 1)"), "{bad}");
         }
-        for good in [0.0, 0.05, 1.0] { assert_eq!(with(&|r| r.rake_rate = good), Ok(()), "{good}"); }
+        for good in [0.0, 0.05, 0.999_999_94] { assert_eq!(with(&|r| r.rake_rate = good), Ok(()), "{good}"); }
     }
     const MAX_REQUEST_NODES: usize = proto::worker::MAX_EXPORTED_NODES;
     use proto::MaterializedNode;
@@ -877,6 +899,18 @@ mod tests {
         assert!(job.cancel.load(Ordering::SeqCst), "control's cancel reaches the job");
     }
 
+    /// Fix round 1 (review I1): `admit` rejects `rake_rate == 1.0` exactly like the shared wire codec's
+    /// half-open domain (`proto::numeric::domain_rake_rate`) -- a direct handler rejection, not merely a
+    /// `precheck` unit result: the worker's state is unchanged and nothing is handed to the executor.
+    #[test]
+    fn admission_rejects_a_rake_rate_of_exactly_one() {
+        let c = control();
+        let before = c.snap();
+        assert_eq!(c.msg(solve_with("river_two_combo", "21", |r| r.rake_rate = 1.0)), vec![refused("21", "rake_rate outside [0, 1)")]);
+        assert_eq!(c.handed().len(), 0, "no job handed to the executor");
+        assert_eq!(c.snap(), before, "no state change");
+    }
+
     /// A cancel never reaches another job: after a cancel of an unknown or finished id, a live job's flag is down.
     #[test]
     fn a_cancel_never_touches_a_different_job() {
@@ -903,6 +937,29 @@ mod tests {
             assert_eq!(c.end("11"), vec![cancelled("11"), Err(0)], "the terminal, then the exit");
             assert_eq!(c.snap(), Snap { state: WorkerState::Stopping, live: None, finished: vec!["11".into()], staged: false, stopping: true });
             assert_eq!(c.msg(cancel("13", "11")), vec![acked("13", AckStatus::AlreadyFinished)]);
+        }
+    }
+
+    /// A watchdog spawn that always fails, injected through `Proto::watchdog_spawn` (review I2's seam).
+    fn failing_watchdog_spawn(_: Duration, _: SyncSender<Out>) -> io::Result<std::thread::JoinHandle<()>> {
+        Err(io::Error::from(io::ErrorKind::Other))
+    }
+
+    /// Fix round 1 (review I2): should the watchdog thread itself fail to start, the exit bound it exists to
+    /// provide must not be silently lost. `Exit(0)` is queued right away -- behind the shutdown ack, when there
+    /// is one -- rather than the worker waiting indefinitely on a job that may never reach a checkpoint, or
+    /// control exiting the process directly while still holding the protocol lock. The state still ends exactly
+    /// as a successful stop leaves it: `Stopping`, the live job's flag raised, no staged lock.
+    #[test]
+    fn a_failed_watchdog_spawn_still_queues_the_exit_bound() {
+        for by_eof in [false, true] {
+            let c = start(Start::Live(WorkerState::Solving));
+            c.shared.proto.lock().unwrap().staged = Some(("spot".into(), vec![]));
+            c.shared.proto.lock().unwrap().watchdog_spawn = failing_watchdog_spawn;
+            let acks = if by_eof { c.eof() } else { c.msg(shutdown("17")) };
+            let want = if by_eof { vec![Err(0)] } else { vec![acked("17", AckStatus::Accepted), Err(0)] };
+            assert_eq!(acks, want, "by_eof: {by_eof}: exactly an ordered ack/exit");
+            assert_eq!(c.snap(), Snap { state: WorkerState::Stopping, live: Some(("11".into(), true)), finished: vec![], staged: false, stopping: true });
         }
     }
 
