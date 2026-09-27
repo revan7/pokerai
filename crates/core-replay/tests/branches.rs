@@ -82,8 +82,10 @@ fn replay_cross_actor_branches(){
 // Beyond the brief's verbatim tests: the rest of the section 13.1 rows and the brief's step 5.
 // ---------------------------------------------------------------------------------------------
 
-use core_replay::{condition, marginal, posterior, range_output, rescale, HistoryBranch};
-use proto::{Action, Seat};
+use core_replay::{
+    cap_branches, condition, marginal, posterior, range_output, rescale, residual_reason, split_action, HistoryBranch, SeatMass,
+};
+use proto::{Action, ApproxReason, Seat};
 
 /// Rounded spec figures (section 13.1 quotes them to 3-4 decimals).
 fn near(a: f64, b: f64) {
@@ -585,4 +587,219 @@ fn rescale_rejects_out_of_domain_weight() {
     let mut b = two_combos();
     b[0].q = 2.5;
     rescale(&mut b, &mut vec![0.0; 6]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// P3.T12 -- the branch cap, its persistent frozen residual, `residual_reason` and the test-only
+// `split_action` (spec sections 8.4, 9.1, 9.2; section 13.1 row `replay_branch_cap_residual`).
+// ---------------------------------------------------------------------------------------------
+
+/// The task brief's worked example, verbatim: uniform likelihood .5 at all combos, three rounds of
+/// splitting every current live branch across one observed wager (f = .6/.4) and capping. Round 3
+/// overflows 8 live branches to 4 live + 1 residual (weights `.027,.018,.018,.018,.012,.012,.012,
+/// .008`, residual `.044`, total `.125`); a later on-menu `.5` halves only the live total to
+/// `.0405` (the residual is frozen, so it does not see the new likelihood); a fourth split then
+/// overflows again, extending the same residual by `.0081` to `.0521`.
+#[test]
+fn replay_branch_cap_residual() {
+    use core_preflop::branches::*;
+    let mut b = two_combos();
+    let actor = proto::Seat(0);
+    let choices = vec![
+        (proto::Action::Raise { to: 50 }, 0.6, vec![0.5; 1326]),
+        (proto::Action::Raise { to: 100 }, 0.4, vec![0.5; 1326]),
+    ];
+    for _ in 0..3 {
+        b = split_action(&b, actor, &choices);
+        cap_branches(&mut b);
+    }
+    assert_eq!(b.iter().filter(|b| !b.residual).count(), 4);
+    close(b.iter().find(|b| b.residual).unwrap().q, 0.044);
+    close(b.iter().map(|b| b.q).sum(), 0.125);
+    b = b.iter().filter_map(|b| condition(b, actor, &vec![0.5; 1326], 1.)).collect();
+    close(b.iter().filter(|b| !b.residual).map(|b| b.q).sum(), 0.0405);
+    close(b.iter().find(|b| b.residual).unwrap().q, 0.044);
+    b = split_action(&b, actor, &choices);
+    cap_branches(&mut b);
+    close(b.iter().find(|b| b.residual).unwrap().q, 0.0521);
+    assert_eq!(b.iter().filter(|b| b.residual).count(), 1);
+}
+
+/// `residual_reason` recomputes the share from current weights every call, never caches the
+/// original cap's figure: `None` before any cap has produced a residual, `35.2%` right after the
+/// cap that built it (`100 * .044 / .125`), and `52.0710059%` (52.1 rounded) after the later
+/// on-menu action halves only the live total, matching the brief's prose for the same sequence.
+#[test]
+fn residual_reason_reports_the_recomputed_share() {
+    let actor = Seat(0);
+    let hero = Seat(1);
+    let mut b = two_combos();
+    let choices = vec![(Action::Raise { to: 50 }, 0.6, vec![0.5; 1326]), (Action::Raise { to: 100 }, 0.4, vec![0.5; 1326])];
+    assert!(residual_reason(&b, hero).is_none(), "no residual exists before the first overflowing cap");
+    for _ in 0..3 {
+        b = split_action(&b, actor, &choices);
+        cap_branches(&mut b);
+    }
+    match residual_reason(&b, hero).expect("cap_branches created a residual") {
+        ApproxReason::BranchResidual { seat, residual_mass_pct, cause } => {
+            assert_eq!(seat, hero);
+            assert_eq!(cause, "cap");
+            assert!((residual_mass_pct - 35.2).abs() < 0.05, "{residual_mass_pct} != 35.2");
+        }
+        other => panic!("expected ApproxReason::BranchResidual, got {other:?}"),
+    }
+    b = b.iter().filter_map(|b| condition(b, actor, &vec![0.5; 1326], 1.)).collect();
+    match residual_reason(&b, hero).expect("the residual survives a live-only conditioning step") {
+        ApproxReason::BranchResidual { residual_mass_pct, .. } => {
+            assert!((residual_mass_pct - 52.0710059).abs() < 0.001, "{residual_mass_pct} != 52.0710059");
+        }
+        other => panic!("expected ApproxReason::BranchResidual, got {other:?}"),
+    }
+}
+
+/// `split_action` assigns each parent's children in choice order (child A before child B),
+/// stamps `parent`/`split_by`/the appended `translated` entry, and copies a residual or stopped
+/// branch through completely unchanged (bit-identical `q` and masses, its own id kept) whatever
+/// the menu -- it is never conditioned, matching `condition`'s own frozen-branch rule.
+#[test]
+fn split_action_wires_parent_split_by_translated_and_freezes_residual_and_stopped() {
+    let b = two_combos();
+    let actor = Seat(0);
+    let choices = vec![(Action::Bet { to: 50 }, 0.6, vec![0.5; 1326]), (Action::Bet { to: 100 }, 0.4, vec![0.5; 1326])];
+    let mut bs = split_action(&b, actor, &choices);
+    assert_eq!(bs.len(), 2);
+    assert_eq!(bs[0].parent, Some(0));
+    assert_eq!(bs[1].parent, Some(0));
+    assert_eq!(bs[0].split_by, Some(actor));
+    assert_eq!(bs[1].split_by, Some(actor));
+    assert_eq!(bs[0].translated, vec![(actor, Action::Bet { to: 50 })]);
+    assert_eq!(bs[1].translated, vec![(actor, Action::Bet { to: 100 })]);
+    assert!(bs[0].id < bs[1].id, "child A (first choice) keeps a lower id than child B");
+
+    bs[0].residual = true;
+    bs[1].stopped = Some("missing node X".into());
+    let (before_q, before_mass) = (bs[0].q, bs[0].seats[0].mass.clone());
+    let (before_stopped_q, before_stopped_mass) = (bs[1].q, bs[1].seats[0].mass.clone());
+    let out = split_action(&bs, actor, &choices);
+    assert_eq!(out.len(), 2, "a residual and a stopped branch are copied through, never expanded");
+    assert_eq!(out[0].id, bs[0].id);
+    assert!(out[0].residual);
+    assert_eq!(out[0].q, before_q);
+    assert_eq!(out[0].seats[0].mass, before_mass);
+    assert_eq!(out[1].id, bs[1].id);
+    assert_eq!(out[1].stopped, Some("missing node X".into()));
+    assert_eq!(out[1].q, before_stopped_q);
+    assert_eq!(out[1].seats[0].mass, before_stopped_mass);
+}
+
+/// A child whose id counter would exceed `u8::MAX` is compacted to `0..out.len()` in creation
+/// order (never a silent id collision left in the output), and child order (A before B) survives
+/// the compaction.
+#[test]
+fn split_action_compacts_ids_past_u8_max() {
+    let mut b = two_combos();
+    b[0].id = 254;
+    let actor = Seat(0);
+    let choices = vec![(Action::Raise { to: 50 }, 0.6, vec![0.5; 1326]), (Action::Raise { to: 100 }, 0.4, vec![0.5; 1326])];
+    let out = split_action(&b, actor, &choices);
+    assert_eq!(out.len(), 2);
+    let ids: Vec<u8> = out.iter().map(|c| c.id).collect();
+    assert_eq!(ids, vec![0, 1], "254/255 would otherwise collide; compaction must yield unique, ordered ids");
+    assert_eq!(out[0].translated.last(), Some(&(actor, Action::Raise { to: 50 })));
+    assert_eq!(out[1].translated.last(), Some(&(actor, Action::Raise { to: 100 })));
+}
+
+/// The audit `cap_branches` itself must satisfy: every seat's public marginal is unchanged by the
+/// cap, combo by combo, at 1e-12 -- including when the merged-away branches have different (not
+/// uniform) mass shapes, so the residual that absorbs them is not flat either.
+#[test]
+fn cap_branches_preserves_marginals_with_nonuniform_masses() {
+    let seat = Seat(0);
+    let mut bs: Vec<HistoryBranch> = (0..6u8)
+        .map(|id| {
+            let mut mass = vec![0.0; 1326];
+            mass[0] = 1.0 + f64::from(id);
+            mass[1] = 2.0 + f64::from(id) * 0.5;
+            mass[2] = if id % 2 == 0 { 3.0 } else { 0.0 };
+            HistoryBranch {
+                id,
+                parent: None,
+                split_by: None,
+                translated: vec![],
+                q: 0.30 - f64::from(id) * 0.04,
+                residual: false,
+                stopped: None,
+                seats: vec![SeatMass { seat, node: None, mass }],
+            }
+        })
+        .collect();
+    let before = marginal(&bs, seat);
+    cap_branches(&mut bs);
+    assert_eq!(bs.iter().filter(|b| !b.residual).count(), 4);
+    assert_eq!(bs.iter().filter(|b| b.residual).count(), 1);
+    let after = marginal(&bs, seat);
+    for (c, (a, z)) in before.iter().zip(&after).enumerate() {
+        assert!((a - z).abs() <= 1e-12, "combo {c}: marginal moved from {a} to {z} across cap_branches");
+    }
+    let r = bs.iter().find(|b| b.residual).unwrap();
+    assert_ne!(r.seats[0].mass[0], r.seats[0].mass[1], "the merged residual keeps a non-flat shape, not a uniform average");
+}
+
+/// A cap that overflows into an *existing* residual (a second overflow event) keeps absorbing
+/// mass rather than creating a second one, and the marginal-preservation audit still holds.
+#[test]
+fn cap_branches_merges_a_second_overflow_into_the_existing_residual() {
+    let seat = Seat(0);
+    let mut bs: Vec<HistoryBranch> = (0..7u8)
+        .map(|id| {
+            let mut mass = vec![0.0; 1326];
+            mass[0] = 1.0 + f64::from(id);
+            mass[1] = 3.0 - f64::from(id) * 0.2;
+            HistoryBranch {
+                id,
+                parent: None,
+                split_by: None,
+                translated: vec![],
+                q: 0.20 - f64::from(id) * 0.02,
+                residual: false,
+                stopped: None,
+                seats: vec![SeatMass { seat, node: None, mass }],
+            }
+        })
+        .collect();
+    let before1 = marginal(&bs, seat);
+    cap_branches(&mut bs);
+    assert_eq!(bs.iter().filter(|b| b.residual).count(), 1);
+    assert_eq!(bs.iter().filter(|b| !b.residual).count(), 4);
+    let after1 = marginal(&bs, seat);
+    for (c, (a, z)) in before1.iter().zip(&after1).enumerate() {
+        assert!((a - z).abs() <= 1e-12, "combo {c}: marginal moved from {a} to {z} across the first cap");
+    }
+
+    // Add three more low-weight live branches (fresh ids) and cap again: the existing residual
+    // must absorb them, never spawn a second one, and the (now larger) marginal is still
+    // preserved exactly across this second cap.
+    for (k, id) in (10u8..13).enumerate() {
+        let mut mass = vec![0.0; 1326];
+        mass[0] = 0.5 + k as f64;
+        mass[1] = 1.0;
+        bs.push(HistoryBranch {
+            id,
+            parent: None,
+            split_by: None,
+            translated: vec![],
+            q: 0.01 + (k as f64) * 0.001,
+            residual: false,
+            stopped: None,
+            seats: vec![SeatMass { seat, node: None, mass }],
+        });
+    }
+    let before2 = marginal(&bs, seat);
+    cap_branches(&mut bs);
+    assert_eq!(bs.iter().filter(|b| b.residual).count(), 1, "a second overflow extends the one residual, never a second");
+    assert_eq!(bs.iter().filter(|b| !b.residual).count(), 4);
+    let after2 = marginal(&bs, seat);
+    for (c, (a, z)) in before2.iter().zip(&after2).enumerate() {
+        assert!((a - z).abs() <= 1e-12, "combo {c}: marginal moved from {a} to {z} across the second cap");
+    }
 }
