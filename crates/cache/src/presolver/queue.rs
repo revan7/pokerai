@@ -106,12 +106,14 @@
 //! `Done` means a validated entry at target exists on disk for the game's normalized identity,
 //! never that a store was issued: a writer receipt is only a barrier. `entry_verified` reads the
 //! cell back through `crate::storage::read_cell` (full decode plus `validate_entry`) and checks the
-//! identity and raw accuracy (`crate::label::accuracy_ok`). `reconcile` applies such a predicate on
-//! startup and periodically to every game a slot is bound to under the current generation -- once
-//! per game, however many slots share it -- promoting games whose entries exist and demoting `Done`
-//! games whose entries are gone, corrupt, or built from other ranges; a slot with no current
-//! binding has no identity to check yet. `reconcile_item` decides one freshly bound slot's game
-//! the same way, so the scheduler can find an entry already on disk before it launches a solve.
+//! identity and raw accuracy (`crate::label::accuracy_ok`). `reconcile` applies such a predicate to
+//! every game a slot is bound to under the current generation -- once per game, however many slots
+//! share it -- promoting games whose entries exist and demoting `Done` games whose entries are gone,
+//! corrupt, or built from other ranges; a slot with no current binding has no identity to check
+//! yet. `reconcile_item` decides one bound slot's game the same way: the scheduler (task 15) calls
+//! it after each `bind`, so an entry already on disk completes a game before any solve is launched,
+//! and runs its startup and periodic sweeps through it, a few games per iteration in `sweep_order`,
+//! rather than through one blocking `reconcile`.
 //!
 //! ## The file
 //!
@@ -913,6 +915,20 @@ impl Queue {
     /// The source/config generation bindings are checked against.
     pub fn generation(&self) -> [u8; 32] {
         self.file.generation
+    }
+
+    /// A reading of the queue clock's monotonic timeline -- the one timeline every `now_ms` passed
+    /// to this queue must come from (module doc, "Retry deadlines and clocks"). The scheduler (task
+    /// 15, ruling S1) takes all its time from here, so it can never drift onto another clock.
+    pub fn now_ms(&self) -> u64 {
+        self.clock.monotonic_ms()
+    }
+
+    /// Every slot identity (`QueueItem::identity_hex`) in sweep order, the order `next_pending`,
+    /// `advance_cursor` and `reconcile` walk. The scheduler's chunked reconciliation (task 15) walks
+    /// it too, a few games per iteration, through `item` and `reconcile_item`.
+    pub fn sweep_order(&self) -> &'static [String] {
+        &frozen().keys
     }
 
     pub fn save(&self) -> Result<(), CacheError> {
