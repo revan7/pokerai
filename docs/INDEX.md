@@ -60,6 +60,7 @@ Status legend: **current** (live, authoritative as written) · **superseded by `
 | Path | Type | Status | Revision / date | Purpose |
 |---|---|---|---|---|
 | [`docs/bench/worker-toolchain.json`](./bench/worker-toolchain.json) | data record | current | 2026-09-17 | Plan 2 V1 toolchain decision record: the pinned solver example built on MSVC with `+avx2` and timed against the R8 GNU FLOP-FAST figure (spec section 3.6); records the toolchain, target, rustc, solver commit, rustflags and workload used. |
+| [`docs/bench/2026-09-10-i7-13700K.md`](./bench/2026-09-10-i7-13700K.md) | bench report | current (pre-baseline) | 2026-09-27 | Plan 2 Task 30's first `bench run` report (spec section 13.5 layout) over the river and turn suites with R8 addendum ranges on the i7-13700K: per-suite wall p50/p95/max, time-to-target, peak RSS, coverage mix, street/final violations and cancel latency; explicitly a pre-baseline reference run, since the V2/V22 gate is measured only after plan 4 Task 20 regenerates the six spot files from chart replay. Appended to by later runs. |
 
 ## docs/design/
 
