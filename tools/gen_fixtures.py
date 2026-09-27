@@ -283,12 +283,7 @@ def generate(count: int, first_seed: int = 1) -> tuple[list[dict], int]:
     return hands, dropped
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--count", type=int, default=200)
-    ap.add_argument("--seed", type=int, default=1)
-    a = ap.parse_args()
+def _run_hands(a: argparse.Namespace) -> None:
     hands, dropped = generate(a.count, a.seed)
     a.out.mkdir(parents=True, exist_ok=True)
     for k, h in enumerate(hands, 1):
@@ -297,5 +292,45 @@ def main() -> None:
     print(f"wrote {len(hands)} hands to {a.out} ({dropped} seeds dropped)")
 
 
+def _run_sources(repo: Path, check: bool) -> None:
+    import chart_sources
+
+    if check:
+        raw = (json.dumps(chart_sources.freeze_sources(repo), sort_keys=True, indent=2) + "\n").encode("utf-8")
+        existing = (repo / "bench/spots/sources.json").read_bytes()
+        if raw != existing:
+            raise SystemExit("bench/spots/sources.json differs from the generator")
+        print("bench/spots/sources.json matches the generator")
+    else:
+        chart_sources.write_sources(repo)
+        print(f"wrote {repo / 'bench/spots/sources.json'}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    # The subcommand table (plan 4 Task 17); `sources` is added here and extended by Task 19
+    # with `worker` and `e2e` (see that task's brief for the shared shape this mirrors).
+    repo = Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser(prog="gen_fixtures", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_hands = sub.add_parser("hands", help="generate PokerKit hand fixtures")
+    p_hands.add_argument("--out", type=Path, required=True)
+    p_hands.add_argument("--count", type=int, default=200)
+    p_hands.add_argument("--seed", type=int, default=1)
+
+    p_sources = sub.add_parser("sources", help="freeze chart provenance and node inventory")
+    p_sources.add_argument(
+        "--check", action="store_true",
+        help="regenerate bench/spots/sources.json in memory and compare bytes instead of writing",
+    )
+
+    args = parser.parse_args(argv)
+    if args.command == "sources":
+        _run_sources(repo, args.check)
+        return 0
+    _run_hands(args)
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

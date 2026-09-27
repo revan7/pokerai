@@ -1,0 +1,138 @@
+{
+  "bundles": [
+    {
+      "bytes": 151264,
+      "manifest": {
+        "accuracy": "unverified",
+        "bundle_id": "pokercoaching_100",
+        "depth_bb": 100,
+        "depths": [
+          100
+        ],
+        "ev_reference": "unverified",
+        "ev_unit": "source_sb",
+        "game": "nl",
+        "license_note": "PokerCoaching 'Implementable GTO Charts' (public PDF online-6max-gto-charts.pdf), transcribed cell by cell for private use; not redistributed. Frequencies are the published pure 0/1 displayed choices; no EVs.",
+        "rake": null,
+        "rake_profile": "undocumented",
+        "sha256": "97670f854018a17f6c9e1bcc851ec1a24a3e29492633aa25f60bf6ed19c4fa86",
+        "source": "ChartTranscription",
+        "source_blinds": [
+          0.5,
+          1.0
+        ],
+        "straddle": false,
+        "version": 2
+      },
+      "name": "pokercoaching_100",
+      "nodes": [
+        "",
+        "F",
+        "FF",
+        "FFF",
+        "FFFF",
+        "R",
+        "RF",
+        "FR",
+        "RFF",
+        "FRF",
+        "FFR",
+        "RFFF",
+        "FRFF",
+        "FFRF",
+        "FFFR",
+        "RFFFF",
+        "FRFFF",
+        "FFRFF",
+        "FFFRF",
+        "FFFFC",
+        "FFFFR",
+        "FFFFRR"
+      ],
+      "sha256": "97670f854018a17f6c9e1bcc851ec1a24a3e29492633aa25f60bf6ed19c4fa86",
+      "source": {
+        "envelope_version": 2,
+        "pages": 6,
+        "url": "https://poker-coaching.s3.amazonaws.com/tools/preflop-charts/online-6max-gto-charts.pdf"
+      }
+    },
+    {
+      "bytes": 280688,
+      "manifest": {
+        "accuracy": "unverified",
+        "bundle_id": "rangeconverter_200",
+        "depth_bb": 200,
+        "depths": [
+          200
+        ],
+        "ev_reference": "unverified",
+        "ev_unit": "source_sb",
+        "game": "nl",
+        "license_note": "RangeConverter '6-Max 200BB Poker Charts - No Limit Texas Holdem Cash' (public PDF, '6 max 200bb 500z GTO Ranges'), transcribed cell by cell for private use; not redistributed. Frequencies are the published cells rounded to the nearest 50% (0, 0.5 or 1); no EVs.",
+        "rake": null,
+        "rake_profile": "undocumented",
+        "sha256": "8595c0a803d4d07bce0ea136b3dcb195d784ca9a5a7bbfdff4f986e352f9434d",
+        "source": "ChartTranscription",
+        "source_blinds": [
+          0.5,
+          1.0
+        ],
+        "straddle": false,
+        "version": 2
+      },
+      "name": "rangeconverter_200",
+      "nodes": [
+        "",
+        "F",
+        "FF",
+        "FFF",
+        "FFFF",
+        "R",
+        "RF",
+        "FR",
+        "RFF",
+        "FRF",
+        "FFR",
+        "RFFF",
+        "FRFF",
+        "FFRF",
+        "FFFR",
+        "RFFFF",
+        "FRFFF",
+        "FFRFF",
+        "FFFRF",
+        "FFFFR",
+        "RRFFFF",
+        "RFRFFF",
+        "RFFRFF",
+        "RFFFRF",
+        "RFFFFR",
+        "FRRFFF",
+        "FRFRFF",
+        "FRFFRF",
+        "FRFFFR",
+        "FFRRFF",
+        "FFRFRF",
+        "FFRFFR",
+        "FFFRRF",
+        "FFFRFR",
+        "FFFFRR"
+      ],
+      "sha256": "8595c0a803d4d07bce0ea136b3dcb195d784ca9a5a7bbfdff4f986e352f9434d",
+      "source": {
+        "download": "https://rangeconverter.com/downloads/6-max-200bb-Poker-Charts-No-Limit-Texas-Holdem-Cash",
+        "envelope_version": 2,
+        "pages": 13,
+        "url": "https://rangeconverter.com/articles/poker-charts-6-max-200bb-no-limit-texas-holdem"
+      }
+    }
+  ],
+  "missing": [
+    "UTG-limp",
+    "CO-limp",
+    "BB-cold-call-vs-3bet"
+  ],
+  "snapshot_date": "2026-09-10",
+  "unavailable": [],
+  "version": 1
+}
