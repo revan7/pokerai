@@ -86,11 +86,10 @@ mod tests {
         StreetRootSnapshot { street: Street::River, board: ["Kh", "7d", "2c", "4d", "9s"].iter().map(|s| Card::parse(s).unwrap()).collect(),
             oop: Seat(2), ip: Seat(0), pot_root: 100, stack_oop_root: 500, stack_ip_root: 500, dead_this_street: 0, projected_from: 2, history: vec![], bb_chips: 2 }
     }
-    /// The same six-handed $1/$2-style hand the brief builds through `crate::testing::hand` (added to `testing.rs` by
-    /// Task 24, which is not on this branch), built here directly through `core_model::begin_hand`.
+    /// The same six-handed $1/$2-style hand, built through the shared hand builder (`crate::testing::hand`,
+    /// `testing.rs:816`; P2T27-M1).
     fn hand_with(hero_cards: Option<[Card; 2]>) -> HandState {
-        let hc = proto::HandConfig { config_revision: 1, sb_chips: 5, bb_chips: 10, straddle: None, rake: proto::Rake::PotRake { rate: 0.05, cap_mchips: 5000, no_flop_no_drop: false }, chip_label: "$1".into() };
-        core_model::begin_hand(&hc, core_model::BeginHand { hand_id: 1, button: Seat(0), hero: Seat(2), hero_cards, dealt: (0..6).map(Seat).collect(), stacks_start: vec![1000; 6] }).expect("begin_hand")
+        crate::testing::hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), Seat(0), Seat(2), hero_cards)
     }
     fn state() -> HandState { hand_with(None) }
     #[test]
