@@ -2,14 +2,17 @@
 //! recorder and a builder of valid solutions. Compiled for this crate's own tests or with the `testing` feature only
 //! (`lib.rs`), never into a release consumer.
 //!
-//! Time. Nothing here reads or waits on wall time. `FakeClock` moves only when a test (or `FakeWorker`, whose waiting
-//! is what moves it) moves it, only forward, and every move wakes every thread blocked in `Clock::wait_until` (the
-//! watchdog, say) through one condition variable; a test that holds the clock keeps them there until it releases it.
+//! Time. The fake clock never reads or waits on wall time. `FakeClock` moves only when a test (or `FakeWorker`, whose
+//! waiting is what moves it) moves it, only forward, and every move wakes every thread blocked in `Clock::wait_until`
+//! (the watchdog, say) through one condition variable; a test that holds the clock keeps them there until it releases
+//! it.
 //!
 //! Acknowledgements (ruling 20-I2). A test synchronizes with other threads by waiting for what they acknowledge, never
 //! by yielding, spinning or sleeping: the clock acknowledges a thread's registration in `wait_until`
 //! (`FakeClock::wait_for_waiter`) and holds waiters at a boundary (`hold`/`release`), and a `RecordingSink` made by
-//! `notifying` acknowledges each emission to its `Recorder` (`Recorder::wait_for`).
+//! `notifying` acknowledges each emission to its `Recorder` (`Recorder::wait_for`). Each such wait is bounded by
+//! `ACK_LIVENESS` of wall time (ruling 20-A), the one wall-time value here: a test-liveness allowance that turns a
+//! hang into a failure naming the missing acknowledgement, never a condition on any time the engine measures.
 //!
 //! The scripted worker. `FakeWorker` answers `WorkerLink` from a script of `FakeReply` items taken in order. The
 //! script is the worker's timeline: its output (`Ack`, `Progress`, `Result`), faulty lines (`Malformed`,
@@ -82,11 +85,39 @@ use proto::worker::{
 use proto::{index_materialized, Action, EffectiveTree, RecommendationEvent, COMBOS};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A lock that survives a panic elsewhere: the panicking test has already failed, and a poisoned double must not turn
 /// every other thread's use of it (a watchdog emitting, a sink recording) into a second, misleading panic.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> { m.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) }
+
+/// How long a test waits for an acknowledgement (a waiter's registration, an emission, a thread's end) before it fails,
+/// naming the acknowledgement it waited for (ruling 20-A).
+///
+/// A test-liveness allowance, never a correctness condition. Every acknowledged event is driven by the test itself on
+/// the fake clock and arrives within microseconds, so the bound only turns a broken implementation's hang into a loud
+/// failure instead of a stuck gate. It is wall time, and the only wall time in this module: the fake clock, and so
+/// every time the engine under test measures, never reads it.
+pub const ACK_LIVENESS: Duration = Duration::from_secs(60);
+
+/// Waits on `cv` (paired with `guard`'s mutex) until `done` holds. After `bound` of wall time without it, the wait
+/// fails, naming the acknowledgement (`what`, given the state at that point). See `ACK_LIVENESS`.
+fn wait_acknowledged<'a, T>(cv: &Condvar, mut guard: MutexGuard<'a, T>, bound: Duration, done: impl Fn(&T) -> bool, what: impl Fn(&T) -> String) -> MutexGuard<'a, T> {
+    let deadline = Instant::now().checked_add(bound);
+    while !done(&guard) {
+        let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        if left.is_some_and(|l| l.is_zero()) {
+            let what = what(&guard);
+            drop(guard);
+            panic!("{what}, no acknowledgement within the {bound:?} liveness bound");
+        }
+        guard = match left {
+            Some(left) => cv.wait_timeout(guard, left).unwrap_or_else(|poisoned| poisoned.into_inner()).0,
+            None => cv.wait(guard).unwrap_or_else(|poisoned| poisoned.into_inner()),
+        };
+    }
+    guard
+}
 
 /// The engine's `Clock` under a test's control, in milliseconds from 0. Monotonic: it never moves back.
 ///
@@ -155,13 +186,15 @@ impl FakeClock {
         self.cv.notify_all();
     }
 
-    /// Blocks, on the clock's condition variable and never on wall time, until a thread is blocked in `wait_until(t_ms)`.
-    /// A thread that returns from `wait_until` at once (its time already come, the clock not held) never registers.
-    pub fn wait_for_waiter(&self, t_ms: u64) {
-        let mut s = lock(&self.state);
-        while !s.waiting.contains(&t_ms) {
-            s = self.cv.wait(s).unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
+    /// Blocks, on the clock's condition variable, until a thread is blocked in `wait_until(t_ms)`; fails naming that
+    /// acknowledgement after `ACK_LIVENESS` of wall time (a liveness allowance, not a condition on the clock's time). A
+    /// thread that returns from `wait_until` at once (its time already come, the clock not held) never registers.
+    pub fn wait_for_waiter(&self, t_ms: u64) { self.wait_for_waiter_within(t_ms, ACK_LIVENESS) }
+
+    fn wait_for_waiter_within(&self, t_ms: u64, bound: Duration) {
+        let s = lock(&self.state);
+        drop(wait_acknowledged(&self.cv, s, bound, |s| s.waiting.contains(&t_ms),
+            |s| format!("FakeClock::wait_for_waiter({t_ms}): no thread blocked in wait_until({t_ms}) (clock at {} ms, waiting {:?})", s.now, s.waiting)));
     }
 
     /// The times the threads blocked in `wait_until` wait for, in ascending order, one entry per thread.
@@ -722,18 +755,18 @@ impl EventSink for RecordingSink {
 }
 
 /// What a `RecordingSink` records, with a wait that each of its emissions acknowledges: `wait_for` blocks on a
-/// condition variable the sink notifies after recording an event, never on wall time or a spin.
+/// condition variable the sink notifies after recording an event, never on a spin.
 #[derive(Clone)]
 pub struct Recorder { events: Arc<Mutex<Vec<Recorded>>>, recorded: Arc<Condvar> }
 
 impl Recorder {
-    /// Blocks until at least `n` events are recorded, and returns every event recorded by then.
-    pub fn wait_for(&self, n: usize) -> Vec<Recorded> {
-        let mut events = lock(&self.events);
-        while events.len() < n {
-            events = self.recorded.wait(events).unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        events.clone()
+    /// Blocks until at least `n` events are recorded, and returns every event recorded by then; fails naming that
+    /// acknowledgement after `ACK_LIVENESS` of wall time (a liveness allowance, not a condition on the events' times).
+    pub fn wait_for(&self, n: usize) -> Vec<Recorded> { self.wait_for_within(n, ACK_LIVENESS) }
+
+    fn wait_for_within(&self, n: usize, bound: Duration) -> Vec<Recorded> {
+        wait_acknowledged(&self.recorded, lock(&self.events), bound, |e| e.len() >= n,
+            |e| format!("Recorder::wait_for({n}): {} event(s) recorded", e.len())).clone()
     }
 
     /// Every event recorded so far.
@@ -853,23 +886,50 @@ mod tests {
 
     /// Ruling 20-I2: a test learns that a thread waits on the clock from the clock (`wait_for_waiter`, `waiting`), and
     /// `hold` keeps every waiter inside `wait_until` past its time, an already-past time included, until `release`.
+    /// Runs `f` on its own thread and returns a channel that acknowledges its result, so the test's wait for the thread
+    /// is bounded (`finished`) where a `join` is not (ruling 20-A).
+    fn spawn_acknowledged<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> std::sync::mpsc::Receiver<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || { let _ = tx.send(f()); });
+        rx
+    }
+    /// The result of a `spawn_acknowledged` thread, or a failure naming it after `ACK_LIVENESS` of wall time.
+    fn finished<T>(rx: &std::sync::mpsc::Receiver<T>, what: &str) -> T {
+        rx.recv_timeout(ACK_LIVENESS).unwrap_or_else(|e| panic!("{what}, no acknowledgement within the {ACK_LIVENESS:?} liveness bound ({e})"))
+    }
+
     #[test]
     fn the_fake_clock_acknowledges_its_waiters_and_holds_them_at_a_boundary() {
         let clock = FakeClock::new();
-        let first = { let c = clock.clone(); std::thread::spawn(move || { c.wait_until(100); c.now_ms() }) };
+        let first = { let c = clock.clone(); spawn_acknowledged(move || { c.wait_until(100); c.now_ms() }) };
         clock.wait_for_waiter(100);
         assert_eq!(clock.waiting(), [100]);
         clock.hold();
         clock.set_ms(150);
         assert_eq!(clock.waiting(), [100], "held: the waiter's time has come and it is still inside wait_until");
-        let second = { let c = clock.clone(); std::thread::spawn(move || { c.wait_until(20); c.now_ms() }) };
+        let second = { let c = clock.clone(); spawn_acknowledged(move || { c.wait_until(20); c.now_ms() }) };
         clock.wait_for_waiter(20);
         assert_eq!(clock.waiting(), [20, 100], "held: a wait for a time already past waits too");
         clock.set_ms(160);
         clock.release();
-        assert_eq!((first.join().unwrap(), second.join().unwrap()), (160, 160));
+        assert_eq!((finished(&first, "the waiter for 100 ms returned"), finished(&second, "the waiter for 20 ms returned")), (160, 160));
         assert!(clock.waiting().is_empty(), "a waiter is listed only while it is inside wait_until");
         clock.wait_until(160); // not held, already there: returns at once
+    }
+
+    /// Ruling 20-A: an acknowledgement that never comes fails the wait, naming it, instead of hanging the test (the
+    /// zero bound here stands for `ACK_LIVENESS` expiring; nothing ever registers).
+    #[test]
+    #[should_panic(expected = "FakeClock::wait_for_waiter(5): no thread blocked in wait_until(5) (clock at 0 ms, waiting []), no acknowledgement within the 0ns liveness bound")]
+    fn a_waiter_that_never_registers_fails_the_wait_instead_of_hanging() {
+        FakeClock::new().wait_for_waiter_within(5, Duration::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "Recorder::wait_for(1): 0 event(s) recorded, no acknowledgement within the 0ns liveness bound")]
+    fn an_emission_that_never_comes_fails_the_wait_instead_of_hanging() {
+        let (_sink, recorder) = RecordingSink::notifying(FakeClock::new(), None);
+        recorder.wait_for_within(1, Duration::ZERO);
     }
 
     #[test]
@@ -896,10 +956,10 @@ mod tests {
         let events = Arc::clone(&sink.events);
         clock.set_ms(7);
         let emitted = (event("a"), event("b"));
-        let emitter = { let e = emitted.clone(); std::thread::spawn(move || { sink.emit(e.0); sink.emit(e.1); }) };
+        let emitter = { let e = emitted.clone(); spawn_acknowledged(move || { sink.emit(e.0); sink.emit(e.1); }) };
         let got = recorder.wait_for(2);
         assert_eq!(got.iter().map(|r| (r.at_ms, &r.event)).collect::<Vec<_>>(), [(7, &emitted.0), (7, &emitted.1)]);
-        emitter.join().unwrap();
+        finished(&emitter, "the emitting thread returned");
         assert_eq!(recorder.recorded().len(), 2);
         assert_eq!(events.lock().unwrap().len(), 2, "the recorder reads the sink's own `events`");
     }

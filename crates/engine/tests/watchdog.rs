@@ -6,13 +6,19 @@
 //! (`Recorder::wait_for`); the watchdog acknowledges the end of each generation thread, after its emission or its
 //! retired return (`wait_for_ended_threads`). A negative assertion runs only after the work it is about is
 //! acknowledged. Time comes only from the fake clock.
+//!
+//! Liveness (ruling 20-A). Every acknowledgement wait is bounded by `ACK_LIVENESS` (60 s) of wall time, after which
+//! the test fails naming the acknowledgement it waited for, so a broken watchdog fails loudly instead of hanging the
+//! gate. The bound is a test-liveness allowance, never a correctness condition: the watchdog's time is the fake
+//! clock's, and every acknowledgement arrives within microseconds of the test driving it.
 
 use engine::deadline::Deadlines;
-use engine::testing::{FakeClock, Recorder, RecordingSink};
+use engine::testing::{FakeClock, Recorder, RecordingSink, ACK_LIVENESS};
 use engine::watchdog::{Armed, SharedSink, StreetDeadline, Watchdog};
 use proto::{Coverage, DecisionIdentity, EquitySummary, Phase, Recommendation, RecommendationEvent, Street, UnsupportedReason};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 fn identity() -> DecisionIdentity { DecisionIdentity { hand_id: 1, hand_revision: 1, decision_id: 1, config_revision: 1, model_revision: 0 } }
 fn fallback() -> Recommendation {
@@ -35,16 +41,36 @@ fn recording(clock: &Arc<FakeClock>) -> (SharedSink, Recorder) {
     let (sink, recorder) = RecordingSink::notifying(clock.clone(), None);
     (Arc::new(Mutex::new(Box::new(sink))), recorder)
 }
+/// Shared, so that a bounded wait on it can run on a helper thread (`ended`).
+fn watchdog(clock: &Arc<FakeClock>) -> Arc<Watchdog> { Arc::new(Watchdog::new(clock.clone())) }
+
+/// Runs a blocking acknowledgement wait on a helper thread and fails the test, naming `what`, when it is not
+/// acknowledged within `bound` of wall time (ruling 20-A: a test-liveness allowance, never a correctness condition).
+/// A wait that never returns leaves its helper thread blocked, not the test.
+fn acknowledged_within<T: Send + 'static>(what: &str, bound: Duration, wait: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(wait()); });
+    rx.recv_timeout(bound).unwrap_or_else(|e| panic!("{what}: no acknowledgement within the {bound:?} liveness bound ({e})"))
+}
+/// The watchdog's completion seam, bounded by `ACK_LIVENESS`.
+fn ended(wd: &Arc<Watchdog>, n: u64) {
+    let wd = wd.clone();
+    acknowledged_within(&format!("Watchdog::wait_for_ended_threads({n})"), ACK_LIVENESS, move || wd.wait_for_ended_threads(n));
+}
+/// A channel acknowledgement, bounded by `ACK_LIVENESS`.
+fn received<T>(rx: &mpsc::Receiver<T>, what: &str) -> T {
+    rx.recv_timeout(ACK_LIVENESS).unwrap_or_else(|e| panic!("{what}: no acknowledgement within the {ACK_LIVENESS:?} liveness bound ({e})"))
+}
 
 #[test]
 fn watchdog_emits_final_at_delivery_minus_100ms() {
     let clock = FakeClock::new();
     let (sink, events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, delivered, street) = armed(sink, "extracting");
     wd.arm(a);
     clock.set_ms(14_900);
-    wd.wait_for_ended_threads(1); // the fire is over: nothing more can be emitted
+    ended(&wd, 1); // the fire is over: nothing more can be emitted
     let ev = events.recorded();
     assert_eq!(ev.len(), 1, "exactly one Final");
     assert_eq!(ev[0].at_ms, 14_900);
@@ -63,13 +89,13 @@ fn watchdog_emits_final_at_delivery_minus_100ms() {
 fn watchdog_disarm_retires_the_generation() {
     let clock = FakeClock::new();
     let (sink, events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, _delivered, street) = armed(sink, "solving");
     street.terminal_arrived(0);
     wd.arm(a);
     wd.disarm();
     clock.set_ms(20_000);
-    wd.wait_for_ended_threads(1); // the retired thread woke at the street deadline and ended
+    ended(&wd, 1); // the retired thread woke at the street deadline and ended
     assert!(events.recorded().is_empty(), "a retired generation emits nothing");
     assert!(!street.violated(), "a terminal was seen before the street deadline");
 }
@@ -78,13 +104,13 @@ fn watchdog_disarm_retires_the_generation() {
 fn a_retired_generation_records_no_street_deadline() {
     let clock = FakeClock::new();
     let (sink, events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, _delivered, street) = armed(sink, "solving");
     wd.arm(a);
     clock.wait_for_waiter(2_000);
     wd.disarm();
     clock.set_ms(20_000);
-    wd.wait_for_ended_threads(1);
+    ended(&wd, 1);
     assert!(events.recorded().is_empty(), "a retired generation emits nothing");
     assert!(!street.violated(), "a retired generation does not record reaching the street deadline");
 }
@@ -93,7 +119,7 @@ fn a_retired_generation_records_no_street_deadline() {
 fn watchdog_delivers_the_retained_payload_as_the_final() {
     let clock = FakeClock::new();
     let (sink, events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, delivered, street) = armed(sink, "solving");
     let mut provisional = fallback();
     provisional.phase = Phase::Provisional;
@@ -105,7 +131,7 @@ fn watchdog_delivers_the_retained_payload_as_the_final() {
     street.terminal_arrived(0);
     wd.arm(a);
     clock.set_ms(14_900);
-    wd.wait_for_ended_threads(1);
+    ended(&wd, 1);
     let ev = events.recorded();
     assert_eq!(ev.len(), 1, "exactly one Final");
     assert_eq!(ev[0].at_ms, 14_900);
@@ -120,7 +146,7 @@ fn watchdog_delivers_the_retained_payload_as_the_final() {
 fn watchdog_records_the_street_violation_at_the_street_deadline() {
     let clock = FakeClock::new();
     let (sink, events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, _delivered, street) = armed(sink, "solving");
     wd.arm(a);
     clock.wait_for_waiter(2_000);
@@ -144,7 +170,7 @@ fn watchdog_records_the_street_violation_at_the_street_deadline() {
 fn a_terminal_one_ms_late_is_a_violation_even_when_published_before_the_watchdog_resumes() {
     let clock = FakeClock::new();
     let (sink, _events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, _delivered, street) = armed(sink, "solving");
     wd.arm(a);
     clock.wait_for_waiter(2_000);
@@ -164,7 +190,7 @@ fn a_terminal_one_ms_late_is_a_violation_even_when_published_before_the_watchdog
 fn a_terminal_at_the_street_deadline_is_on_time_even_when_the_watchdog_resumes_after_it() {
     let clock = FakeClock::new();
     let (sink, _events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, _delivered, street) = armed(sink, "solving");
     wd.arm(a);
     clock.wait_for_waiter(2_000);
@@ -180,7 +206,7 @@ fn a_terminal_at_the_street_deadline_is_on_time_even_when_the_watchdog_resumes_a
 fn an_on_time_terminal_records_no_street_violation() {
     let clock = FakeClock::new();
     let (sink, _events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, _delivered, street) = armed(sink, "solving");
     wd.arm(a);
     clock.wait_for_waiter(2_000);
@@ -200,7 +226,7 @@ fn compliance_is_judged_from_the_arrival_time_whenever_the_terminal_is_published
     for (arrival_ms, late) in [(1_999, false), (2_500, true)] {
         let clock = FakeClock::new();
         let (sink, _events) = recording(&clock);
-        let wd = Watchdog::new(clock.clone());
+        let wd = watchdog(&clock);
         let (a, _delivered, street) = armed(sink, "solving");
         wd.arm(a);
         clock.wait_for_waiter(2_000);
@@ -218,13 +244,13 @@ fn compliance_is_judged_from_the_arrival_time_whenever_the_terminal_is_published
 fn watchdog_never_delivers_a_final_the_engine_already_delivered() {
     let clock = FakeClock::new();
     let (sink, events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, delivered, street) = armed(sink, "extracting");
     wd.arm(a);
     street.terminal_arrived(0);
     delivered.store(true, Ordering::SeqCst); // the engine's own Final claimed the delivery first
     clock.set_ms(20_000);
-    wd.wait_for_ended_threads(1); // the fire found the delivery claimed and ended
+    ended(&wd, 1); // the fire found the delivery claimed and ended
     assert!(events.recorded().is_empty(), "one Final per request: the watchdog does not deliver a second");
 }
 
@@ -232,13 +258,13 @@ fn watchdog_never_delivers_a_final_the_engine_already_delivered() {
 fn arming_retires_the_previous_generation() {
     let clock = FakeClock::new();
     let (sink, events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (first, first_delivered, first_street) = armed(sink.clone(), "building");
     let (second, second_delivered, second_street) = armed(sink, "solving");
     wd.arm(first);
     wd.arm(second);
     clock.set_ms(14_900);
-    wd.wait_for_ended_threads(2); // the retired first thread and the fired second one
+    ended(&wd, 2); // the retired first thread and the fired second one
     let ev = events.recorded();
     assert_eq!(ev.len(), 1, "only the live generation delivers");
     match &ev[0].event {
@@ -254,7 +280,7 @@ fn arming_retires_the_previous_generation() {
 fn arming_a_request_after_its_fire_is_a_bug() {
     let clock = FakeClock::new();
     let (sink, events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, delivered, street) = armed(sink.clone(), "solving");
     let (retained, stage) = (a.retained.clone(), a.stage.clone());
     wd.arm(a);
@@ -269,7 +295,7 @@ fn arming_a_request_after_its_fire_is_a_bug() {
 fn arming_an_identity_after_the_watchdog_fired_for_it_is_a_bug() {
     let clock = FakeClock::new();
     let (sink, events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, _, _) = armed(sink.clone(), "solving");
     wd.arm(a);
     clock.set_ms(14_900);
@@ -302,7 +328,7 @@ fn arming_with_a_fallback_that_is_not_deadline_exceeded_is_a_bug() {
 fn watchdog_waits_without_holding_the_sink() {
     let clock = FakeClock::new();
     let (sink, events) = recording(&clock);
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, _delivered, street) = armed(sink.clone(), "solving");
     wd.arm(a);
     clock.wait_for_waiter(2_000);
@@ -314,16 +340,18 @@ fn watchdog_waits_without_holding_the_sink() {
     assert!(sink.try_lock().is_ok(), "the sink is free while the watchdog waits for the fire");
     assert!(!wd.retirement_would_block(), "and so is the generation lock");
     clock.set_ms(14_900);
-    wd.wait_for_ended_threads(1);
+    ended(&wd, 1);
     assert_eq!(events.recorded().len(), 1);
 }
 
 /// Blocks inside `emit` until the test releases it, so a fire can be caught in progress; notes when the emission ends.
+/// Its wait for the release is bounded like the test's own waits, so a test that fails before releasing it never
+/// leaves the fire (and the generation lock it holds) stuck.
 struct GatedSink { entered: mpsc::Sender<()>, release: mpsc::Receiver<()>, inner: RecordingSink, order: Arc<Mutex<Vec<&'static str>>> }
 impl engine::EventSink for GatedSink {
     fn emit(&mut self, ev: RecommendationEvent) {
         self.entered.send(()).unwrap();
-        self.release.recv().unwrap();
+        received(&self.release, "GatedSink: the test released the emission");
         self.inner.emit(ev);
         self.order.lock().unwrap().push("emitted");
     }
@@ -337,25 +365,27 @@ fn disarm_returns_only_after_a_fire_in_progress_has_emitted() {
     let (release_tx, release_rx) = mpsc::channel();
     let order = Arc::new(Mutex::new(Vec::new()));
     let sink: SharedSink = Arc::new(Mutex::new(Box::new(GatedSink { entered: entered_tx, release: release_rx, inner, order: order.clone() })));
-    let wd = Watchdog::new(clock.clone());
+    let wd = watchdog(&clock);
     let (a, _, _) = armed(sink, "solving");
     wd.arm(a);
     clock.set_ms(14_900);
-    entered_rx.recv().unwrap(); // acknowledgement: the fire is inside `emit`, and stays there until released
+    received(&entered_rx, "the fire entered emit"); // it stays there until released
     assert!(wd.retirement_would_block(), "a fire holds the generation lock through its emission, so a disarm now blocks");
     let (calling_tx, calling_rx) = mpsc::channel();
     std::thread::scope(|s| {
         let (wd, order) = (&wd, &order);
+        // Moved in, so a failed acknowledgement below drops it and frees the fire before the scope joins the disarm.
+        let release_tx = release_tx;
         s.spawn(move || {
             calling_tx.send(()).unwrap();
             wd.disarm();
             order.lock().unwrap().push("disarm returned");
         });
-        calling_rx.recv().unwrap(); // acknowledgement: the disarm is being called while the fire is still emitting
+        received(&calling_rx, "the disarm thread is calling disarm while the fire is still emitting");
         release_tx.send(()).unwrap();
     });
     assert_eq!(*order.lock().unwrap(), ["emitted", "disarm returned"], "disarm returned while a fire of the generation it retires was still emitting");
-    wd.wait_for_ended_threads(1);
+    ended(&wd, 1);
     assert_eq!(events.recorded().len(), 1, "the fire that began before the disarm completes, once");
 }
 
@@ -367,4 +397,13 @@ fn arming_with_the_street_deadline_after_the_fire_is_a_bug() {
     let (mut a, _, _) = armed(sink, "solving");
     a.street_deadline = Arc::new(StreetDeadline::new(a.fire_ms + 1));
     Watchdog::new(clock.clone()).arm(a);
+}
+
+/// Ruling 20-A: an acknowledgement that never comes fails the test, naming it, instead of hanging the gate (the zero
+/// bound stands for `ACK_LIVENESS` expiring; the helper's wait ends when the test's sender is dropped).
+#[test]
+#[should_panic(expected = "an acknowledgement that never comes: no acknowledgement within the 0ns liveness bound")]
+fn an_acknowledgement_that_never_comes_fails_the_test_instead_of_hanging() {
+    let (_never, rx) = mpsc::channel::<()>();
+    acknowledged_within("an acknowledgement that never comes", Duration::ZERO, move || { let _ = rx.recv(); });
 }
