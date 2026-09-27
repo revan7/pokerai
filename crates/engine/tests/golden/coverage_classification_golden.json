@@ -1,0 +1,4 @@
+[["hu_flop","hu_street"],["three_way_flop","multiway:3"],["third_player_allin","multiway:3"],["two_folds_then_hu_flop","hu_street"],
+ ["projection_a_admitted_dead_0","hu_street:MultiwayStreetRoot{1,0}"],["projection_b_admitted_dead_50","hu_street:MultiwayStreetRoot{1,50}"],
+ ["projection_c_not_reproducible","unsupported_history"],["opponent_allin","hu_street:facing_allin"],["hero_allin","no_decision"],
+ ["hero_cards_unknown","no_decision"],["two_dealt_seats","format_unsupported:true"]]

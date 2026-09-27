@@ -799,6 +799,30 @@ pub fn uniform_solution(tree: &EffectiveTree, requested: &[Action], exploitabili
     solution
 }
 
+// Hand builders (plan 2 Task 24): real `core_model` hands for classifier and engine tests, built only through the
+// crate's own fallible entry points, so every state they return replays.
+use core_model::{apply_action, begin_hand, derive, set_board, BeginHand};
+use proto::{Card, GameConfig, HandConfig, HandState, Rake, Seat, SolverPrefs};
+
+/// The session and hand config the engine tests share: blinds 5/10 chips, 5% pot rake capped at 5 chips
+/// (`cap_mchips` 5000), no straddle.
+pub fn cfg_1_2() -> (GameConfig, HandConfig) {
+    let rake = Rake::PotRake { rate: 0.05, cap_mchips: 5000, no_flop_no_drop: false };
+    let hc = HandConfig { config_revision: 1, sb_chips: 5, bb_chips: 10, straddle: None, rake, chip_label: "$1".into() };
+    (GameConfig { config_revision: 1, chip_label: "$1".into(), sb_chips: 5, bb_chips: 10, straddle: None, rake, seats: vec![], solver: SolverPrefs { threads: 16, target_bp: 50, flop_budget_s: 10 } }, hc)
+}
+/// `core_model::BeginHand` carries the engine-assigned `hand_id` and the field name `stacks_start` (cross-plan M6);
+/// the ID-free `proto::BeginHand` is the admission DTO the public `Engine` takes (Task 29).
+pub fn hand(dealt_stacks: &[(Seat, u32)], button: Seat, hero: Seat, hero_cards: Option<[Card; 2]>) -> HandState {
+    let (_, hc) = cfg_1_2();
+    begin_hand(&hc, BeginHand { hand_id: 1, button, hero, hero_cards, dealt: dealt_stacks.iter().map(|d| d.0).collect(), stacks_start: dealt_stacks.iter().map(|d| d.1).collect() }).expect("begin_hand")
+}
+/// Applies actions for whoever is to act, in order.
+pub fn play(state: &HandState, actions: &[Action]) -> HandState { let mut s = state.clone(); for a in actions { s = apply_action(&s, *a).unwrap_or_else(|e| panic!("{a:?}: {e}")); } s }
+/// Enters the full board (`"Kh 7d 2c"`, space-separated) for the street the hand is awaiting.
+pub fn board(state: &HandState, cards: &str) -> HandState { set_board(state, &cards.split(' ').map(|c| Card::parse(c).unwrap()).collect::<Vec<_>>()).expect("set_board") }
+pub fn derived(state: &HandState) -> proto::Derived { derive(state) }
+
 #[cfg(test)]
 mod tests {
     use super::*;
