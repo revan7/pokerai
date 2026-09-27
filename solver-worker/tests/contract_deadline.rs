@@ -15,7 +15,7 @@
 //!   deadlines are performance conditions here, not correctness gates: every wall-clock bound below is a liveness
 //!   allowance, and the solve outcome is accepted on condition of the run's own measurements (`deadline_outcome`).
 mod common;
-use common::{fixture_lines, Worker};
+use common::{fixture_lines, meets_raw_target, raw_target_chips, Worker};
 use proto::worker::{validate_solution, StreetSolution};
 use proto::EffectiveTree;
 use serde_json::{json, Value};
@@ -50,12 +50,16 @@ fn deadline_request(fixture: &str, id: &str, deadline_ms: u32, margin_ms: u32, t
     })
 }
 
-/// Review P2.T17-I2: the target in chips exactly as the worker computes it (`job::run_with`, where it sets the §7 loop's
-/// `LoopParams::target_chips`): `pot * target_bp / 10_000` in `f64`, narrowed once to `f32`. The loop compares its raw
-/// `f32` measurement with this `f32` (`value <= target_chips` ends the loop at the target), so the status boundary is
-/// this number, not a decimal: 1 bp is `0.02f32` chips of the turn fixture's 200-chip pot and `0.018f32` of the flop
-/// fixtures' 180.
-fn target_chips(pot: u32, target_bp: u16) -> f32 { (f64::from(pot) * f64::from(target_bp) / 10_000.0) as f32 }
+/// Review P2.T17-I2 with follow-up P2.W1: the status boundary is spec 4.4's raw comparison (`common::meets_raw_target`,
+/// the engine's exact `f64` form), which the §7 loop now evaluates itself (`solve_loop::meets_target`), never a target
+/// narrowed to `f32` (that narrowing can round up past the raw target, 0.6f32 chips for 30 bp of a 200-chip pot). The
+/// largest `f32` measurement that still meets `target_bp` of `pot`: the inclusive edge of that comparison.
+fn target_edge(pot: u32, target_bp: u16) -> f32 {
+    let t = raw_target_chips(pot, target_bp) as f32;
+    let edge = if meets_raw_target(t, pot, target_bp) { t } else { f32::from_bits(t.to_bits() - 1) };
+    assert!(meets_raw_target(edge, pot, target_bp) && !meets_raw_target(f32::from_bits(edge.to_bits() + 1), pot, target_bp), "{target_bp} bp of {pot}: edge {edge:e}");
+    edge
+}
 
 /// How a deadline run ended, as its `result` reports it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -63,11 +67,12 @@ enum Outcome { Ok { expl: f32, iterations: u32 }, BestSoFar { expl: f32, iterati
 
 /// §7's stop-point outcome of one job, checked against the request's own target and the run's own measurements
 /// (`msgs`: every message of the job, in order, its `result` last). The conditional acceptance of ruling 17-I1:
-/// - `ok` iff the reported measurement meets the target, and `best_so_far` iff it is above it (review P2.T17-I2): the
-///   loop decides on the raw measurement, and the reported one differs from it only where a raw value in the noise
-///   band `[-tolerance, 0)` is reported as exactly 0.0 (constraints: noise-floor ruling), which is below every target;
-///   so the comparison is exact, with no tolerance. Either carries a street export `validate_solution` accepts, and
-///   the measurement it reports is the one its `Extracting` progress announced.
+/// - `ok` iff the reported measurement meets the raw target (`meets_raw_target`), and `best_so_far` iff it misses it
+///   (review P2.T17-I2, follow-up P2.W1): the loop decides on the raw measurement by the same comparison, and the
+///   reported one differs from it only where a raw value in the noise band `[-tolerance, 0)` is reported as exactly 0.0
+///   (constraints: noise-floor ruling), which meets every target; so the comparison is exact, with no tolerance. Either
+///   carries a street export `validate_solution` accepts, and the measurement it reports is the one its `Extracting`
+///   progress announced.
 /// - `no_iteration` only when no measurement fit before the stop point: no progress of the job carried one, and
 ///   neither a solution nor a retryable error is reported.
 ///
@@ -84,9 +89,9 @@ fn deadline_outcome(request: &str, msgs: &[Value]) -> Result<Outcome, String> {
         "ok" | "best_so_far" => {
             if !r["error"].is_null() { return Err(format!("{status} with an error {}", r["error"])); }
             let sol: StreetSolution = serde_json::from_value(r["solution"].clone()).map_err(|e| format!("{status} without a street solution: {e}"))?;
-            let (expl, target) = (sol.exploitability_chips, target_chips(pot, target_bp));
+            let (expl, target) = (sol.exploitability_chips, raw_target_chips(pot, target_bp));
             if !expl.is_finite() { return Err(format!("{status} with exploitability {expl:e} chips")); }
-            match (status, expl <= target) {
+            match (status, meets_raw_target(expl, pot, target_bp)) {
                 ("ok", false) => return Err(format!("ok with exploitability {expl:e} chips above the target {target:e} chips ({target_bp} bp of pot {pot})")),
                 ("best_so_far", true) => return Err(format!("best_so_far with exploitability {expl:e} chips at or below the target {target:e} chips ({target_bp} bp of pot {pot})")),
                 _ => {}
@@ -269,7 +274,7 @@ fn deadline_best_so_far_forced_in_process() {
         assert!(n >= 1 && steps == n as usize && measurements == [&LoopSite::Measurement(n)], "{fixture}: {n} real steps, then one measurement: {before:?}");
         assert_eq!(loop_sites(&sites[held + 1..]), [LoopSite::Boundary(n)], "{fixture}: the scripted deadline ends the loop at its next boundary");
         let raw = h.barrier.take_raw();
-        let target = target_chips(pot, 1);
+        let target = raw_target_chips(pot, 1);
         let outcome = deadline_outcome(&request, &msgs).unwrap_or_else(|e| panic!("{fixture}: {e}"));
         let measured = *raw.last().unwrap_or_else(|| panic!("{fixture}: the job reported no measurement"));
         assert_eq!(outcome, Outcome::BestSoFar { expl: measured, iterations: n }, "{fixture}: raw {raw:?} chips, target {target:e} chips");
@@ -312,20 +317,32 @@ fn deadline_no_iteration_forced_in_process() {
 /// contradicts, with a payload the strict validator accepts (it sees neither the status nor the target), is refused
 /// by `deadline_outcome`, with both numbers in the diagnostic. The job's `measured` hook substitutes the reported
 /// measurement while the loop decides on the raw one: `best_so_far` (placed as in the forced test) reported at 0.01
-/// chips, below the turn's 1 bp target, and at exactly the target; and `ok` (the raw first measurement meets a
-/// `u16::MAX` bp target) reported above that target. The positive control first: the same `ok` run without a
-/// substitute is accepted, as `deadline_best_so_far_forced_in_process` accepts its `best_so_far`.
+/// chips, below the turn's 1 bp target, and at exactly the target's inclusive edge (`target_edge`); and `ok` (the raw
+/// first measurement meets a `u16::MAX` bp target) reported above that target. The positive controls first: the same
+/// `ok` run without a substitute is accepted, as `deadline_best_so_far_forced_in_process` accepts its `best_so_far`;
+/// and (follow-up P2.W1) a `best_so_far` reported at 0.6f32 chips against 30 bp of the 200-chip pot is accepted, since
+/// that `f32`, the old rounded threshold, lies above the raw 0.6-chip target: it misses it.
 #[test]
 fn a_status_its_measurement_contradicts_is_refused() {
     let h = InProcess::new();
-    let one_bp = target_chips(200, 1);
-    let all_bp = target_chips(200, u16::MAX);
+    let one_bp = raw_target_chips(200, 1);
+    let all_bp = raw_target_chips(200, u16::MAX);
     let request = deadline_request("basic_turn_std_request", "146", u32::MAX, 200, u16::MAX);
     let (msgs, sites, held) = run_placed(&h, &request, is_measured, 0.0);
     let Site::Loop(LoopSite::Measured(n)) = sites[held] else { unreachable!("held at {:?}", sites[held]) };
     let measured = *h.barrier.take_raw().last().expect("the job reported the loop's measurement");
     assert_eq!(deadline_outcome(&request, &msgs), Ok(Outcome::Ok { expl: measured, iterations: n }), "raw {measured:e} chips, target {all_bp:e} chips");
-    let cases = [("144", 1, one_bp, 0.01f32, "best_so_far", PAST_EVERY_DEADLINE_MS), ("145", 1, one_bp, one_bp, "best_so_far", PAST_EVERY_DEADLINE_MS), ("147", u16::MAX, all_bp, 4.0 * all_bp, "ok", 0.0)];
+    let rounded = raw_target_chips(200, 30) as f32;
+    assert!(f64::from(rounded) > raw_target_chips(200, 30) && !meets_raw_target(rounded, 200, 30), "0.6f32 is {:e} chips", f64::from(rounded));
+    let request = deadline_request("basic_turn_std_request", "148", u32::MAX, 200, 30);
+    h.barrier.substitute(Some(rounded));
+    let (msgs, sites, held) = run_placed(&h, &request, is_measured, PAST_EVERY_DEADLINE_MS);
+    h.barrier.substitute(None);
+    let Site::Loop(LoopSite::Measured(n)) = sites[held] else { unreachable!("held at {:?}", sites[held]) };
+    let raw = h.barrier.take_raw();
+    assert!(!raw.is_empty() && raw.iter().all(|&r| !meets_raw_target(r, 200, 30)), "the loop's own measurement misses 30 bp: {raw:?}");
+    assert_eq!(deadline_outcome(&request, &msgs), Ok(Outcome::BestSoFar { expl: rounded, iterations: n }), "raw {raw:?}: best_so_far at the old rounded threshold");
+    let cases = [("144", 1, one_bp, 0.01f32, "best_so_far", PAST_EVERY_DEADLINE_MS), ("145", 1, one_bp, target_edge(200, 1), "best_so_far", PAST_EVERY_DEADLINE_MS), ("147", u16::MAX, all_bp, (4.0 * all_bp) as f32, "ok", 0.0)];
     for (id, target_bp, target, reported, status, clock_after_ms) in cases {
         let request = deadline_request("basic_turn_std_request", id, u32::MAX, 200, target_bp);
         h.barrier.substitute(Some(reported));

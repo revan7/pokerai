@@ -5,7 +5,7 @@
 //! machine-independent (the tree cross-check; a stop rule that admits no iteration at any elapsed time), and
 //! conditional smoke checks under a liveness bound where it is not (how far a clock-driven §7 solve gets).
 mod common;
-use common::{fixture_lines, run_fixed, started, Barrier, Harness, Site, Worker, LIVENESS};
+use common::{fixture_lines, meets_raw_target, run_fixed, started, Barrier, Harness, Site, Worker, LIVENESS};
 use proto::worker::{EngineMessage, ResultStatus, SolveRequest, StreetSolution, WorkerMessage};
 use proto::{combo_cards, combo_index, Action, Card, MaterializedNode, Range1326, Street, COMBOS};
 use serde_json::{json, Value};
@@ -422,8 +422,8 @@ const PINNED_EV_BOUND_CHIPS: f64 = 1e-3;
 const PINNED_EXPLOITABILITY_BOUND_CHIPS: f64 = 1e-3;
 
 /// The oracle checks on one export: the oracle's metadata; the shared structural and numeric comparison under the
-/// pinned bounds; and a finite exploitability within its bound of the oracle's and within the request's target.
-fn check_pinned(what: &str, req: &SolveRequest, oracle: &StreetSolution, sol: &StreetSolution, target: f32) -> (Deltas, f64) {
+/// pinned bounds; and a finite exploitability within its bound of the oracle's and meeting the request's raw target.
+fn check_pinned(what: &str, req: &SolveRequest, oracle: &StreetSolution, sol: &StreetSolution) -> (Deltas, f64) {
     assert_eq!((sol.iterations, sol.mode.as_str(), sol.memory_bytes, sol.locks_applied), (oracle.iterations, oracle.mode.as_str(), oracle.memory_bytes, oracle.locks_applied), "{what}: metadata");
     let d = compare_exports(what, (req, oracle), (req, sol), |c| c, PINNED_PROB_BOUND, Some(PINNED_EV_BOUND_CHIPS));
     assert_eq!(d.entries, PINNED_ENTRIES, "{what}: every entry of the oracle compared");
@@ -431,7 +431,7 @@ fn check_pinned(what: &str, req: &SolveRequest, oracle: &StreetSolution, sol: &S
     assert!(e.is_finite() && e >= 0.0, "{what}: exploitability {e}");
     let de = (f64::from(e) - f64::from(oracle.exploitability_chips)).abs();
     assert!(de <= PINNED_EXPLOITABILITY_BOUND_CHIPS, "{what}: exploitability {e} chips against the oracle's {}", oracle.exploitability_chips);
-    assert!(e <= target, "{what}: an `ok` export at {e} chips above the {target}-chip target");
+    assert!(meets_raw_target(e, req.pot, req.target_bp), "{what}: an `ok` export at {e} chips misses the {}-bp target of the {}-chip pot", req.target_bp, req.pot);
     (d, de)
 }
 
@@ -442,11 +442,12 @@ fn pinned_example_fixture() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/solver/basic_0p3.json");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e} (run: cargo run --release -p solver-worker --example gen_basic_fixture)", path.display()));
     let oracle: StreetSolution = serde_json::from_str(&text).expect("the V1 oracle is a street solution");
-    // The job's own target arithmetic (`job::run_with`): 30 bp of the 200 pot, 0.6 chips.
-    let target = (f64::from(req.pot) * f64::from(req.target_bp) / 10_000.0) as f32;
-    assert_eq!((req.pot, req.target_bp, target), (200, 30, 0.6));
+    // Spec 4.4's raw target, 30 bp of the 200 pot (0.6 chips), compared as the worker's §7 loop and the engine compare
+    // it (follow-up P2.W1: never the f32-rounded 0.6f32, which lies above it).
+    assert_eq!((req.pot, req.target_bp), (200, 30));
+    let meets = |e: f32| meets_raw_target(e, req.pot, req.target_bp);
     assert_eq!((oracle.iterations, oracle.exploitability_chips, oracle.nodes.len(), oracle.export.as_str()), (PINNED_ITERATIONS, PINNED_EXPLOITABILITY, PINNED_NODES, "street"));
-    assert!(oracle.exploitability_chips <= target, "the oracle meets its own target");
+    assert!(meets(oracle.exploitability_chips), "the oracle meets its own target");
 
     // In process on the oracle's own schedule (reviews P2T16R-I4/I5): exactly its 120 real iterations, measured every
     // ten as §7 and `solve()` measure. Every earlier measurement is above the target and the last within it, so §7's
@@ -455,7 +456,7 @@ fn pinned_example_fixture() {
     let run = run_fixed(&req, 16, oracle.iterations, &mut hooks);
     assert_eq!(run.measured.iter().map(|m| m.0).collect::<Vec<_>>(), (1..=12).map(|k| 10 * k).collect::<Vec<u32>>());
     let (&(_, last), earlier) = run.measured.split_last().unwrap();
-    assert!(earlier.iter().all(|&(_, e)| e > target) && last <= target, "the 30-bp target is first met at iteration 120: {:?}", run.measured);
+    assert!(earlier.iter().all(|&(_, e)| !meets(e)) && meets(last), "the 30-bp target is first met at iteration 120: {:?}", run.measured);
     use Op::*;
     assert_eq!(started(&hooks.passed()), [TreeBuild, TreeCheck, GameConfig, MemoryCheck, Allocate, Solve, Finalize, Export, Validate]);
     let sol = match run.outcome { JobOutcome::Ok(s) => s, other => panic!("{other:?}") };
@@ -463,7 +464,7 @@ fn pinned_example_fixture() {
     // ... through the wire codec: the result line the worker writes for it, decoded as the engine decodes it.
     let result = serde_json::to_string(&WorkerMessage::Result { id: req.id.clone(), status: ResultStatus::Ok, elapsed_ms: 0, solution: Some(sol), error: None }).unwrap();
     let sol = match serde_json::from_str::<WorkerMessage>(&result).expect("the result line decodes") { WorkerMessage::Result { solution: Some(s), .. } => s, other => panic!("{other:?}") };
-    let (d, de) = check_pinned("in process", &req, &oracle, &sol, target);
+    let (d, de) = check_pinned("in process", &req, &oracle, &sol);
     assert_eq!(reported.to_bits(), last.to_bits(), "the last measurement is reported unchanged");
     eprintln!("pinned_example_fixture in process: {} entries per matrix, max |dp| {:e}, max |dEV| {:e} chips, |d exploitability| {de:e} chips; measurements {:?}", d.entries, d.probs, d.ev, run.measured);
 
@@ -478,17 +479,17 @@ fn pinned_example_fixture() {
         Some("ok") => {
             let s = solution_of(&r);
             if s.iterations == oracle.iterations {
-                let (d, de) = check_pinned("wire", &req, &oracle, &s, target);
+                let (d, de) = check_pinned("wire", &req, &oracle, &s);
                 eprintln!("pinned_example_fixture on the wire: max |dp| {:e}, max |dEV| {:e} chips, |d exploitability| {de:e} chips", d.probs, d.ev);
             } else {
                 assert_street_structure("wire", &req, &s);
-                assert!(s.exploitability_chips <= target, "an `ok` above the target: {}", s.exploitability_chips);
+                assert!(meets(s.exploitability_chips), "an `ok` that misses the target: {}", s.exploitability_chips);
             }
         }
         Some("best_so_far") => {
             let s = solution_of(&r);
             assert_street_structure("wire", &req, &s);
-            assert!(s.exploitability_chips > target, "a `best_so_far` within the target: {}", s.exploitability_chips);
+            assert!(!meets(s.exploitability_chips), "a `best_so_far` that meets the target: {}", s.exploitability_chips);
         }
         Some("error") => assert_eq!(r["error"]["code"], "no_iteration", "{r}"),
         other => panic!("{other:?}: {r}"),

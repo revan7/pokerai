@@ -14,6 +14,7 @@
 use postflop_solver::{compute_exploitability, finalize, solve, solve_step, CardConfig, PostFlopGame, Range};
 use proto::worker::{validate_solution, EngineMessage, SolveRequest, StreetSolution};
 use proto::{Card, EffectiveTree, Range1326};
+use solver_worker::solve_loop::meets_target;
 use solver_worker::{cards, extract, memory, protocol, tree_build};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -67,6 +68,18 @@ fn replay_solve(game: &mut PostFlopGame, max_iterations: u32, target: f32) -> (u
     (iterations, exploitability)
 }
 
+/// The `f32` stopping threshold that makes `solve()`'s own comparison (`exploitability <= target`, in `f32`) the
+/// worker's (follow-up P2.W1): the largest `f32` that meets the raw target by the §7 loop's predicate
+/// (`solve_loop::meets_target`, spec 4.4), so every `f32` measurement is at or below it exactly when it meets the raw
+/// target. The quotient narrowed to `f32` can lie above the raw target (0.6f32 for 30 bp of 200 chips); the `f32` below
+/// it then is the edge.
+fn target_edge(pot: u32, target_bp: u16) -> f32 {
+    let rounded = (f64::from(pot) * f64::from(target_bp) / 10_000.0) as f32;
+    let edge = if meets_target(rounded, pot, target_bp) { rounded } else { f32::from_bits(rounded.to_bits() - 1) };
+    assert!(meets_target(edge, pot, target_bp) && !meets_target(f32::from_bits(edge.to_bits() + 1), pot, target_bp), "{target_bp} bp of {pot}: edge {edge:e}");
+    edge
+}
+
 fn export(game: &mut PostFlopGame, req: &SolveRequest, meta: extract::SolutionMeta) -> StreetSolution {
     extract::street_solution(game, req, meta, &AtomicBool::new(false)).expect("street export").expect("never cancelled")
 }
@@ -88,8 +101,9 @@ fn main() {
     }
     let req = SolveRequest { id: "basic".into(), spot: "b".repeat(64), board, oop_range: oop_v, ip_range: ip_v, pot: 200, stack_oop: 900, stack_ip: 900,
         rake_rate: 0.0, rake_cap_mchips: 0, tree, history: vec![], target_bp: 30, deadline_ms: 20000, extraction_margin_ms: 200, memory_limit_bytes: 10 << 30, background: false };
-    // The job's own target arithmetic (`job::run_with`): 30 bp of the 200 pot = 0.6 chips.
-    let target = (f64::from(req.pot) * f64::from(req.target_bp) / 10_000.0) as f32;
+    // The worker's own target comparison (`solve_loop::meets_target`): 30 bp of the 200 pot = 0.6 chips, met by every
+    // `f32` up to 0.59999996f32 and missed by 0.6f32 (0.60000002384185791015625).
+    let target = target_edge(req.pot, req.target_bp);
 
     // V1: the library's own `solve()` (it finalizes).
     let (mut game, adm) = build_game(&req);
@@ -97,7 +111,7 @@ fn main() {
     let (mut replay, _) = build_game(&req);
     let (iterations, replay_raw) = replay_solve(&mut replay, MAX_ITERATIONS, target);
     assert_eq!(raw.to_bits(), replay_raw.to_bits(), "the step-wise replay must end where solve() ended: {raw} vs {replay_raw}");
-    assert!(raw <= target, "solve() stopped at {raw} chips after {iterations} iterations, above the {target}-chip target");
+    assert!(meets_target(raw, req.pot, req.target_bp), "solve() stopped at {raw} chips after {iterations} iterations, missing the {}-bp target of the {}-chip pot", req.target_bp, req.pot);
     // The worker's reporting policy (constraints: exploitability noise floor) applies to the fixture as to any result.
     let reported = extract::report_exploitability(raw, req.pot).expect("reportable exploitability");
     if let Some(line) = &reported.log_line { eprintln!("{line}"); }

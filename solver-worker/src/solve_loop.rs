@@ -2,9 +2,20 @@ use postflop_solver::{compute_exploitability, solve_step, PostFlopGame};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-pub struct LoopParams { pub deadline_ms: u32, pub extraction_margin_ms: u32, pub target_chips: f32, pub started: Instant }
+pub struct LoopParams { pub deadline_ms: u32, pub extraction_margin_ms: u32, pub pot: u32, pub target_bp: u16, pub started: Instant }
 #[derive(Debug, Clone, Copy)]
 pub struct LoopOutcome { pub iterations: u32, pub exploitability: Option<f32>, pub reached_target: bool, pub cancelled: bool }
+
+/// Spec 4.4 and §5 step 7's target compliance, the raw comparison `exploitability_chips / pot <= target_bp / 10_000`,
+/// evaluated exactly as the engine evaluates it (`engine::solve::meets_target`, ruling 26-Q4): `expl * 10_000 <=
+/// target_bp * pot` in `f64`, where an `f32` significand times 10^4 and a `u16` times a `u32` are both exact. The §7
+/// loop's `reached_target` is this predicate (follow-up P2.W1), never a threshold narrowed to `f32`: that narrowing can
+/// round up past the raw target (0.6 chips, 30 bp of a 200-chip pot, becomes 0.60000002384185791015625), so a
+/// measurement equal to it would have been reported `ok` while missing the target. A worker `ok` therefore always meets
+/// the raw target. NaN and +infinity meet no target; a negative measurement meets every one.
+pub fn meets_target(exploitability_chips: f32, pot: u32, target_bp: u16) -> bool {
+    f64::from(exploitability_chips) * 10_000.0 <= f64::from(target_bp) * f64::from(pot)
+}
 
 /// §7 stop rule, as pure arithmetic so it can be tested without a solve: stop when
 /// `elapsed + 1.5 * max_iteration_so_far + (one more iteration if an exploitability pass is due) + margin > deadline`.
@@ -76,7 +87,7 @@ impl LoopOps for RealOps<'_, '_> {
 /// measurement costs stay real.
 pub fn run(game: &PostFlopGame, p: &LoopParams, cancel: &AtomicBool, progress: impl FnMut(u32, Option<f32>), at_site: &mut dyn FnMut(LoopSite), clock: &mut dyn FnMut(f64) -> f64) -> LoopOutcome {
     let mut ops = RealOps { game, started: p.started, at_site, clock };
-    run_loop(&mut ops, p.deadline_ms as f64, p.extraction_margin_ms as f64, p.target_chips, cancel, progress)
+    run_loop(&mut ops, p.deadline_ms as f64, p.extraction_margin_ms as f64, p.pot, p.target_bp, cancel, progress)
 }
 
 /// The §7/§10.3 scheduling core, generic over `LoopOps` (see its doc above). Takes `&mut O` (not
@@ -86,7 +97,8 @@ fn run_loop<O: LoopOps>(
     ops: &mut O,
     deadline_ms: f64,
     margin_ms: f64,
-    target_chips: f32,
+    pot: u32,
+    target_bp: u16,
     cancel: &AtomicBool,
     mut progress: impl FnMut(u32, Option<f32>),
 ) -> LoopOutcome {
@@ -138,7 +150,7 @@ fn run_loop<O: LoopOps>(
                 if cancel.load(Ordering::SeqCst) {
                     return LoopOutcome { iterations: iters, exploitability: expl, reached_target: false, cancelled: true };
                 }
-                if value <= target_chips {
+                if meets_target(value, pot, target_bp) {
                     progress(iters, expl);
                     return LoopOutcome { iterations: iters, exploitability: expl, reached_target: true, cancelled: false };
                 }
@@ -252,7 +264,7 @@ mod tests {
     fn declines_all_work_when_even_the_first_iteration_cannot_fit() {
         let cancel = AtomicBool::new(false);
         let mut ops = FakeOps::new(&cancel).with_step_costs(&[80.0]);
-        let outcome = run_loop(&mut ops, 100.0, 150.0, 0.0, &cancel, |_, _| {});
+        let outcome = run_loop(&mut ops, 100.0, 150.0, 100, 1, &cancel, |_, _| {});
         assert_eq!((outcome.iterations, outcome.exploitability, outcome.reached_target, outcome.cancelled), (0, None, false, false));
         assert_eq!((ops.step_call_count(), ops.measure_call_count()), (0, 0));
     }
@@ -266,7 +278,7 @@ mod tests {
     fn first_iteration_uses_a_conservative_cost_bound_not_zero() {
         let cancel = AtomicBool::new(false);
         let mut ops = FakeOps::new(&cancel).with_step_costs(&[5.0]);
-        let outcome = run_loop(&mut ops, 100.0, 90.0, 0.0, &cancel, |_, _| {});
+        let outcome = run_loop(&mut ops, 100.0, 90.0, 100, 1, &cancel, |_, _| {});
         assert_eq!((outcome.iterations, outcome.exploitability, outcome.cancelled), (0, None, false));
         assert_eq!(ops.step_call_count(), 0);
     }
@@ -280,7 +292,7 @@ mod tests {
     fn measurement_is_skipped_when_the_updated_cost_estimate_no_longer_fits() {
         let cancel = AtomicBool::new(false);
         let mut ops = FakeOps::new(&cancel).with_step_costs(&[80.0]);
-        let outcome = run_loop(&mut ops, 300.0, 200.0, 0.0, &cancel, |_, _| {});
+        let outcome = run_loop(&mut ops, 300.0, 200.0, 100, 1, &cancel, |_, _| {});
         assert_eq!((outcome.iterations, outcome.exploitability, outcome.reached_target, outcome.cancelled), (1, None, false, false));
         assert_eq!((ops.step_call_count(), ops.measure_call_count()), (1, 0));
     }
@@ -292,7 +304,7 @@ mod tests {
     fn measurement_proceeds_and_reaches_target_when_budget_allows() {
         let cancel = AtomicBool::new(false);
         let mut ops = FakeOps::new(&cancel).with_step_costs(&[95.0]).with_measurements(&[(5.0, 5.0)]);
-        let outcome = run_loop(&mut ops, 1000.0, 100.0, 1e9, &cancel, |_, _| {});
+        let outcome = run_loop(&mut ops, 1000.0, 100.0, 100, u16::MAX, &cancel, |_, _| {});
         assert_eq!((outcome.iterations, outcome.exploitability, outcome.reached_target, outcome.cancelled), (1, Some(5.0), true, false));
         assert_eq!((ops.step_call_count(), ops.measure_call_count()), (1, 1));
     }
@@ -304,21 +316,94 @@ mod tests {
     fn cancellation_after_solve_step_stops_before_any_measurement() {
         let cancel = AtomicBool::new(false);
         let mut ops = FakeOps::new(&cancel).with_step_costs(&[80.0]).cancel_after_step(1);
-        let outcome = run_loop(&mut ops, 200.0, 100.0, 0.0, &cancel, |_, _| {});
+        let outcome = run_loop(&mut ops, 200.0, 100.0, 100, 1, &cancel, |_, _| {});
         assert_eq!((outcome.iterations, outcome.exploitability, outcome.reached_target, outcome.cancelled), (1, None, false, true));
         assert_eq!((ops.step_call_count(), ops.measure_call_count()), (1, 0));
     }
 
     // R2: cancellation observed immediately after a measurement must stop the loop before
-    // publishing a target-reached outcome -- the early return on `value <= target_chips` must not
+    // publishing a target-reached outcome -- the early return on `meets_target` must not
     // bypass this checkpoint even though the measured value did reach target, and no second
     // measurement or iteration follows.
     #[test]
     fn cancellation_after_measurement_stops_before_publishing_target_reached() {
         let cancel = AtomicBool::new(false);
         let mut ops = FakeOps::new(&cancel).with_step_costs(&[95.0]).with_measurements(&[(5.0, 5.0)]).cancel_after_measurement(1);
-        let outcome = run_loop(&mut ops, 1000.0, 100.0, 1e9, &cancel, |_, _| {});
+        let outcome = run_loop(&mut ops, 1000.0, 100.0, 100, u16::MAX, &cancel, |_, _| {});
         assert_eq!((outcome.iterations, outcome.exploitability, outcome.reached_target, outcome.cancelled), (1, Some(5.0), false, true));
         assert_eq!((ops.step_call_count(), ops.measure_call_count()), (1, 1));
+    }
+
+    /// The raw target `pot * target_bp / 10_000` chips as an `f64` quotient, and the pre-P2.W1 worker threshold: that
+    /// quotient narrowed once to `f32`.
+    fn raw_quotient(pot: u32, target_bp: u16) -> f64 { f64::from(pot) * f64::from(target_bp) / 10_000.0 }
+    fn rounded_threshold(pot: u32, target_bp: u16) -> f32 { raw_quotient(pot, target_bp) as f32 }
+
+    /// The spec 4.4 comparison `x / pot <= target_bp / 10_000`, i.e. `x * 10_000 <= target_bp * pot`, over the integers
+    /// (an oracle independent of `f64`): a finite positive `f32` is exactly `m * 2^e`, so both sides are integers once
+    /// the negative power of two moves across. The callers' values keep the shift far inside `u128`.
+    fn exact_meets(x: f32, pot: u32, target_bp: u16) -> bool {
+        assert!(x.is_finite() && x > 0.0, "{x:e}");
+        let (biased, frac) = ((x.to_bits() >> 23) as i32, x.to_bits() & 0x7F_FFFF);
+        let (m, e) = if biased == 0 { (u128::from(frac), -149) } else { (u128::from(frac | 0x80_0000), biased - 150) };
+        let (lhs, rhs) = (m * 10_000, u128::from(target_bp) * u128::from(pot));
+        assert!((-79..=40).contains(&e), "{x:e}: 2^{e} leaves the u128 range of this oracle");
+        if e >= 0 { lhs << e <= rhs } else { lhs <= rhs << -e }
+    }
+
+    /// Follow-up P2.W1: the loop's `reached_target` is spec 4.4's raw comparison, evaluated as the engine evaluates it,
+    /// never the f32-rounded threshold. The search finds a `(pot, target_bp)` whose rounded threshold lies strictly above
+    /// the raw target (the first in pot-major order over 1..=1000 x 1..=1000); the V1 fixture's own 30 bp of a 200-chip
+    /// pot is a second (0.6f32 is 0.60000002384185791015625 chips). A measurement exactly at that threshold misses the
+    /// raw target, so the loop must not report it reached (a worker `ok` there would be refused by the engine as a
+    /// worker-contract error); the next `f32` below it meets the raw target and is reported reached. One step per
+    /// millisecond, the first measurement at iteration 10 (§7's cadence), and that measurement's cost carries the clock
+    /// past the deadline, so a miss ends the loop at its next boundary.
+    #[test]
+    fn reached_target_is_the_raw_comparison_not_the_f32_rounded_threshold() {
+        let found = (1..=1000u32).flat_map(|pot| (1..=1000u16).map(move |bp| (pot, bp))).find(|&(pot, bp)| f64::from(rounded_threshold(pot, bp)) > raw_quotient(pot, bp));
+        let found = found.expect("some (pot, target_bp) has an f32-rounded target strictly above the raw one");
+        assert_eq!(found, (1, 3), "the first such pair: 0.0003 chips rounds up to 0.0003000000142492354");
+        for (pot, bp) in [found, (200, 30)] {
+            let threshold = rounded_threshold(pot, bp);
+            let below = f32::from_bits(threshold.to_bits() - 1);
+            assert!(!exact_meets(threshold, pot, bp) && exact_meets(below, pot, bp), "pot {pot}, {bp} bp: the rounded threshold {:e} misses the raw target, the f32 below it meets it", f64::from(threshold));
+            for (value, reached) in [(threshold, false), (below, true)] {
+                let cancel = AtomicBool::new(false);
+                let mut ops = FakeOps::new(&cancel).with_step_costs(&[1.0]).with_measurements(&[(value, 1e6)]);
+                let outcome = run_loop(&mut ops, 1000.0, 0.0, pot, bp, &cancel, |_, _| {});
+                assert_eq!(
+                    (outcome.iterations, outcome.exploitability.map(f32::to_bits), outcome.reached_target, outcome.cancelled),
+                    (10, Some(value.to_bits()), reached, false),
+                    "pot {pot}, {bp} bp: a measurement of {:e} chips against the raw target {:e} chips", f64::from(value), raw_quotient(pot, bp)
+                );
+                assert_eq!((ops.step_call_count(), ops.measure_call_count()), (10, 1), "pot {pot}, {bp} bp, {:e}: one measurement, then the stop point", f64::from(value));
+            }
+        }
+    }
+
+    /// `meets_target` is exactly spec 4.4's comparison (the engine's `f64` form: an `f32` significand times 10^4 and a
+    /// `u16` times a `u32` are both exact there), checked against the integer oracle at every pot and target up to 200
+    /// on the rounded threshold and its two `f32` neighbours; inclusive at a representable target (25 bp of 100 chips
+    /// is 0.25); at the largest inputs (`u32::MAX` chips, `u16::MAX` bp); any non-positive measurement meets every
+    /// target, and NaN or +infinity none.
+    #[test]
+    fn meets_target_is_the_exact_raw_comparison() {
+        for pot in 1..=200u32 {
+            for bp in 1..=200u16 {
+                let t = rounded_threshold(pot, bp);
+                for x in [f32::from_bits(t.to_bits() - 1), t, f32::from_bits(t.to_bits() + 1)] {
+                    assert_eq!(meets_target(x, pot, bp), exact_meets(x, pot, bp), "pot {pot}, {bp} bp, measurement {:e}", f64::from(x));
+                }
+            }
+        }
+        let quarter = 0.25f32;
+        assert!(meets_target(quarter, 100, 25) && !meets_target(f32::from_bits(quarter.to_bits() + 1), 100, 25));
+        let t = rounded_threshold(u32::MAX, u16::MAX);
+        for x in [f32::from_bits(t.to_bits() - 1), t, f32::from_bits(t.to_bits() + 1)] {
+            assert_eq!(meets_target(x, u32::MAX, u16::MAX), exact_meets(x, u32::MAX, u16::MAX), "the largest target, measurement {:e}", f64::from(x));
+        }
+        for x in [0.0f32, -0.0, -1e-6, f32::NEG_INFINITY] { assert!(meets_target(x, 1, 0) && meets_target(x, 200, 30), "{x:e}"); }
+        for x in [f32::NAN, f32::INFINITY] { assert!(!meets_target(x, u32::MAX, u16::MAX), "{x:e}"); }
     }
 }
