@@ -56,7 +56,7 @@
 //! the offending index -- never clamped into range, and every update checks its own mass
 //! accounting (always on) within [`MASS_TOLERANCE`].
 
-use proto::{Action, Range1326, Seat, COMBOS};
+use proto::{Action, ApproxReason, Range1326, Seat, COMBOS};
 
 /// Relative tolerance of the always-on mass-accounting checks: a conditioned branch keeps the
 /// actor's pre-update mass total, and a rescaled seat's marginal has maximum 1. Both are exact in
@@ -395,4 +395,188 @@ pub fn range_output(r: &[f64]) -> Range1326 {
         );
     }
     out
+}
+
+/// Caps the live branch list at 4, merging every branch beyond the four highest `q_k` (ties break
+/// by ascending `id`, i.e. creation order) into the single frozen residual (spec sections 8.4 and
+/// 9.2): `q_R' = q_R + sum_k q_k` and, per seat, `w_{S,R}'[c] = (q_R * w_{S,R}[c] + sum_k q_k *
+/// w_{S,k}[c]) / q_R'`. This is exactly the weighted average that keeps every seat's public
+/// marginal `r_S[c] = sum_k q_k * w_{S,k}[c]` unchanged: the merged terms are regrouped, never
+/// dropped or renormalized away. A stopped branch (spec section 9.3, `stopped: Some(reason)`) is
+/// not otherwise distinguished from a live one here -- it keeps its rank by `q` and can itself be
+/// merged into the residual on a later overflow, at which point its `stopped` reason is dropped
+/// (the residual carries no reason of its own; [`residual_reason`] reports the cap, not why any
+/// one merged branch stopped). If no residual exists yet, the first merged branch becomes it (its
+/// `translated` history, `stopped` reason and every seat's `node` are cleared, since the residual
+/// has no history or node of its own); every following overflow event folds into that same
+/// residual -- at most one residual ever exists afterward. The output order is every surviving
+/// live branch by ascending `id`, then the residual last (if any); `bs` is otherwise unchanged when
+/// there are 4 or fewer live branches (nothing overflows).
+///
+/// # Panics
+/// Always, if more than one input branch is already marked residual, any branch's weight is not a
+/// finite value in `[0, 1]`, any seat's masses are not 1326 finite non-negative values, a merged
+/// residual mass is not finite and non-negative, or the total `q` across every branch moves by
+/// more than [`MASS_TOLERANCE`] (relative) across the cap -- the merge only ever regroups existing
+/// mass, never creates or drops it.
+pub fn cap_branches(bs: &mut Vec<HistoryBranch>) {
+    for b in bs.iter() {
+        validate_branch_weight(b, "cap_branches");
+        for index in 0..b.seats.len() {
+            check_masses(b, index, "cap_branches");
+        }
+    }
+    let residual_count = bs.iter().filter(|b| b.residual).count();
+    assert!(residual_count <= 1, "cap_branches: {residual_count} branches are already marked residual, expected at most 1");
+    let before: f64 = bs.iter().map(|b| b.q).sum();
+
+    let mut live = Vec::new();
+    let mut residual: Option<HistoryBranch> = None;
+    for b in bs.drain(..) {
+        if b.residual {
+            residual = Some(b);
+        } else {
+            live.push(b);
+        }
+    }
+    live.sort_by(|a, b| b.q.total_cmp(&a.q).then(a.id.cmp(&b.id)));
+    let overflow = if live.len() > 4 { live.split_off(4) } else { Vec::new() };
+    for b in overflow {
+        if let Some(r) = &mut residual {
+            let total = r.q + b.q;
+            assert_eq!(
+                r.seats.len(),
+                b.seats.len(),
+                "cap_branches: residual holds {} seats, overflow branch {} holds {}",
+                r.seats.len(),
+                b.id,
+                b.seats.len()
+            );
+            for (rs, ss) in r.seats.iter_mut().zip(&b.seats) {
+                assert_eq!(
+                    rs.seat, ss.seat,
+                    "cap_branches: residual seat {:?} does not line up with overflow branch {}'s seat {:?}",
+                    rs.seat, b.id, ss.seat
+                );
+                for (c, (rw, w)) in rs.mass.iter_mut().zip(&ss.mass).enumerate() {
+                    let merged = (r.q * *rw + b.q * w) / total;
+                    assert!(
+                        merged.is_finite() && merged >= 0.0,
+                        "cap_branches: residual seat {:?} mass[{c}] merged to {merged}, not a finite non-negative value",
+                        rs.seat
+                    );
+                    *rw = merged;
+                }
+            }
+            r.q = total;
+        } else {
+            let mut r = b;
+            r.residual = true;
+            r.translated.clear();
+            r.stopped = None;
+            for s in &mut r.seats {
+                s.node = None;
+            }
+            residual = Some(r);
+        }
+    }
+    live.sort_by_key(|b| b.id);
+    bs.extend(live);
+    if let Some(r) = residual {
+        bs.push(r);
+    }
+
+    let after: f64 = bs.iter().map(|b| b.q).sum();
+    assert!(
+        (after - before).abs() <= MASS_TOLERANCE * before.max(1.0),
+        "cap_branches: total branch weight moved from {before} to {after}, outside MASS_TOLERANCE"
+    );
+}
+
+/// The `ApproxReason::BranchResidual` this branch list's cap has earned, or `None` when it holds
+/// no residual (never capped, or built without one). The share is recomputed from the branches'
+/// current `q` every call -- never cached from the cap that created the residual -- so later
+/// conditioning that changes live `q` (the residual itself is frozen and never conditioned; see
+/// [`condition`]) is reflected immediately, as spec section 8.4 requires: "recompute the displayed
+/// share after later evidence; storing only the original ... share would be wrong."
+///
+/// # Panics
+/// Always, if any branch's weight is not a finite value in `[0, 1]`, or every branch's weight is
+/// 0 (a residual's share of a zero total is undefined).
+pub fn residual_reason(bs: &[HistoryBranch], hero: Seat) -> Option<ApproxReason> {
+    for b in bs {
+        validate_branch_weight(b, "residual_reason");
+    }
+    let r = bs.iter().find(|b| b.residual)?;
+    let total: f64 = bs.iter().map(|b| b.q).sum();
+    assert!(total > 0.0, "residual_reason: total branch weight is {total}, cannot compute a residual share");
+    let pct = (100.0 * r.q / total) as f32;
+    assert!(pct.is_finite() && pct >= 0.0, "residual_reason: residual share {pct} is not a finite non-negative percentage");
+    Some(ApproxReason::BranchResidual { seat: hero, residual_mass_pct: pct, cause: "cap".into() })
+}
+
+/// Splits every **live** branch (a residual or a stopped branch is copied through unchanged, per
+/// [`condition`]'s own frozen-branch rule) across one observed wager's common menu -- `(action, f,
+/// p)` triples, applied as [`condition`]`(branch, actor, p, f)` -- preserving parent creation
+/// order and, within one parent, choice order (child A before child B); a choice whose integrated
+/// likelihood is 0 does not create a child. This is the test-only common-menu case: production
+/// replay's branches can each carry a different menu (a different translated history reaching a
+/// different node), so it builds each branch's own choices and calls [`condition`] directly,
+/// running [`cap_branches`] once after every parent in the batch has been expanded -- never per
+/// parent, or an earlier parent's overflow would compete against a later, still-unexpanded
+/// parent's children for the same four live slots (see the module docs' transactional-update
+/// section).
+///
+/// Every created child's `parent` is set to its parent's `id`, `split_by` to `actor`, and `action`
+/// is appended to its `translated` history; every other field ([`condition`]'s own `q` and mass
+/// update aside) is copied from the parent. Child ids are assigned in creation order, starting one
+/// past the highest id already in `bs`; if that counter would exceed `u8::MAX`, every id in the
+/// output -- new children and copied-through branches alike -- is compacted to `0..out.len()` in
+/// the same order (see [`compact_ids`]).
+///
+/// A parent all of whose children have `M = 0` (an impossible action against that parent's public
+/// range) contributes nothing to `out`; a parent whose *every* child across the whole `bs` is
+/// dropped this way is the zero-support case, handled by the caller (this batch-transactional
+/// function does not itself reject an update -- spec section 9.2's zero-support rejection keeps
+/// the pre-action list, which is `bs` unchanged, not an empty `out`).
+pub fn split_action(bs: &[HistoryBranch], actor: Seat, choices: &[(Action, f64, Vec<f64>)]) -> Vec<HistoryBranch> {
+    let mut next_id: u32 = bs.iter().map(|b| b.id as u32 + 1).max().unwrap_or(0);
+    let mut out: Vec<HistoryBranch> = Vec::new();
+    for b in bs {
+        if b.residual || b.stopped.is_some() {
+            out.push(b.clone());
+            continue;
+        }
+        for (action, f, p) in choices {
+            let Some(mut child) = condition(b, actor, p, *f) else { continue };
+            child.parent = Some(b.id);
+            child.split_by = Some(actor);
+            child.translated.push((actor, action.clone()));
+            child.id = u8::try_from(next_id).unwrap_or(u8::MAX);
+            next_id += 1;
+            out.push(child);
+        }
+    }
+    if next_id > u8::MAX as u32 {
+        compact_ids(&mut out);
+    }
+    out
+}
+
+/// Rewrites every branch's `id` to its position in `out` (`0..out.len()`), remapping every
+/// `parent` reference by looking up that old id's new position -- a reference to a branch not
+/// present in `out` (the ordinary case: a child's `parent` names an ancestor from the *previous*
+/// batch, which this function never sees) becomes `None` rather than a stale id. Relative creation
+/// order and every cap tie-break above (`then(a.id.cmp(&b.id))`) are preserved, since positions in
+/// `out` are assigned in the same order the original ids were.
+///
+/// # Panics
+/// Always, if `out` holds more than 256 branches (one more than a `u8` id can address).
+fn compact_ids(out: &mut [HistoryBranch]) {
+    assert!(out.len() <= u8::MAX as usize + 1, "compact_ids: {} branches cannot be addressed by a u8 id", out.len());
+    let old: Vec<u8> = out.iter().map(|b| b.id).collect();
+    for (i, b) in out.iter_mut().enumerate() {
+        b.parent = b.parent.and_then(|p| old.iter().position(|&o| o == p).map(|k| k as u8));
+        b.id = i as u8;
+    }
 }
