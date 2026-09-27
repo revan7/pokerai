@@ -52,8 +52,10 @@ fn bet_sizes(side: &SideMenu, street: Street, who: &str) -> Result<BetSizeOption
 ///
 /// `rake_cap_mchips` needs no check: `u32 / 1000.0` is finite and non-negative by construction.
 fn validate_scalars(t: &EffectiveTree, rake_rate: f32) -> Result<(), String> {
-    if !(rake_rate.is_finite() && (0.0..=1.0).contains(&rake_rate)) {
-        return Err(format!("rake_rate {rake_rate:e} must be finite and in [0, 1]"));
+    // Fix round 1 (review I1): half-open at 1, aligned with the shared wire codec's domain
+    // (`proto::numeric::domain_rake_rate`) and with `protocol::precheck`'s admission check.
+    if !(rake_rate.is_finite() && (0.0..1.0).contains(&rake_rate)) {
+        return Err(format!("rake_rate {rake_rate:e} must be finite and in [0, 1)"));
     }
     for (label, x) in [("add_allin_threshold", t.add_allin_threshold), ("force_allin_threshold", t.force_allin_threshold)] {
         if !(x.is_finite() && x >= 0.0) { return Err(format!("{label} {x:e} must be finite and non-negative")); }
@@ -317,12 +319,13 @@ mod tests {
             let e = tree_config(&t, 100, 500, 0.0, 0).unwrap_err();
             assert!(e.contains("force_allin_threshold"), "force threshold {bad:e}: {e}");
         }
-        // upstream tests the rake rate with `< 0.0` / `> 1.0`, which a NaN passes
-        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01f32, 1.01f32] {
+        // Fix round 1 (review I1): the shared wire domain (`proto::numeric::domain_rake_rate`) is half-open
+        // at 1, so this direct-builder path must refuse 1.0 too, never a NaN either.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01f32, 1.0f32, 1.01f32] {
             let e = tree_config(&ok, 100, 500, bad, 0).unwrap_err();
             assert!(e.contains("rake_rate"), "rake_rate {bad:e}: {e}");
         }
-        tree_config(&ok, 100, 500, 1.0, 5_000).expect("a rake rate of exactly 1.0 is upstream's own upper bound");
+        tree_config(&ok, 100, 500, 0.999_999_94, 5_000).expect("a rake rate immediately below 1.0 is valid");
     }
 
     #[test]
