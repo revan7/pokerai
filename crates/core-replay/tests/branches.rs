@@ -1044,13 +1044,15 @@ fn cap_branches_keeps_support_that_exists_only_in_overflow() {
     }
 }
 
-/// R3's rejection side: a merged mass whose exact weighted average is below the smallest positive
-/// `f64` (weight `2^-1074` merged into a residual of weight .5, mass .2: 0.4 of the smallest
-/// positive value) is unrepresentable support, not zero support -- rejected with a named
-/// assertion, as `condition` and `marginal` do, never left as a silent zero.
+/// R3's former rejection side, now kept at the floor (ruling 12-N1d, fix round 5). The case is a
+/// merged mass whose exact weighted average is below the smallest positive `f64`: weight
+/// `2^-1074` with mass .2 merged into a residual of weight .5, an average of 0.4 of the smallest
+/// positive value. That is unrepresentable support, not zero support. It is never left as a silent
+/// zero, and it is no longer rejected either: the residual keeps it at one representable unit.
+/// This input's own combo-0 marginal (`.2 * 2^-1074`) is already unrepresentable before the cap,
+/// so the before/after marginal check (N1b) does not apply to it.
 #[test]
-#[should_panic(expected = "cap_branches: residual seat Seat(0) mass[0] underflowed to 0 despite a positive branch weight and mass on some merged branch")]
-fn cap_branches_rejects_an_unrepresentable_merged_support() {
+fn cap_branches_keeps_an_unrepresentable_merged_support_at_one_unit() {
     let tiny = f64::from_bits(1);
     let branch = |id: u8, q: f64, m0: f64| {
         let mut mass = vec![1.0; 1326];
@@ -1072,6 +1074,11 @@ fn cap_branches_rejects_an_unrepresentable_merged_support() {
     residual.residual = true;
     bs.push(residual);
     cap_branches(&mut bs);
+    assert_eq!(bs.iter().filter(|b| !b.residual).count(), 4);
+    let r = bs.iter().find(|b| b.residual).expect("the existing residual absorbs the overflow");
+    assert_eq!((r.id, r.q), (5, 0.5));
+    assert_eq!(r.seats[0].mass[0], tiny, "the merged support is kept at one representable unit");
+    assert!(r.seats[0].mass[1..].iter().all(|&w| w == 1.0), "every other residual mass is unchanged");
 }
 
 /// With normalized weights a merge whose every weight is zero has no average to take (`0 / 0`);
@@ -1280,12 +1287,31 @@ fn cap_branches_rejects_a_marginal_that_residual_steps_cannot_restore() {
 /// The merged average `.06 / .15 = .4` units rounds to 0, but the pre-cap marginal `.48 + .06 = .54`
 /// units is the representable `5e-324`, and the post-cap `.48` units rounds to 0. One N1b step
 /// (residual mass `2^-1074`, share `.15`, sum `.63` units) restores both the marginal and the
-/// residual's support, so the cap must accept.
+/// residual's support, so the cap must accept. Since fix round 5 (ruling 12-N1d), the merge's
+/// one-unit floor reaches the same mass before any stepping, and the post-cap sum is already
+/// positive, so no step is taken.
 #[test]
 fn cap_branches_steps_a_lost_merged_support_back_before_rejecting() {
     let mut bs: Vec<HistoryBranch> = (0..3u8).map(|id| last_unit_branch(id, 0.2, 0.0)).collect();
     bs.push(last_unit_branch(3, 0.16, f64::from_bits(3)));
     bs.push(last_unit_branch(4, 0.15, 0.0));
     bs.push(last_unit_branch(5, f64::from_bits(1), 0.06));
+    check_last_unit_cap(bs, 4, f64::from_bits(1));
+}
+
+/// Ruling 12-N1d (fix round 5): a merged support whose average rounds to zero is kept at one
+/// representable unit instead of rejecting the cap. This case comes from the round-4 sweep's
+/// rejected set (`ql .17, k 3, qr .05, j 1, m .02`). Live `q = .2, .2, .2, .17` (the `.17` branch
+/// with combo-0 mass `3 * 2^-1074`, a live share of `.51` units, representable on its own), a
+/// created residual (`q = .05`, combo-0 mass 0) and one merged branch (`q = 2^-1074`, combo-0 mass
+/// .02). The merged average `.02 / .05 = .4` units rounds to 0. The post-cap marginal is already
+/// positive from the live share, so N1b never steps. The residual mass becomes `2^-1074` (share
+/// `.05` units), and the post-cap sum `.56` units stays `5e-324`.
+#[test]
+fn cap_branches_keeps_merged_support_at_one_unit_beside_representable_live_reach() {
+    let mut bs: Vec<HistoryBranch> = (0..3u8).map(|id| last_unit_branch(id, 0.2, 0.0)).collect();
+    bs.push(last_unit_branch(3, 0.17, f64::from_bits(3)));
+    bs.push(last_unit_branch(4, 0.05, 0.0));
+    bs.push(last_unit_branch(5, f64::from_bits(1), 0.02));
     check_last_unit_cap(bs, 4, f64::from_bits(1));
 }
