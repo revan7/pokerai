@@ -959,14 +959,24 @@ fn per_combo_equity_reports_a_stop_with_equity_status_semantics() {
 /// S10: a stop raised while the enumerations are running is observed between hero combos, and the
 /// combos finished before it are kept -- the caller gets a partial answer, not an empty one.
 ///
-/// Sized so the stop is never a race. On a **flop** every tuple carries 990 runouts, so one hero
-/// combo against the six `AA` combos costs about 95 us in release, and the full 1,176-combo hero
-/// range costs about 112 ms: a combo is three orders of magnitude cheaper than the stop window and
-/// the whole run is an order of magnitude more expensive than it, on either build profile. An
+/// Sized so the stop is *usually* not a race. On a **flop** every tuple carries 990 runouts, so one
+/// hero combo against the six `AA` combos costs about 95 us in release, and the full 1,176-combo
+/// hero range costs about 112 ms: a combo is three orders of magnitude cheaper than the stop window
+/// and the whole run is an order of magnitude more expensive than it, on either build profile. An
 /// earlier version of this test sized both windows at 20 ms against a 17 ms *river* run, which the
 /// release build finished inside -- and it burned a core in a spin loop while doing so, which was
 /// enough extra contention to destabilise the raw-`sleep` timing tests elsewhere in this file. The
 /// budget half needs no helper thread at all.
+///
+/// Still scheduling-dependent, though: a debug-workspace gate run alongside another cargo build and
+/// the release gate saw the main thread descheduled past the whole 5 ms budget before it reached
+/// `per_combo_equity`'s first per-combo poll, i.e. `scored == 0` with status `BudgetExceeded` --
+/// exactly the shape `mc_partial_runs_keep_their_shares`'s cancel-flag block already retries (see
+/// `eventually`'s doc comment, orchestrator ruling, post-close follow-up 4), not a defect in the
+/// retention this test exists to pin. `status` and the "never scores every combo" bound stay hard
+/// invariants on every attempt -- sized as above, a genuine regression that dropped the partial
+/// array, or one that let the whole range complete inside 5 ms, would fail them on every attempt and
+/// still panic; only "at least one combo finished" is retried.
 #[test]
 fn per_combo_equity_observes_a_stop_mid_run_and_keeps_what_it_finished() {
     let board = cards("Kh7d2c");
@@ -978,11 +988,17 @@ fn per_combo_equity_observes_a_stop_mid_run_and_keeps_what_it_finished() {
     assert_eq!(hero_combos, 1176);
 
     // Budget, no helper thread: the per-combo poll stops the run and keeps the partial array.
-    let (status, out) = per_combo_equity(&hero, &villain, &board, Duration::from_millis(5), &no_cancel());
-    let scored = out.iter().filter(|v| **v > 0.0).count();
-    assert_eq!(status, EquityStatus::BudgetExceeded);
-    assert!(scored > 0, "the combos finished before the budget ran out are kept, not discarded");
-    assert!(scored < hero_combos, "the run stopped before scoring every hero combo: {scored}");
+    eventually("per_combo_equity_observes_a_stop_mid_run_and_keeps_what_it_finished", || {
+        per_combo_equity(&hero, &villain, &board, Duration::from_millis(5), &no_cancel())
+    }, |(status, out)| {
+        assert_eq!(*status, EquityStatus::BudgetExceeded);
+        let scored = out.iter().filter(|v| **v > 0.0).count();
+        assert!(scored < hero_combos, "the run stopped before scoring every hero combo: {scored}");
+        if scored == 0 {
+            return Err(format!("0 of {hero_combos} combos finished before the 5 ms budget"));
+        }
+        Ok(())
+    });
 
     // The `Cancelled` variant of the same stop is deliberately *not* re-tested here with a helper
     // thread. Both statuses leave `per_combo_equity` through one path -- `Deadline`'s poll returns
