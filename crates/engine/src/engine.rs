@@ -1,8 +1,9 @@
 //! §3.5 public surface: commands never block; `engine-main` serves the request slot of depth 1 (newest wins).
 //!
 //! Construction. `Engine::new` builds the `EngineCore` (Task 27's defaults: an empty snapshot store, the default
-//! session config, `ExplicitRanges` with no ranges; Task 20's watchdog) around the Task 18 process worker link, whose
-//! `ready` validation refuses a worker built without AVX2 (§3.6, §3.7), then hands it to `engine-main`. The caller
+//! session config; Task 20's watchdog) around the Task 18 process worker link, whose `ready` validation refuses a worker
+//! built without AVX2 (§3.6, §3.7), loads the preflop store and installs the replay range source over it (plan 3 Tasks
+//! 17 and 18; `with_core` keeps whatever range source the core it is given holds), then hands it to `engine-main`. The caller
 //! locates the worker binary (`Paths::worker_exe`): the app stages it, the tests and `bench` find it through
 //! `POKERAI_WORKER`; the engine never searches for it. `with_core` takes a core built elsewhere (the tests' fake worker
 //! and clock).
@@ -37,8 +38,9 @@
 //! run by `engine-main` on its way out, a panic included), the watchdog's generation threads and the requests'
 //! `fast-path` threads; then the worker is told to shut down and killed. `shutdown` holds no lock while it joins, and
 //! `engine-main` finishes the request in hand first: invalidated, it ends at its next identity check. Lock order: the
-//! identity lock, then the equity token slot (`serve_request` takes the slot alone); the snapshot store, the config
-//! and the range source are each locked alone.
+//! identity lock, then the equity token slot (`serve_request` takes the slot alone) or the snapshot store
+//! (`register_snapshot`, as `serve`'s accepted delivery registers); the snapshot store, the config and the range
+//! source are otherwise each locked alone.
 //!
 //! Admission (final review I1, orchestrator ruling F-I1; spec 7, spec 5 step 4). `recommend` supersedes the active
 //! decision, allocates the new one, stamps `t0` and admits the request (`serve::admit`): a request at a decision point
@@ -63,7 +65,7 @@ use crate::identity::IdentityState;
 use crate::log::DecisionLog;
 use crate::ranges::{ExplicitRanges, RangeSource};
 use crate::serve::{admit, LiveRequest};
-use crate::snapshots::SnapshotStore;
+use crate::snapshots::{SnapshotStore, StreetSnapshot};
 use crate::startup::StartupReport;
 use crate::watchdog::Watchdog;
 use crate::worker::link::{RefusedWorker, WorkerLink, WorkerLinkError};
@@ -177,7 +179,8 @@ pub struct Engine {
 impl Engine {
     /// Validates `cfg`, launches the worker at `paths.worker_exe` (its `ready` validated, §4.5: a worker built without
     /// AVX2 is refused, §3.7), loads the preflop store from `paths.preflop` (plan 3 Task 17; its banners and quarantined
-    /// bundles join the startup report) and starts `engine-main`; `cfg` becomes the session's first config revision. A
+    /// bundles join the startup report), installs the replay range source over it (plan 3 Task 18) and starts
+    /// `engine-main`; `cfg` becomes the session's first config revision. A
     /// refused `ready` leaves a degraded engine (see the module doc); an invalid config or a failed launch is an error,
     /// and neither touches the preflop directory.
     pub fn new(cfg: GameConfig, paths: Paths) -> Result<Engine, EngineError> {
@@ -191,9 +194,11 @@ impl Engine {
         let identity = Arc::new(Mutex::new(IdentityState::new()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
         let mut core = EngineCore::new(worker, clock, identity, DecisionLog::open(&paths.log_dir));
-        // Loaded once, here, before the core is handed to `engine-main` (plan 3 Task 17).
+        // Loaded once, here, before the core is handed to `engine-main` (plan 3 Task 17), and the replay range source
+        // installed over it, the only root-range provider from here on (plan 3 Task 18).
         let loaded = crate::preflop::load_store(&paths.preflop);
         core.preflop = Arc::new(loaded.store);
+        core.install_replay_ranges();
         let mut e = Engine::with_core(core);
         e.startup.banners.extend(loaded.banners);
         e.startup.quarantined_bundles = loaded.quarantined;
@@ -265,6 +270,20 @@ impl Engine {
     /// The preflop store the engine loaded once at construction (plan 3 Task 17; plan 4's consumption point): the same
     /// store every preflop decision reads, never reloaded.
     pub fn preflop_store(&self) -> &PreflopStore { &self.preflop }
+
+    /// §9.2's single registration path for a snapshot validated outside `engine-main`'s own delivery: plan 4's cache
+    /// route (plan 3 Task 18). Registers `snapshot` iff `active` is still the active decision, checked under the identity
+    /// lock, which is held while the store registers (lock order: identity, then the store), by the one registration rule
+    /// `serve` applies inside its accepted deliveries (`replay_bridge::register_accepted`: `SnapshotStore::register`'s
+    /// identity gate, and a `Provisional` never replacing the `Final` of the same decision and street). Returns false for
+    /// a stale identity, which is how a late result is refused, and for any snapshot that rule refuses.
+    pub fn register_snapshot(&mut self, active: &DecisionIdentity, snapshot: StreetSnapshot) -> bool {
+        let ids = lock(&self.identity);
+        if !ids.is_active(active) {
+            return false;
+        }
+        crate::replay_bridge::register_accepted(&mut lock(&self.snapshots), active, snapshot)
+    }
 
     /// §4.2 / §13.3: validates the config, allocates a revision and applies it — immediately when no hand is in
     /// progress, otherwise from the next `begin_hand` (the active hand keeps its frozen `HandConfig`). A rejected config
@@ -369,7 +388,8 @@ impl Engine {
         Ok(s)
     }
 
-    /// Plan 2 only: the public ranges at the street root (plan 3 installs a replay-backed `RangeSource` instead).
+    /// Plan 2's fixed public ranges at the street root, replacing the range source (`Engine::new` installs the replay's,
+    /// plan 3 Task 18) through the shared handle: tests and `bench` only.
     pub fn set_explicit_ranges(&mut self, oop: Range1326, ip: Range1326) { *lock(&self.range_source) = Box::new(ExplicitRanges { oop: Some(oop), ip: Some(ip) }); }
 
     /// Allocates the decision's identity, stamps `t0`, admits the request (`serve::admit`: a decision point is armed on

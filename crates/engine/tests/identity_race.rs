@@ -1055,3 +1055,33 @@ fn a_watchdog_final_delivered_then_superseded_before_the_engines_claim_is_logged
     assert_eq!(kills_and_restarts(&r), (0, 0));
     assert_the_delivered_watchdog_final_is_logged_once(&r, &id, false, "finish's stale exit");
 }
+
+/// Plan 3 Task 18 (spec 9.3, Task 15 Q2) with ruling W3-I1: a `Final` the watchdog delivered while the decision was
+/// active is that decision's outcome even once a mutation (here the sink, from the `Final`'s callback, as a UI acting on
+/// it at once) has superseded it before `engine-main` got there. In both stale exits, after the solve and at the engine's
+/// own claim, the decision records the watchdog's deadline as its miss at its street root (the river root, whose history
+/// is empty), for a later replay to name, and registers no snapshot.
+#[test]
+fn a_watchdog_final_delivered_then_superseded_still_records_the_decisions_miss() {
+    let recorded = |r: &Rig, id: &DecisionIdentity, what: &str| {
+        let store = r.core.snapshots.lock().unwrap();
+        let misses = store.misses_for_identity(id);
+        assert_eq!(misses.iter().map(|m| (&m.identity, m.street, m.prefix.len())).collect::<Vec<_>>(), [(id, Street::River, 0)], "{what}");
+        assert!(misses[0].cause.starts_with("deadline exceeded"), "{what}: {:?}", misses[0].cause);
+        assert!(store.for_hand(id.hand_id).is_empty(), "{what}: no snapshot");
+    };
+    let (mut r, _finals) = superseding_rig("t18_miss_post_solve", vec![]);
+    let (worker, state) = FakeWorker::scripted(r.clock.clone(), r.identity.clone(), vec![ack(), FakeReply::Hang, ack(), FakeReply::Hang]);
+    let fires = Arc::new(Mutex::new(VecDeque::from([(14_900, 1)])));
+    r.core.worker = Box::new(FireDuringReceive { inner: worker, clock: r.clock.clone(), ends: r.core.watchdog.ended_threads(), fires });
+    r.state = state;
+    let id = serve(&mut r, &river_state());
+    assert!(!r.identity.lock().unwrap().is_active(&id));
+    recorded(&r, &id, "the post-solve stale exit");
+    let s = river_state();
+    let (mut r, finals) = superseding_rig("t18_miss_finish", vec![ack(), result(ResultStatus::Ok, solution_on(&s, "river_std_v1", 0.2))]);
+    let seams = fire_before_claim(&r, &finals);
+    let id = serve_with(&mut r, &s, seams);
+    assert!(!r.identity.lock().unwrap().is_active(&id));
+    recorded(&r, &id, "finish's stale exit");
+}

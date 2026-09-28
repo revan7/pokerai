@@ -16,6 +16,6 @@ pub use preflop::*; // ReplayInput, ReplayOutput, replay, walk_preflop, apply_pr
                     // board_mask, block_and_rescale, publish, replay_decision, DecisionLookup (P3.T17)
 pub use snapshot::*; // SnapshotKey, SnapshotProvenance, StreetSnapshot, CompatKey, compatible, covered_prefix,
                      // select_snapshot, snapshot_node_at, street_number, street_history, root_board,
-                     // SnapshotStore (P3.T14, P3.T15)
+                     // SnapshotStore (P3.T14, P3.T15), SnapshotMiss (P3.T18)
 // P3.T16: the branch-supported assembly of hero's current preflop decision (spec section 8.4).
 pub use core_preflop::{mix_action, mix_nodes, range_mix_weight, BranchNode, MixedNode};

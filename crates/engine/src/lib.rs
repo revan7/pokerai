@@ -14,6 +14,7 @@ pub mod identity;
 pub mod log;
 pub mod preflop;
 pub mod ranges;
+pub mod replay_bridge;
 pub mod serve;
 pub mod snapshots;
 pub mod solve;

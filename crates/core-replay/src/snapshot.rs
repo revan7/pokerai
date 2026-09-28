@@ -10,6 +10,12 @@
 //! `engine::snapshots::SolvedStreet` store; `engine::snapshots` re-exports it. The walk that
 //! consumes a selected snapshot is P3.T15's `crate::postflop`, which also uses
 //! [`snapshot_node_at`] and the model-based root recovery `decision_roots` defined here.
+//!
+//! P3.T18 adds the store's second record, [`SnapshotMiss`] (Task 15 Q2): a hero decision on a
+//! postflop street whose request ended without a registered solution, with the engine's concrete
+//! cause (an engine error, a deadline). It is recorded for the identity whose `Final` was
+//! delivered, and kept or dropped by the same invalidation rules, so the engine can name the cause
+//! of a street that has no snapshot (spec section 9.3) through `ReplayInput::missing`.
 
 use core_model::lifecycle::simulate;
 use core_model::street_root;
@@ -58,6 +64,33 @@ pub struct StreetSnapshot {
     pub covered_paths: Vec<OrdinalPath>,
     pub exploitability_chips: f32,
     pub reasons: Vec<ApproxReason>,
+}
+
+/// A hero decision on a postflop street whose request ended with no registered solution (P3.T18,
+/// Task 15 Q2; spec section 9.3's "engine error, deadline"): the decision's identity, the street,
+/// its root board and the history of its street root (a snapshot's `solved_prefix` domain), and
+/// the engine's concrete `cause`, which names the street's `UnconditionedPriorStreet` when no
+/// snapshot of it exists. Recorded and invalidated exactly as a snapshot is ([`SnapshotStore`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotMiss {
+    pub identity: DecisionIdentity,
+    pub street: Street,
+    pub root_board: Vec<Card>,
+    pub prefix: Vec<(Seat, Action)>,
+    pub cause: String,
+}
+
+impl SnapshotMiss {
+    /// Whether this miss's decision is still in `state`'s history, by the rules
+    /// [`SnapshotStore::invalidate`] keeps a record by: its street is not later than the state's
+    /// current or awaited street, its root board is the street's board on record, and its prefix is
+    /// the history of a street root the model recovers at one of the street's cutoffs. The read-side
+    /// check of an engine that cannot assume the store was fully invalidated.
+    pub fn in_history(&self, state: &HandState) -> bool {
+        street_number(self.street) <= street_number(state.derived.street)
+            && self.root_board == root_board(state, self.street)
+            && decision_roots(state, self.street).iter().any(|r| r.history == self.prefix)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -322,14 +355,41 @@ pub(crate) fn translated_children(node: &MaterializedNode, level: u32, observed:
 /// The registered street snapshots: the single registration path of spec section 9.2 (the engine's
 /// `engine::snapshots` re-exports this type). Only already validated solutions are registered, by
 /// the engine, never raw worker results; a snapshot's provenance is never rewritten once stored.
+/// Beside them, the recorded misses (P3.T18): hero decisions whose request registered nothing, with
+/// the engine's cause, under the same identity rule and the same invalidation.
 #[derive(Debug, Default)]
 pub struct SnapshotStore {
     entries: Vec<StreetSnapshot>,
+    misses: Vec<SnapshotMiss>,
 }
 
 impl SnapshotStore {
     pub fn new() -> Self {
-        Self { entries: vec![] }
+        Self { entries: vec![], misses: vec![] }
+    }
+
+    /// Records `miss` if it is `owner`'s, the identity the caller vouches for: the decision it read
+    /// as active when that decision's `Final` was delivered (the rule [`SnapshotStore::register`]
+    /// applies to a snapshot). A miss of any other identity is refused and leaves the store
+    /// untouched. A later miss of the same decision on the same street replaces its earlier one.
+    /// Returns whether `miss` was stored.
+    pub fn record_miss(&mut self, owner: &DecisionIdentity, miss: SnapshotMiss) -> bool {
+        if miss.identity != *owner {
+            return false;
+        }
+        self.misses.retain(|m| m.street != miss.street || m.identity != *owner);
+        self.misses.push(miss);
+        true
+    }
+
+    /// The misses of `id`'s hand, config revision and model revision, in recording order (the
+    /// slice [`SnapshotStore::for_identity`] reads for the snapshots).
+    pub fn misses_for_identity(&self, id: &DecisionIdentity) -> Vec<SnapshotMiss> {
+        self.misses
+            .iter()
+            .filter(|m| m.identity.hand_id == id.hand_id && m.identity.config_revision == id.config_revision && m.identity.model_revision == id.model_revision)
+            .cloned()
+            .collect()
     }
 
     /// Registers `snap` if it was solved for the `active` decision, the identity the caller read as
@@ -372,10 +432,11 @@ impl SnapshotStore {
         self.entries.iter().filter(|s| s.key.hand_id == hand_id).collect()
     }
 
-    /// Drops every snapshot of `hand_id` (`begin_hand`, `finish_hand`, `abandon_hand`: the hand's
-    /// identity ends).
+    /// Drops every snapshot and every miss of `hand_id` (`begin_hand`, `finish_hand`,
+    /// `abandon_hand`: the hand's identity ends).
     pub fn invalidate_hand(&mut self, hand_id: u64) {
         self.entries.retain(|s| s.key.hand_id != hand_id);
+        self.misses.retain(|m| m.identity.hand_id != hand_id);
     }
 
     /// Spec section 9.2's mutation invalidation, prefix-based, against the new `state` of a mutation
@@ -391,25 +452,28 @@ impl SnapshotStore {
     /// solved one. So an append-only mutation or a change of hero's cards keeps the snapshot, and an
     /// undo across its solved decision (or across the projection that admitted it) removes it. Retained
     /// snapshots keep their original immutable provenance: an undo assigns a new hand revision but
-    /// never rewrites `identity_at_solve`.
+    /// never rewrites `identity_at_solve`. The recorded misses are kept or dropped by the same four
+    /// rules, their `prefix` in the place of `solved_prefix` (P3.T18).
     pub fn invalidate(&mut self, state: &HandState) {
         let current = street_number(state.derived.street);
         // The recovered root histories of each street, computed once per call.
         let mut solved_at: [Option<Vec<Vec<(Seat, Action)>>>; 4] = Default::default();
-        self.entries.retain(|s| {
-            if s.key.hand_id != state.hand_id {
+        let mut keep = |hand_id: u64, street: Street, board: &[Card], prefix: &[(Seat, Action)]| {
+            if hand_id != state.hand_id {
                 return false; // (1)
             }
-            if street_number(s.key.street) > current {
+            if street_number(street) > current {
                 return false; // (2)
             }
-            if s.key.root_board != root_board(state, s.key.street) {
+            if board != root_board(state, street) {
                 return false; // (3)
             }
-            let histories = solved_at[usize::from(street_number(s.key.street))]
-                .get_or_insert_with(|| decision_roots(state, s.key.street).into_iter().map(|root| root.history).collect());
-            histories.contains(&s.provenance.solved_prefix) // (4)
-        });
+            let histories = solved_at[usize::from(street_number(street))]
+                .get_or_insert_with(|| decision_roots(state, street).into_iter().map(|root| root.history).collect());
+            histories.iter().any(|h| h == prefix) // (4)
+        };
+        self.entries.retain(|s| keep(s.key.hand_id, s.key.street, &s.key.root_board, &s.provenance.solved_prefix));
+        self.misses.retain(|m| keep(m.identity.hand_id, m.street, &m.root_board, &m.prefix));
     }
 }
 
@@ -504,5 +568,50 @@ mod tests {
         assert_eq!(wager_level(&index, &[1, 2, 1], Street::Turn), Some(0));
         assert_eq!(wager_level(&index, &[1, 2, 1, 1], Street::Turn), Some(90));
         assert_eq!(wager_level(&index, &[3], Street::Flop), None, "an index off the menu");
+    }
+
+    /// Six-handed at 5/10 chips, the button at seat 5, hero in the small blind (seat 0) holding AhAd: everyone folds to
+    /// hero, who raises to 30, the big blind calls, the flop comes, and `flop` is played.
+    fn flop_hand(flop: &[Action]) -> HandState {
+        let cfg = proto::HandConfig { config_revision: 1, sb_chips: 5, bb_chips: 10, straddle: None, rake: proto::Rake::TimeCharge, chip_label: "$1".into() };
+        let begin = core_model::BeginHand { hand_id: 1, button: Seat(5), hero: Seat(0), dealt: (0..6).map(Seat).collect(), stacks_start: vec![1000; 6],
+            hero_cards: Some(core_model::parse_hand("AhAd").unwrap()) };
+        let preflop = [Action::Fold, Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Call];
+        let mut s = preflop.iter().fold(core_model::begin_hand(&cfg, begin).unwrap(), |s, a| core_model::apply_action(&s, *a).unwrap());
+        s = core_model::set_board(&s, &core_model::parse_cards("Kh7d2c").unwrap()).unwrap();
+        flop.iter().fold(s, |s, a| core_model::apply_action(&s, *a).unwrap())
+    }
+
+    /// P3.T18 (Task 15 Q2): a miss is recorded only for the identity it belongs to (a later miss of the same decision
+    /// and street replaces its earlier one), read by hand, config and model revision like the snapshots, and kept or
+    /// dropped by the same prefix rules: `in_history` answers that rule on read.
+    #[test]
+    fn a_miss_is_recorded_for_its_own_decision_and_invalidated_like_a_snapshot() {
+        let root = flop_hand(&[]);
+        let facing = flop_hand(&[Action::Check, Action::Bet { to: 44 }]);
+        let id = |decision_id: u64| DecisionIdentity { hand_id: 1, hand_revision: 0, decision_id, config_revision: 1, model_revision: 0 };
+        let miss = |state: &HandState, decision_id: u64, cause: &str| SnapshotMiss {
+            identity: id(decision_id),
+            street: Street::Flop,
+            root_board: root_board(state, Street::Flop),
+            prefix: street_root(state).unwrap().history,
+            cause: cause.into(),
+        };
+        let causes = |store: &SnapshotStore| store.misses_for_identity(&id(9)).into_iter().map(|m| m.cause).collect::<Vec<_>>();
+        let mut store = SnapshotStore::new();
+        assert!(store.record_miss(&id(1), miss(&root, 1, "engine error: a")));
+        assert!(!store.record_miss(&id(2), miss(&root, 1, "engine error: b")), "a miss is recorded only for its own decision");
+        assert!(store.record_miss(&id(1), miss(&root, 1, "deadline exceeded")), "the same decision's later miss replaces its earlier one");
+        assert!(store.record_miss(&id(2), miss(&facing, 2, "engine error: c")));
+        assert_eq!(causes(&store), ["deadline exceeded", "engine error: c"]);
+        assert!(store.misses_for_identity(&DecisionIdentity { config_revision: 2, ..id(9) }).is_empty(), "another config revision reads none");
+        // Hero checks and the big blind has not bet: the root decision is still in the history, the one facing a bet is not.
+        let checked = flop_hand(&[Action::Check]);
+        assert_eq!(store.misses_for_identity(&id(9)).iter().map(|m| m.in_history(&checked)).collect::<Vec<_>>(), [true, false]);
+        assert!(store.misses_for_identity(&id(9)).iter().all(|m| m.in_history(&facing)), "both decisions are in the facing history");
+        store.invalidate(&checked);
+        assert_eq!(causes(&store), ["deadline exceeded"]);
+        store.invalidate_hand(1);
+        assert!(causes(&store).is_empty());
     }
 }

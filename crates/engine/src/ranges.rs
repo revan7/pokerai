@@ -1,9 +1,10 @@
 //! The root-range source (spec §9): the public ranges both players hold at a street root.
 //!
 //! `RangeSource::ranges_at_root` is the only root-range provider (cross-plan M15, M16; orchestrator interface request
-//! g). Plan 3 implements it for a replay-backed `ReplayRanges` and installs that into `EngineCore.range_source`; this
-//! plan ships `ExplicitRanges`, used by the tests and by `bench`. Hero's cards never enter a public range (spec §2): the
-//! board is the only thing blocked here.
+//! g). Plan 3 Task 18 implements it for the replay-backed `crate::replay_bridge::ReplayRanges`, which `Engine::new`
+//! installs into `EngineCore.range_source` (`EngineCore::install_replay_ranges`) and which reuses this module's two
+//! validators; this module ships `ExplicitRanges`, used by the tests and by `bench`. Hero's cards never enter a public
+//! range (spec §2): the board is the only thing blocked here.
 
 use core_ranges::{block_public, mass, range_to_string};
 use proto::{combo_cards, ApproxReason, ComboIndex, HandState, Range1326, Seat, StreetRootSnapshot, UnsupportedReason};
@@ -50,15 +51,17 @@ impl RangeSource for ExplicitRanges {
 }
 
 /// Every weight is a finite frequency in `[0, 1]` (the domain the worker's range adapter accepts). Checked on the range
-/// as given, before blocking: a malformed weight is rejected even on a combo the board would remove.
-fn weights_valid(r: &Range1326) -> bool {
+/// as given, before blocking: a malformed weight is rejected even on a combo the board would remove. Crate-visible: the
+/// replay range source validates with it too (plan-2 carry P2T27R).
+pub(crate) fn weights_valid(r: &Range1326) -> bool {
     r.0.iter().all(|w| w.is_finite() && (0.0..=1.0).contains(w))
 }
 
 /// Whether some OOP combo and some IP combo, both with positive weight, share no card. For an OOP combo `{a, b}` the
 /// clashing IP combos are those holding `a` or `b`; by inclusion-exclusion the compatible count is
 /// `support - with[a] - with[b] + [ip holds {a, b}]`, compared here without subtraction so it cannot underflow.
-fn jointly_compatible(oop: &Range1326, ip: &Range1326) -> bool {
+/// Crate-visible: the replay range source validates with it too (plan-2 carry P2T27R).
+pub(crate) fn jointly_compatible(oop: &Range1326, ip: &Range1326) -> bool {
     let mut support = 0u32;
     let mut with = [0u32; 52];
     for (i, w) in ip.0.iter().enumerate() {

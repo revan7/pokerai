@@ -2,7 +2,8 @@
 //! identity, the watchdog, the decision log, the request-id counter, the memory limit and the furthest stage the live
 //! request has reached, and (Task 27) the snapshot store, the game config and the range source, and (Task 28) the
 //! equity cancellation token of the request served last, and (ruling 29-I2) the threads its requests start, and (plan
-//! 3 Task 17) the preflop store, loaded once before the core is handed to `engine-main`.
+//! 3 Task 17) the preflop store, loaded once before the core is handed to `engine-main`, over which (plan 3 Task 18)
+//! the replay range source is installed.
 //!
 //! Ownership (rulings 29-I2, 29-I3). `Engine` hands the core to `engine-main`, which owns it alone (no lock around it)
 //! and tears it down on its way out (`shutdown`): every thread the core started is stopped and joined, then the worker
@@ -12,6 +13,7 @@ use crate::clock::Clock;
 use crate::identity::IdentityState;
 use crate::log::DecisionLog;
 use crate::ranges::{ExplicitRanges, RangeSource};
+use crate::replay_bridge::ReplayRanges;
 use crate::snapshots::SnapshotStore;
 use crate::watchdog::Watchdog;
 use crate::worker::link::WorkerLink;
@@ -103,7 +105,9 @@ pub struct EngineCore {
     pub snapshots: Arc<Mutex<SnapshotStore>>,
     /// Read once, as a snapshot, at the start of each request.
     pub config: Arc<Mutex<GameConfig>>,
-    /// The only root-range provider (`RangeSource::ranges_at_root`); plan 3 installs its replay-backed source here.
+    /// The only root-range provider (`RangeSource::ranges_at_root`). `ExplicitRanges` with no ranges as built (a core
+    /// for a test sets its own); `Engine::new` installs the replay-backed source (plan 3 Task 18,
+    /// `install_replay_ranges`) once the preflop store is loaded.
     pub range_source: Arc<Mutex<Box<dyn RangeSource>>>,
     /// The equity cancellation token of the request served last (ruling 28-I4): `serve_request` sets it when the next
     /// request starts (a newer request supersedes it), and `Engine` can clone this handle to set it on a mutation.
@@ -145,6 +149,14 @@ impl EngineCore {
             preflop: Arc::new(PreflopStore::from_sources(vec![])),
             shut_down: false,
         }
+    }
+
+    /// Plan 3 Task 18: installs the replay range source (`replay_bridge::ReplayRanges`) into the shared `range_source`,
+    /// over the fields this core holds: the preflop store (installed first: the source keeps this `Arc`), the snapshot
+    /// store and the decision identity. `Engine::new` runs it once the store is loaded, before `engine-main` starts; a
+    /// later `Engine::set_explicit_ranges` replaces it through the same shared handle.
+    pub fn install_replay_ranges(&self) {
+        *lock(&self.range_source) = Box::new(ReplayRanges { store: self.preflop.clone(), snapshots: self.snapshots.clone(), identity: self.identity.clone() });
     }
 
     /// The teardown (ruling 29-I2), run once, by `engine-main` on its way out (`Engine::shutdown`, or a panic): the

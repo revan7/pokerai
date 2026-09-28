@@ -129,7 +129,7 @@ fn hand(text: &str) -> [Card; 2] {
 }
 
 fn run(store: &PreflopStore, state: &HandState) -> ReplayOutput {
-    replay(ReplayInput { cfg: &state.config, state, store, snapshots: &[] })
+    replay(ReplayInput { cfg: &state.config, state, store, snapshots: &[], missing: &[] })
 }
 
 /// UTG opens to the source's 2.5 bb, HJ calls, CO/BTN/SB fold: the BB is to act.
@@ -469,9 +469,10 @@ fn a_branch_whose_node_is_present_continues_independently() {
         log_reach: vec![0.0; 6],
         reasons: vec![],
         unsupported: None,
+        snapshots_used: vec![],
     };
     let before = out.clone();
-    let input = ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &[] };
+    let input = ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &[], missing: &[] };
     assert!(apply_preflop_action(&input, &mut out, 1, HJ, &Action::Call));
     assert_eq!(out.branches.len(), 2);
     let present = out.branches.iter().find(|b| b.id == 1).expect("the 2.5 bb branch");
@@ -526,7 +527,7 @@ fn zero_support_rejects_the_update_and_keeps_every_weight() {
 
     let mut out = after_open.clone();
     out.ranges = vec![None; 6];
-    let input = ReplayInput { cfg: &three_bet.config, state: &three_bet, store: &store, snapshots: &[] };
+    let input = ReplayInput { cfg: &three_bet.config, state: &three_bet, store: &store, snapshots: &[], missing: &[] };
     let before = out.clone();
     assert!(!apply_preflop_action(&input, &mut out, 1, HJ, &Action::Raise { to: 8750 }), "the update is rejected");
     assert_eq!(out.branches.len(), 1);
@@ -584,7 +585,7 @@ fn a_rejected_translation_stops_the_branch_without_a_guessed_size() {
 
     let mut out = after_open.clone();
     let before = out.clone();
-    let input = ReplayInput { cfg: &raised.config, state: &raised, store: &store, snapshots: &[] };
+    let input = ReplayInput { cfg: &raised.config, state: &raised, store: &store, snapshots: &[], missing: &[] };
     assert!(!apply_preflop_action(&input, &mut out, 1, HJ, &Action::Raise { to: 4000 }));
     let b = &out.branches[0];
     assert_eq!(b.stopped, Some("zero support after Raise { to: 4000 }".into()));
@@ -750,7 +751,7 @@ fn block_and_rescale_keeps_equal_totals_and_blocks_only_the_marginal() {
     );
     let mut log_reach = vec![0.0; 6];
     rescale(&mut branches, &mut log_reach);
-    let mut out = ReplayOutput { ranges: vec![None; 6], branches, folded_ranges: vec![], log_reach, reasons: vec![], unsupported: None };
+    let mut out = ReplayOutput { ranges: vec![None; 6], branches, folded_ranges: vec![], log_reach, reasons: vec![], unsupported: None, snapshots_used: vec![] };
     let board: Vec<Card> = core_model::parse_cards("AsAhAdKc").unwrap();
     let before = out.clone();
     let mask = board_mask(&board);
@@ -936,7 +937,7 @@ fn apply_preflop_action_refuses_an_action_that_was_not_recorded() {
     let store = full_store();
     let state = act(&table(&cfg()), &[Action::Raise { to: 2500 }, Action::Call]);
     let mut out = run(&store, &act(&table(&cfg()), &[Action::Raise { to: 2500 }]));
-    let input = ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &[] };
+    let input = ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &[], missing: &[] };
     let _ = apply_preflop_action(&input, &mut out, 1, HJ, &Action::Fold);
 }
 
@@ -1154,7 +1155,7 @@ fn a_translated_edge_keeps_its_source_size_past_chip_rounding() {
         assert_eq!(chip_only.unsupported, Some(UnsupportedReason::MissingPreflopNode { key: chip_only.key.clone() }));
         assert_eq!(chip_only.actor, Some(HJ));
         let mut standalone = after_open.clone();
-        let input = ReplayInput { cfg: &cfg, state: &called, store: &store, snapshots: &[] };
+        let input = ReplayInput { cfg: &cfg, state: &called, store: &store, snapshots: &[], missing: &[] };
         assert!(apply_preflop_action(&input, &mut standalone, 1, HJ, &Action::Call), "{open}");
         let s = &standalone.branches[0];
         assert_eq!(s.stopped, Some(format!("missing node {}", chip_only.key)), "{open}");
@@ -1335,8 +1336,9 @@ fn several_branches_split_at_one_action_in_one_generation() {
         log_reach: vec![0.0; 6],
         reasons: vec![],
         unsupported: None,
+        snapshots_used: vec![],
     };
-    let input = ReplayInput { cfg: &cfg, state: &state, store: &store, snapshots: &[] };
+    let input = ReplayInput { cfg: &cfg, state: &state, store: &store, snapshots: &[], missing: &[] };
     assert!(apply_preflop_action(&input, &mut out, 1, HJ, &Action::Raise { to: 75 }));
     assert_eq!(
         out.branches.iter().map(|b| (b.id, b.parent)).collect::<Vec<_>>(),

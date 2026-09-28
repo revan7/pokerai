@@ -1182,6 +1182,40 @@ mod stand_in {
         e.shutdown();
     }
 
+    /// Plan 3 Task 18: `Engine::new` installs the replay range source over the store it loaded, before `engine-main`
+    /// starts. On the packaged chart line (everyone folds to hero in the small blind, who raises to 3 bb, and the big
+    /// blind calls) hero asks at the turn root after a checked-through flop on which nothing was requested: the
+    /// request's first event is its `Fast` (the default explicit source, with no ranges, would have refused them at
+    /// once), carrying the replay's cause for the flop that has no snapshot.
+    #[test]
+    fn new_installs_the_replay_range_source() {
+        let s = StandIn::new("replay-ranges", &FakeWorker::default_ready());
+        let mut e = start(&s);
+        let begin = proto::BeginHand { button: Seat(5), hero: Seat(0), dealt: (0..6).map(Seat).collect(), stacks: vec![1000; 6],
+            hero_cards: Some([Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()]) };
+        e.begin_hand(begin).unwrap();
+        for a in [Action::Fold, Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Call] {
+            e.apply_action(a).unwrap();
+        }
+        let cards = |s: &str| s.split(' ').map(|c| Card::parse(c).unwrap()).collect::<Vec<_>>();
+        e.set_board(&cards("Kh 7d 2c")).unwrap();
+        e.apply_action(Action::Check).unwrap();
+        e.apply_action(Action::Check).unwrap();
+        e.set_board(&cards("Kh 7d 2c 4s")).unwrap();
+        let (sink, recorder) = RecordingSink::notifying(FakeClock::new(), None);
+        e.recommend(Box::new(sink)).unwrap();
+        let first = recorder.wait_for(1)[0].event.clone();
+        e.shutdown();
+        match first {
+            proto::RecommendationEvent::Fast(f) => {
+                let flop = proto::ApproxReason::UnconditionedPriorStreet { street: proto::Street::Flop, seat: Seat(0), cause: "no request".into() };
+                assert!(matches!(&f.coverage, proto::Coverage::Approximate { reasons } if reasons.contains(&flop)), "{:?}", f.coverage);
+                assert_eq!(f.assumptions.ranges_used.iter().map(|u| u.0).collect::<Vec<_>>(), [Seat(0), Seat(1)]);
+            }
+            other => panic!("expected the Fast of replayed ranges, got {other:?}"),
+        }
+    }
+
     /// §3.7: a CPU without AVX2 gets a startup banner, not a refusal.
     #[test]
     fn a_cpu_without_avx2_gets_a_startup_banner_not_a_refusal() {
