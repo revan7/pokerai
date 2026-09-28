@@ -52,7 +52,12 @@
 //! assert of an internal invariant) is contained at that boundary by `contain_panic`: the request's `Final`, unless the
 //! watchdog already delivered it, is a non-retryable `Unsupported{EngineError("internal: ..")}` delivered through the
 //! request's claim; its watchdog generation is retired, the `Final` delivered is logged once, the worker (which may be
-//! running the request's job) is killed, for the next solve to relaunch, and `engine-main` goes on serving.
+//! running the request's job) is killed, for the next solve to relaunch, and `engine-main` goes on serving. A panic
+//! after `engine-main` took the claim for its own `Final` and before it handed that `Final` over (final fix round 2,
+//! ruling F2-I3) is answered the same way: the claim is `engine-main`'s (`Watched::claimed_by_engine`, set under the
+//! identity lock as the claim is taken), so the containment delivers the internal-error `Final` without claiming again;
+//! a panic after the handover logs the `Final` handed over (`Watched::handed`) if it is not logged yet. Every engine
+//! lock survives a panic (ruling N2): a poisoned lock is used as it stands, its value consistent at every panic point.
 //!
 //! Street verdict (ruling 20-I1). A request has one `StreetDeadline`, shared by its watchdog (`Armed::street_deadline`)
 //! and the solve client (`SolvePlan::street_deadline`), which publishes the first attempt's terminal arrival to it at
@@ -64,11 +69,11 @@
 //!
 //! After the `Final` (§7, §12, rulings 23-I1 and 28-I3). At the watchdog's fire the client stops and cleans nothing up,
 //! and reports whether it left a sent job that may still be running, or a failed link, behind
-//! (`SolveOutcome::outstanding_job`). Only then is the worker killed and restarted, once, after the `Final` is out,
-//! whoever delivered it; an idle worker (nothing sent, the job's terminal received, the worker's own `no_iteration`) is
-//! left alone. The link's `restart` revalidates `ready`; a restart that fails is recorded in the diagnostics log (final
-//! review M2, as every kill and restart is), is never a panic and is never retried here: it leaves no live worker, which
-//! the next request relaunches once (`run_solve`).
+//! (`SolveOutcome::outstanding_job`). Only then is the worker killed, once, after the `Final` is out, whoever delivered
+//! it; an idle worker (nothing sent, the job's terminal received, the worker's own `no_iteration`) is left alone. The
+//! cleanup never relaunches the worker (final fix round 2, ruling F2-Q1: a relaunch of up to two startup timeouts on
+//! `engine-main` would delay the next request's `Fast`): the next request's solve relaunches it once before its send,
+//! its `ready` validated again (`run_solve`). The kill is recorded in the diagnostics log (final review M2).
 //!
 //! Equity (§3.4, §7, ruling 28-I4). Each request's `fast-path` equity runs with its own cancellation token, polled by
 //! the equity routine between its units of work. It is set on supersession: by the next request as it starts
@@ -125,8 +130,8 @@ pub struct LiveRequest {
 
 /// A request's side of its watchdog, armed at admission (final review I1): the generation to retire, the street and
 /// deadlines it was armed with, the shared street deadline, the once-only `Final` claim, the record of what the
-/// watchdog delivered, the fallback the watchdog delivers (refreshed by `serve_request`), the request's own stage slot,
-/// and whether the `Final` delivered has been logged.
+/// watchdog delivered, the fallback the watchdog delivers (refreshed by `serve_request`), the payload it delivers in the
+/// fallback's place (`set_retained`), the request's own stage slot, and whether the `Final` delivered has been logged.
 pub struct Watched {
     pub generation: u64,
     pub street: Street,
@@ -135,9 +140,34 @@ pub struct Watched {
     pub delivered: Arc<AtomicBool>,
     pub fired: Arc<Mutex<Option<Fired>>>,
     pub fallback: Arc<Mutex<Recommendation>>,
+    /// The watchdog's retained slot (`Armed::retained`, the same `Arc`): written through `set_retained` only (final fix
+    /// round 2, ruling F2-N3).
+    pub(crate) retained: Arc<Mutex<Option<Recommendation>>>,
     pub stage: Arc<Mutex<String>>,
     /// Set once the `Final` delivered is logged (§5 step 10), so a panic's containment never logs it twice.
     pub logged: Arc<AtomicBool>,
+    /// Set under the identity lock the moment `engine-main` takes the request's claim for its own `Final` (`finish`):
+    /// a panic before the handover leaves the claim `engine-main`'s, and the containment delivers the `Final` then
+    /// (final fix round 2, ruling F2-I3).
+    pub(crate) claimed_by_engine: AtomicBool,
+    /// The `Final` `engine-main` handed to the sink, the engine-clock time it did and whether it is a `best_so_far`,
+    /// recorded immediately before the handover: a panic after it logs that `Final` (ruling F2-I3).
+    pub(crate) handed: Mutex<Option<(u64, Recommendation, bool)>>,
+}
+
+/// Retains `rec` for `req`'s watchdog (final fix round 2, ruling F2-N3; spec 7): at the fire the watchdog delivers the
+/// retained payload as the request's `Final` in place of its `DeadlineExceeded` fallback (`watchdog`'s fire). The
+/// handle plan 4 Task 11 Step 4a writes its validated `Provisional` (or an earlier `best_so_far`) through, for a request
+/// armed at admission: it never arms the watchdog itself (ruling F-Q2), and it emits that `Provisional` through
+/// `deliver` with `Some(&watch.delivered)` (ruling 28-N1), so nothing but an `Equity` follows a delivered `Final`. A
+/// later call replaces the payload; one landing after the fire changes nothing delivered. Takes the retained slot's
+/// lock alone, one step: never call it holding the sink, the fallback or the stage slot (`watchdog`'s lock order).
+/// `req` must be armed (a request at a decision point) and `rec` must answer its decision: either is a caller bug.
+#[allow(dead_code)] // plan 4 Task 11 Step 4a is its first caller outside this crate's tests (ruling F2-N3)
+pub(crate) fn set_retained(req: &LiveRequest, rec: Recommendation) {
+    let watch = req.watch.as_ref().unwrap_or_else(|| panic!("set_retained for decision {:?}: a request at no decision point has no watchdog", req.identity));
+    assert!(rec.identity == req.identity, "set_retained for decision {:?}: a payload of decision {:?}", req.identity, rec.identity);
+    *lock(&watch.retained) = Some(rec);
 }
 
 /// Admits a request (final review I1, ruling F-I1): what `Engine::recommend` does the moment it allocates `identity`,
@@ -160,10 +190,12 @@ pub fn admit(watchdog: &Watchdog, identity_state: &Arc<Mutex<IdentityState>>, co
     let street_deadline = Arc::new(StreetDeadline::new(deadlines.street_deadline_ms));
     let (delivered, fired): (Arc<AtomicBool>, Arc<Mutex<Option<Fired>>>) = (Arc::default(), Arc::default());
     let stage = Arc::new(Mutex::new("queued".to_string()));
-    let armed = Armed { identity: identity.clone(), street_deadline: street_deadline.clone(), fire_ms: deadlines.watchdog_fire_ms(), retained: Arc::new(Mutex::new(None)),
+    let retained: Arc<Mutex<Option<Recommendation>>> = Arc::default();
+    let armed = Armed { identity: identity.clone(), street_deadline: street_deadline.clone(), fire_ms: deadlines.watchdog_fire_ms(), retained: retained.clone(),
         fallback: fallback.clone(), stage: stage.clone(), sink: sink.clone(), delivered: delivered.clone(), fired: fired.clone(), identity_state: identity_state.clone() };
     let generation = watchdog.try_arm(armed).map_err(|_| EngineError::Message("the engine is not running: its watchdog is stopped".into()))?;
-    let watch = Watched { generation, street: d.street, deadlines, street_deadline, delivered, fired, fallback, stage, logged: Arc::default() };
+    let watch = Watched { generation, street: d.street, deadlines, street_deadline, delivered, fired, fallback, retained, stage, logged: Arc::default(),
+        claimed_by_engine: AtomicBool::new(false), handed: Mutex::new(None) };
     Ok(LiveRequest { identity, state, t0_ms, sink, config, watch: Some(watch) })
 }
 
@@ -183,9 +215,11 @@ fn event_identity(ev: &RecommendationEvent) -> &DecisionIdentity {
     }
 }
 
-/// A lock that survives a panic elsewhere (final review I3): the identity state, a sink and a request's watchdog slots
-/// stay consistent at every point a panic could interrupt them (see `watchdog`'s `lock`), and the panic's containment
-/// must still deliver the request's `Final` through them.
+/// A lock that survives a panic elsewhere (final review I3; final fix round 2, ruling N2): the identity state, a sink, a
+/// request's watchdog slots, the equity token slot and the range source slot (replaced whole), and the snapshot store
+/// (each entry whole: `Vec::retain` keeps the entries it had not examined when a panic interrupts it) stay consistent
+/// at every point a panic could interrupt them (see `watchdog`'s `lock`); the panic's containment must still deliver
+/// the request's `Final` through them, and `engine-main` must go on serving with them.
 fn lock<T: ?Sized>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -204,17 +238,18 @@ pub(crate) enum Delivery {
 
 /// Accepts an event of decision `identity` under the identity lock (ruling 28-I1): stale unless the decision is active,
 /// and, when `final_claim` is given, the request's once-only `Final` claimed there. `on_accept` runs under the same
-/// lock once the event is accepted (the snapshot registration of an accepted `Final`, §9.2). The lock is released on
-/// return, before anything is handed to a sink.
+/// lock once the event is accepted, immediately after the claim (the engine's record of its claim and the snapshot
+/// registration of an accepted `Final`, §9.2). The lock is released on return, before anything is handed to a sink.
 fn accept(ids: &Mutex<IdentityState>, identity: &DecisionIdentity, final_claim: Option<&AtomicBool>, on_accept: impl FnOnce(&DecisionIdentity)) -> Delivery {
     let ids = lock(ids);
     if !ids.is_active(identity) {
         return Delivery::Stale;
     }
+    let active = ids.active().expect("the active decision was just checked");
     if final_claim.is_some_and(|d| d.swap(true, Ordering::SeqCst)) {
         return Delivery::AlreadyDelivered;
     }
-    on_accept(ids.active().expect("the active decision was just checked"));
+    on_accept(active);
     Delivery::Accepted
 }
 
@@ -283,10 +318,15 @@ struct Hooks {
     /// Runs on `engine-main` once the solve has returned and its decision was found still active, before the watchdog's
     /// claim is consulted.
     after_active_check: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs on `engine-main` inside the accepted claim of the engine's own `Final`, under the identity lock, immediately
+    /// before a solved candidate's snapshot is registered.
+    at_registration: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Hooks {
-    fn production() -> Self { Self { equity: Arc::new(equity_summary_with_clock), before_claim: None, after_fast: None, after_active_check: None } }
+    fn production() -> Self {
+        Self { equity: Arc::new(equity_summary_with_clock), before_claim: None, after_fast: None, after_active_check: None, at_registration: None }
+    }
 }
 
 /// Test seams of `serve_request` (plan 2 Task 28 fix round 1), compiled for this crate's tests and with the `testing`
@@ -296,8 +336,10 @@ impl Hooks {
 /// released, before the tree is built (ruling 28-O1b: a fire between the watchdog fallback's two refreshes);
 /// `after_active_check` runs on `engine-main` once the solve has returned and its decision was found still active,
 /// between that identity read and the read of the watchdog's claim (follow-up P2.W3, re-review observation O4: a
-/// supersession and a fire landing between the two). `None` keeps production behaviour. A seam that panics exercises
-/// `engine-main`'s containment (final review I3).
+/// supersession and a fire landing between the two); `at_registration` runs on `engine-main` inside the accepted claim
+/// of the engine's own `Final`, under the identity lock, immediately before a solved candidate's snapshot is registered
+/// (final fix round 2, ruling F2-I3: the re-review's probe P7 site, a panic after the claim and before the handover).
+/// `None` keeps production behaviour. A seam that panics exercises `engine-main`'s containment (final review I3).
 #[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Default)]
 pub struct ServeSeams {
@@ -305,6 +347,7 @@ pub struct ServeSeams {
     pub before_claim: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_fast: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_active_check: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub at_registration: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -312,7 +355,7 @@ impl ServeSeams {
     fn hooks(&self) -> Hooks {
         let production = Hooks::production();
         Hooks { equity: self.equity.clone().unwrap_or(production.equity), before_claim: self.before_claim.clone(), after_fast: self.after_fast.clone(),
-            after_active_check: self.after_active_check.clone() }
+            after_active_check: self.after_active_check.clone(), at_registration: self.at_registration.clone() }
     }
 }
 
@@ -343,7 +386,7 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     // Ruling 28-I4: this request's equity cancellation token. A newer request supersedes the one served before it (§5
     // step 4), whose equity is cancelled before anything of this one starts.
     let equity_cancel = Arc::new(AtomicBool::new(false));
-    let older = core.equity_cancel.lock().unwrap().replace(equity_cancel.clone());
+    let older = lock(&core.equity_cancel).replace(equity_cancel.clone());
     if let Some(older) = older {
         older.store(true, Ordering::SeqCst);
     }
@@ -411,7 +454,7 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     let street_deadline = watch.street_deadline.clone();
 
     // Fast phase (§5 step 5). The range source's lock is released at the end of this statement, before any emission.
-    let ranges = core.range_source.lock().unwrap().ranges_at_root(&req.state, &root);
+    let ranges = lock(&core.range_source).ranges_at_root(&req.state, &root);
     let ranges = match ranges {
         Ok(r) => r,
         Err(reason) => {
@@ -460,7 +503,7 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     assert!(street_deadline.terminal_arrival_ms() == out.first_terminal_ms, "the shared street deadline holds the first terminal at {:?} ms, the solve returned {:?} ms",
         street_deadline.terminal_arrival_ms(), out.first_terminal_ms);
     // Ruling 28-I3: the client's liveness provenance, not the clock, says whether a job was left running at the fire.
-    let restart_after_final = out.outstanding_job;
+    let kill_after_final = out.outstanding_job;
 
     let logged = Logged { street: root.street, verdict: StreetVerdict::Judged(out.street_violation), range_hashes };
     let active = core.identity_active(&req.identity);
@@ -529,8 +572,8 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
         };
         finish(core, req, hooks, &claim, candidate, logged);
     }
-    if restart_after_final {
-        restart_the_worker(core);
+    if kill_after_final {
+        kill_the_busy_worker(core);
     }
 }
 
@@ -645,8 +688,9 @@ fn settle(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, claim: &Claim
 /// cancelled), and the log records only a `Final` its watchdog delivered while it was still active (`retire_stale`,
 /// ruling W3-I1); a claim the watchdog already won discards the candidate, which registers nothing, and logs the
 /// watchdog's `Final` with its delivery time; a claim won registers the candidate's snapshot under the same lock, as
-/// part of that accepted delivery, hands the `Final` to the sink with no engine lock held, and logs it. The request's
-/// watchdog generation is retired in every case.
+/// part of that accepted delivery, hands the `Final` to the sink with no engine lock held, and logs it. The claim and
+/// the handover are recorded on the request (`Watched::claimed_by_engine`, `Watched::handed`) for a panic's containment
+/// (ruling F2-I3). The request's watchdog generation is retired in every case.
 fn finish(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, claim: &Claim<'_>, candidate: Candidate, logged: Logged) {
     if let Some(before_claim) = &hooks.before_claim {
         before_claim();
@@ -655,8 +699,12 @@ fn finish(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, claim: &Claim
     let Candidate { rec, snapshot, best_so_far } = candidate;
     let snapshots = &core.snapshots;
     let verdict = accept(&core.identity, &req.identity, Some(&claim.watch.delivered), |active| {
+        claim.watch.claimed_by_engine.store(true, Ordering::SeqCst);
         if let Some(snapshot) = snapshot {
-            snapshots.lock().unwrap().register(active, snapshot);
+            if let Some(at_registration) = &hooks.at_registration {
+                at_registration();
+            }
+            lock(snapshots).register(active, snapshot);
         }
     });
     match verdict {
@@ -667,6 +715,7 @@ fn finish(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, claim: &Claim
             log_final(core, req, claim.watch, Delivered { at_ms: fired.at_ms, rec: &fired.rec, by_watchdog: true, best_so_far: false }, &logged);
         }
         Delivery::Accepted => {
+            *lock(&claim.watch.handed) = Some((at_ms, rec.clone(), best_so_far));
             lock(&req.sink).emit(RecommendationEvent::Final(rec.clone()));
             core.watchdog.disarm(claim.watch.generation);
             log_final(core, req, claim.watch, Delivered { at_ms, rec: &rec, by_watchdog: false, best_so_far }, &logged);
@@ -711,23 +760,37 @@ pub(crate) fn retire_unserved(core: &mut EngineCore, req: &LiveRequest) {
 
 /// Final review I3 (ruling F-I3): `engine-main` caught a panic while it served `req` (an always-on assert of an internal
 /// invariant, `message`). The worker may be running the request's job, so it is killed; the next solve relaunches it
-/// once (`run_solve`). The request's watchdog generation is retired. Its `Final`, unless the watchdog already delivered
-/// it, is the non-retryable `Unsupported{EngineError("internal: ..")}` built from the request's fallback (its legal
-/// intervals, equity and inherited reasons), delivered through the request's claim to a decision still active; the
-/// `Final` delivered, the engine's or the watchdog's, is logged once. Every lock here survives the panic (`lock`).
+/// once (`run_solve`). The request's watchdog generation is retired. Its `Final`, unless one was already delivered, is
+/// the non-retryable `Unsupported{EngineError("internal: ..")}` built from the request's fallback (its legal intervals,
+/// equity and inherited reasons), delivered through the request's claim to a decision still active, or, when
+/// `engine-main` had already taken that claim for its own `Final` and panicked before handing it over (final fix round
+/// 2, ruling F2-I3: `Watched::claimed_by_engine` with nothing `handed`), delivered at once under that claim, as the
+/// engine's own `Final` would have been. The `Final` delivered (the engine's handed over before the panic, this one, or
+/// the watchdog's) is logged once. Every lock here survives the panic (`lock`).
 pub(crate) fn contain_panic(core: &mut EngineCore, req: &LiveRequest, message: &str) {
     crate::solve::diagnose(core, core.clock.now_ms(), "panic", Some(&req.identity), format!("engine-main panicked serving this decision: {message}"), None);
     crate::solve::kill_worker(core, &format!("engine-main panicked serving decision {:?}", req.identity));
     let Some(watch) = &req.watch else { return };
     let logged = Logged::unsolved(watch.street, Some(watch.street_deadline.clone()), vec![]);
     core.watchdog.disarm(watch.generation);
+    // The engine's own `Final` went out before the panic: it is the request's `Final`, logged once.
+    let handed = lock(&watch.handed).clone();
+    if let Some((at_ms, rec, best_so_far)) = handed {
+        if !watch.logged.load(Ordering::SeqCst) {
+            log_final(core, req, watch, Delivered { at_ms, rec: &rec, by_watchdog: false, best_so_far }, &logged);
+        }
+        return;
+    }
     let mut rec = lock(&watch.fallback).clone();
     rec.phase = Phase::Final;
     let partial = match &rec.coverage { Coverage::Unsupported { partial, .. } => partial.clone(), _ => vec![] };
     rec.coverage = Coverage::Unsupported { reason: UnsupportedReason::EngineError { message: format!("internal: {message}"), retryable: false }, partial };
     let at_ms = core.clock.now_ms();
-    match accept(&core.identity, &req.identity, Some(&watch.delivered), |_| {}) {
+    // A claim `engine-main` took is its own: the watchdog lost it, so no other `Final` went out.
+    let verdict = if watch.claimed_by_engine.load(Ordering::SeqCst) { Delivery::Accepted } else { accept(&core.identity, &req.identity, Some(&watch.delivered), |_| {}) };
+    match verdict {
         Delivery::Accepted => {
+            *lock(&watch.handed) = Some((at_ms, rec.clone(), false));
             lock(&req.sink).emit(RecommendationEvent::Final(rec.clone()));
             log_final(core, req, watch, Delivered { at_ms, rec: &rec, by_watchdog: false, best_so_far: false }, &logged);
         }
@@ -760,11 +823,10 @@ fn log_final(core: &mut EngineCore, req: &LiveRequest, watch: &Watched, delivere
         street_violation, final_violation, template_id: rec.assumptions.template_id.clone(), input: InputRecord::from_state(&req.state, logged.range_hashes.clone()) });
 }
 
-/// §7 after a `Final` at the watchdog's fire: kill and restart the worker (see "After the `Final`" above). Both are
-/// recorded in the diagnostics log, a failed restart with its failure (final review M2).
-fn restart_the_worker(core: &mut EngineCore) {
+/// §7 after a `Final` at the watchdog's fire: kill the busy worker, never relaunch it here (ruling F2-Q1; see "After the
+/// `Final`" above). Recorded in the diagnostics log (final review M2).
+fn kill_the_busy_worker(core: &mut EngineCore) {
     crate::solve::kill_worker(core, "a job was left running at the watchdog's fire");
-    let _ = crate::solve::restart_worker(core, "after the watchdog's Final");
 }
 
 /// §4.4's "exploitability <= x" in basis points of `pot` (ruling 28-I5): the least whole number of basis points not
@@ -848,5 +910,45 @@ mod tests {
         assert_eq!((&snap.tree, &snap.nodes, &snap.covered_paths), (&built.tree, &sol.nodes, &ordinal));
         assert_eq!((snap.exploitability_chips, snap.reasons.clone()), (0.2, vec![]));
         assert_eq!(core.snapshots.lock().unwrap().for_hand(id.hand_id).len(), 1, "for_hand (identity_race_golden's view) reads the same store");
+    }
+
+    /// Final fix round 2, ruling F2-N3 (spec 7: at the fire the watchdog delivers the retained payload, a `Provisional`
+    /// or an earlier `best_so_far`, when there is one): a request armed at admission exposes its watchdog's retained
+    /// slot through `set_retained`, and a payload set there is what the watchdog delivers as the request's `Final` at its
+    /// fire, in place of the `DeadlineExceeded` fallback, recorded as delivered and with the claim taken.
+    #[test]
+    fn a_payload_retained_through_set_retained_is_what_the_watchdog_delivers_at_the_fire() {
+        let aa = [Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()];
+        let s = hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), Seat(0), Seat(2), Some(aa));
+        let s = play(&s, &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold, Action::Call]);
+        let s = board(&play(&board(&play(&board(&s, "Kh 7d 2c"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d 9s");
+        let clock = FakeClock::new();
+        let identity = Arc::new(Mutex::new(IdentityState::new()));
+        let (worker, _) = FakeWorker::scripted(clock.clone(), identity.clone(), vec![]);
+        let mut core = EngineCore::new(worker, clock.clone(), identity.clone(), DecisionLog::open(&std::env::temp_dir().join("pokerai_serve_retained_log")));
+        let ended = core.watchdog.ended_threads();
+        let (sink, events) = RecordingSink::new(clock.clone(), None);
+        let id = { let mut ids = identity.lock().unwrap(); ids.set_config(); ids.begin_hand(); ids.next_decision().unwrap() };
+        let req = LiveRequest::admitted(&core, id.clone(), s, clock.now_ms(), Arc::new(Mutex::new(Box::new(sink))));
+        let watch = req.watch.as_ref().expect("a river decision is armed at admission");
+        // A validated payload of the request (plan 4's promoted `Provisional` or `best_so_far`), marked so it cannot be
+        // mistaken for the fallback.
+        let mut retained = lock(&watch.fallback).clone();
+        retained.phase = Phase::Provisional;
+        retained.coverage = Coverage::Approximate { reasons: vec![ApproxReason::UnconditionedCurrentStreet] };
+        retained.assumptions.notes.push("the retained payload".into());
+        set_retained(&req, retained.clone());
+        clock.set_ms(watch.deadlines.watchdog_fire_ms());
+        ended.wait_for(1);
+        let finals: Vec<(u64, Recommendation)> = events.lock().unwrap().iter()
+            .filter_map(|r| match &r.event { RecommendationEvent::Final(x) => Some((r.at_ms, x.clone())), _ => None }).collect();
+        let fired = lock(&watch.fired).clone().map(|f| (f.at_ms, f.rec));
+        let claimed = watch.delivered.load(Ordering::SeqCst);
+        core.shutdown();
+        let mut expected = retained;
+        expected.phase = Phase::Final;
+        let fire_ms = watch.deadlines.watchdog_fire_ms();
+        assert_eq!(finals, vec![(fire_ms, expected.clone())], "the watchdog delivers the retained payload as the Final at the fire");
+        assert_eq!((fired, claimed), (Some((fire_ms, expected)), true), "recorded as delivered, the claim taken");
     }
 }

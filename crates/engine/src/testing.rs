@@ -339,6 +339,10 @@ pub struct FakeState {
     pub cancels: Vec<String>,
     /// What the worker's stderr ring holds, set by the test: `WorkerLink::stderr_tail` answers it.
     pub stderr: String,
+    /// What the engine did to the worker, in order, at the fake time it did it: `solve <id>`, `cancel <target>`,
+    /// `lock <id>` and `shutdown <id>` for the requests the worker took, `kill` and `restart` for every such call
+    /// (a failed restart included). A test pins the order of a cleanup against the requests around it.
+    pub calls: Vec<(u64, String)>,
 }
 
 /// Where the scripted worker process stands.
@@ -705,12 +709,15 @@ impl WorkerLink for FakeWorker {
             self.refused_request = Some(why);
             return Err(err);
         }
+        let now = self.clock.now_ms();
         let mut s = lock(&self.state);
-        match msg {
-            EngineMessage::Solve(r) => s.last_solve_id = Some(r.id.clone()),
-            EngineMessage::Cancel { target, .. } => s.cancels.push(target.clone()),
-            EngineMessage::Lock { .. } | EngineMessage::Shutdown { .. } => {}
-        }
+        let call = match msg {
+            EngineMessage::Solve(r) => { s.last_solve_id = Some(r.id.clone()); format!("solve {}", r.id) }
+            EngineMessage::Cancel { target, .. } => { s.cancels.push(target.clone()); format!("cancel {target}") }
+            EngineMessage::Lock { id, .. } => format!("lock {id}"),
+            EngineMessage::Shutdown { id } => format!("shutdown {id}"),
+        };
+        s.calls.push((now, call));
         s.sent.push(msg.clone());
         Ok(())
     }
@@ -733,7 +740,11 @@ impl WorkerLink for FakeWorker {
 
     fn restart(&mut self) -> Result<(), WorkerLinkError> {
         self.end_process();
-        lock(&self.state).restarts += 1;
+        {
+            let mut s = lock(&self.state);
+            s.restarts += 1;
+            s.calls.push((self.clock.now_ms(), "restart".into()));
+        }
         // The next item, past the identity markers a kill left at the front (they stay for the next worker).
         let next = self.script.iter().position(|r| !matches!(r, FakeReply::InvalidateIdentity));
         if let Some(i) = next.filter(|i| matches!(self.script[*i], FakeReply::SpawnFails(_) | FakeReply::ReadyRefused { .. })) {
@@ -750,7 +761,11 @@ impl WorkerLink for FakeWorker {
     }
 
     fn kill(&mut self) {
-        lock(&self.state).kills += 1;
+        {
+            let mut s = lock(&self.state);
+            s.kills += 1;
+            s.calls.push((self.clock.now_ms(), "kill".into()));
+        }
         self.end_process();
     }
 
