@@ -227,7 +227,8 @@ impl Engine {
         let hand_id = self.state.as_ref().map(|p| p.hand_id).unwrap_or(next.hand_id);
         if let Some(prev) = self.state.take() { self.undo.push(prev); }
         let s = self.stamp(next, hand_id, rev);
-        self.snapshots.lock().unwrap().invalidate_hand(hand_id);
+        // §9.2 prefix-based invalidation against the new state: an append-only mutation keeps earlier roots.
+        self.snapshots.lock().unwrap().invalidate(&s);
         self.state = Some(s.clone());
         s
     }
@@ -256,7 +257,9 @@ impl Engine {
         let rev = self.supersede(|ids| ids.mutate());
         let hand_id = self.state.as_ref().map(|s| s.hand_id).unwrap_or(prev.hand_id);
         let s = self.stamp(prev, hand_id, rev);
-        self.snapshots.lock().unwrap().invalidate_hand(hand_id);
+        // §9.2: later streets and same-street snapshots whose solved prefix no longer fits are dropped; retained ones
+        // keep their original identity (the new revision never rewrites it).
+        self.snapshots.lock().unwrap().invalidate(&s);
         self.state = Some(s.clone());
         Ok(s)
     }
@@ -401,6 +404,61 @@ mod tests {
         check(&mut e, "set_board", 1, &|e| { e.set_board(&cards("Kh 7d 2c")).unwrap(); });
         check(&mut e, "abandon_hand", 1, &|e| e.abandon_hand());
         check(&mut e, "shutdown", 1, &|e| e.shutdown());
+    }
+
+    /// A flop snapshot of the engine's current hand, solved for decision `decision_id` at `prefix` (plan 3 Task 14).
+    fn flop_snapshot(e: &Engine, decision_id: u64, prefix: Vec<(Seat, Action)>) -> (DecisionIdentity, crate::snapshots::StreetSnapshot) {
+        use crate::snapshots::{SnapshotKey, SnapshotProvenance, StreetSnapshot};
+        let s = e.state().expect("a hand in progress");
+        let identity = DecisionIdentity { hand_id: s.hand_id, hand_revision: s.hand_revision, decision_id, config_revision: s.config.config_revision, model_revision: 0 };
+        let tree = proto::EffectiveTree { rules_version: 3, template_id: "t".into(), root_street: proto::Street::Flop, menus: Default::default(), add_allin_threshold: 0.0,
+            force_allin_threshold: 0.0, merging_threshold: 0.0, wager_cap: 1, inserted: vec![], materialized: vec![] };
+        let snapshot = StreetSnapshot {
+            key: SnapshotKey { hand_id: s.hand_id, config_revision: s.config.config_revision, model_revision: 0, street: proto::Street::Flop, root_board: s.board[..3].to_vec(),
+                root_range_hashes: [[0; 32]; 2], tree_signature: "t".into() },
+            provenance: SnapshotProvenance { identity_at_solve: identity.clone(), solved_prefix: prefix, origin: "live".into() },
+            tree, nodes: vec![], covered_paths: vec![], exploitability_chips: 0.1, reasons: vec![] };
+        (identity, snapshot)
+    }
+    fn solved_for(e: &Engine, hand_id: u64) -> Vec<(u64, u32)> {
+        e.snapshots.lock().unwrap().for_hand(hand_id).iter().map(|s| (s.provenance.identity_at_solve.decision_id, s.provenance.identity_at_solve.hand_revision)).collect()
+    }
+
+    /// Plan 3 Task 14 (spec 9.2): `apply_action`, `set_board`, `set_hero_cards` and `undo` invalidate by prefix against the
+    /// new state, so an append-only mutation keeps every snapshot whose solved prefix still fits, with its original
+    /// identity, and an undo drops only those it no longer fits; `finish_hand` (as `begin_hand` over a hand and
+    /// `abandon_hand`) drops the hand's snapshots by identity.
+    #[test]
+    fn mutations_invalidate_snapshots_by_prefix_and_ending_the_hand_drops_them() {
+        let (cfg, _) = cfg_1_2();
+        let mut e = Engine::with_core(core());
+        e.set_config(cfg).unwrap();
+        e.begin_hand(begin()).unwrap();
+        for a in [Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold, Action::Call] { e.apply_action(a).unwrap(); }
+        e.set_board(&cards("Kh 7d 2c")).unwrap();
+        let (root_id, at_root) = flop_snapshot(&e, 1, vec![]);
+        assert!(e.snapshots.lock().unwrap().register(&root_id, at_root));
+        e.apply_action(Action::Check).unwrap();
+        let (check_id, after_check) = flop_snapshot(&e, 2, vec![(Seat(2), Action::Check)]);
+        assert!(e.snapshots.lock().unwrap().register(&check_id, after_check));
+        let hand = root_id.hand_id;
+        let solved = vec![(1, root_id.hand_revision), (2, check_id.hand_revision)];
+        // Append-only: both prefixes still fit; nothing is rewritten.
+        e.apply_action(Action::Bet { to: 40 }).unwrap();
+        assert_eq!(solved_for(&e, hand), solved, "apply_action keeps prefix-valid snapshots with their identity");
+        e.set_hero_cards([Card::parse("Ks").unwrap(), Card::parse("Kd").unwrap()]).unwrap();
+        assert_eq!(solved_for(&e, hand), solved, "set_hero_cards changes nothing public");
+        // Undo the hero cards, then the bet: the history is back to [Check]; both still fit.
+        e.undo().unwrap();
+        e.undo().unwrap();
+        assert_eq!(solved_for(&e, hand), solved, "undo keeps what still fits");
+        // Undo the check: `[Check]` no longer prefixes the flop's history; the root snapshot keeps its old revision.
+        e.undo().unwrap();
+        assert!(e.state().unwrap().hand_revision > root_id.hand_revision);
+        assert_eq!(solved_for(&e, hand), vec![(1, root_id.hand_revision)], "undo drops a same-street snapshot whose prefix no longer fits");
+        e.finish_hand();
+        assert!(solved_for(&e, hand).is_empty(), "finish_hand drops the hand's snapshots");
+        e.shutdown();
     }
 
     /// Named `try_lock` probes of every engine lock (ruling 28-I1: identity, snapshot store, config, range source, and

@@ -890,6 +890,7 @@ dependencies = [
  "core-iso",
  "core-model",
  "core-ranges",
+ "core-replay",
  "engine",
  "hex",
  "proto",

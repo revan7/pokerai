@@ -72,7 +72,7 @@ use crate::deadline::Deadlines;
 use crate::equity::{equity_summary_with_clock, pending_summary, EQUITY_BUDGET_MS};
 use crate::identity::IdentityState;
 use crate::log::{DecisionRecord, InputRecord};
-use crate::snapshots::SolvedStreet;
+use crate::snapshots::{SnapshotKey, SnapshotProvenance, StreetSnapshot};
 use crate::solve::{run_solve, SolvePlan, Terminal};
 use crate::tree::{build_tree_full, tree_signature, TemplateSelection, Templates};
 use crate::watchdog::{Armed, Fired, SharedSink, StreetDeadline};
@@ -373,11 +373,18 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
                 let coverage = assemble::coverage_for_solve(sol.exploitability_chips, build.pot, config.solver.target_bp, best_so_far, inherited.clone());
                 let requested = sol.requested as usize;
                 let reach = assemble::hero_reach(&sol.nodes, &out.ordinal_paths, requested, hero_public, hero_actor);
+                // Registered only as part of this `Final`'s accepted delivery (§9.2, ruling 28-I2). Keyed by the public
+                // root ranges solved (hero's cards are in neither) and the solved tree's signature; the solved prefix is
+                // the street's observed history at the root; the covered paths are the ordinal paths the solve client
+                // resolved from the wire chip paths (§2). Built before `assumptions` moves into the `Final`.
+                let snapshot = StreetSnapshot {
+                    key: SnapshotKey { hand_id: req.identity.hand_id, config_revision: req.identity.config_revision, model_revision: req.identity.model_revision,
+                        street: root.street, root_board: root.board.clone(), root_range_hashes: [hash_scaled(&ranges.oop), hash_scaled(&ranges.ip)],
+                        tree_signature: assumptions.tree_signature.clone() },
+                    provenance: SnapshotProvenance { identity_at_solve: req.identity.clone(), solved_prefix: root.history.clone(), origin: "live".into() },
+                    tree: out.tree.clone(), nodes: sol.nodes.clone(), covered_paths: out.ordinal_paths.clone(), exploitability_chips: sol.exploitability_chips,
+                    reasons: inherited.clone() };
                 let rec = assemble::final_from_solution(&ctx, &sol.nodes[requested], &reach, coverage, assumptions);
-                // Registered only as part of this `Final`'s accepted delivery (§9.2, ruling 28-I2).
-                let snapshot = SolvedStreet { identity_at_solve: req.identity.clone(), street: root.street, board: root.board.clone(), tree: out.tree.clone(),
-                    nodes: sol.nodes.clone(), ordinal_paths: out.ordinal_paths.clone(), exploitability_chips: sol.exploitability_chips, reasons: inherited.clone(),
-                    solved_prefix: root.history.clone() };
                 Candidate { rec, snapshot: Some(snapshot), best_so_far }
             }
             Terminal::Failed(reason) => {
@@ -453,7 +460,7 @@ struct Claim<'a> {
 /// `best_so_far` (§12's violation rule).
 struct Candidate {
     rec: Recommendation,
-    snapshot: Option<SolvedStreet>,
+    snapshot: Option<StreetSnapshot>,
     best_so_far: bool,
 }
 
@@ -611,4 +618,68 @@ fn accuracy_bound_bp(exploitability_chips: f32, pot: u32) -> f64 {
 fn elapsed_ms(t0_ms: u64, now_ms: u64) -> u32 {
     let span = now_ms.checked_sub(t0_ms).unwrap_or_else(|| panic!("engine clock reading {now_ms} ms precedes the request's admission at t0 {t0_ms} ms"));
     u32::try_from(span).unwrap_or_else(|_| panic!("a request span of {span} ms does not fit u32"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::DecisionLog;
+    use crate::ranges::ExplicitRanges;
+    use crate::testing::{board, hand, play, uniform_solution, FakeClock, FakeReply, FakeWorker, IdRef, RecordingSink};
+    use proto::worker::{AckStatus, ResultStatus};
+    use proto::{resolve_chip_path, Action, OrdinalPath};
+
+    /// Plan 3 Task 14: the snapshot an accepted river `Final` registers is a `core_replay::StreetSnapshot` built at the
+    /// register site: keyed by the request's identity, the street root and the public root ranges solved (hero's cards
+    /// are in neither: the hashes are the public ranges', never a hero-conditioned copy's) and the solved tree's
+    /// signature; its provenance is the request's identity, the street's observed history at the root and `live`; its
+    /// tree, nodes, covered ordinal paths, exploitability and reasons are the validated solve's.
+    #[test]
+    fn an_accepted_final_registers_the_street_snapshot_of_its_solve() {
+        let aa = [Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()];
+        // Hero holds the button (IP); the BB checks the river to hero.
+        let s = hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), Seat(0), Seat(0), Some(aa));
+        let s = play(&s, &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold, Action::Call]);
+        let s = board(&play(&board(&play(&board(&s, "Kh 7d 2c"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d 9s");
+        let s = play(&s, &[Action::Check]);
+        let root = core_model::street_root(&s).unwrap();
+        assert_eq!(root.history, vec![(Seat(2), Action::Check)]);
+        let built = build_tree_full(&root, &TemplateSelection::from_history("river_std_v1", &root.history)).unwrap();
+        let sol = uniform_solution(&built.tree, &built.history, 0.2);
+
+        let clock = FakeClock::new();
+        let identity = Arc::new(Mutex::new(IdentityState::new()));
+        let script = vec![FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None },
+            FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(sol.clone()), error: None, elapsed_ms: 3 }];
+        let (worker, _) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
+        let mut core = EngineCore::new(worker, clock.clone(), identity.clone(), DecisionLog::open(&std::env::temp_dir().join("pokerai_serve_snapshot_log")));
+        let mut public = Range1326([1.0; 1326]);
+        core_ranges::block_public(&mut public, &s.board);
+        // IP's public range differs from OOP's, so the key's OOP-then-IP order is observable.
+        let mut ip = public.clone();
+        ip.0.iter_mut().take(200).for_each(|w| *w *= 0.5);
+        *core.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: Some(public.clone()), ip: Some(ip.clone()) });
+        let (sink, events) = RecordingSink::new(clock.clone(), None);
+        let id = { let mut ids = identity.lock().unwrap(); ids.set_config(); ids.begin_hand(); ids.next_decision().unwrap() };
+        serve_request(&mut core, LiveRequest { identity: id.clone(), state: s.clone(), t0_ms: clock.now_ms(), sink: Arc::new(Mutex::new(Box::new(sink))) });
+        core.shutdown();
+
+        let finals: Vec<Recommendation> = events.lock().unwrap().iter().filter_map(|r| match &r.event { RecommendationEvent::Final(x) => Some(x.clone()), _ => None }).collect();
+        assert_eq!(finals.len(), 1);
+        assert!(matches!(finals[0].coverage, Coverage::Exact), "{:?}", finals[0].coverage);
+        let stored = core.snapshots.lock().unwrap().for_identity(&id);
+        assert_eq!(stored.len(), 1);
+        let snap = &stored[0];
+        let hashes = [hash_scaled(&public), hash_scaled(&ip)];
+        assert_ne!(hashes[0], hashes[1]);
+        assert_eq!(snap.key, SnapshotKey { hand_id: id.hand_id, config_revision: id.config_revision, model_revision: id.model_revision, street: Street::River,
+            root_board: s.board.clone(), root_range_hashes: hashes, tree_signature: finals[0].assumptions.tree_signature.clone() });
+        assert_eq!(snap.key.tree_signature, tree_signature(&built.tree, built.pot));
+        assert_ne!(hash_scaled(&core_ranges::hero_conditioned(&public, aa)), hashes[0], "hero's cards would change the hash, so they are in neither range");
+        assert_eq!(snap.provenance, SnapshotProvenance { identity_at_solve: id.clone(), solved_prefix: vec![(Seat(2), Action::Check)], origin: "live".into() });
+        let ordinal: Vec<OrdinalPath> = sol.covered_paths.iter().map(|p| resolve_chip_path(&built.tree.materialized, p).unwrap()).collect();
+        assert_eq!((&snap.tree, &snap.nodes, &snap.covered_paths), (&built.tree, &sol.nodes, &ordinal));
+        assert_eq!((snap.exploitability_chips, snap.reasons.clone()), (0.2, vec![]));
+        assert_eq!(core.snapshots.lock().unwrap().for_hand(id.hand_id).len(), 1, "for_hand (identity_race_golden's view) reads the same store");
+    }
 }
