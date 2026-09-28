@@ -25,8 +25,9 @@ thiserror.workspace = true
 # Enables `testing` (fake clock, fake worker, recording sink: Task 19) for this crate's own test and example builds.
 # Cargo unifies features within one build, so in a workspace test run (`cargo test --workspace`, debug or release) the
 # other members' test binaries link this same `testing`-enabled engine; ordinary non-test builds (`cargo build`, with
-# or without `--release`) never enable `testing` through this edge.
-engine = { path = ".", features = ["testing"] }
+# or without `--release`) never enable `testing` through this edge. `test-templates` (plan 4 Task 8: the three spec
+# 13.1 T4 cache test templates behind `install_cache_test_templates`) rides the same edge under the same rule.
+engine = { path = ".", features = ["testing", "test-templates"] }
 
 [features]
 # Fake clock, fake worker and recording sink (Task 19). Never enabled by a release consumer.
