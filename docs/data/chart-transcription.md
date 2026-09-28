@@ -3207,7 +3207,102 @@ diagnostics (both out of the gate's scope per plan 3's standing ruling (f) and t
 
 ## Replay/bet-translation goldens audit (Task 19)
 
-*Not started.*
+Completed 2026-09-28. This section records the two spec section 13.3 engine goldens plan 3 owns,
+the audit of every fixture generator this plan touches, the Plan 4 handoff check, and the section
+13.1 test-name inventory. It changes no chart cell, inventory row or bundle.
+
+### The two goldens
+
+| Golden | Runner | What it freezes |
+|---|---|---|
+| `crates/engine/tests/golden/replay_weights_golden.json` | `crates/engine/tests/preflop_goldens.rs`, `replay_weights_golden` | Two three-seat preflop replays (BTN = 0, SB = 1, BB = 2, 100 bb, the standard 5% / 0.5 bb rake): the uniform line (1/2 chips; BTN raises to the source's 2.5 bb, SB folds, BB calls; flop Kh7d2c; hero BB holds As Ad, which enter no public range) with all six optional 1326-vectors, `q`, the translated history and the six `log_reach` values; and the off-menu line (20/40 chips; BTN raises to 113 chips, `s = 0.73` between the source menu's 2.25 bb (`A = 0.5`) and 3.5 bb (`B = 1.0`); SB folds) with `f = 81/173, 92/173`, both branch weights and translated histories, BTN's full marginal, BTN's branch posteriors at AA, AKs and 72o, and the BB's combo-independent posterior `q_k / sum_j q_j`. |
+| `crates/engine/tests/golden/bet_translation_golden.json` | same file, `bet_translation_golden` | Section 8.4's six interpolation boundaries (below, between, above with and without an all-in size, single size, equal sizes); `BetTranslation` prominence at `d = 0.10` exactly (not prominent) and just above (prominent), through the replay; four legality-after-mapping rows (below-minimum raise to the smallest legal source raise and to call, above-stack wager creating an all-in with `MovedProbability` and no EV, and joining a source all-in that keeps its own EV); seven assembly rows through `mix_nodes` and the one headline rule (T7's "EV incomplete", the chart and unverified-source wordings, "highest EV", no headline at `unresolved_mass = 0.05`, `MissingPreflopNode` with no node anywhere, and hero out of support with the range mix). |
+
+Both carry `schema_version: 1`, `synthetic: true`, their complete inputs and their tolerances
+(1326-vectors and shares 1e-6, `q`/`log_reach`/posteriors 1e-10, interpolation weights and
+deviations 1e-12). The runner compares numbers within those tolerances and enum tags, strings
+and flags exactly; it has no update mode.
+
+**Generator and oracles.** `tools/gen_preflop_fixtures.py` `generate_goldens` (run by the
+module's `main`) writes both files from `replay_golden_expected`, `replay_golden_offmenu_expected`,
+`bet_cases`, `legalize_expected`, `assemble_expected` and `prominence_cases` -- this module's own
+card/combo/class indexing (`combo_class` expands AA/AKs/AKo to 6/4/12 combos) and scalar
+arithmetic, never Rust output. One modelling rule applies: a class likelihood enters the oracles
+at the precision the source envelope carries it (`f32`, rounded once with `struct`), because the
+1e-10 tolerance on `q` and `log_reach` is far below the 1.5e-8 relative difference between 0.8
+and its single-precision value; everything after that is double, and the expected 1326-vectors
+are converted to `f32` exactly once before writing.
+
+**Sources.** Three synthetic bundles (`golden_replay_uniform_100bb`,
+`golden_replay_offmenu_100bb`, `golden_prominence_100bb`) are embedded in the goldens as their
+manifest plus the envelope's exact bytes, hashed as the loader hashes a bundle on disk; the
+runner admits them through `checked_envelope` and `build_node_map`. They are never written under
+`fixtures/charts/` (checked by `test_golden_sources_are_synthetic_embedded_and_hash_checked`).
+
+### Fixture-generation audit
+
+- `fixtures/preflop/synthetic_v2/*` (Task 2): `generate` is unchanged; re-running the generator
+  reproduces all six files byte for byte (`test_regeneration_reproduces_committed_bytes_exactly`,
+  and `git status` shows no change under that directory after a regeneration).
+- The two goldens regenerate byte for byte (`test_golden_regeneration_reproduces_committed_bytes_exactly`).
+- Independent re-derivations in `tools/tests/test_preflop_fixtures.py`: `q` and `log_reach` of
+  the uniform line from class multiplicities (a second computation path), the six interpolation
+  rows from exact rationals, `f_A = 81/173` from the formula, the prominence cases' exact
+  deviations (1/10 and 7/60), mass conservation of every legal-move and assembly row, and the
+  section 4.4 headline wordings.
+- The chart bundles themselves (Tasks 5-7) are unchanged; `tools/chart_ingest.py verify` and the
+  Task 7 frozen-checklist tests still pass.
+
+### Plan 4 handoff check
+
+The source URLs and hashes and the missing-node fallback inventory are available to Plan 4 where
+Task 7 froze them: `fixtures/charts/sources.manifest.json` (both depths `available`, with final
+URLs and SHA-256), the "Source acquisition (Task 4)" section above (the same hashes), and the
+"Frozen coverage and Plan 4 handoff (Task 7)" section above (inventories, handoff prefixes, and
+the rule that every `absent` row is the section 9.3 fallback only). Rechecked 2026-09-28 against
+the committed files:
+
+```
+pokercoaching_100.pdf f5686c6dd672c782249752c60cd4ff5850378271e2139abc2b15e690149d091b in manifest: True in doc: True
+rangeconverter_200.pdf f0797be2a9894c520af90e70c17e2b7dee208215eab58b6ae953e8cc81bf70e2 in manifest: True in doc: True
+pokercoaching_100 inventory rows: 45 {'covered': 23, 'absent': 22}
+rangeconverter_200 inventory rows: 44 {'covered': 36, 'absent': 8}
+```
+
+### Section 13.1 test-name inventory
+
+Every name exists as a real test with numeric assertions (none ignored, none a comment). Where a
+row's clause is asserted in another binary, a spec-named test was added there that runs that
+assertion (ruling 15-D2 placed the postflop halves in `tests/snapshots.rs`).
+
+| Crate | Spec name | Where (file: test) | Status |
+|---|---|---|---|
+| core-preflop | `pokerdata_schema_mapping` | `tests/envelope.rs`: `pokerdata_schema_mapping` | pre-existing (Tasks 1-2, 9) |
+| core-preflop | `bundle_validation_quarantine` | `tests/envelope.rs`: `bundle_validation_quarantine` | pre-existing (Task 2) |
+| core-preflop | `pokerdata_action_path_lookup` | `tests/lookup.rs`: `pokerdata_action_path_lookup` | pre-existing (Task 8) |
+| core-preflop | `depth_bucket_labels_per_prefix` | `tests/lookup.rs`: `depth_bucket_labels_per_prefix` | pre-existing (Task 8) |
+| core-preflop | `straddle_mapping_labels` | `tests/lookup.rs`: `straddle_mapping_labels` | pre-existing (Task 8) |
+| core-preflop | `rake_profile_ordering` | `tests/lookup.rs`: `rake_profile_ordering` | pre-existing (Task 8) |
+| core-preflop | `pokerdata_units_source_scaling` | `tests/ev.rs`: `pokerdata_units_source_scaling` (re-raise, no-fold node and straddle unit in `ev_reference_normalization_extended`) | pre-existing (Task 9) |
+| core-replay | `replay_bayes_two_combos` (T3) | `tests/branches.rs`: `replay_bayes_two_combos`; the inserted-bet and 1e-30 clauses in `replay_bayes_inserted_bet_and_tiny_reach` and `range_output_preserves_positive_reach` (same file); the inserted observed size through a snapshot in `tests/snapshots.rs`: `replay_snapshot_prefix_reuse` case (d) | pre-existing (Tasks 11, 15) |
+| core-replay | `replay_off_tree_pseudo_harmonic` | `tests/branches.rs`: `replay_off_tree_pseudo_harmonic` (spec figures and prominence in `replay_off_tree_pseudo_harmonic_spec_figures`) | pre-existing (Task 11) |
+| core-replay | `replay_off_tree_pseudo_harmonic`, node-translation clause | `tests/assembly.rs`: `replay_off_tree_pseudo_harmonic` | **added** (Task 19) |
+| core-replay | `replay_cross_actor_branches` (T6) | `tests/branches.rs`: `replay_cross_actor_branches` (rescaled figures and next keys in `replay_cross_actor_branches_rescaled`, `M_X = 0` in `replay_zero_m_child_disappears_for_every_seat`) | pre-existing (Task 11) |
+| core-replay | `replay_cross_actor_branches`, snapshot-menu clause | `tests/snapshots.rs`: `replay_cross_actor_branches` (runs `replay_cross_actor_branches_through_snapshot_nodes`) | **added** (Task 19) |
+| core-replay | `replay_branch_cap_residual` | `tests/branches.rs`: `replay_branch_cap_residual`, extended with the eight pre-cap weights, the four kept, 35.2% / 52.1%, the fourth split's children and the three earliest-created ties | pre-existing (Task 12), **extended** (Task 19) |
+| core-replay | `replay_missing_continuation`, preflop half | `tests/replay.rs`: `replay_missing_continuation` | pre-existing (Task 13) |
+| core-replay | `replay_missing_continuation`, postflop half | `tests/snapshots.rs`: `replay_missing_continuation` (runs `replay_missing_continuation_postflop`) | **added** (Task 19) |
+| core-replay | `replay_snapshot_prefix_reuse` | `tests/snapshots.rs`: `replay_snapshot_prefix_reuse` | pre-existing (Task 15) |
+| core-replay | `replay_snapshot_compatibility` | `tests/snapshots.rs`: `replay_snapshot_compatibility` (undo in `undo_drops_later_streets_and_same_street_snapshots_whose_prefix_no_longer_fits`, cache origins in `cache_origins_behave_exactly_as_live`; engine registration in `crates/engine/tests/preflop_replay.rs`: `replay_feeds_street_root_solves`) | pre-existing (Tasks 14, 18) |
+| core-replay | `replay_incomplete_branch_ev` (T7) | `tests/assembly.rs`: `replay_incomplete_branch_ev` (no node anywhere in `missing_node_in_every_positive_branch_names_the_heaviest_retained_key`; the headline wording in the engine goldens) | pre-existing (Task 16) |
+| core-replay | `replay_hero_out_of_support` | `tests/assembly.rs`: `replay_hero_out_of_support` | pre-existing (Task 16) |
+| core-preflop (plan name) | `published_chart_bundles_load` | `crates/core-preflop/tests/envelope.rs`: `published_chart_bundles_load` (plan 3 Task 7 names this file; the plan's audit table lists it under engine) | pre-existing (Task 7) |
+| engine | `chart_headline_requires_complete_frequency_support` | `tests/preflop_replay.rs` | pre-existing (Task 17) |
+| engine | `replay_feeds_street_root_solves` | `tests/preflop_replay.rs` | pre-existing (Task 18) |
+| engine | `replay_weights_golden`, `bet_translation_golden` | `tests/preflop_goldens.rs` | **added** (Task 19) |
+| engine | `recommendation_assembly_golden` (charts / unverified / T7 wordings, no headline with unresolved mass) | `tests/assembly.rs` | pre-existing (Plan 2, Task 17); unchanged here |
+
+Plan 2's identity, deadline and analytic goldens are unchanged by this task.
 
 ## Independent blind re-read of the 100bb grids (2026-09-26)
 

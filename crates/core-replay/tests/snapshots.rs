@@ -1956,3 +1956,31 @@ fn replay_cross_actor_branches_through_snapshot_nodes() {
     assert_eq!(dropped.branches[0].translated, vec![(SB, Action::Check), (BB, Action::Bet { to: 75 })]);
     close_to(dropped.branches[0].q, qa, "q_A");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Section 13.1 names whose postflop halves live in this file (plan 3 Task 19's test-name audit;
+// ruling 15-D2 placed both tests here rather than in `tests/branches.rs`). Each spec-named test
+// runs the test that asserts that half, with its numeric assertions unchanged.
+// ---------------------------------------------------------------------------------------------
+
+/// Section 13.1's `replay_missing_continuation`, postflop half: a deleted continuation leaves the
+/// action unapplied in that branch (the actor's masses as conditioned so far, `q_k` unchanged),
+/// `UnconditionedPriorStreet{cause: "uncovered path [0, 1]"}` persists, nothing is invented, and the
+/// other seat's actions, the same seat's later action at a covered path and the other branch keep
+/// conditioning (`replay_missing_continuation_postflop`). The preflop half -- a branch stopped on a
+/// missing node is frozen for the rest of the street and hero's lookup in it is unresolved mass --
+/// is `tests/replay.rs`'s test of the same name.
+#[test]
+fn replay_missing_continuation() {
+    replay_missing_continuation_postflop();
+}
+
+/// Section 13.1's `replay_cross_actor_branches` (T6), last clause: "the same rules apply to a
+/// postflop off-menu wager against a snapshot menu" -- the villain's 100-into-150 bet over the
+/// snapshot's 75/150 menu gives `q = 0.27 / 0.10`, the rest of T6's figures and the dropped
+/// `M_X = 0` branch (`replay_cross_actor_branches_through_snapshot_nodes`). The kernel example
+/// itself is `tests/branches.rs`'s test of the same name.
+#[test]
+fn replay_cross_actor_branches() {
+    replay_cross_actor_branches_through_snapshot_nodes();
+}

@@ -1,0 +1,1405 @@
+{
+  "schema_version": 1,
+  "synthetic": true,
+  "description": "Spec section 13.3 bet_translation_golden: section 8.4's interpolation boundaries, BetTranslation prominence at d = 0.10, legality after mapping, and the branch-supported assembly with its section 4.4 headline. Oracles: tools/gen_preflop_fixtures.py.",
+  "tolerances": {
+    "f": 1e-12,
+    "deviation": 1e-12,
+    "probability": 1e-06,
+    "reason": 1e-06
+  },
+  "interpolation": [
+    {
+      "name": "below",
+      "s": 0.2,
+      "menu": [
+        0.5,
+        1.0
+      ],
+      "f": [
+        1.0,
+        0.0
+      ],
+      "deviation": 0.3,
+      "clamped": true
+    },
+    {
+      "name": "between",
+      "s": 0.73,
+      "menu": [
+        0.5,
+        1.0
+      ],
+      "f": [
+        0.4682080924855491,
+        0.5317919075144508
+      ],
+      "deviation": 0.23,
+      "clamped": false
+    },
+    {
+      "name": "above_no_jam",
+      "s": 1.5,
+      "menu": [
+        0.5,
+        1.0
+      ],
+      "f": [
+        0.0,
+        1.0
+      ],
+      "deviation": 0.5,
+      "clamped": true
+    },
+    {
+      "name": "above_with_jam",
+      "s": 1.5,
+      "menu": [
+        1.0,
+        2.0
+      ],
+      "f": [
+        0.4,
+        0.6
+      ],
+      "deviation": 0.5,
+      "clamped": false
+    },
+    {
+      "name": "single",
+      "s": 0.73,
+      "menu": [
+        0.5
+      ],
+      "f": [
+        1.0
+      ],
+      "deviation": 0.23,
+      "clamped": true
+    },
+    {
+      "name": "equal",
+      "s": 0.73,
+      "menu": [
+        0.5,
+        0.5
+      ],
+      "f": [
+        1.0,
+        0.0
+      ],
+      "deviation": 0.23,
+      "clamped": true
+    }
+  ],
+  "prominence": {
+    "sources": [
+      {
+        "manifest": {
+          "bundle_id": "golden_prominence_100bb",
+          "source": "PokerDataJson",
+          "game": "nl",
+          "version": 2,
+          "depth_bb": 100,
+          "depths": [
+            100
+          ],
+          "source_blinds": [
+            0.5,
+            1.0
+          ],
+          "rake_profile": "5% cap 0.5bb",
+          "rake": {
+            "rate": 0.05,
+            "cap_bb": 0.5,
+            "no_flop_no_drop": true
+          },
+          "straddle": false,
+          "ev_unit": "source_sb",
+          "ev_reference": "unverified",
+          "accuracy": "unverified",
+          "license_note": "Synthetic golden test data (plan 3 Task 19); not vendor data; never a chart",
+          "sha256": "22624f28334d8bf3c2ce0cf41dfcd7c4d2db80f29619f7a1d2fc0c1bd1d0fa5d"
+        },
+        "nodes_json": "{\"bundle_id\":\"golden_prominence_100bb\",\"depth_bb\":100,\"rake_profile\":\"5% cap 0.5bb\",\"straddle\":false,\"class_order\":\"A-2 row-major, section 4.1\",\"nodes\":[{\"history\":[],\"actor\":\"UTG\",\"actions\":[{\"step\":\"fold\"},{\"step\":\"call\"}],\"weights\":[[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5],[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]],\"unreachable_classes\":[]},{\"history\":[[\"UTG\",\"call\",0]],\"actor\":\"HJ\",\"actions\":[{\"step\":\"fold\"},{\"step\":\"call\"}],\"weights\":[[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5],[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]],\"unreachable_classes\":[]},{\"history\":[[\"UTG\",\"call\",0],[\"HJ\",\"call\",0]],\"actor\":\"CO\",\"actions\":[{\"step\":\"fold\"},{\"step\":\"call\"}],\"weights\":[[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5],[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]],\"unreachable_classes\":[]},{\"history\":[[\"UTG\",\"call\",0],[\"HJ\",\"call\",0],[\"CO\",\"call\",0]],\"actor\":\"BTN\",\"actions\":[{\"step\":\"fold\"},{\"step\":\"call\"}],\"weights\":[[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5],[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]],\"unreachable_classes\":[]},{\"history\":[[\"UTG\",\"call\",0],[\"HJ\",\"call\",0],[\"CO\",\"call\",0],[\"BTN\",\"call\",0]],\"actor\":\"SB\",\"actions\":[{\"step\":\"fold\"},{\"step\":\"call\"}],\"weights\":[[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5],[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]],\"unreachable_classes\":[]},{\"history\":[[\"UTG\",\"call\",0],[\"HJ\",\"call\",0],[\"CO\",\"call\",0],[\"BTN\",\"call\",0],[\"SB\",\"call\",0]],\"actor\":\"BB\",\"actions\":[{\"step\":\"check\"},{\"step\":\"raise\",\"to_bb_x1000\":2000}],\"weights\":[[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5],[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]],\"unreachable_classes\":[]}]}"
+      }
+    ],
+    "cases": [
+      {
+        "name": "deviation_exactly_0.10",
+        "input": {
+          "hand_id": 3,
+          "config": {
+            "config_revision": 1,
+            "sb_chips": 5,
+            "bb_chips": 10,
+            "straddle": null,
+            "rake": {
+              "kind": "pot_rake",
+              "rate": 0.05,
+              "cap_mchips": 5000,
+              "no_flop_no_drop": true
+            },
+            "chip_label": "$1"
+          },
+          "button": 0,
+          "hero": 2,
+          "hero_cards": null,
+          "dealt": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "stacks_start": [
+            1000,
+            1000,
+            1000,
+            1000,
+            1000,
+            1000
+          ],
+          "actions": [
+            {
+              "seat": 3,
+              "action": {
+                "kind": "call"
+              }
+            },
+            {
+              "seat": 4,
+              "action": {
+                "kind": "call"
+              }
+            },
+            {
+              "seat": 5,
+              "action": {
+                "kind": "call"
+              }
+            },
+            {
+              "seat": 0,
+              "action": {
+                "kind": "call"
+              }
+            },
+            {
+              "seat": 1,
+              "action": {
+                "kind": "call"
+              }
+            },
+            {
+              "seat": 2,
+              "action": {
+                "kind": "raise",
+                "to": 26
+              }
+            }
+          ],
+          "board": "",
+          "board_cards": []
+        },
+        "deviation_exact": "1/10",
+        "expected_prominent": false,
+        "expected": {
+          "reasons": [
+            {
+              "kind": "BetTranslation",
+              "street": "preflop",
+              "seat": 2,
+              "observed_pct": 0.26666666666666666,
+              "mapped": [
+                [
+                  0.16666666666666666,
+                  1.0
+                ]
+              ],
+              "deviation": 0.1,
+              "prominent": false
+            }
+          ]
+        }
+      },
+      {
+        "name": "deviation_above_0.10",
+        "input": {
+          "hand_id": 3,
+          "config": {
+            "config_revision": 1,
+            "sb_chips": 5,
+            "bb_chips": 10,
+            "straddle": null,
+            "rake": {
+              "kind": "pot_rake",
+              "rate": 0.05,
+              "cap_mchips": 5000,
+              "no_flop_no_drop": true
+            },
+            "chip_label": "$1"
+          },
+          "button": 0,
+          "hero": 2,
+          "hero_cards": null,
+          "dealt": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ],
+          "stacks_start": [
+            1000,
+            1000,
+            1000,
+            1000,
+            1000,
+            1000
+          ],
+          "actions": [
+            {
+              "seat": 3,
+              "action": {
+                "kind": "call"
+              }
+            },
+            {
+              "seat": 4,
+              "action": {
+                "kind": "call"
+              }
+            },
+            {
+              "seat": 5,
+              "action": {
+                "kind": "call"
+              }
+            },
+            {
+              "seat": 0,
+              "action": {
+                "kind": "call"
+              }
+            },
+            {
+              "seat": 1,
+              "action": {
+                "kind": "call"
+              }
+            },
+            {
+              "seat": 2,
+              "action": {
+                "kind": "raise",
+                "to": 27
+              }
+            }
+          ],
+          "board": "",
+          "board_cards": []
+        },
+        "deviation_exact": "7/60",
+        "expected_prominent": true,
+        "expected": {
+          "reasons": [
+            {
+              "kind": "BetTranslation",
+              "street": "preflop",
+              "seat": 2,
+              "observed_pct": 0.2833333333333333,
+              "mapped": [
+                [
+                  0.16666666666666666,
+                  1.0
+                ]
+              ],
+              "deviation": 0.11666666666666667,
+              "prominent": true
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "legal_moves": [
+    {
+      "name": "below_min_to_smallest_legal_raise",
+      "legal": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call",
+          "cost": 2
+        },
+        {
+          "kind": "raise",
+          "min_to": 10,
+          "max_to": 100
+        },
+        {
+          "kind": "all_in",
+          "to": 100
+        }
+      ],
+      "source": [
+        {
+          "action": {
+            "kind": "call"
+          },
+          "probability": 0.5,
+          "ev_chips": 2.0
+        },
+        {
+          "action": {
+            "kind": "raise",
+            "to": 7
+          },
+          "probability": 0.2,
+          "ev_chips": 10.0
+        },
+        {
+          "action": {
+            "kind": "raise",
+            "to": 12
+          },
+          "probability": 0.3,
+          "ev_chips": 3.0
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "call"
+            },
+            "probability": 0.5,
+            "ev_chips": 2.0,
+            "unavailable": null
+          },
+          {
+            "action": {
+              "kind": "raise",
+              "to": 12
+            },
+            "probability": 0.5,
+            "ev_chips": 3.0,
+            "unavailable": null
+          }
+        ],
+        "notes": [
+          "Moved Raise { to: 7 } probability 0.2 to Raise { to: 12 }"
+        ]
+      }
+    },
+    {
+      "name": "below_min_to_call",
+      "legal": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call",
+          "cost": 2
+        },
+        {
+          "kind": "raise",
+          "min_to": 10,
+          "max_to": 100
+        },
+        {
+          "kind": "all_in",
+          "to": 100
+        }
+      ],
+      "source": [
+        {
+          "action": {
+            "kind": "fold"
+          },
+          "probability": 0.3,
+          "ev_chips": 0.0
+        },
+        {
+          "action": {
+            "kind": "call"
+          },
+          "probability": 0.5,
+          "ev_chips": 2.0
+        },
+        {
+          "action": {
+            "kind": "raise",
+            "to": 7
+          },
+          "probability": 0.2,
+          "ev_chips": 10.0
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "fold"
+            },
+            "probability": 0.3,
+            "ev_chips": 0.0,
+            "unavailable": null
+          },
+          {
+            "action": {
+              "kind": "call"
+            },
+            "probability": 0.7,
+            "ev_chips": 2.0,
+            "unavailable": null
+          }
+        ],
+        "notes": [
+          "Moved Raise { to: 7 } probability 0.2 to Call"
+        ]
+      }
+    },
+    {
+      "name": "above_stack_creates_allin",
+      "legal": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "min_to": 2,
+          "max_to": 100
+        },
+        {
+          "kind": "all_in",
+          "to": 100
+        }
+      ],
+      "source": [
+        {
+          "action": {
+            "kind": "check"
+          },
+          "probability": 0.6,
+          "ev_chips": 1.0
+        },
+        {
+          "action": {
+            "kind": "bet",
+            "to": 120
+          },
+          "probability": 0.4,
+          "ev_chips": 5.0
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "check"
+            },
+            "probability": 0.6,
+            "ev_chips": 1.0,
+            "unavailable": null
+          },
+          {
+            "action": {
+              "kind": "allin",
+              "to": 100
+            },
+            "probability": 0.4,
+            "ev_chips": null,
+            "unavailable": {
+              "kind": "MovedProbability",
+              "from": {
+                "kind": "bet",
+                "to": 120
+              }
+            }
+          }
+        ],
+        "notes": [
+          "Moved Bet { to: 120 } probability 0.4 to AllIn { to: 100 }"
+        ]
+      }
+    },
+    {
+      "name": "above_stack_joins_source_allin",
+      "legal": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "min_to": 2,
+          "max_to": 100
+        },
+        {
+          "kind": "all_in",
+          "to": 100
+        }
+      ],
+      "source": [
+        {
+          "action": {
+            "kind": "check"
+          },
+          "probability": 0.5,
+          "ev_chips": 1.0
+        },
+        {
+          "action": {
+            "kind": "bet",
+            "to": 120
+          },
+          "probability": 0.3,
+          "ev_chips": 5.0
+        },
+        {
+          "action": {
+            "kind": "allin",
+            "to": 100
+          },
+          "probability": 0.2,
+          "ev_chips": 4.0
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "check"
+            },
+            "probability": 0.5,
+            "ev_chips": 1.0,
+            "unavailable": null
+          },
+          {
+            "action": {
+              "kind": "allin",
+              "to": 100
+            },
+            "probability": 0.5,
+            "ev_chips": 4.0,
+            "unavailable": null
+          }
+        ],
+        "notes": [
+          "Moved Bet { to: 120 } probability 0.3 to AllIn { to: 100 }"
+        ]
+      }
+    }
+  ],
+  "assembly": [
+    {
+      "name": "t7_branch_support_incomplete",
+      "hero": 0,
+      "hero_combo": 942,
+      "bb_chips": 10,
+      "branches": [
+        {
+          "id": 0,
+          "q": 0.2,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        },
+        {
+          "id": 1,
+          "q": 0.8,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        }
+      ],
+      "nodes": [
+        {
+          "branch_id": 0,
+          "key": "golden:after raise A",
+          "node": {
+            "actions": [
+              {
+                "kind": "fold"
+              },
+              {
+                "kind": "call"
+              },
+              {
+                "kind": "raise",
+                "to": 60
+              }
+            ],
+            "probs": [
+              0.3,
+              0.3,
+              0.4
+            ],
+            "evs": [
+              0.0,
+              2.0,
+              10.0
+            ],
+            "source": "PokerDataJson",
+            "ev_reference": "decision_incremental_verified"
+          }
+        },
+        {
+          "branch_id": 1,
+          "key": "golden:after raise B",
+          "node": {
+            "actions": [
+              {
+                "kind": "fold"
+              },
+              {
+                "kind": "call"
+              }
+            ],
+            "probs": [
+              0.4,
+              0.6
+            ],
+            "evs": [
+              0.0,
+              -1.0
+            ],
+            "source": "PokerDataJson",
+            "ev_reference": "decision_incremental_verified"
+          }
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "fold"
+            },
+            "frequency": 0.38000000000000006,
+            "ev_bb": 0.0,
+            "unavailable": null,
+            "headline": false
+          },
+          {
+            "action": {
+              "kind": "call"
+            },
+            "frequency": 0.54,
+            "ev_bb": -0.04,
+            "unavailable": null,
+            "headline": true
+          },
+          {
+            "action": {
+              "kind": "raise",
+              "to": 60
+            },
+            "frequency": 0.08000000000000002,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "BranchSupportIncomplete",
+              "covered_posterior": 0.2
+            },
+            "headline": false
+          }
+        ],
+        "unresolved_mass": 0.0,
+        "range_mix": [
+          [
+            {
+              "kind": "fold"
+            },
+            0.38
+          ],
+          [
+            {
+              "kind": "call"
+            },
+            0.5399999999999999
+          ],
+          [
+            {
+              "kind": "raise",
+              "to": 60
+            },
+            0.08
+          ]
+        ],
+        "reasons": [],
+        "notes": [],
+        "unsupported": null,
+        "headline": "highest-frequency action, EV incomplete"
+      }
+    },
+    {
+      "name": "chart_frequency",
+      "hero": 0,
+      "hero_combo": 942,
+      "bb_chips": 10,
+      "branches": [
+        {
+          "id": 0,
+          "q": 1.0,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        }
+      ],
+      "nodes": [
+        {
+          "branch_id": 0,
+          "key": "golden:chart",
+          "node": {
+            "actions": [
+              {
+                "kind": "fold"
+              },
+              {
+                "kind": "call"
+              },
+              {
+                "kind": "raise",
+                "to": 25
+              }
+            ],
+            "probs": [
+              0.5,
+              0.2,
+              0.3
+            ],
+            "evs": [
+              null,
+              null,
+              null
+            ],
+            "source": "ChartTranscription",
+            "ev_reference": "unverified"
+          }
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "fold"
+            },
+            "frequency": 0.5,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "ChartNoEv"
+            },
+            "headline": true
+          },
+          {
+            "action": {
+              "kind": "call"
+            },
+            "frequency": 0.2,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "ChartNoEv"
+            },
+            "headline": false
+          },
+          {
+            "action": {
+              "kind": "raise",
+              "to": 25
+            },
+            "frequency": 0.3,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "ChartNoEv"
+            },
+            "headline": false
+          }
+        ],
+        "unresolved_mass": 0.0,
+        "range_mix": [
+          [
+            {
+              "kind": "fold"
+            },
+            0.5
+          ],
+          [
+            {
+              "kind": "call"
+            },
+            0.19999999999999998
+          ],
+          [
+            {
+              "kind": "raise",
+              "to": 25
+            },
+            0.3
+          ]
+        ],
+        "reasons": [
+          {
+            "kind": "ChartRounded"
+          }
+        ],
+        "notes": [],
+        "unsupported": null,
+        "headline": "highest-frequency chart action"
+      }
+    },
+    {
+      "name": "unverified_source_frequency",
+      "hero": 0,
+      "hero_combo": 942,
+      "bb_chips": 10,
+      "branches": [
+        {
+          "id": 0,
+          "q": 1.0,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        }
+      ],
+      "nodes": [
+        {
+          "branch_id": 0,
+          "key": "golden:unverified",
+          "node": {
+            "actions": [
+              {
+                "kind": "fold"
+              },
+              {
+                "kind": "call"
+              },
+              {
+                "kind": "raise",
+                "to": 25
+              }
+            ],
+            "probs": [
+              0.2,
+              0.5,
+              0.3
+            ],
+            "evs": [
+              null,
+              null,
+              null
+            ],
+            "source": "PokerDataJson",
+            "ev_reference": "unverified"
+          }
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "fold"
+            },
+            "frequency": 0.2,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "NoEvReference"
+            },
+            "headline": false
+          },
+          {
+            "action": {
+              "kind": "call"
+            },
+            "frequency": 0.5,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "NoEvReference"
+            },
+            "headline": true
+          },
+          {
+            "action": {
+              "kind": "raise",
+              "to": 25
+            },
+            "frequency": 0.3,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "NoEvReference"
+            },
+            "headline": false
+          }
+        ],
+        "unresolved_mass": 0.0,
+        "range_mix": [
+          [
+            {
+              "kind": "fold"
+            },
+            0.19999999999999998
+          ],
+          [
+            {
+              "kind": "call"
+            },
+            0.5
+          ],
+          [
+            {
+              "kind": "raise",
+              "to": 25
+            },
+            0.3
+          ]
+        ],
+        "reasons": [
+          {
+            "kind": "EvReferenceUnverified"
+          }
+        ],
+        "notes": [],
+        "unsupported": null,
+        "headline": "highest-frequency source action, EV reference unverified"
+      }
+    },
+    {
+      "name": "complete_ev",
+      "hero": 0,
+      "hero_combo": 942,
+      "bb_chips": 10,
+      "branches": [
+        {
+          "id": 0,
+          "q": 0.2,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        },
+        {
+          "id": 1,
+          "q": 0.8,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        }
+      ],
+      "nodes": [
+        {
+          "branch_id": 0,
+          "key": "golden:after raise A",
+          "node": {
+            "actions": [
+              {
+                "kind": "fold"
+              },
+              {
+                "kind": "call"
+              }
+            ],
+            "probs": [
+              0.3,
+              0.7
+            ],
+            "evs": [
+              0.0,
+              4.0
+            ],
+            "source": "PokerDataJson",
+            "ev_reference": "decision_incremental_verified"
+          }
+        },
+        {
+          "branch_id": 1,
+          "key": "golden:after raise B",
+          "node": {
+            "actions": [
+              {
+                "kind": "fold"
+              },
+              {
+                "kind": "call"
+              }
+            ],
+            "probs": [
+              0.6,
+              0.4
+            ],
+            "evs": [
+              0.0,
+              -2.0
+            ],
+            "source": "PokerDataJson",
+            "ev_reference": "decision_incremental_verified"
+          }
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "fold"
+            },
+            "frequency": 0.54,
+            "ev_bb": 0.0,
+            "unavailable": null,
+            "headline": true
+          },
+          {
+            "action": {
+              "kind": "call"
+            },
+            "frequency": 0.4600000000000001,
+            "ev_bb": -0.08,
+            "unavailable": null,
+            "headline": false
+          }
+        ],
+        "unresolved_mass": 0.0,
+        "range_mix": [
+          [
+            {
+              "kind": "fold"
+            },
+            0.5399999999999999
+          ],
+          [
+            {
+              "kind": "call"
+            },
+            0.46
+          ]
+        ],
+        "reasons": [],
+        "notes": [],
+        "unsupported": null,
+        "headline": "highest EV"
+      }
+    },
+    {
+      "name": "t7_residual_no_headline",
+      "hero": 0,
+      "hero_combo": 942,
+      "bb_chips": 10,
+      "branches": [
+        {
+          "id": 0,
+          "q": 0.19,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        },
+        {
+          "id": 1,
+          "q": 0.76,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        },
+        {
+          "id": 2,
+          "q": 0.05,
+          "residual": true,
+          "stopped": null,
+          "zero_combos": []
+        }
+      ],
+      "nodes": [
+        {
+          "branch_id": 0,
+          "key": "golden:after raise A",
+          "node": {
+            "actions": [
+              {
+                "kind": "fold"
+              },
+              {
+                "kind": "call"
+              },
+              {
+                "kind": "raise",
+                "to": 60
+              }
+            ],
+            "probs": [
+              0.3,
+              0.3,
+              0.4
+            ],
+            "evs": [
+              0.0,
+              2.0,
+              10.0
+            ],
+            "source": "PokerDataJson",
+            "ev_reference": "decision_incremental_verified"
+          }
+        },
+        {
+          "branch_id": 1,
+          "key": "golden:after raise B",
+          "node": {
+            "actions": [
+              {
+                "kind": "fold"
+              },
+              {
+                "kind": "call"
+              }
+            ],
+            "probs": [
+              0.4,
+              0.6
+            ],
+            "evs": [
+              0.0,
+              -1.0
+            ],
+            "source": "PokerDataJson",
+            "ev_reference": "decision_incremental_verified"
+          }
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "fold"
+            },
+            "frequency": 0.36100000000000004,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "BranchSupportIncomplete",
+              "covered_posterior": 0.95
+            },
+            "headline": false
+          },
+          {
+            "action": {
+              "kind": "call"
+            },
+            "frequency": 0.5129999999999999,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "BranchSupportIncomplete",
+              "covered_posterior": 0.95
+            },
+            "headline": false
+          },
+          {
+            "action": {
+              "kind": "raise",
+              "to": 60
+            },
+            "frequency": 0.07600000000000001,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "BranchSupportIncomplete",
+              "covered_posterior": 0.19
+            },
+            "headline": false
+          }
+        ],
+        "unresolved_mass": 0.05,
+        "range_mix": [
+          [
+            {
+              "kind": "fold"
+            },
+            0.38
+          ],
+          [
+            {
+              "kind": "call"
+            },
+            0.5399999999999999
+          ],
+          [
+            {
+              "kind": "raise",
+              "to": 60
+            },
+            0.08
+          ]
+        ],
+        "reasons": [
+          {
+            "kind": "BranchResidual",
+            "seat": 0,
+            "residual_mass_pct": 5.0,
+            "cause": "missing node golden:after raise B"
+          }
+        ],
+        "notes": [
+          "range mix excludes 5.0% of hero's public range mass (no strategy)",
+          "5.0% of the posterior has no strategy"
+        ],
+        "unsupported": null,
+        "headline": null
+      }
+    },
+    {
+      "name": "missing_node_everywhere",
+      "hero": 0,
+      "hero_combo": 942,
+      "bb_chips": 10,
+      "branches": [
+        {
+          "id": 0,
+          "q": 0.6,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        },
+        {
+          "id": 1,
+          "q": 0.4,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        }
+      ],
+      "nodes": [
+        {
+          "branch_id": 0,
+          "key": "golden:after raise A",
+          "node": null
+        },
+        {
+          "branch_id": 1,
+          "key": "golden:after raise B",
+          "node": null
+        }
+      ],
+      "expected": {
+        "actions": [],
+        "unresolved_mass": 1.0,
+        "range_mix": null,
+        "reasons": [],
+        "notes": [],
+        "unsupported": {
+          "kind": "MissingPreflopNode",
+          "key": "golden:after raise A"
+        },
+        "headline": null
+      }
+    },
+    {
+      "name": "hero_out_of_support",
+      "hero": 0,
+      "hero_combo": 942,
+      "bb_chips": 10,
+      "branches": [
+        {
+          "id": 0,
+          "q": 1.0,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": [
+            942
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "branch_id": 0,
+          "key": "golden:out of support",
+          "node": {
+            "actions": [
+              {
+                "kind": "fold"
+              },
+              {
+                "kind": "call"
+              },
+              {
+                "kind": "raise",
+                "to": 25
+              }
+            ],
+            "probs": [
+              0.5,
+              0.3,
+              0.2
+            ],
+            "evs": [
+              0.0,
+              1.0,
+              3.0
+            ],
+            "source": "PokerDataJson",
+            "ev_reference": "decision_incremental_verified"
+          }
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "fold"
+            },
+            "frequency": null,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "HeroOutOfSupport"
+            },
+            "headline": false
+          },
+          {
+            "action": {
+              "kind": "call"
+            },
+            "frequency": null,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "HeroOutOfSupport"
+            },
+            "headline": false
+          },
+          {
+            "action": {
+              "kind": "raise",
+              "to": 25
+            },
+            "frequency": null,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "HeroOutOfSupport"
+            },
+            "headline": false
+          }
+        ],
+        "unresolved_mass": 0.0,
+        "range_mix": [
+          [
+            {
+              "kind": "fold"
+            },
+            0.5
+          ],
+          [
+            {
+              "kind": "call"
+            },
+            0.3
+          ],
+          [
+            {
+              "kind": "raise",
+              "to": 25
+            },
+            0.2
+          ]
+        ],
+        "reasons": [],
+        "notes": [],
+        "unsupported": {
+          "kind": "HeroComboOutOfSupport"
+        },
+        "headline": null
+      }
+    }
+  ]
+}

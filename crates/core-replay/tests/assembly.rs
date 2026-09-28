@@ -166,6 +166,76 @@ fn replay_hero_out_of_support() {
     assert_eq!(m.unresolved_mass, 0.0);
 }
 
+/// Section 13.1's `replay_off_tree_pseudo_harmonic`, last clause (plan 3 Task 19's test-name
+/// audit): "node translation mixes strategies with `pi` and EV with the complete-support rule". The
+/// row's other figures are `tests/branches.rs`'s test of the same name; this clause is an assembly
+/// rule, so it is asserted here. The row's split -- 73 into 100 over menu sizes 50/100 (`f =
+/// 81/173, 92/173`), `P_A = (0.9, 0.3)`, `P_B = (0.1, 0.5)` on the actor's two combos -- gives the
+/// actor a branch posterior that differs per combo (`pi_A = 0.888` for combo 1, `0.346` for combo
+/// 2). The actor's next node differs per branch, and a raise exists only after 50: each combo's
+/// advice mixes the two nodes with that combo's own posterior, the raise gets its known frequency
+/// but no EV (only its covered posterior), and fold and call average their EVs over both branches.
+#[test]
+fn replay_off_tree_pseudo_harmonic() {
+    use core_preflop::branches::{condition, posterior};
+    let menu = [Action::Bet { to: 50 }, Action::Bet { to: 100 }];
+    let s = core_preflop::wager_fraction(73, 0, 0, 100).expect("73 into 100");
+    let t = core_preflop::interpolate(s, &core_preflop::menu_fractions(&menu, 0, 0, 100).expect("both sizes")).expect("73 lies between 50 and 100");
+    let (fa, fb) = (t.choices[0].1, t.choices[1].1);
+    close(fa, 81.0 / 173.0);
+    close(fb, 92.0 / 173.0);
+    let mut start = initial(&[V, H]).remove(0);
+    for seat in &mut start.seats {
+        seat.mass.fill(0.0);
+        seat.mass[0] = 1.0;
+        seat.mass[1] = 1.0;
+    }
+    let pair = |a: f64, b: f64| {
+        let mut p = vec![0.0; COMBOS];
+        p[0] = a;
+        p[1] = b;
+        p
+    };
+    let mut bs = vec![condition(&start, V, &pair(0.9, 0.3), fa).expect("M_A = 0.6"), condition(&start, V, &pair(0.1, 0.5), fb).expect("M_B = 0.3")];
+    bs[1].id = 1;
+    close(bs[0].q, fa * 0.6);
+    close(bs[1].q, fb * 0.3);
+    // The actor's own next node in each branch: after bet 50 it may raise, after bet 100 it may not.
+    let raise = Action::Raise { to: 300 };
+    let actor = |row: &[(Action, f32, Option<f32>)]| ExpandedNode { actor: V, ..verified(row) };
+    let nodes = vec![
+        at(0, Some(actor(&[(FOLD, 0.2, Some(0.0)), (CALL, 0.5, Some(12.0)), (raise, 0.3, Some(30.0))])), "after bet 50"),
+        at(1, Some(actor(&[(FOLD, 0.6, Some(0.0)), (CALL, 0.4, Some(-8.0))])), "after bet 100"),
+    ];
+    let pi_a = [fa * 0.9 / (fa * 0.9 + fb * 0.1), fa * 0.3 / (fa * 0.3 + fb * 0.5)];
+    assert!((pi_a[0] - 0.888).abs() < 5e-4 && (pi_a[1] - 0.346).abs() < 5e-4, "the row's rounded posteriors: {pi_a:?}");
+    let mut frequencies = vec![];
+    for (combo, &pa) in pi_a.iter().enumerate() {
+        let pb = 1.0 - pa;
+        let pi = posterior(&bs, V, combo);
+        close(pi[0], pa);
+        close(pi[1], pb);
+        let m = mix_nodes(&bs, &nodes, V, combo, 10);
+        assert_eq!(m.unsupported, None);
+        assert_eq!(m.unresolved_mass, 0.0);
+        assert_eq!(m.actions.iter().map(|a| a.action).collect::<Vec<_>>(), vec![FOLD, CALL, raise]);
+        let fold = advice(&m, FOLD);
+        close(f64::from(fold.frequency.unwrap()), pa * 0.2 + pb * 0.6);
+        assert_eq!((fold.ev_bb, fold.unavailable.clone()), (Some(0.0), None));
+        let call = advice(&m, CALL);
+        close(f64::from(call.frequency.unwrap()), pa * 0.5 + pb * 0.4);
+        close(f64::from(call.ev_bb.unwrap()), (pa * 12.0 + pb * -8.0) / 10.0);
+        assert_eq!(call.unavailable, None);
+        let r = advice(&m, raise);
+        close(f64::from(r.frequency.unwrap()), pa * 0.3);
+        assert_eq!(r.ev_bb, None, "the raise exists in branch A only: no EV over incomplete support");
+        close(f64::from(covered(r)), pa);
+        close(frequency_total(&m), 1.0);
+        frequencies.push(m.actions.iter().map(|a| a.frequency.unwrap()).collect::<Vec<_>>());
+    }
+    assert_ne!(frequencies[0], frequencies[1], "each combo mixes with its own branch posterior");
+}
+
 #[test]
 fn explicitly_unreachable_hero_class_is_out_of_support() {
     // Positive public mass, but the source marks hero's class unreachable at the node: never
