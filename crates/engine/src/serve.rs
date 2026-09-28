@@ -29,22 +29,29 @@
 //! The cache (plan 4 Task 10; spec 5 step 7, 7, 10.4, 10.5). After the `Fast`, a flop or turn decision probes the cache
 //! (`cache_phase`): on the flop the pre-solver's template first and then the live template the flop policy picks (Task
 //! 9: `flop_min_v1` only for an admitted single-raised pot), when it differs; on the turn its one template. The probes
-//! run on `engine-main`, inside the request's own budget: together at most `CACHE_BUDGET_MS` from the start of the phase
-//! and never past the street deadline (ruling 10-pre1: the shared 500 ms cache budget of spec 7; the watchdog never
-//! asks the cache, and a lookup that holds `engine-main` to its bound cannot delay the watchdog's `Final`). The suit
-//! permutation of every key is `cache_bridge::canonical_perm`'s over the public root ranges (hero's cards enter no
-//! key). A hit at the request's raw target is its `Final` (`cache_exact` or `cache_approximate` snapshot, registered
-//! through `finish` like a live one), with no live solve. An above-target hit is its `Provisional` while a live solve
-//! refines it: the `Provisional` is accepted under the identity lock like any event, and in that same accepted delivery
-//! its `cache_provisional` snapshot is registered (`replay_bridge::register_accepted`: a `Provisional` never replaces a
-//! `Final`) and its payload, promoted to `Final`, is retained for the watchdog (`set_retained`), so a watchdog `Final`
-//! delivers exactly it. A decision already superseded, or whose `Final` the watchdog already delivered, gets no
-//! `Provisional` and registers nothing. The live refinement's `Final` replaces the `Provisional` unless the retained hit
-//! is more accurate (raw) or the refinement failed: that `Final` is then the retained payload, disclosing both
-//! accuracies. A lookup miss changes nothing but the label; only a lookup that ran out of its budget is disclosed in the
-//! notes. The live terminal of a flop or turn solve (the tree actually solved: the `_min` retry's when it answered) is
-//! stored through the non-blocking `Cache::store` once its `Final` is delivered; an entry the cache refuses is logged
-//! (`EngineCore::log_cache_reject`) and never affects delivery. River solves are never stored.
+//! run on `engine-main`, inside the request's own budget: one absolute cutoff, `CACHE_BUDGET_MS` from the start of the
+//! phase or the street deadline when that comes first, with the time left read again immediately before each lookup
+//! and no probe started once the cutoff has passed (ruling 10-pre1: the shared 500 ms cache budget of spec 7; review
+//! P4T10-I4). The watchdog never asks the cache, and a lookup that holds `engine-main` to its bound cannot delay the
+//! watchdog's `Final`. The suit permutation of every key is `cache_bridge::canonical_perm`'s over the public root ranges
+//! (hero's cards enter no key).
+//!
+//! A hit at the request's raw target is its `Final` (`cache_exact` or `cache_approximate` snapshot, registered through
+//! `finish` like a live one), with no live solve. An above-target hit is its `Provisional` while a live solve refines
+//! it; its coverage discloses its accuracy shortfall (`DeadlineBestSoFar` at the stored raw accuracy against the
+//! request's target, review P4T10-I1). Every cache result lists the translations and mappings of its complete coverage
+//! in its assumptions (P4T10-I3). The `Provisional` is accepted under the identity lock like any event, and in that
+//! same accepted delivery its `cache_provisional` snapshot is registered (`replay_bridge::register_accepted`: a
+//! `Provisional` never replaces a `Final`) and its payload, promoted to `Final`, is retained for the watchdog
+//! (`set_retained`), so a watchdog `Final` delivers exactly it. A decision already superseded, or whose `Final` the
+//! watchdog already delivered, gets no `Provisional` and registers nothing. The live refinement's `Final` replaces the
+//! `Provisional` unless the retained hit is more accurate (raw) or the refinement failed: that `Final` is then the
+//! retained payload with its own coverage (P4T10-I2: nothing of the discarded live solve), its note disclosing both
+//! accuracies. A lookup miss changes nothing but the label; only a lookup that ran out of its budget, or was never made
+//! because the budget was spent, is disclosed in the notes. The live terminal of a flop or turn solve (the tree
+//! actually solved: the `_min` retry's when it answered) is stored through the non-blocking `Cache::store` once its
+//! `Final` is delivered; an entry the cache refuses is logged (`EngineCore::log_cache_reject`) and never affects
+//! delivery. River solves are never stored.
 //!
 //! Identity (ruling 28-I1). Every event goes through `deliver` (`emit` for the crate): it is accepted under the
 //! identity lock, where a decision no longer active is refused and a `Final` claims the request's once-only delivery,
@@ -570,12 +577,14 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     let mut retained: Option<Retained> = None;
     if matches!(root.street, Street::Flop | Street::Turn) {
         perm = canonical_perm(&root.board, &ranges.oop, &ranges.ip);
-        let (route, probes) = cache_phase(core, hooks, &root, [&ranges.oop, &ranges.ip], &d, &req.state, &inherited, &perm, template, target_bp,
+        let (route, probes, unasked) = cache_phase(core, hooks, &root, [&ranges.oop, &ranges.ip], &d, &req.state, &inherited, &perm, template, target_bp,
             deadlines.street_deadline_ms);
         assumptions.cache = cache_label_for(&probes);
-        // A lookup that ran out of its budget is the one miss disclosed: the cache was too slow, not empty.
-        assumptions.notes.extend(probes.iter().filter(|p| p.result == Lookup::Miss { reason: MissReason::BudgetExhausted }).map(|p| {
-            format!("cache lookup of {} missed: it ran out of the {CACHE_BUDGET_MS} ms cache budget", p.template_id)
+        // A lookup that ran out of its budget, or was never made because the phase's budget was spent (review P4T10-I4),
+        // is the one miss disclosed: the cache was too slow, not empty.
+        let spent = probes.iter().filter(|p| p.result == Lookup::Miss { reason: MissReason::BudgetExhausted }).map(|p| p.template_id.as_str()).chain(unasked.iter().map(String::as_str));
+        assumptions.notes.extend(spent.map(|t| {
+            format!("cache lookup of {t} missed: the cache phase's budget ({CACHE_BUDGET_MS} ms, never past the street deadline) was spent")
         }));
         *lock(&watch.fallback) = deadline_fallback(&ctx, &inherited, &assumptions);
         let cached = Cached { root: &root, ranges: &ranges, ctx: &ctx, hero_public, hero_actor, target_bp };
@@ -595,13 +604,16 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
                 return;
             }
             CacheRoute::Refine { retained: Some(ProvisionalHit { hit, reasons }) } => {
-                // An above-target hit: the `Provisional`, labelled here (never `Exact`: its raw accuracy missed the
-                // target), refined by the live solve below.
+                // An above-target hit: the `Provisional`, labelled here, refined by the live solve below. Its raw accuracy
+                // missed the request's target (the lookup's raw comparison), so its coverage is never `Exact`: the lookup's
+                // own reasons, the inherited ones, and the shortfall itself (review P4T10-I1, ruling 10-Q2), which the
+                // cache label layer never synthesizes.
                 let probe = probe_of(&probes, &hit);
                 let mut provisional = assumptions.clone();
                 provisional.template_id = probe.template_id.clone();
                 provisional.tree_signature = probe.signature.clone();
-                let rec = cached.recommendation(core, req, &hit, assemble::accumulate(Coverage::Approximate { reasons }, inherited.clone()), &provisional, Phase::Provisional);
+                let incurred = inherited.iter().cloned().chain([accuracy_shortfall(hit.raw_exploitability_over_p, target_bp)]).collect();
+                let rec = cached.recommendation(core, req, &hit, assemble::accumulate(Coverage::Approximate { reasons }, incurred), &provisional, Phase::Provisional);
                 let snapshot = cached.snapshot(req, &hit, "cache_provisional", coverage_reasons(&rec.coverage));
                 let mut promoted = rec.clone();
                 promoted.phase = Phase::Final;
@@ -620,7 +632,7 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
             let logged = Logged::unsolved(root.street, Some(street_deadline.clone()), range_hashes);
             // A retained cache payload is a validated solution: it answers when no live refinement can start.
             let candidate = match &retained {
-                Some(r) => Cached { root: &root, ranges: &ranges, ctx: &ctx, hero_public, hero_actor, target_bp }.retained_final(core, req, r, vec![],
+                Some(r) => Cached { root: &root, ranges: &ranges, ctx: &ctx, hero_public, hero_actor, target_bp }.retained_final(core, req, r,
                     format!("live refinement could not start ({}); the retained cache payload {:.6} is delivered", miss_cause(&reason), r.hit.raw_exploitability_over_p), false),
                 None => Candidate::missed(assemble::unsupported(&ctx, reason.clone(), inherited, assumptions), miss_for(&req.identity, &root, miss_cause(&reason))),
             };
@@ -675,8 +687,9 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
             .map_or_else(|| "unverified".to_string(), |sol| format!("exploitability <= {} bp", accuracy_bound_bp(sol.exploitability_chips, build.pot)));
         let best_so_far = out.terminal == Terminal::BestSoFar;
         // Plan 4 Task 10: a retained cache payload stays the `Final` when it is more accurate than the live refinement (raw,
-        // over each one's own pot) or when the refinement has no solution. Both accuracies are disclosed, and the reasons
-        // the refinement incurred accumulate onto the payload's.
+        // over each one's own pot) or when the refinement has no solution. It keeps its own coverage (review P4T10-I2,
+        // ruling 10-Q4): nothing of the discarded live solve is its reason; the note names both accuracies, and the
+        // deadline log keeps the refinement's own verdict.
         let live_over_p = out.solution.as_ref().map(|sol| f64::from(sol.exploitability_chips) / f64::from(build.pot));
         let keep = match (&retained, live_over_p) {
             (Some(r), Some(live)) if r.hit.raw_exploitability_over_p < live => Some(r),
@@ -687,14 +700,13 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
             let cached = Cached { root: &root, ranges: &ranges, ctx: &ctx, hero_public, hero_actor, target_bp };
             let raw = r.hit.raw_exploitability_over_p;
             match (&out.terminal, &out.solution) {
-                (Terminal::Ok | Terminal::BestSoFar, Some(sol)) => {
-                    let live = assemble::coverage_for_solve(sol.exploitability_chips, build.pot, target_bp, best_so_far, inherited.clone());
+                (Terminal::Ok | Terminal::BestSoFar, Some(_)) => {
                     let note = format!("live refinement reached raw {:.6}; the retained cache payload {raw:.6} is better", live_over_p.unwrap_or_default());
-                    cached.retained_final(core, req, r, coverage_reasons(&live), note, best_so_far)
+                    cached.retained_final(core, req, r, note, best_so_far)
                 }
                 (Terminal::Failed(reason), _) => {
                     let note = format!("live refinement failed ({}); the retained cache payload {raw:.6} is delivered", miss_cause(reason));
-                    cached.retained_final(core, req, r, vec![], note, false)
+                    cached.retained_final(core, req, r, note, false)
                 }
                 (terminal, _) => unreachable!("run_solve: a {terminal:?} outcome without its solution"),
             }
@@ -785,30 +797,36 @@ pub struct Probe {
 
 /// One probe: `template`'s effective tree at `root` (as the live solve would build it), the §10.4 query of the decision
 /// over the public root `ranges` (OOP then IP) with the request's inherited reasons, the shared suit permutation `perm`
-/// and the request's captured `target_bp`, answered by `Cache::lookup` within `budget` (itself bounded by
-/// `cache::lookup::LOOKUP_BOUND`). `None` when the template does not build at this root or the query cannot be formed
-/// (the live solve then answers as it would without the cache).
+/// and the request's captured `target_bp`, answered by `Cache::lookup` within what is left, on the engine clock, until
+/// the phase's absolute `cutoff_ms` (review P4T10-I4): read again immediately before the lookup, so the time the tree,
+/// signature and query took, or a stall of `engine-main`, is never given back to it (`Cache::lookup` further bounds
+/// it by `cache::lookup::LOOKUP_BOUND`; nothing left is a `BudgetExhausted` miss decided at once, before anything is
+/// posted). `None` when the template does not build at this root or the query cannot be formed (the live solve then
+/// answers as it would without the cache).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn probe_cache(core: &EngineCore, hooks: &Hooks, root: &StreetRootSnapshot, ranges: [&Range1326; 2], d: &Derived, state: &HandState,
-    inherited: &[ApproxReason], perm: &SuitPerm, template: &str, target_bp: u16, budget: Duration) -> Option<Probe> {
+    inherited: &[ApproxReason], perm: &SuitPerm, template: &str, target_bp: u16, cutoff_ms: u64) -> Option<Probe> {
     let build = build_tree_full(root, &TemplateSelection::from_history(template, &root.history)).ok()?;
     let signature = tree_signature(&build.tree, build.pot);
     let input = SolveInput { root: root.clone(), ranges: [ranges[0].clone(), ranges[1].clone()], tree: build.tree.clone(), target_bp };
-    let query = make_cache_query(&input, d, state.config.bb_chips, &state.config.rake, inherited, &signature, perm, target_bp, budget).ok()?;
+    let mut query = make_cache_query(&input, d, state.config.bb_chips, &state.config.rake, inherited, &signature, perm, target_bp, Duration::ZERO).ok()?;
     if let Some(before_lookup) = &hooks.before_lookup {
         before_lookup();
     }
+    query.budget = Duration::from_millis(cutoff_ms.saturating_sub(core.clock.now_ms()));
     let result = core.cache.lookup(&query);
     Some(Probe { template_id: template.into(), tree: build.tree, signature, pot: build.pot, result })
 }
 
 /// §5 step 7 / §10.5: the decision's probes, the pre-solver's template first on the flop and then the live template when
-/// it is another, stopping at the first hit at target; every probe gets what is left of `CACHE_BUDGET_MS` from the
-/// start of the phase, and never more than what is left until the street deadline. Returns the route
-/// (`flop::choose_cache_route`) and the probes made. Runs on `engine-main` (ruling 10-pre1), holding no engine lock.
+/// it is another, stopping at the first hit at target. The phase has one absolute cutoff on the engine clock (review
+/// P4T10-I4): `CACHE_BUDGET_MS` from its start, or the street deadline when that comes first. A probe is never started
+/// once the cutoff has passed (no tree, signature or query is built for it), and each lookup gets only what is left
+/// until the cutoff when it is made. Returns the route (`flop::choose_cache_route`), the probes made and the templates
+/// never asked because the phase was spent. Runs on `engine-main` (ruling 10-pre1), holding no engine lock.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cache_phase(core: &EngineCore, hooks: &Hooks, root: &StreetRootSnapshot, ranges: [&Range1326; 2], d: &Derived, state: &HandState,
-    inherited: &[ApproxReason], perm: &SuitPerm, live_template: &str, target_bp: u16, street_deadline_ms: u64) -> (CacheRoute, Vec<Probe>) {
+    inherited: &[ApproxReason], perm: &SuitPerm, live_template: &str, target_bp: u16, street_deadline_ms: u64) -> (CacheRoute, Vec<Probe>, Vec<String>) {
     let mut order: Vec<&str> = Vec::new();
     if root.street == Street::Flop {
         order.push(PRESOLVER_TEMPLATE);
@@ -816,12 +834,14 @@ pub(crate) fn cache_phase(core: &EngineCore, hooks: &Hooks, root: &StreetRootSna
     if !order.contains(&live_template) {
         order.push(live_template);
     }
-    let start_ms = core.clock.now_ms();
-    let mut probes = Vec::new();
+    let cutoff_ms = core.clock.now_ms().saturating_add(CACHE_BUDGET_MS).min(street_deadline_ms);
+    let (mut probes, mut unasked) = (Vec::new(), Vec::new());
     for template in order {
-        let now = core.clock.now_ms();
-        let left = CACHE_BUDGET_MS.saturating_sub(now.saturating_sub(start_ms)).min(street_deadline_ms.saturating_sub(now));
-        let Some(probe) = probe_cache(core, hooks, root, ranges, d, state, inherited, perm, template, target_bp, Duration::from_millis(left)) else { continue };
+        if core.clock.now_ms() >= cutoff_ms {
+            unasked.push(template.to_string());
+            continue;
+        }
+        let Some(probe) = probe_cache(core, hooks, root, ranges, d, state, inherited, perm, template, target_bp, cutoff_ms) else { continue };
         let at_target = matches!(probe.result, Lookup::Exact { .. } | Lookup::Approximate { .. });
         probes.push(probe);
         if at_target {
@@ -829,7 +849,7 @@ pub(crate) fn cache_phase(core: &EngineCore, hooks: &Hooks, root: &StreetRootSna
         }
     }
     let route = choose_cache_route(probes.iter().map(|p| p.result.clone()).collect());
-    (route, probes)
+    (route, probes, unasked)
 }
 
 /// §4.4 `Assumptions.cache` (`miss | exact | approximate | provisional`, review m13) of a decision's probes: the label
@@ -846,6 +866,20 @@ pub fn cache_label_for(probes: &[Probe]) -> String {
         };
     }
     label.into()
+}
+
+/// §4.4 display: a raw exploitability over the pot in basis points, rounded, shown as `u16::MAX` above it (the bounded
+/// display conversion `assemble::coverage_for_solve` and the solve client use). Never compared with a target.
+fn display_bp(raw_over_p: f64) -> u16 {
+    let bp = (raw_over_p * 10_000.0).round();
+    if bp <= f64::from(u16::MAX) { bp as u16 } else { u16::MAX }
+}
+
+/// Review P4T10-I1 (ruling 10-Q2; spec 2, 7): the coverage reason of a cache hit served above the request's target, the
+/// stored raw accuracy it reached (`display_bp`) against the request's own target. Only the engine's delivery of a
+/// `Provisional` adds it; the cache's label layer never does.
+fn accuracy_shortfall(raw_over_p: f64, target_bp: u16) -> ApproxReason {
+    ApproxReason::DeadlineBestSoFar { reached_bp: display_bp(raw_over_p), target_bp }
 }
 
 /// The probe a route's hit came from: the one whose tree signature the hit carries (each probe asks a template of its
@@ -875,7 +909,9 @@ impl Cached<'_> {
     /// The result a cache hit answers with (§4.4, §10.4): hero's frequencies and EVs at the requested node of the hit's
     /// solution (rebuilt in the query's chips and suits), labelled `coverage`, in `phase`. The assumptions are `base`
     /// with the cache as the source, the hit's raw accuracy as an upper bound in bp and rounded for display, the hit's
-    /// notes (the realized menu, the source storage mode) and the elapsed time.
+    /// notes (the realized menu, the source storage mode), the elapsed time, and (review P4T10-I3; plan-3 F-I1, spec
+    /// 4.4, 10.4) `translations` and `mappings` rebuilt from the complete `coverage`, the stored entry's inherited reasons
+    /// included, with the one classification of a mapping (`preflop::is_mapping`), each reason once.
     fn recommendation(&self, core: &EngineCore, req: &LiveRequest, hit: &CacheHit, coverage: Coverage, base: &Assumptions, phase: Phase) -> Recommendation {
         let requested = hit.solution.requested as usize;
         let raw = hit.raw_exploitability_over_p;
@@ -884,9 +920,11 @@ impl Cached<'_> {
         a.source = format!("cache@{SOLVER_COMMIT}");
         // §4.4 vocabulary `"exploitability <= x"`, a true bound in bp over the raw stored value (ruling 28-I5).
         a.source_accuracy = format!("exploitability <= {} bp", (raw * 10_000.0).ceil() + 0.0);
-        let bp = (raw * 10_000.0).round();
-        a.reached_bp = Some(if bp <= f64::from(u16::MAX) { bp as u16 } else { u16::MAX });
+        a.reached_bp = Some(display_bp(raw));
         a.elapsed_ms = elapsed_ms(req.t0_ms, core.clock.now_ms());
+        let reasons = coverage_reasons(&coverage);
+        a.translations = reasons.iter().filter(|r| matches!(r, ApproxReason::BetTranslation { .. })).cloned().collect();
+        a.mappings = reasons.iter().filter(|r| crate::preflop::is_mapping(r)).cloned().collect();
         a.notes.extend(hit.notes.iter().cloned());
         let reach = assemble::hero_reach(&hit.solution.nodes, &hit.covered_paths, requested, self.hero_public, self.hero_actor);
         let mut rec = assemble::final_from_solution(self.ctx, &hit.solution.nodes[requested], &reach, coverage, a);
@@ -903,13 +941,14 @@ impl Cached<'_> {
         snapshot_from_solution(&req.identity, &input, &hit.solution, hit.covered_paths.clone(), hit.tree_signature.clone(), origin, reasons)
     }
 
-    /// The `Final` of a retained cache payload (plan 4 Task 10): the promoted `Provisional`, with the reasons the live
-    /// refinement incurred accumulated onto it, `note` disclosing the refinement's own outcome and the elapsed time now;
-    /// its `cache_provisional` snapshot registered again with the `Final` (the same decision's, so it replaces the
-    /// `Provisional`'s), carrying the `Final`'s full coverage reasons. `best_so_far` is the refinement's.
-    fn retained_final(&self, core: &EngineCore, req: &LiveRequest, r: &Retained, incurred: Vec<ApproxReason>, note: String, best_so_far: bool) -> Candidate {
+    /// The `Final` of a retained cache payload (plan 4 Task 10): the promoted `Provisional` with its own coverage (review
+    /// P4T10-I2, ruling 10-Q4: the payload's reasons, its accuracy shortfall and the inherited ones, never a reason of the
+    /// discarded live solve), `note` disclosing the refinement's own outcome, and the elapsed time now; its
+    /// `cache_provisional` snapshot registered again with the `Final` (the same decision's, so it replaces the
+    /// `Provisional`'s), carrying the `Final`'s full coverage reasons. `best_so_far` is the refinement's, for the log's
+    /// street verdict only.
+    fn retained_final(&self, core: &EngineCore, req: &LiveRequest, r: &Retained, note: String, best_so_far: bool) -> Candidate {
         let mut rec = r.promoted.clone();
-        rec.coverage = assemble::accumulate(rec.coverage, incurred);
         rec.assumptions.notes.push(note);
         rec.assumptions.elapsed_ms = elapsed_ms(req.t0_ms, core.clock.now_ms());
         let snapshot = self.snapshot(req, &r.hit, "cache_provisional", coverage_reasons(&rec.coverage));

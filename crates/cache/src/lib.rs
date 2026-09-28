@@ -187,7 +187,29 @@ pub struct Cache {
     /// The byte budget the writer enforces (`open`'s `quota_bytes`; 0 for a disabled handle).
     quota_bytes: u64,
     skipped: std::sync::atomic::AtomicBool,
+    /// Test seam (feature `testing`, `with_logical_clock`): the clock a lookup deadline is measured on, when a test
+    /// supplies one; `None` measures it on the real clock, as every production handle does.
+    #[cfg(feature = "testing")]
+    logical: Option<LogicalClock>,
 }
+
+/// The channel a posted lookup's prepared outcome comes back on, with the request's token.
+type Reply = std::sync::mpsc::Receiver<(u64, crate::lookup::Prepared)>;
+
+/// Test seam (feature `testing`; plan 4 Task 10 fix round 1, review P4T10-I5): a test's logical clock, in
+/// milliseconds, that `Cache::with_logical_clock` measures a lookup's deadline on (the engine's fake clock, say).
+#[cfg(feature = "testing")]
+pub type LogicalClock = std::sync::Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Test seam (feature `testing`): how long a lookup on a logical clock waits, in wall time, for a reply before it gives
+/// up as `BudgetExhausted` all the same -- a liveness allowance for a reader that never answers, never a condition on
+/// the lookup's logical deadline.
+#[cfg(feature = "testing")]
+pub const LOGICAL_LIVENESS: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The slice a lookup on a logical clock waits in before it reads that clock again.
+#[cfg(feature = "testing")]
+const LOGICAL_SLICE: std::time::Duration = std::time::Duration::from_millis(5);
 
 impl Cache {
     /// A handle that stores nothing and serves nothing: every lookup is a miss and every store is
@@ -204,7 +226,23 @@ impl Cache {
             warning: None,
             quota_bytes: 0,
             skipped: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "testing")]
+            logical: None,
         }
+    }
+
+    /// Test seam (feature `testing`; plan 4 Task 10 fix round 1, review P4T10-I5): this handle measures every lookup's
+    /// deadline on `clock` instead of the real clock. The deadline is still `min(budget, LOOKUP_BOUND)` from the
+    /// lookup's entry, now in `clock`'s milliseconds, so the query budget and the bound stay one coherent limit: a zero
+    /// budget is spent at once, and a lookup whose logical deadline passes before its reply is accepted is a
+    /// `BudgetExhausted` miss. Wall time the reader spends is not logical time, so a test that holds its clock still is
+    /// never refused on the machine's load; the reader works to a wall deadline of `LOGICAL_LIVENESS` (a liveness
+    /// allowance only). Everything else is the production lookup: the same reader, cells on disk, selection,
+    /// reconstruction, labelling and touch. No production handle has a logical clock.
+    #[cfg(feature = "testing")]
+    pub fn with_logical_clock(mut self, clock: LogicalClock) -> Cache {
+        self.logical = Some(clock);
+        self
     }
 
     /// The disabled handle `open` falls back to, carrying the reason for the startup banner.
@@ -378,28 +416,29 @@ impl Cache {
     /// touched (a nonblocking writer command) so eviction sees it as fresh.
     ///
     /// Every miss carries its `MissReason`. An ordinary query mismatch never deletes anything;
-    /// only `read_cell` deletes, and only a file that fails `decode`/`validate_entry`. The caller
-    /// runs this on the request's own `fast-path` work, never on `watchdog` or `engine-main`.
+    /// only `read_cell` deletes, and only a file that fails `decode`/`validate_entry`.
+    ///
+    /// Caller (plan 4 Task 10, ruling 10-pre1): the engine's `serve_request` calls this on
+    /// `engine-main`, within the decision's shared cache budget (at most 500 ms for all its lookups
+    /// together, spec 7) and never past its street deadline, the time left read again immediately
+    /// before each call; the watchdog never calls it. `LOOKUP_BOUND` caps any one call whatever
+    /// budget it is given.
     pub fn lookup(&self, q: &crate::lookup::CacheQuery) -> crate::lookup::Lookup {
-        use crate::lookup::{Lookup, MissReason, ReadCommand};
+        use crate::lookup::{Lookup, MissReason};
         let miss = |reason| Lookup::Miss { reason };
         if q.budget.is_zero() {
             return miss(MissReason::BudgetExhausted);
         }
-        let deadline = std::time::Instant::now() + q.budget.min(crate::lookup::LOOKUP_BOUND);
-        let Some(reader) = self.reader.as_ref() else { return miss(MissReason::ReaderUnavailable) };
-        if self.reader_state.stop.load(std::sync::atomic::Ordering::SeqCst) {
-            return miss(MissReason::ReaderUnavailable);
+        let allowance = q.budget.min(crate::lookup::LOOKUP_BOUND);
+        #[cfg(feature = "testing")]
+        if let Some(clock) = &self.logical {
+            return self.lookup_logical(q, allowance, clock);
         }
-        let token = self.next_token.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let b = q.key.spr_bucket;
-        let keys = [q.key.at_bucket(b.saturating_sub(1)).digest(), q.key.digest(), q.key.at_bucket(b.saturating_add(1)).digest()];
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        match reader.try_send(ReadCommand::Serve { token, keys, deadline, query: Box::new(q.clone()), reply: tx }) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full(_)) => return miss(MissReason::QueueFull),
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return miss(MissReason::ReaderUnavailable),
-        }
+        let deadline = std::time::Instant::now() + allowance;
+        let (token, rx) = match self.post(q, deadline) {
+            Ok(posted) => posted,
+            Err(reason) => return miss(reason),
+        };
         #[cfg(test)]
         seams::fire(&self.root, seams::Point::Receive);
         let (replied, prepared) = match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
@@ -410,14 +449,73 @@ impl Cache {
         if std::time::Instant::now() >= deadline {
             return miss(MissReason::BudgetExhausted);
         }
+        self.accept_reply(token, replied, prepared)
+    }
+
+    /// Posts one `ReadCommand::Serve` for `q` with the reader deadline `deadline` (`lookup`'s steps after the zero-budget
+    /// check): the token and the reply channel, or why nothing was posted.
+    fn post(&self, q: &crate::lookup::CacheQuery, deadline: std::time::Instant) -> Result<(u64, Reply), crate::lookup::MissReason> {
+        use crate::lookup::{MissReason, ReadCommand};
+        let Some(reader) = self.reader.as_ref() else { return Err(MissReason::ReaderUnavailable) };
+        if self.reader_state.stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(MissReason::ReaderUnavailable);
+        }
+        let token = self.next_token.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let b = q.key.spr_bucket;
+        let keys = [q.key.at_bucket(b.saturating_sub(1)).digest(), q.key.digest(), q.key.at_bucket(b.saturating_add(1)).digest()];
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        match reader.try_send(ReadCommand::Serve { token, keys, deadline, query: Box::new(q.clone()), reply: tx }) {
+            Ok(()) => Ok((token, rx)),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => Err(MissReason::QueueFull),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(MissReason::ReaderUnavailable),
+        }
+    }
+
+    /// A reply received inside its deadline: the request's own is accepted (a hit is touched, so eviction sees it as
+    /// fresh); another token's is `ReaderUnavailable`.
+    fn accept_reply(&self, token: u64, replied: u64, prepared: crate::lookup::Prepared) -> crate::lookup::Lookup {
         if replied != token {
-            return miss(MissReason::ReaderUnavailable);
+            return crate::lookup::Lookup::Miss { reason: crate::lookup::MissReason::ReaderUnavailable };
         }
         if let Some((key, payload_digest)) = prepared.touch {
             let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
             self.touch(key, payload_digest, now_ms);
         }
         prepared.outcome
+    }
+
+    /// `lookup` on a logical clock (`with_logical_clock`): the deadline is `clock() + allowance`, read on `clock`
+    /// before the wait, between wait slices and once a reply has arrived; the reader works to a wall deadline of
+    /// `LOGICAL_LIVENESS`, which only a reader that never answers reaches (`BudgetExhausted`).
+    #[cfg(feature = "testing")]
+    fn lookup_logical(&self, q: &crate::lookup::CacheQuery, allowance: std::time::Duration, clock: &LogicalClock) -> crate::lookup::Lookup {
+        use crate::lookup::{Lookup, MissReason};
+        let miss = |reason| Lookup::Miss { reason };
+        let logical_deadline = clock().saturating_add(u64::try_from(allowance.as_millis()).unwrap_or(u64::MAX));
+        let wall_deadline = std::time::Instant::now() + LOGICAL_LIVENESS;
+        let (token, rx) = match self.post(q, wall_deadline) {
+            Ok(posted) => posted,
+            Err(reason) => return miss(reason),
+        };
+        loop {
+            if clock() >= logical_deadline {
+                return miss(MissReason::BudgetExhausted);
+            }
+            match rx.recv_timeout(LOGICAL_SLICE) {
+                Ok((replied, prepared)) => {
+                    if clock() >= logical_deadline {
+                        return miss(MissReason::BudgetExhausted);
+                    }
+                    return self.accept_reply(token, replied, prepared);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if std::time::Instant::now() >= wall_deadline {
+                        return miss(MissReason::BudgetExhausted);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return miss(MissReason::ReaderUnavailable),
+            }
+        }
     }
 
     fn send(&self, command: WriteCommand) {
@@ -838,6 +936,45 @@ mod tests {
         assert_eq!(last_hit_on_disk(&dir, &e), before, "a discarded hit is never touched");
         q.budget = std::time::Duration::from_secs(5);
         assert!(matches!(cache.lookup(&q), Lookup::Exact { .. }), "the next request is served");
+        drop(cache);
+    }
+
+    /// Plan 4 Task 10 fix round 1 (review P4T10-I5): a handle on a logical clock
+    /// (`with_logical_clock`) measures its lookup deadline, `min(budget, LOOKUP_BOUND)` from entry, on
+    /// that clock alone. Wall time the reader spends (a 700 ms stall, past the 500 ms bound) is not
+    /// logical time, so the stored entry is served; the logical clock reaching the deadline while
+    /// the reader works is a `BudgetExhausted` miss, whichever of the query budget and the bound is
+    /// the smaller; a zero budget is spent at once.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_logical_lookup_deadline_is_measured_on_the_logical_clock_alone() {
+        use crate::lookup::{Lookup, MissReason, Stage};
+        use seams::Point;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = test_dir::TempDir::new("logical-deadline");
+        let (cache, e) = opened_with_fixture(&dir);
+        let now = std::sync::Arc::new(AtomicU64::new(1_000));
+        let read = now.clone();
+        let cache = cache.with_logical_clock(std::sync::Arc::new(move || read.load(Ordering::SeqCst)));
+        let mut q = root_query(&e);
+        q.budget = std::time::Duration::from_millis(500);
+        seams::arm(dir.path(), Point::Gate(Stage::Select), || std::thread::sleep(std::time::Duration::from_millis(700)));
+        assert!(matches!(cache.lookup(&q), Lookup::Exact { .. }), "the reader's wall time is not logical time");
+        // The logical clock moves while the reader works: `advance` ms after the lookup's entry.
+        let lookup_after = |budget_ms: u64, advance: u64| {
+            let (start, moved) = (now.load(Ordering::SeqCst), now.clone());
+            seams::arm(dir.path(), Point::Gate(Stage::Select), move || moved.store(start + advance, Ordering::SeqCst));
+            let mut q = root_query(&e);
+            q.budget = std::time::Duration::from_millis(budget_ms);
+            cache.lookup(&q)
+        };
+        assert_eq!(lookup_after(100, 100), Lookup::Miss { reason: MissReason::BudgetExhausted }, "the query budget is spent");
+        assert!(matches!(lookup_after(100, 99), Lookup::Exact { .. }), "one millisecond is left of the query budget");
+        assert_eq!(lookup_after(5_000, 500), Lookup::Miss { reason: MissReason::BudgetExhausted }, "the 500 ms bound caps a larger budget");
+        assert!(matches!(lookup_after(5_000, 499), Lookup::Exact { .. }), "one millisecond is left of the bound");
+        let mut spent = root_query(&e);
+        spent.budget = std::time::Duration::ZERO;
+        assert_eq!(cache.lookup(&spent), Lookup::Miss { reason: MissReason::BudgetExhausted }, "a zero budget is spent at once");
         drop(cache);
     }
 

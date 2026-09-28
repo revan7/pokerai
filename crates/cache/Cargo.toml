@@ -11,6 +11,9 @@ description = "Canonical cache keys, on-disk street-solution store and backgroun
 typescript = ["dep:ts-rs"]
 # Exhaustive suites (spec section 5 / CLAUDE.md section 5): not part of the default gate.
 exhaustive = []
+# Test seam (plan 4 Task 10 fix round 1, P4T10-I5): `Cache::with_logical_clock`, a lookup deadline measured on a test's
+# logical clock. The engine's `testing` feature forwards it; no production build enables it.
+testing = []
 
 [dependencies]
 proto = { path = "../proto" }

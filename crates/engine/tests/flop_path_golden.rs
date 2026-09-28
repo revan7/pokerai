@@ -389,7 +389,7 @@ fn deadline_best_so_far_labelling() {
     let provisional = second.provisionals()[0];
     assert_eq!((provisional.phase, &provisional.identity), (Phase::Provisional, &second.id));
     assert_eq!((provisional.assumptions.cache.as_str(), provisional.assumptions.reached_bp), ("provisional", Some(190)));
-    assert!(matches!(provisional.coverage, Coverage::Approximate { .. }), "an above-target hit is never Exact: {:?}", provisional.coverage);
+    assert_eq!(provisional.coverage, Coverage::Approximate { reasons: vec![bsf(190)] }, "an above-target hit discloses its shortfall, never Exact (P4T10-I1)");
     assert!(every_ev(provisional));
     assert_eq!(rig.solves().len(), 2, "the Provisional is refined by a live solve");
     let refined = second.final_rec();
@@ -592,6 +592,7 @@ fn the_watchdog_delivers_the_promoted_provisional_at_its_fire() {
     let mut promoted = served.provisionals()[0].clone();
     promoted.phase = Phase::Final;
     assert_eq!(served.final_rec(), &promoted, "the watchdog's Final is the retained Provisional, promoted");
+    assert_eq!(promoted.coverage, Coverage::Approximate { reasons: vec![ApproxReason::ChartRounded, bsf(190)] }, "with the Provisional's shortfall (P4T10-I1)");
     assert_eq!(rig.origins(), vec![(Street::Flop, "cache_provisional".to_string(), served.id.decision_id)]);
     rig.core.shutdown();
 }
@@ -611,6 +612,157 @@ fn a_stored_solution_is_served_back_in_the_querys_own_suits() {
     let hit = rig.serve(&flop);
     assert_eq!((hit.final_rec().assumptions.cache.as_str(), rig.solves().len()), ("exact", 1), "the repeated request is a hit");
     assert_eq!(hit.final_rec().actions, live.final_rec().actions, "hero's own row, in the query's suits");
+    rig.core.shutdown();
+}
+
+// ===================== fix round 1 (review P4T10-I1..I4) =====================
+
+/// Every reason a result's coverage lists, whatever its label.
+fn reasons_of(rec: &Recommendation) -> Vec<ApproxReason> {
+    match &rec.coverage {
+        Coverage::Exact => vec![],
+        Coverage::Approximate { reasons } => reasons.clone(),
+        Coverage::Unsupported { partial, .. } => partial.clone(),
+    }
+}
+
+/// A translation and a mapping no request of the rig incurs (its root ranges are explicit): only a stored entry can
+/// bring them.
+fn cache_only_reasons() -> (ApproxReason, ApproxReason) {
+    let translation = ApproxReason::BetTranslation { street: Street::Preflop, seat: BTN, observed_pct: 0.73, mapped: vec![(0.5, 0.468), (1.0, 0.532)], deviation: 0.23,
+        prominent: true };
+    let mapping = ApproxReason::RakeProfileMapped { actual: "PotRake 5% capped at 5 chips".into(), used: "undocumented chart rake".into() };
+    (translation, mapping)
+}
+
+/// Review P4T10-I1 (ruling 10-Q2; spec 2, 7, 10.4): an above-target hit discloses its accuracy shortfall in its
+/// coverage, `DeadlineBestSoFar { reached_bp: the stored raw exploitability over P in bp, rounded, target_bp: the
+/// request's }`, merged with the lookup's own reasons. The raw comparison, never the rounded value, makes it a
+/// Provisional: a stored 0.005049 is 50 bp once rounded and still misses the 50 bp target (spec 10.4's own example). The
+/// same coverage is the registered snapshot's and the retained payload's (here the refinement fails, so the retained
+/// payload is the Final).
+#[test]
+fn a_provisional_discloses_its_accuracy_shortfall_in_its_coverage() {
+    let pre = engine::flop::PRESOLVER_TEMPLATE;
+    for (seed, expected) in [
+        (Seed::exact(pre).raw(0.019), vec![bsf(190)]),
+        (Seed::exact(pre).raw(0.005049).reasons(vec![ApproxReason::ChartRounded]), vec![ApproxReason::ChartRounded, bsf(50)]),
+    ] {
+        let flop = support::srp_flop(SB);
+        let mut rig = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 0.0, "no_iteration"));
+        rig.seed(&[seed.clone()]);
+        let served = rig.serve(&flop);
+        assert_eq!(served.kinds(), ["Fast", "Provisional", "Final"], "{seed:?}");
+        let provisional = served.provisionals()[0];
+        assert_eq!((provisional.coverage.clone(), provisional.assumptions.cache.as_str()), (Coverage::Approximate { reasons: expected.clone() }, "provisional"), "{seed:?}");
+        assert_eq!(served.final_rec().coverage, provisional.coverage, "{seed:?}: the retained payload keeps it");
+        let snapshots = rig.snapshots_of(served.id.decision_id);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!((snapshots[0].provenance.origin.as_str(), &snapshots[0].reasons), ("cache_provisional", &expected), "{seed:?}: the snapshot carries it");
+        rig.core.shutdown();
+    }
+}
+
+/// Review P4T10-I2 (ruling 10-Q4): a retained payload that beats the live refinement is served with its own coverage
+/// (its shortfall 190/50 and its stored `ChartRounded`) and nothing of the discarded live solve: neither the `Final` nor
+/// its rebuilt snapshot carries the live best_so_far's 300/50. The live attempt stays disclosed in the note, naming both
+/// raw accuracies, and in the deadline log.
+#[test]
+fn a_retained_payload_keeps_its_own_coverage_over_a_worse_live_result() {
+    let flop = support::srp_flop(SB);
+    let mut rig = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 3.0, "best_so_far"));
+    rig.seed(&support::provisional_route());
+    let served = rig.serve(&flop);
+    let f = served.final_rec();
+    let own = vec![ApproxReason::ChartRounded, bsf(190)];
+    assert_eq!(f.coverage, Coverage::Approximate { reasons: own.clone() });
+    let snapshots = rig.snapshots_of(served.id.decision_id);
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!((snapshots[0].provenance.origin.as_str(), &snapshots[0].reasons), ("cache_provisional", &own));
+    assert!(!reasons_of(f).contains(&bsf(300)) && !snapshots[0].reasons.contains(&bsf(300)), "the discarded live solve's accuracy is nobody's reason");
+    let note = f.assumptions.notes.iter().find(|n| n.starts_with("live refinement")).expect("the live attempt is disclosed");
+    assert!(note.contains("0.030000") && note.contains("0.019000"), "{note}");
+    let records = rig.records();
+    assert_eq!((records.len(), &records[0].coverage, records[0].street_violation), (1, &f.coverage, true), "the deadline log keeps the live best_so_far's verdict");
+    rig.core.shutdown();
+}
+
+/// Review P4T10-I3 (plan-3 F-I1; spec 4.4, 10.4): a cache result lists every translation and mapping of its complete
+/// coverage in `assumptions.translations` / `assumptions.mappings`, the ones its stored entry brings included, on the
+/// at-target `Final`, the `Provisional`, the retained `Final` and the watchdog's promotion alike.
+#[test]
+fn cache_results_list_the_entrys_translations_and_mappings() {
+    let pre = engine::flop::PRESOLVER_TEMPLATE;
+    let (translation, mapping) = cache_only_reasons();
+    let both = vec![translation.clone(), mapping.clone()];
+    let lists = |r: &Recommendation| (r.assumptions.translations.clone(), r.assumptions.mappings.clone());
+    let expected = (vec![translation.clone()], vec![mapping.clone()]);
+    let flop = support::srp_flop(SB);
+    // The at-target Final.
+    let mut rig = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 0.4, "ok"));
+    rig.seed(&[Seed::exact(pre).reasons(both.clone())]);
+    let hit = rig.serve(&flop);
+    assert_eq!((hit.final_rec().assumptions.cache.as_str(), lists(hit.final_rec())), ("approximate", expected.clone()), "the at-target cache Final");
+    rig.core.shutdown();
+    // The Provisional and the retained Final.
+    let mut rig = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 0.0, "no_iteration"));
+    rig.seed(&[Seed::exact(pre).raw(0.019).reasons(both.clone())]);
+    let retained = rig.serve(&flop);
+    assert_eq!(lists(retained.provisionals()[0]), expected, "the Provisional");
+    assert_eq!(lists(retained.final_rec()), expected, "the retained Final");
+    rig.core.shutdown();
+    // The watchdog's promotion.
+    let mut rig = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 5.0, "best_so_far"));
+    rig.seed(&[Seed::exact(pre).raw(0.019).reasons(both)]);
+    let (clock, ended) = (rig.clock.clone(), rig.core.watchdog.ended_threads());
+    let promoted = rig.serve_with(&flop, ServeSeams { before_claim: seam(move || { clock.set_ms(14_900); ended.wait_for(1); }), ..ServeSeams::default() });
+    assert_eq!(promoted.final_rec().phase, Phase::Final);
+    assert_eq!(lists(promoted.final_rec()), expected, "the watchdog's promotion");
+    rig.core.shutdown();
+}
+
+/// The budget notes a result carries.
+fn budget_notes(rec: &Recommendation) -> Vec<String> {
+    rec.assumptions.notes.iter().filter(|n| n.starts_with("cache lookup of")).cloned().collect()
+}
+
+/// Review P4T10-I4 (spec 7; ruling 10-pre1): the cache phase's cutoff is absolute, the earlier of 500 ms from its
+/// start and the street deadline, and the time left is read again immediately before each lookup. A lookup reached
+/// past the phase cutoff serves nothing even with an exact entry stored, and no later probe is started (V3 admitted:
+/// the flop_min_v1 probe never reaches its lookup); a lookup reached past the street deadline serves nothing either.
+/// Both are disclosed as a spent budget, and the decision is answered without the cache.
+#[test]
+fn a_lookup_reached_past_the_cache_cutoff_serves_no_hit() {
+    let pre = engine::flop::PRESOLVER_TEMPLATE;
+    let flop = support::srp_flop(SB);
+    // Past the 500 ms phase cutoff (the phase starts at 0 ms).
+    let mut rig = FlopRig::new(support::live_script(&flop, "flop_min_v1", 0.4, "ok"));
+    rig.core.flop_policy = ADMITTED;
+    rig.seed(&[Seed::exact(pre), Seed::exact("flop_min_v1")]);
+    let (clock, lookups) = (rig.clock.clone(), Arc::new(std::sync::atomic::AtomicU32::new(0)));
+    let counted = lookups.clone();
+    let past_phase = seam(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        clock.set_ms(501);
+    });
+    let served = rig.serve_with(&flop, ServeSeams { before_lookup: past_phase, ..ServeSeams::default() });
+    let f = served.final_rec();
+    assert_eq!((f.assumptions.cache.as_str(), f.assumptions.source.starts_with("solver-worker@")), ("miss", true), "no hit past the phase cutoff");
+    assert_eq!(lookups.load(std::sync::atomic::Ordering::SeqCst), 1, "no probe is started once the phase is spent");
+    assert_eq!(budget_notes(f).len(), 2, "both templates' lookups are disclosed as a spent budget: {:?}", f.assumptions.notes);
+    assert_eq!(rig.origins(), vec![(Street::Flop, "live".to_string(), served.id.decision_id)]);
+    rig.core.shutdown();
+    // Past the street deadline (the request was admitted at 0 ms and served at 9 900 ms: the street cutoff, 10 000 ms,
+    // comes before the phase's 10 400 ms).
+    let mut rig = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 0.4, "ok"));
+    rig.seed(&[Seed::exact(pre)]);
+    let clock = rig.clock.clone();
+    let past_street = seam(move || clock.set_ms(10_000));
+    let served = rig.serve_at(&flop, 9_900, ServeSeams { before_lookup: past_street, ..ServeSeams::default() });
+    let f = served.final_rec();
+    assert_eq!(f.assumptions.cache, "miss", "no hit past the street deadline: {:?}", f.coverage);
+    assert!(!f.assumptions.source.starts_with("cache@") && budget_notes(f).len() == 1, "{:?}", f.assumptions);
+    assert!(rig.origins().iter().all(|(_, origin, _)| !origin.starts_with("cache")), "{:?}", rig.origins());
     rig.core.shutdown();
 }
 

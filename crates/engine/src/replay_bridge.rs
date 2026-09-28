@@ -47,8 +47,10 @@
 //! public root ranges, hashed by `hash_scaled`; the street root and its history, the solved prefix; the tree the solution
 //! was validated on). The crate-private `register_accepted` is the one registration rule: `SnapshotStore::register`'s
 //! identity gate, and a `Provisional` that never replaces the `Final` of the same decision and street. `serve` applies
-//! it inside the accepted delivery of the engine's own `Final` (live `ok` and `best_so_far`), and
-//! `Engine::register_snapshot` applies it for plan 4's cache route.
+//! it inside the accepted delivery of the engine's own `Final` (`finish`: live `ok` and `best_so_far`, and plan 4's cache
+//! hits at target and retained cache payloads) and of a cache `Provisional` (`deliver_provisional`), each under the
+//! identity lock that accepts the delivery. `Engine::register_snapshot` applies the same rule for a snapshot validated
+//! outside `serve`'s deliveries: the public registration seam, which the tests use.
 
 use crate::identity::IdentityState;
 use crate::ranges::{jointly_compatible, weights_valid, RangeSource, RootRanges};
@@ -249,8 +251,10 @@ pub fn snapshot_from_solution(id: &DecisionIdentity, input: &SolveInput, s: &Str
     }
 }
 
-/// Spec 9.2's one registration rule, applied by `serve` inside the accepted delivery of the engine's own `Final` and by
-/// `Engine::register_snapshot` (plan 4's cache route): `SnapshotStore::register` (only the `active` decision's snapshot,
+/// Spec 9.2's one registration rule, applied by `serve` inside the accepted delivery of the engine's own `Final`
+/// (`finish`, for live and cache Finals) and of a cache `Provisional` (`deliver_provisional`), and by
+/// `Engine::register_snapshot` (the public seam for a snapshot validated outside those deliveries, which the tests use):
+/// `SnapshotStore::register` (only the `active` decision's snapshot,
 /// the one its caller read as active under the identity lock; a later snapshot of the same decision and street replaces
 /// its earlier one), except that a `Provisional` never replaces a snapshot of the same decision and street that is not
 /// one (the engine permits only Provisional-then-Final). Returns whether `snapshot` was stored.
