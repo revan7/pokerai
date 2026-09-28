@@ -11,6 +11,7 @@ pub mod coverage;
 pub mod deadline;
 pub mod engine;
 pub mod equity;
+pub mod flop;
 pub mod identity;
 pub mod log;
 pub mod preflop;
