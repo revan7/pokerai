@@ -39,16 +39,18 @@
 //! assembly's. Charts carry `ChartRounded` and no EV (their EV absence says nothing about a later postflop EV: charts are
 //! incoming-range provenance there).
 //!
-//! # Two residual disclosures (Task 15 carry, rulings 15-I1 and 15-Q5)
+//! # Residual disclosures (Task 15 carry, rulings 15-I1, 15-Q5, 19-I1 and 19f-C3)
 //!
-//! The replay boundary discloses a cap residual as `BranchResidual{seat: hero, cause: "cap"}`, its share of the branch
-//! weights; the assembly adds `BranchResidual{seat: hero, cause: "missing node <key>"}`, hero's posterior share with no
-//! strategy, whenever `unresolved_mass > 0`. They are different disclosures and both are kept, deduplicated by value
-//! only, whenever a node is actually missing (a stopped branch, or a live branch without hero's node): the cap share and
-//! hero's unresolved share name different things. When the residual is the only positive-posterior branch without a
-//! node, no node is missing, and the assembly's wording would name a key whose node is present: that one reason is then
-//! not added, and a note says the unresolved share is the cap residual's. Nothing is lost: the cap reason stays, and
-//! hero's exact share stays on the `Final` as `unresolved_mass` and its "x% of the posterior has no strategy" note.
+//! Hero's unresolved share is disclosed by cause, the assembly's `BranchResidual`s (spec 8.4's vocabulary; ruling 19-I1):
+//! the cap residual's own share as `BranchResidual{seat: hero, cause: "cap"}` -- hero's posterior share on the residual
+//! branch, the mass without a strategy that drives the no-headline rule -- and the share of the positive-posterior
+//! branches whose key has no node (a stopped branch, or a live branch without hero's node) as `BranchResidual{seat: hero,
+//! cause: "missing node <key>"}`; the two shares sum to `unresolved_mass`, which the "x% of the posterior has no
+//! strategy" note renders once. The replay boundary also discloses the cap residual, as the residual's share of the
+//! branch weights; that figure is the `Fast`'s (and a watchdog `Final`'s) cap disclosure. At a preflop decision the
+//! `Final` carries one cap disclosure (ruling 19f-C3): where the assembly disclosed hero's cap share, the replay's hero
+//! cap reason is dropped as the two sets of reasons meet (`one_cap_disclosure`); every other reason is kept, each once by
+//! value. A postflop decision runs no assembly, so the replay's figure stands there.
 //!
 //! # The store (spec 8.2; Plan 5 stages the packaged charts into `Paths::preflop`)
 //!
@@ -70,7 +72,7 @@ use core_preflop::{
     PreflopSource, PreflopStore, SourceKind,
 };
 use core_ranges::{mass, range_to_string};
-use core_replay::{posterior, replay_decision, DecisionLookup, HistoryBranch, ReplayInput, ReplayOutput};
+use core_replay::{replay_decision, DecisionLookup, ReplayInput, ReplayOutput};
 use proto::{
     Action, ApproxReason, Assumptions, Coverage, HandState, LegalAction, Range1326, Recommendation, RecommendationEvent, Seat, Street, Unavailable,
     UnsupportedReason, COMBOS,
@@ -257,12 +259,9 @@ impl Replayed {
                 Err(reason) => return assemble::unsupported(ctx, reason, inherited, assumptions),
             }
         }
-        let MixedNode { actions, unresolved_mass, range_mix, mut reasons, notes, unsupported } = mix_nodes(branches, &nodes, state.hero, hero_combo, ctx.bb_chips);
-        if residual_alone(branches, &nodes, state.hero, hero_combo) && drop_missing_node_residual(&mut reasons, state.hero) {
-            assert!(inherited.iter().any(|r| is_hero_residual(r, state.hero, |cause| cause == "cap")),
-                "preflop: a residual branch holds hero's unresolved share, but the replay disclosed no cap residual: {inherited:?}");
-            assumptions.notes.push("the unresolved share is the cap residual's (BranchResidual cause \"cap\"): no node is missing".into());
-        }
+        let MixedNode { actions, unresolved_mass, range_mix, reasons, notes, unsupported } = mix_nodes(branches, &nodes, state.hero, hero_combo, ctx.bb_chips);
+        // Ruling 19f-C3: the replay's reasons and the assembly's meet here, with one cap disclosure between them.
+        let inherited = one_cap_disclosure(inherited, &reasons, state.hero);
         match unsupported {
             None => {
                 let (kind, reference) = source.expect("preflop: advice was assembled, so a node answered in some branch");
@@ -369,29 +368,18 @@ fn legalize(expanded: &ExpandedNode, legal: &[LegalAction], hero_combo: usize, n
     Ok((node, created))
 }
 
-/// Whether hero's combo has positive posterior on some branch without a node, and every such branch is the residual:
-/// the unresolved share is the cap residual's alone, and no node is missing (see the module doc).
-fn residual_alone(branches: &[HistoryBranch], nodes: &[BranchNode], hero: Seat, hero_combo: usize) -> bool {
-    let pi = posterior(branches, hero, hero_combo);
-    let has_node = |b: &HistoryBranch| !b.residual && b.stopped.is_none() && nodes.iter().any(|n| n.branch_id == b.id && n.node.is_some());
-    let without: Vec<&HistoryBranch> = branches.iter().zip(&pi).filter(|(b, p)| **p > 0.0 && !has_node(b)).map(|(b, _)| b).collect();
-    !without.is_empty() && without.iter().all(|b| b.residual)
-}
-
-/// `reasons` without the assembly's hero "missing node" residual; whether it held one.
-///
-/// # Panics
-/// Always, if it held more than one (the assembly adds at most one).
-fn drop_missing_node_residual(reasons: &mut Vec<ApproxReason>, hero: Seat) -> bool {
-    let before = reasons.len();
-    reasons.retain(|r| !is_hero_residual(r, hero, |cause| cause.starts_with("missing node ")));
-    assert!(before - reasons.len() <= 1, "preflop: the assembly disclosed {} missing-node residuals", before - reasons.len());
-    reasons.len() < before
-}
-
-/// Whether `r` is hero's `BranchResidual` whose cause satisfies `cause`.
-fn is_hero_residual(r: &ApproxReason, hero: Seat, cause: impl Fn(&str) -> bool) -> bool {
-    matches!(r, ApproxReason::BranchResidual { seat, cause: c, .. } if *seat == hero && cause(c))
+/// The replay's reasons (`inherited`) as they meet the assembly's (`assembled`) at a preflop decision (ruling 19f-C3):
+/// when the assembly disclosed hero's cap residual (`BranchResidual{seat: hero, cause: "cap"}`, hero's posterior share
+/// on the residual branch, the mass without a strategy that the no-headline rule reads), the replay's own hero cap
+/// reason (the residual's share of the branch weights) is dropped, so the `Final` carries one cap disclosure, the
+/// assembly's. Every other inherited reason is kept, in order; when the assembly disclosed no cap (hero has no
+/// posterior on the residual, or the decision is unsupported before any share is assembled) the replay's stands.
+fn one_cap_disclosure(mut inherited: Vec<ApproxReason>, assembled: &[ApproxReason], hero: Seat) -> Vec<ApproxReason> {
+    let is_cap = |r: &ApproxReason| matches!(r, ApproxReason::BranchResidual { seat, cause, .. } if *seat == hero && cause == "cap");
+    if assembled.iter().any(is_cap) {
+        inherited.retain(|r| !is_cap(r));
+    }
+    inherited
 }
 
 /// Keeps first occurrences only (by value).
