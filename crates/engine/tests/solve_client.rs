@@ -34,7 +34,7 @@ fn rig(street: Street, script: Vec<FakeReply>) -> Rig {
     let tree = build_tree_full(&root, &TemplateSelection::from_history(template, &root.history)).unwrap().tree;
     let input = SolveInput { root: root.clone(), ranges: [full_range(&root.board), full_range(&root.board)], tree, target_bp: 50 };
     let deadlines = Deadlines::for_request(0, street, 10);
-    let plan = SolvePlan { identity: id, deadlines, street_deadline: Arc::new(StreetDeadline::new(deadlines.street_deadline_ms)), template_id: template.into(), retry_template_id: engine::tree::Templates::min_variant(template).map(String::from), rake: Rake::TimeCharge, hero_actor: "oop".into(), background: false };
+    let plan = SolvePlan { identity: id, deadlines, street_deadline: Arc::new(StreetDeadline::new(deadlines.street_deadline_ms)), template_id: template.into(), retry_template_id: engine::tree::Templates::min_variant(template).map(String::from), rake: Rake::TimeCharge, hero_actor: "oop".into(), background: false, final_claim: None };
     let (sink, events) = RecordingSink::new(clock.clone(), Some(state.clone()));
     Rig { core, input, plan, sink: Arc::new(Mutex::new(Box::new(sink))), events, state, clock, published_at_restart: Arc::default() }
 }
@@ -1199,5 +1199,47 @@ fn a_rejection_observed_at_the_fire_leaves_no_job_outstanding() {
             assert!(message.contains("solve rejected: busy"), "rejection seen at {seen_at} ms: {message}");
         }
         assert_eq!((out.outstanding_job, out.restarts, kills_and_restarts(&r.state)), (false, 0, (0, 0)), "rejection seen at {seen_at} ms");
+    }
+}
+
+// --- Follow-up P2.W3 (re-review observation O5, ruling 28-N1): `SolvePlan::final_claim`. ---
+
+/// The scripted worker behind a link that takes the request's `Final` claim as it hands over this solve's progress: the
+/// watchdog's delivery landing between the client's observation of the progress, before the fire, and its emission.
+struct ClaimedOnProgress { inner: Box<dyn WorkerLink>, claim: Arc<AtomicBool> }
+impl WorkerLink for ClaimedOnProgress {
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError> { self.inner.send(msg) }
+    fn recv(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> {
+        let got = self.inner.recv(timeout);
+        if let Ok(Some(WorkerMessage::Progress { .. })) = &got { self.claim.store(true, Ordering::SeqCst); }
+        got
+    }
+    fn restart(&mut self) -> Result<(), WorkerLinkError> { self.inner.restart() }
+    fn kill(&mut self) { self.inner.kill() }
+    fn ready(&self) -> Option<&Ready> { self.inner.ready() }
+}
+
+/// Ruling 28-N1 for `Progress` (re-review observation O5): the plan carries the request's `Final` claim, shared with its
+/// watchdog (`SolvePlan::final_claim`), and a `Progress` is forwarded only while that claim is untaken, checked under the
+/// sink lock in the same hold as the emission. A progress observed before the fire whose claim is taken before the
+/// client emits it (the watchdog delivered its `Final` meanwhile) is dropped; with the claim untaken, or with no claim
+/// (a job no watchdog watches), it is forwarded. The solve goes on either way, and its result is accepted.
+#[test]
+fn a_progress_is_forwarded_only_while_the_requests_final_is_unclaimed() {
+    let progress = FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 5, exploitability_chips: Some(0.8), elapsed_ms: 2 };
+    // (case, the plan carries the claim, the link takes it as it hands the progress over, progresses forwarded)
+    for (case, carried, taken, forwarded) in [("taken as the progress is handed over", true, true, 0usize), ("untaken", true, false, 1), ("no claim", false, false, 1)] {
+        let mut r = rig(Street::River, vec![]);
+        let identity = r.core.identity.clone();
+        let (worker, state) = FakeWorker::scripted(r.clock.clone(), identity.clone(), vec![ack(), progress.clone(), ok_for(Street::River, "river_std_v1", 0.3)]);
+        let claim = Arc::new(AtomicBool::new(false));
+        let link: Box<dyn WorkerLink> = if taken { Box::new(ClaimedOnProgress { inner: worker, claim: claim.clone() }) } else { worker };
+        r.core = EngineCore::new(link, r.clock.clone(), identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log")));
+        r.state = state;
+        r.plan.final_claim = carried.then(|| claim.clone());
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        assert_eq!(out.terminal, Terminal::Ok, "{case}");
+        let progresses = r.events.lock().unwrap().iter().filter(|e| matches!(e.event, RecommendationEvent::Progress { .. })).count();
+        assert_eq!((progresses, claim.load(Ordering::SeqCst)), (forwarded, taken), "{case}");
     }
 }
