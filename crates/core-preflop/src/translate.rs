@@ -577,9 +577,11 @@ pub struct BranchNode {
 /// - `range_mix`: the mass-weighted action frequencies over hero's public range at the node,
 ///   over the node-covered branches only (the excluded share is disclosed in `notes`); present
 ///   whenever a node strategy exists, and the only strategy output under `HeroComboOutOfSupport`.
-/// - `reasons`: `ChartRounded` / `EvReferenceUnverified` for the sources that contributed, and
-///   `BranchResidual { cause: "missing node <key>" }` whenever `unresolved_mass > 0`; no
-///   duplicates.
+/// - `reasons`: `ChartRounded` / `EvReferenceUnverified` for the sources that contributed, and,
+///   whenever `unresolved_mass > 0`, one `BranchResidual` per cause actually incurred (spec section
+///   8.4's vocabulary; ruling 19-I1): `cause: "cap"` with the cap residual's posterior share, and
+///   `cause: "missing node <key>"` with the share of the positive branches whose key has no node;
+///   their shares sum to `unresolved_mass`. No duplicates.
 /// - `notes`: `"x% of the posterior has no strategy"` whenever `unresolved_mass > 0`, and the
 ///   range mix's excluded share.
 /// - `unsupported`: `MissingPreflopNode { key }` when hero has a node in no positive-posterior
@@ -709,10 +711,16 @@ fn check_mix_inputs(pi: &[f64], probs: &[Option<f64>], evs: &[Option<f64>]) {
 ///
 /// `range_mix` weights each combo by `sum_{k has node} q_k * w_{H,k}[c]`, independently of hero's
 /// combo, and divides by that covered mass (the excluded share is disclosed in `notes`).
-/// Whenever `unresolved_mass > 0`, `BranchResidual { seat: hero, residual_mass_pct: 100 *
-/// unresolved_mass, cause: "missing node <key>" }` is added (the heaviest positive no-node branch's
-/// key, or the heaviest known stopped/live key when only the residual lacks a node) together with
-/// the note `"x% of the posterior has no strategy"`. Contributing chart nodes add `ChartRounded`
+/// Whenever `unresolved_mass > 0`, hero's unresolved share is disclosed by cause (spec section 8.4's
+/// `"cap" | "missing node <key>"`; section 2: only reasons actually incurred; ruling 19-I1, which
+/// replaces plan 3 Task 16's single `"missing node"` wording): the persistent cap residual's
+/// posterior share as `BranchResidual { seat: hero, residual_mass_pct: 100 * pi_R, cause: "cap" }`,
+/// then the share of the positive branches whose key has no node (stopped, or live without a node)
+/// as `BranchResidual { seat: hero, residual_mass_pct: 100 * sum pi_k, cause: "missing node <key>" }`
+/// naming the heaviest such branch's retained key (`"no retained key"` when none retains one --
+/// never a key whose node is present). A residual-only share therefore has only the cap reason, and
+/// both shares sum to `unresolved_mass`, whose total is the note `"x% of the posterior has no
+/// strategy"`. Contributing chart nodes add `ChartRounded`
 /// and unverified PokerData nodes add `EvReferenceUnverified`. Branches are read, never mutated:
 /// stopping a branch belongs to the replay walk, and nothing is renormalized.
 ///
@@ -782,22 +790,38 @@ pub fn mix_nodes(branches: &[HistoryBranch], nodes: &[BranchNode], hero: Seat, h
         }
     }
     if unresolved > 0.0 {
-        let missing: Vec<usize> = positive.iter().copied().filter(|&k| entry[k].is_none()).collect();
         let pct = 100.0 * unresolved;
         assert!(pct.is_finite() && pct <= 100.0 * (1.0 + MASS_TOLERANCE), "mix_nodes: unresolved share {pct}% is not a percentage");
-        push_unique(
-            &mut out.reasons,
-            ApproxReason::BranchResidual {
-                seat: hero,
-                // Positive stays positive at the f32 boundary; `pct <= 100 * (1 + MASS_TOLERANCE)`
-                // narrows to at most exactly 100.
-                residual_mass_pct: pct.max(f64::from(f32::MIN_POSITIVE)) as f32,
-                cause: format!("missing node {}", residual_cause_key(branches, nodes, &missing)),
-            },
-        );
+        // Ruling 19-I1 (spec sections 2 and 8.4): one reason per cause actually incurred -- the cap
+        // residual's share first, then the share of the positive branches whose key has no node.
+        let (capped, missing): (Vec<usize>, Vec<usize>) =
+            positive.iter().copied().filter(|&k| entry[k].is_none()).partition(|&k| branches[k].residual);
+        if !capped.is_empty() {
+            push_unique(&mut out.reasons, residual_share(hero, &pi, &capped, "cap".into()));
+        }
+        if !missing.is_empty() {
+            let cause = format!("missing node {}", residual_cause_key(branches, nodes, &missing));
+            push_unique(&mut out.reasons, residual_share(hero, &pi, &missing, cause));
+        }
         out.notes.push(format!("{pct:.1}% of the posterior has no strategy"));
     }
     out
+}
+
+/// Hero's `BranchResidual` for one cause: the posterior share of branches `ks`, as a percentage.
+///
+/// # Panics
+/// Always, if that share is not a percentage (at most `100 * (1 + MASS_TOLERANCE)`).
+fn residual_share(hero: Seat, pi: &[f64], ks: &[usize], cause: String) -> ApproxReason {
+    let pct = 100.0 * ks.iter().map(|&k| pi[k]).sum::<f64>();
+    assert!(pct.is_finite() && pct <= 100.0 * (1.0 + MASS_TOLERANCE), "mix_nodes: residual share {pct}% ({cause}) is not a percentage");
+    ApproxReason::BranchResidual {
+        seat: hero,
+        // Positive stays positive at the f32 boundary; `pct <= 100 * (1 + MASS_TOLERANCE)` narrows
+        // to at most exactly 100.
+        residual_mass_pct: pct.max(f64::from(f32::MIN_POSITIVE)) as f32,
+        cause,
+    }
 }
 
 /// The covered-mass weight of combo `c` in hero's range mix: `sum_{k in covered} q_k *
@@ -1038,7 +1062,8 @@ fn push_unique(reasons: &mut Vec<ApproxReason>, reason: ApproxReason) {
     }
 }
 
-/// The label used when no branch retains any key at all -- never an empty key.
+/// The label used when no candidate branch retains any key -- never an empty key, and never another
+/// branch's key.
 const NO_RETAINED_KEY: &str = "no retained key";
 
 /// Branch `k`'s retained key: the lookup key of its [`BranchNode`] entry, when it has an entry
@@ -1074,14 +1099,12 @@ fn missing_node_key(branches: &[HistoryBranch], nodes: &[BranchNode], candidates
         .unwrap_or_else(|| NO_RETAINED_KEY.into())
 }
 
-/// The key in the partial-coverage `BranchResidual` cause ("missing node <key>"), which prefers an
-/// actual missing key: the heaviest known key among the positive no-node branches `missing`; only
-/// when none retains one (the residual alone lacks a node) the heaviest known stopped/live key
-/// across all branches; else [`NO_RETAINED_KEY`].
+/// The key in the partial-coverage `BranchResidual` cause ("missing node <key>"): the heaviest
+/// known key among `missing`, the positive-posterior branches (never the residual) whose key has no
+/// node; [`NO_RETAINED_KEY`] when none of them retains one. Ruling 19-I1: never another branch's
+/// key, whose node is present -- the residual's own share is disclosed as the cap instead.
 fn residual_cause_key(branches: &[HistoryBranch], nodes: &[BranchNode], missing: &[usize]) -> String {
-    heaviest_known_key(branches, nodes, missing.iter().copied())
-        .or_else(|| heaviest_known_key(branches, nodes, 0..branches.len()))
-        .unwrap_or_else(|| NO_RETAINED_KEY.into())
+    heaviest_known_key(branches, nodes, missing.iter().copied()).unwrap_or_else(|| NO_RETAINED_KEY.into())
 }
 
 /// Narrows a probability share (a frequency, a posterior mass, a range-mix weight) from `f64` to

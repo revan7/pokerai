@@ -1229,7 +1229,7 @@
             "kind": "BranchResidual",
             "seat": 0,
             "residual_mass_pct": 5.0,
-            "cause": "missing node golden:after raise B"
+            "cause": "cap"
           }
         ],
         "notes": [
@@ -1398,6 +1398,239 @@
         "unsupported": {
           "kind": "HeroComboOutOfSupport"
         },
+        "headline": null
+      }
+    },
+    {
+      "name": "missing_node_partial",
+      "hero": 0,
+      "hero_combo": 942,
+      "bb_chips": 10,
+      "branches": [
+        {
+          "id": 0,
+          "q": 0.6,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        },
+        {
+          "id": 1,
+          "q": 0.4,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        }
+      ],
+      "nodes": [
+        {
+          "branch_id": 0,
+          "key": "golden:after raise A",
+          "node": {
+            "actions": [
+              {
+                "kind": "fold"
+              },
+              {
+                "kind": "call"
+              }
+            ],
+            "probs": [
+              0.4,
+              0.6
+            ],
+            "evs": [
+              0.0,
+              -1.0
+            ],
+            "source": "PokerDataJson",
+            "ev_reference": "decision_incremental_verified"
+          }
+        },
+        {
+          "branch_id": 1,
+          "key": "golden:after raise B",
+          "node": null
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "fold"
+            },
+            "frequency": 0.24,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "BranchSupportIncomplete",
+              "covered_posterior": 0.6
+            },
+            "headline": false
+          },
+          {
+            "action": {
+              "kind": "call"
+            },
+            "frequency": 0.36,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "BranchSupportIncomplete",
+              "covered_posterior": 0.6
+            },
+            "headline": false
+          }
+        ],
+        "unresolved_mass": 0.4,
+        "range_mix": [
+          [
+            {
+              "kind": "fold"
+            },
+            0.4
+          ],
+          [
+            {
+              "kind": "call"
+            },
+            0.6
+          ]
+        ],
+        "reasons": [
+          {
+            "kind": "BranchResidual",
+            "seat": 0,
+            "residual_mass_pct": 40.0,
+            "cause": "missing node golden:after raise B"
+          }
+        ],
+        "notes": [
+          "range mix excludes 40.0% of hero's public range mass (no strategy)",
+          "40.0% of the posterior has no strategy"
+        ],
+        "unsupported": null,
+        "headline": null
+      }
+    },
+    {
+      "name": "cap_beside_missing_node",
+      "hero": 0,
+      "hero_combo": 942,
+      "bb_chips": 10,
+      "branches": [
+        {
+          "id": 0,
+          "q": 0.5,
+          "residual": true,
+          "stopped": null,
+          "zero_combos": []
+        },
+        {
+          "id": 1,
+          "q": 0.1,
+          "residual": false,
+          "stopped": "missing node golden:k-missing",
+          "zero_combos": []
+        },
+        {
+          "id": 2,
+          "q": 0.4,
+          "residual": false,
+          "stopped": null,
+          "zero_combos": []
+        }
+      ],
+      "nodes": [
+        {
+          "branch_id": 1,
+          "key": "golden:k-missing",
+          "node": null
+        },
+        {
+          "branch_id": 2,
+          "key": "golden:k-live",
+          "node": {
+            "actions": [
+              {
+                "kind": "fold"
+              },
+              {
+                "kind": "call"
+              }
+            ],
+            "probs": [
+              0.4,
+              0.6
+            ],
+            "evs": [
+              0.0,
+              -1.0
+            ],
+            "source": "PokerDataJson",
+            "ev_reference": "decision_incremental_verified"
+          }
+        }
+      ],
+      "expected": {
+        "actions": [
+          {
+            "action": {
+              "kind": "fold"
+            },
+            "frequency": 0.16000000000000003,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "BranchSupportIncomplete",
+              "covered_posterior": 0.4
+            },
+            "headline": false
+          },
+          {
+            "action": {
+              "kind": "call"
+            },
+            "frequency": 0.24,
+            "ev_bb": null,
+            "unavailable": {
+              "kind": "BranchSupportIncomplete",
+              "covered_posterior": 0.4
+            },
+            "headline": false
+          }
+        ],
+        "unresolved_mass": 0.6,
+        "range_mix": [
+          [
+            {
+              "kind": "fold"
+            },
+            0.4
+          ],
+          [
+            {
+              "kind": "call"
+            },
+            0.6
+          ]
+        ],
+        "reasons": [
+          {
+            "kind": "BranchResidual",
+            "seat": 0,
+            "residual_mass_pct": 50.0,
+            "cause": "cap"
+          },
+          {
+            "kind": "BranchResidual",
+            "seat": 0,
+            "residual_mass_pct": 10.0,
+            "cause": "missing node golden:k-missing"
+          }
+        ],
+        "notes": [
+          "range mix excludes 60.0% of hero's public range mass (no strategy)",
+          "60.0% of the posterior has no strategy"
+        ],
+        "unsupported": null,
         "headline": null
       }
     }

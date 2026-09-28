@@ -130,8 +130,9 @@ fn replay_incomplete_branch_ev(){
         [ApproxReason::BranchResidual { seat, residual_mass_pct, cause }] => {
             assert_eq!(*seat, H);
             close(f64::from(*residual_mass_pct), 5.0);
-            // The residual has no source key: the heaviest known live/stopped key is named.
-            assert_eq!(cause, "missing node k1");
+            // Both live branches have their node; only the cap residual lacks one, so its share is
+            // disclosed as the cap (ruling 19-I1, spec 8.4), never as a missing node that is present.
+            assert_eq!(cause, "cap");
         }
         other => panic!("expected one BranchResidual reason, got {other:?}"),
     }
@@ -505,10 +506,11 @@ fn a_heaviest_residual_names_the_heaviest_known_key_across_all_branches() {
     assert_eq!(m.range_mix, None);
     close(f64::from(m.unresolved_mass), 1.0);
 
-    // Guard (unchanged by the fix): the partial-coverage reason keeps its preference for an actual
-    // missing key. q = [0.5 residual, 0.1 stopped "k-missing", 0.4 live "k-live"]: hero has a node
-    // in branch 2 only, and BranchResidual names the stopped branch's missing key, although the
-    // residual is heavier and the live key is the heaviest known key.
+    // Guard: the partial-coverage reason keeps its preference for an actual missing key. q = [0.5
+    // residual, 0.1 stopped "k-missing", 0.4 live "k-live"]: hero has a node in branch 2 only, and
+    // the missing-node BranchResidual names the stopped branch's missing key, although the residual
+    // is heavier and the live key is the heaviest known key. Ruling 19-I1: the residual's own share
+    // is a second reason, the cap's (50%), and the missing node's share is its own (10%).
     let mut bs = branches(&[0.5, 0.1, 0.4]);
     bs[0].residual = true;
     bs[1].stopped = Some("missing node k-missing".into());
@@ -517,7 +519,101 @@ fn a_heaviest_residual_names_the_heaviest_known_key_across_all_branches() {
     assert_eq!(m.unsupported, None);
     close(f64::from(m.unresolved_mass), 0.6);
     assert!(matches!(m.reasons.as_slice(),
-        [ApproxReason::BranchResidual { cause, .. }] if cause == "missing node k-missing"), "{:?}", m.reasons);
+        [ApproxReason::BranchResidual { cause: cap, residual_mass_pct: cap_pct, .. },
+         ApproxReason::BranchResidual { cause, residual_mass_pct: missing_pct, .. }]
+            if cap == "cap" && (cap_pct - 50.0).abs() < 1e-4 && cause == "missing node k-missing" && (missing_pct - 10.0).abs() < 1e-4),
+        "{:?}", m.reasons);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ruling 19-I1 (P3.T19 fix round 1): `BranchResidual` names only causes actually incurred (spec
+// section 2), with spec section 8.4's vocabulary -- the persistent cap residual's share is `"cap"`,
+// the share of positive-posterior branches whose key has no node is `"missing node <key>"` (the
+// heaviest such key) -- one reason per distinct cause, each with its own share, so both shares sum
+// to the unresolved mass; the note keeps the total.
+// ---------------------------------------------------------------------------------------------
+
+/// The residual share as `(residual_mass_pct, cause)` pairs, in the order the reasons list them.
+fn residual_causes(m: &MixedNode) -> Vec<(f32, String)> {
+    m.reasons
+        .iter()
+        .filter_map(|r| match r {
+            ApproxReason::BranchResidual { seat, residual_mass_pct, cause } => {
+                assert_eq!(*seat, H, "hero's residual");
+                Some((*residual_mass_pct, cause.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_causes(m: &MixedNode, expected: &[(f64, &str)]) {
+    let got = residual_causes(m);
+    assert_eq!(got.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>(), expected.iter().map(|(_, c)| *c).collect::<Vec<_>>(), "{:?}", m.reasons);
+    for ((pct, cause), (want, _)) in got.iter().zip(expected) {
+        close(f64::from(*pct), *want);
+        assert!(!cause.is_empty());
+    }
+}
+
+/// T7's residual case: both live branches have hero's node; only the cap residual (q = 0.05) has no
+/// strategy. The reason is the cap's, never a "missing node" naming a node that is present.
+#[test]
+fn a_cap_residual_alone_is_disclosed_as_the_cap() {
+    let raise = Action::Raise { to: 60 };
+    let mut bs = branches(&[0.19, 0.76, 0.05]);
+    bs[2].residual = true;
+    let nodes = vec![
+        at(0, Some(verified(&[(FOLD, 0.3, Some(0.0)), (CALL, 0.5, Some(20.0)), (raise, 0.2, Some(100.0))])), "k0"),
+        at(1, Some(verified(&[(FOLD, 0.4, Some(0.0)), (CALL, 0.6, Some(-10.0))])), "k1"),
+        at(2, None, ""),
+    ];
+    let m = mix_nodes(&bs, &nodes, H, 0, 2);
+    assert_eq!(m.unsupported, None);
+    close(f64::from(m.unresolved_mass), 0.05);
+    assert_causes(&m, &[(5.0, "cap")]);
+    assert!(m.reasons.iter().all(|r| !matches!(r, ApproxReason::BranchResidual { cause, .. } if cause.starts_with("missing node"))), "{:?}", m.reasons);
+    assert!(m.notes.iter().any(|n| n == "5.0% of the posterior has no strategy"), "{:?}", m.notes);
+}
+
+/// The cap residual (q = 0.5) beside a stopped branch whose node is missing (q = 0.1, key
+/// "k-missing") and a live branch with hero's node (q = 0.4): two reasons, one per cause, each with
+/// its own share (50% and 10%), summing to the unresolved 60%, which the note states once.
+#[test]
+fn a_cap_residual_beside_a_missing_node_discloses_both_causes() {
+    let mut bs = branches(&[0.5, 0.1, 0.4]);
+    bs[0].residual = true;
+    bs[1].stopped = Some("missing node k-missing".into());
+    let live = verified(&[(FOLD, 0.5, Some(0.0)), (CALL, 0.5, Some(2.0))]);
+    let nodes = vec![at(0, None, ""), at(1, None, "k-missing"), at(2, Some(live), "k-live")];
+    let m = mix_nodes(&bs, &nodes, H, 0, 2);
+    assert_eq!(m.unsupported, None);
+    close(f64::from(m.unresolved_mass), 0.6);
+    assert_causes(&m, &[(50.0, "cap"), (10.0, "missing node k-missing")]);
+    let shares: f64 = residual_causes(&m).iter().map(|(pct, _)| f64::from(*pct)).sum();
+    close(shares / 100.0, f64::from(m.unresolved_mass)); // the two causes' shares sum to the unresolved mass
+    assert_eq!(m.notes.iter().filter(|n| n.ends_with("% of the posterior has no strategy")).collect::<Vec<_>>(), vec!["60.0% of the posterior has no strategy"]);
+}
+
+/// No residual: a missing node alone keeps its cause and its whole share, exactly as before.
+#[test]
+fn a_missing_node_alone_keeps_its_cause() {
+    let mut bs = branches(&[0.6, 0.4]);
+    bs[1].stopped = Some("missing node kB".into());
+    let nodes = vec![at(0, Some(verified(&[(FOLD, 0.25, Some(0.0)), (CALL, 0.75, Some(2.0))])), "kA"), at(1, None, "kB")];
+    let m = mix_nodes(&bs, &nodes, H, 0, 2);
+    assert_causes(&m, &[(40.0, "missing node kB")]);
+    assert!(m.notes.iter().any(|n| n == "40.0% of the posterior has no strategy"), "{:?}", m.notes);
+}
+
+/// A positive branch with no node and no retained key (no entry at all) is still a missing node,
+/// but its reason never borrows another branch's key, whose node is present: it names none.
+#[test]
+fn a_missing_node_without_a_retained_key_names_no_present_key() {
+    let bs = branches(&[0.7, 0.3]);
+    let nodes = vec![at(0, Some(verified(&[(FOLD, 0.5, Some(0.0)), (CALL, 0.5, Some(2.0))])), "k-present")];
+    let m = mix_nodes(&bs, &nodes, H, 0, 2);
+    assert_causes(&m, &[(30.0, "missing node no retained key")]);
 }
 
 /// Hero's node built from real P3.T10 output, one source row repeated on every combo: source

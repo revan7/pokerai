@@ -272,7 +272,37 @@ def test_legal_move_and_assembly_rows_conserve_mass():
         if e["unresolved_mass"] > 0:
             assert e["headline"] is None and not any(a["headline"] for a in e["actions"]), case["name"]
     labels = {c["name"]: c["expected"]["headline"] for c in g["assembly"]}
+    assert labels["t7_residual_no_headline"] is None
     assert labels["t7_branch_support_incomplete"] == "highest-frequency action, EV incomplete"
     assert labels["chart_frequency"] == "highest-frequency chart action"
     assert labels["unverified_source_frequency"] == "highest-frequency source action, EV reference unverified"
     assert labels["complete_ev"] == "highest EV"
+
+
+def residual_reasons(case: dict) -> list:
+    return [(r["cause"], r["residual_mass_pct"]) for r in case["expected"]["reasons"] if r["kind"] == "BranchResidual"]
+
+
+def test_branch_residual_causes_follow_spec_8_4():
+    """Ruling 19-I1: a `BranchResidual` names only a cause actually incurred, in spec section
+    8.4's vocabulary -- `cap` for the persistent cap residual's share, `missing node <key>` for a
+    positive-posterior branch whose key has no node -- one reason per distinct cause."""
+    cases = {c["name"]: c for c in golden("bet_translation_golden.json")["assembly"]}
+    # T7's residual row: both live branches have their node; only the cap residual has no strategy.
+    t7 = cases["t7_residual_no_headline"]
+    live = [b for b in t7["branches"] if not b["residual"] and b["stopped"] is None]
+    nodes = {n["branch_id"]: n for n in t7["nodes"]}
+    assert len(live) == 2 and all(nodes[b["id"]]["node"] is not None for b in live)
+    assert [nodes[b["id"]]["key"] for b in live] == ["golden:after raise A", "golden:after raise B"]
+    assert [b["q"] for b in t7["branches"] if b["residual"]] == [0.05]
+    ((cause, pct),) = residual_reasons(t7)
+    assert cause == "cap" and abs(pct - 5.0) < 1e-9
+    # A node actually missing keeps its missing-node cause, naming that branch's own key.
+    missing = cases["missing_node_partial"]
+    ((cause, pct),) = residual_reasons(missing)
+    absent = [n["key"] for n in missing["nodes"] if n["node"] is None]
+    assert cause == f"missing node {absent[0]}" and abs(pct - 40.0) < 1e-9
+    # Both causes at once: one reason each, with shares summing to the unresolved mass.
+    both = cases["cap_beside_missing_node"]
+    assert [c for c, _ in residual_reasons(both)] == ["cap", "missing node golden:k-missing"]
+    assert abs(math.fsum(p for _, p in residual_reasons(both)) - 100 * both["expected"]["unresolved_mass"]) < 1e-9
