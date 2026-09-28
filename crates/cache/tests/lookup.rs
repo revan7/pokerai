@@ -710,6 +710,18 @@ fn label_output_is_unaffected_by_entry_mode_f32_or_i16() {
 
 // --- task 7: strict menu legality, bounded lookup, node reconstruction (spec 10.4) -------------
 
+/// Fix round 1 (review P4T7-I4): only an accuracy-passing label claims coverage. `Provisional`
+/// maps to none at all, with or without reasons, so no caller can read it as `Exact`.
+#[test]
+fn only_an_accuracy_passing_label_claims_coverage() {
+    use cache::label::Label;
+    let reasons = vec![proto::ApproxReason::ChartRounded];
+    assert_eq!(Label::Exact.coverage(), Some(proto::Coverage::Exact));
+    assert_eq!(Label::Approximate { reasons: reasons.clone() }.coverage(), Some(proto::Coverage::Approximate { reasons: reasons.clone() }));
+    assert_eq!(Label::Provisional { reasons: vec![] }.coverage(), None);
+    assert_eq!(Label::Provisional { reasons }.coverage(), None);
+}
+
 #[test]
 fn query_menu_must_be_legal_without_probability_moves() {
     use cache::lookup::legal_menu;
@@ -764,7 +776,7 @@ fn map_rows_and_map_flags_move_every_combo_to_its_image_under_the_inverse_permut
 #[path = "support/temp_dir.rs"]
 mod temp_dir;
 
-use cache::lookup::{CacheQuery, Lookup};
+use cache::lookup::{CacheQuery, Lookup, MissReason};
 use cache::Cache;
 use std::time::Duration;
 use temp_dir::TempDir;
@@ -843,7 +855,7 @@ fn lookup_serves_an_exact_hit_rebuilt_in_the_querys_chips() {
         Lookup::Exact { hit } => hit,
         other => panic!("an identical query is an exact hit, got {other:?}"),
     };
-    assert_eq!(hit.coverage, proto::Coverage::Exact);
+    assert_eq!(hit.coverage, Some(proto::Coverage::Exact));
     proto::worker::validate_solution(&hit.solution, &q.tree.materialized).expect("the served solution validates against the query tree");
     assert_eq!(hit.solution.requested, 0, "the root is the first covered node");
     assert_eq!(hit.solution.nodes.len(), e.nodes.len());
@@ -964,7 +976,7 @@ fn lookup_reads_the_neighbouring_buckets_and_never_further() {
 
     let dir = TempDir::new("lookup-far");
     let cache = open_with(&dir, &[&far]);
-    assert!(matches!(cache.lookup(&q), Lookup::Miss), "an entry two buckets away is never read");
+    assert_eq!(cache.lookup(&q), Lookup::Miss { reason: MissReason::NoMatch }, "an entry two buckets away is never read");
     assert_cell_intact(&dir, &far);
     drop(cache);
 
@@ -974,7 +986,7 @@ fn lookup_reads_the_neighbouring_buckets_and_never_further() {
         Lookup::Approximate { hit, reasons } => {
             let bucketed = vec![proto::ApproxReason::SprBucketed { actual: q.source.spr.value() as f32, used: near.source.spr.value() as f32 }];
             assert_eq!(reasons, bucketed);
-            assert_eq!(hit.coverage, proto::Coverage::Approximate { reasons: bucketed });
+            assert_eq!(hit.coverage, Some(proto::Coverage::Approximate { reasons: bucketed }));
         }
         other => panic!("the neighbouring bucket's entry is an approximate hit, got {other:?}"),
     }
@@ -1012,21 +1024,33 @@ fn lookup_ranks_by_closeness_before_accuracy_and_serves_the_closer_one_provision
         Lookup::Provisional { hit, reasons } => {
             assert!(reasons.is_empty(), "the closer entry is at the query's exact SPR: {reasons:?}");
             assert_eq!(hit.raw_exploitability_over_p, 0.006);
-            assert_eq!(hit.coverage, proto::Coverage::Exact, "coverage claims input matching only; the accuracy miss is the Provisional variant");
+            assert_eq!(hit.coverage, None, "an above-target hit claims no coverage (spec 2: Exact requires the raw accuracy)");
         }
         other => panic!("the closer, above-target entry must be served Provisional, got {other:?}"),
     }
     drop(cache);
 }
 
+/// Fix round 1 (review P4T7-I4): an above-target, reason-free entry is `Provisional` with no
+/// reasons and NO coverage -- never `Coverage::Exact`, which spec 2 line 51 reserves for inputs
+/// whose requested accuracy was reached on the raw exploitability (spec 10.4: a validated entry
+/// above the target is served as Provisional). No `DeadlineBestSoFar` is synthesized: this query
+/// never reached a live deadline. The raw accuracy stays on the hit.
 #[test]
-fn lookup_is_provisional_when_raw_accuracy_misses_the_querys_target() {
+fn an_above_target_reason_free_entry_is_provisional_with_no_coverage() {
     let e = support::entry();
     let dir = TempDir::new("lookup-provisional");
     let cache = open_with(&dir, &[&e]);
     let mut q = query_for(&e, 100, 500);
     q.target_bp = 30;
-    assert!(matches!(cache.lookup(&q), Lookup::Provisional { reasons, .. } if reasons.is_empty()), "0.004 > 30bp");
+    match cache.lookup(&q) {
+        Lookup::Provisional { hit, reasons } => {
+            assert!(reasons.is_empty(), "no reason applies and none is invented: {reasons:?}");
+            assert_eq!(hit.coverage, None, "0.004 > 30bp: never Coverage::Exact");
+            assert_eq!(hit.raw_exploitability_over_p, 0.004);
+        }
+        other => panic!("0.004 > 30bp must be Provisional, got {other:?}"),
+    }
     drop(cache);
 }
 
@@ -1040,7 +1064,7 @@ fn lookup_carries_the_querys_own_reasons() {
     match cache.lookup(&q) {
         Lookup::Approximate { hit, reasons } => {
             assert_eq!(reasons, vec![proto::ApproxReason::EvReferenceUnverified]);
-            assert_eq!(hit.coverage, proto::Coverage::Approximate { reasons });
+            assert_eq!(hit.coverage, Some(proto::Coverage::Approximate { reasons }));
         }
         other => panic!("{other:?}"),
     }
@@ -1056,9 +1080,9 @@ fn lookup_misses_when_the_requested_menu_is_not_legal_and_keeps_the_cell() {
     let cache = open_with(&dir, &[&e]);
     let mut q = query_for(&e, 100, 500);
     q.legal = vec![proto::LegalAction::Check, proto::LegalAction::AllIn { to: 499 }];
-    assert!(matches!(cache.lookup(&q), Lookup::Miss), "an all-in to 500 is not the legal all-in to 499");
+    assert_eq!(cache.lookup(&q), Lookup::Miss { reason: MissReason::Rejected }, "an all-in to 500 is not the legal all-in to 499");
     q.legal = vec![proto::LegalAction::AllIn { to: 500 }];
-    assert!(matches!(cache.lookup(&q), Lookup::Miss), "a check the live state does not offer");
+    assert_eq!(cache.lookup(&q), Lookup::Miss { reason: MissReason::Rejected }, "a check the live state does not offer");
     assert_cell_intact(&dir, &e);
     q.legal = vec![proto::LegalAction::Check, proto::LegalAction::AllIn { to: 500 }];
     assert!(matches!(cache.lookup(&q), Lookup::Exact { .. }), "the same cell still serves a legal query");
@@ -1074,12 +1098,12 @@ fn lookup_misses_on_an_uncovered_path_or_the_wrong_actor_and_serves_a_covered_no
     let cache = open_with(&dir, &[&e]);
     let mut q = query_for(&e, 100, 500);
     q.actor = "ip".into();
-    assert!(matches!(cache.lookup(&q), Lookup::Miss), "the root is oop's");
+    assert_eq!(cache.lookup(&q), Lookup::Miss { reason: MissReason::NoMatch }, "the root is oop's");
     let mut q = query_for(&e, 100, 500);
     q.requested = vec![0, 0];
-    assert!(matches!(cache.lookup(&q), Lookup::Miss), "the turn root is not in a flop street export");
+    assert_eq!(cache.lookup(&q), Lookup::Miss { reason: MissReason::NoMatch }, "the turn root is not in a flop street export");
     q.requested = vec![7];
-    assert!(matches!(cache.lookup(&q), Lookup::Miss), "not a node of the tree at all");
+    assert_eq!(cache.lookup(&q), Lookup::Miss { reason: MissReason::NoMatch }, "not a node of the tree at all");
     assert_cell_intact(&dir, &e);
 
     let mut q = query_for(&e, 100, 500);
@@ -1097,8 +1121,9 @@ fn lookup_misses_on_an_uncovered_path_or_the_wrong_actor_and_serves_a_covered_no
     drop(cache);
 }
 
-/// A zero remaining budget is an immediate miss, and the one reader thread keeps serving (no
-/// respawn, no stale reply leaking into the next lookup).
+/// A zero remaining budget is an immediate `BudgetExhausted` miss (review P4T7-I2: decided before
+/// anything is posted; the private-channel unit test in `src/lib.rs` pins that nothing is), and the
+/// one reader thread keeps serving the requests after it.
 #[test]
 fn a_spent_budget_is_an_immediate_miss_and_the_reader_keeps_serving() {
     let e = support::entry();
@@ -1106,12 +1131,10 @@ fn a_spent_budget_is_an_immediate_miss_and_the_reader_keeps_serving() {
     let cache = open_with(&dir, &[&e]);
     let mut q = query_for(&e, 100, 500);
     q.budget = Duration::ZERO;
-    let started = std::time::Instant::now();
-    assert!(matches!(cache.lookup(&q), Lookup::Miss));
-    assert!(started.elapsed() < Duration::from_millis(400), "a spent budget never waits for the reader");
+    assert_eq!(cache.lookup(&q), Lookup::Miss { reason: MissReason::BudgetExhausted });
     q.budget = Duration::from_secs(5);
     for _ in 0..3 {
-        assert!(matches!(cache.lookup(&q), Lookup::Exact { .. }), "the reader still serves after a timed-out request");
+        assert!(matches!(cache.lookup(&q), Lookup::Exact { .. }), "the reader still serves after a spent request");
     }
     drop(cache);
 }
@@ -1120,12 +1143,22 @@ fn a_spent_budget_is_an_immediate_miss_and_the_reader_keeps_serving() {
 fn a_disabled_or_shut_down_cache_always_misses() {
     let e = support::entry();
     let q = query_for(&e, 100, 500);
-    assert!(matches!(Cache::disabled().lookup(&q), Lookup::Miss));
+    assert_eq!(Cache::disabled().lookup(&q), Lookup::Miss { reason: MissReason::ReaderUnavailable });
     let dir = TempDir::new("lookup-shutdown");
     let cache = open_with(&dir, &[&e]);
     assert!(matches!(cache.lookup(&q), Lookup::Exact { .. }));
     cache.shutdown();
-    assert!(matches!(cache.lookup(&q), Lookup::Miss), "a stopped reader is a miss, never a hang");
+    assert_eq!(cache.lookup(&q), Lookup::Miss { reason: MissReason::ReaderUnavailable }, "a stopped reader is a miss, never a hang");
+    drop(cache);
+}
+
+/// Review P4T7-I6: a key with nothing stored under any of its three buckets is `NoMatch`.
+#[test]
+fn an_absent_board_class_is_a_no_match_miss() {
+    let e = support::entry();
+    let dir = TempDir::new("lookup-empty");
+    let cache = open_with(&dir, &[]);
+    assert_eq!(cache.lookup(&query_for(&e, 100, 500)), Lookup::Miss { reason: MissReason::NoMatch });
     drop(cache);
 }
 

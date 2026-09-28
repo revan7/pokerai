@@ -202,11 +202,14 @@ impl Engine {
         core.install_replay_ranges();
         // Plan 4 Task 7: the cache handle, opened once at `Paths::cache`. A root that cannot be opened leaves the core's
         // cache disabled (every lookup a miss, every store dropped) and is a startup banner, never a construction error.
+        // Its state (fix round 1, review P4T7-I1) is captured here, before the core moves to `engine-main`.
         core.cache = cache::Cache::open(paths.cache.clone(), cache::CACHE_QUOTA_BYTES);
         let cache_warning = core.cache.availability_warning();
+        let cache_state = core.cache.summary();
         let mut e = Engine::with_core(core);
         e.startup.banners.extend(loaded.banners);
         e.startup.banners.extend(cache_warning);
+        e.startup.cache_state = cache_state;
         e.startup.quarantined_bundles = loaded.quarantined;
         e.set_config(cfg)?;
         Ok(e)
@@ -605,12 +608,16 @@ mod tests {
         let paths = |cache: PathBuf| Paths { log_dir: dir.join("log"), worker_exe: dir.join("worker.cmd"), preflop: dir.join("preflop"), cache };
         let (cfg, _) = cfg_1_2();
         let mut e = Engine::new(cfg.clone(), paths(dir.join("blocker").join("v3"))).expect("an unusable cache never fails construction");
-        let banners = e.startup_report().banners;
-        assert!(banners.iter().any(|b| b.contains("flop cache") && b.contains("could not be opened")), "{banners:?}");
+        let report = e.startup_report();
+        let banner = report.banners.iter().find(|b| b.contains("flop cache") && b.contains("could not be opened")).cloned();
+        let banner = banner.unwrap_or_else(|| panic!("the failure is a banner: {:?}", report.banners));
+        // Fix round 1 (review P4T7-I1, ruling 7-Q1): the cache's own state, never "absent" once opened.
+        assert_eq!(report.cache_state, format!("disabled: {banner}"), "the startup state names the disabled cache and why");
         e.shutdown();
         let mut e = Engine::new(cfg, paths(dir.join("cache"))).expect("a stand-in worker and a usable cache");
-        let banners = e.startup_report().banners;
-        assert!(!banners.iter().any(|b| b.contains("flop cache")), "a usable cache adds no banner: {banners:?}");
+        let report = e.startup_report();
+        assert!(!report.banners.iter().any(|b| b.contains("flop cache")), "a usable cache adds no banner: {:?}", report.banners);
+        assert_eq!(report.cache_state, format!("open: {} (quota {} bytes)", dir.join("cache").display(), cache::CACHE_QUOTA_BYTES));
         assert!(dir.join("cache").is_dir(), "the cache root is created at startup");
         e.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
