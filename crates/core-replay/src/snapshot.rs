@@ -10,11 +10,13 @@
 //! `engine::snapshots::SolvedStreet` store; `engine::snapshots` re-exports it. The walk that
 //! consumes a selected snapshot is Task 15.
 
+use core_model::lifecycle::simulate;
+use core_model::street_root;
 use core_preflop::interpolate;
 use proto::worker::NodeStrategy;
 use proto::{
     index_materialized, resolve_chip_path_indexed, Action, ApproxReason, Card, DecisionIdentity, EffectiveTree, HandState, MaterializedIndex,
-    MaterializedNode, OrdinalPath, Seat, Street,
+    MaterializedNode, OrdinalPath, Seat, Street, StreetRootSnapshot,
 };
 use serde::{Deserialize, Serialize};
 
@@ -173,8 +175,10 @@ pub fn street_number(s: Street) -> u8 {
     }
 }
 
-/// The observed actions of `street`, in order, as `(seat, action)` pairs: the history a street
-/// snapshot's `solved_prefix` is compared against (spec section 9.2). Task 15's walk consumes it too.
+/// The observed actions of `street`, in order, as `(seat, action)` pairs: every seat's, including
+/// the actions of players who have folded. This is not the domain of a snapshot's `solved_prefix`,
+/// which holds a street root's history (spec section 10.2 drops the actions of players who folded on
+/// the street from a projected root; see `decision_roots`). Task 15's walk consumes it.
 pub fn street_history(s: &HandState, street: Street) -> Vec<(Seat, Action)> {
     s.actions.iter().filter(|a| a.street == street).map(|a| (a.seat, a.action)).collect()
 }
@@ -184,6 +188,47 @@ pub fn street_history(s: &HandState, street: Street) -> Vec<(Seat, Action)> {
 /// snapshot's root board). Task 15's walk consumes it too.
 pub fn root_board(s: &HandState, street: Street) -> Vec<Card> {
     s.board.iter().take(street.board_len()).copied().collect()
+}
+
+/// The street root of every hero decision on `street` that `state`'s history passes through, in
+/// cutoff order: the model-based cutoff recovery that ruling 14-I1 makes the shared approach for
+/// invalidation (rule (4) of [`SnapshotStore::invalidate`]) and for Task 15's `snapshot_root`.
+///
+/// For each cutoff of the street's observed actions, from none of them to all of them, the hand is
+/// truncated there with the board on record up to `street`'s root board, and the model replays it
+/// (`core_model::lifecycle::simulate`, which also sets the truncated state's phase and `Derived`).
+/// Where that is hero's decision, `core_model::street_root` returns its genuine heads-up root or its
+/// admitted projected root (spec section 10.2: the players who folded on the street removed, their
+/// actions dropped from `history`, admitted only if the projection reproduces the decision). That
+/// root's `history` is exactly the domain the engine registers a snapshot's `solved_prefix` in, so
+/// the cutoff whose root history equals a solved prefix is the decision the snapshot was solved for.
+/// A cutoff with no root contributes nothing: someone other than hero to act, the street closed, a
+/// multiway decision, a projection that does not reproduce, a truncation that does not replay, or a
+/// state without hero's cards (`core_model::is_decision_point` requires them). The seat pair is never
+/// inferred from a prefix, and no folded player's actions are stripped: the model decides both.
+/// Empty when `state` has not dealt `street`. A root recovered on another street than `street` would
+/// be a model inconsistency and is asserted against (always on).
+pub(crate) fn decision_roots(state: &HandState, street: Street) -> Vec<StreetRootSnapshot> {
+    let board = root_board(state, street);
+    if board.len() != street.board_len() {
+        return vec![];
+    }
+    let before = state.actions.iter().take_while(|a| street_number(a.street) < street_number(street)).count();
+    let count = state.actions[before..].iter().take_while(|a| a.street == street).count();
+    (0..=count)
+        .filter_map(|cut| {
+            let mut at = state.clone();
+            at.actions.truncate(before + cut);
+            at.board = board.clone();
+            let sim = simulate(&at).ok()?;
+            at.derived = sim.derived();
+            at.phase = sim.phase;
+            let root = street_root(&at).ok()?;
+            // A cutoff of this street's actions, on this street's board, replays on this street.
+            assert!(root.street == street, "a cutoff of the {street:?} actions replayed to a {:?} root", root.street);
+            Some(root)
+        })
+        .collect()
 }
 
 /// Task 15's `snapshot_node_at`, forward-declared under a private name: the exported strategy at
@@ -317,15 +362,21 @@ impl SnapshotStore {
     }
 
     /// Spec section 9.2's mutation invalidation, prefix-based, against the new `state` of a mutation
-    /// (`apply_action`, `set_board`, `undo`). Four rules, in this order: (1) a snapshot of another
-    /// hand is dropped; (2) every snapshot of a street later than the state's current or awaited
-    /// street is dropped; (3) a snapshot whose `root_board` no longer matches its street's board on
-    /// record is dropped; (4) a snapshot survives iff its street's observed history still starts with
-    /// its `solved_prefix`, so append-only mutations keep earlier roots. Retained snapshots keep
-    /// their original immutable provenance: an undo assigns a new hand revision but never rewrites
-    /// `identity_at_solve`.
+    /// (`apply_action`, `set_board`, `set_hero_cards`, `undo`). Four rules, in this order: (1) a
+    /// snapshot of another hand is dropped; (2) every snapshot of a street later than the state's
+    /// current or awaited street is dropped; (3) a snapshot whose `root_board` no longer matches its
+    /// street's board on record is dropped; (4) a snapshot survives iff its `solved_prefix` is still
+    /// a prefix of the new history in the domain it was registered in (ruling 14-I1): the history of
+    /// a street root recovered by the model at one of the street's cutoffs (`decision_roots`), which
+    /// for a spec section 10.2 projection omits the actions of the players who folded on the street.
+    /// So an append-only mutation or a change of hero's cards keeps the snapshot, and an undo across
+    /// its solved decision (or across the projection that admitted it) removes it. Retained
+    /// snapshots keep their original immutable provenance: an undo assigns a new hand revision but
+    /// never rewrites `identity_at_solve`.
     pub fn invalidate(&mut self, state: &HandState) {
         let current = street_number(state.derived.street);
+        // The recovered root histories of each street, computed once per call.
+        let mut solved_at: [Option<Vec<Vec<(Seat, Action)>>>; 4] = Default::default();
         self.entries.retain(|s| {
             if s.key.hand_id != state.hand_id {
                 return false; // (1)
@@ -336,7 +387,9 @@ impl SnapshotStore {
             if s.key.root_board != root_board(state, s.key.street) {
                 return false; // (3)
             }
-            street_history(state, s.key.street).starts_with(&s.provenance.solved_prefix) // (4)
+            let histories = solved_at[usize::from(street_number(s.key.street))]
+                .get_or_insert_with(|| decision_roots(state, s.key.street).into_iter().map(|root| root.history).collect());
+            histories.contains(&s.provenance.solved_prefix) // (4)
         });
     }
 }

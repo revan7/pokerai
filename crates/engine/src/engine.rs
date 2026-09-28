@@ -436,26 +436,30 @@ mod tests {
         e.begin_hand(begin()).unwrap();
         for a in [Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold, Action::Call] { e.apply_action(a).unwrap(); }
         e.set_board(&cards("Kh 7d 2c")).unwrap();
+        // Hero (the BB, seat 2) is first to act on the flop: a decision at the street root.
         let (root_id, at_root) = flop_snapshot(&e, 1, vec![]);
         assert!(e.snapshots.lock().unwrap().register(&root_id, at_root));
+        // Hero checks and the button bets: hero's next decision, solved at the street root's history there (ruling 14-I1:
+        // every snapshot is registered at a hero decision, in its street root's history domain).
         e.apply_action(Action::Check).unwrap();
-        let (check_id, after_check) = flop_snapshot(&e, 2, vec![(Seat(2), Action::Check)]);
-        assert!(e.snapshots.lock().unwrap().register(&check_id, after_check));
-        let hand = root_id.hand_id;
-        let solved = vec![(1, root_id.hand_revision), (2, check_id.hand_revision)];
-        // Append-only: both prefixes still fit; nothing is rewritten.
         e.apply_action(Action::Bet { to: 40 }).unwrap();
+        let (bet_id, facing_bet) = flop_snapshot(&e, 2, vec![(Seat(2), Action::Check), (Seat(0), Action::Bet { to: 40 })]);
+        assert!(e.snapshots.lock().unwrap().register(&bet_id, facing_bet));
+        let hand = root_id.hand_id;
+        let solved = vec![(1, root_id.hand_revision), (2, bet_id.hand_revision)];
+        // Append-only: hero calls; both solved decisions are still in the flop's history; nothing is rewritten.
+        e.apply_action(Action::Call).unwrap();
         assert_eq!(solved_for(&e, hand), solved, "apply_action keeps prefix-valid snapshots with their identity");
         e.set_hero_cards([Card::parse("Ks").unwrap(), Card::parse("Kd").unwrap()]).unwrap();
         assert_eq!(solved_for(&e, hand), solved, "set_hero_cards changes nothing public");
-        // Undo the hero cards, then the bet: the history is back to [Check]; both still fit.
+        // Undo the hero cards, then the call: back at hero's decision facing the bet; both still fit.
         e.undo().unwrap();
         e.undo().unwrap();
         assert_eq!(solved_for(&e, hand), solved, "undo keeps what still fits");
-        // Undo the check: `[Check]` no longer prefixes the flop's history; the root snapshot keeps its old revision.
+        // Undo the bet: hero's decision facing it is no longer in the history; the root snapshot keeps its old revision.
         e.undo().unwrap();
         assert!(e.state().unwrap().hand_revision > root_id.hand_revision);
-        assert_eq!(solved_for(&e, hand), vec![(1, root_id.hand_revision)], "undo drops a same-street snapshot whose prefix no longer fits");
+        assert_eq!(solved_for(&e, hand), vec![(1, root_id.hand_revision)], "undo drops a same-street snapshot whose decision is gone");
         e.finish_hand();
         assert!(solved_for(&e, hand).is_empty(), "finish_hand drops the hand's snapshots");
         e.shutdown();
