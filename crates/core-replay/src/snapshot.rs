@@ -8,7 +8,8 @@
 //! ([`select_snapshot`]) and the store ([`SnapshotStore`]): the active-identity registration gate
 //! and the prefix-based mutation invalidation. The store replaces Plan 2's temporary
 //! `engine::snapshots::SolvedStreet` store; `engine::snapshots` re-exports it. The walk that
-//! consumes a selected snapshot is Task 15.
+//! consumes a selected snapshot is P3.T15's `crate::postflop`, which also uses
+//! [`snapshot_node_at`] and the model-based root recovery `decision_roots` defined here.
 
 use core_model::lifecycle::simulate;
 use core_model::street_root;
@@ -105,8 +106,8 @@ pub fn compatible(a: &SnapshotKey, b: &CompatKey) -> bool {
 /// `covered_paths`); an off-menu wager maps to every menu child its section 8.4 interpolation gives
 /// a nonzero coefficient (both bracketing sizes strictly between two menu sizes, the nearest one
 /// alone at an exact size or a clamp), and each of those children must then be exported for the
-/// next action to count. Counting stops at the first uncovered action; the real walk (Task 15)
-/// continues past it, this only measures coverage for selection. It also stops where the line
+/// next action to count. Counting stops at the first uncovered action; the real walk
+/// (`crate::postflop::walk_postflop`) continues past it, this only measures coverage for selection. It also stops where the line
 /// leaves the skeleton (a terminal edge, or no materialized node) and at an off-menu action that is
 /// not a wager or has no interpolation.
 ///
@@ -114,7 +115,7 @@ pub fn compatible(a: &SnapshotKey, b: &CompatKey) -> bool {
 /// (`proto::resolve_chip_path_indexed`, over one index of `snapshot.tree.materialized` built per
 /// call). An off-menu wager's children come from Task 10's `interpolate` over chip amounts beyond
 /// the node's wager level (see `translated_children`), which selects exactly the children the
-/// pot-fraction interpolation selects.
+/// pot-fraction interpolation of the walk selects.
 pub fn covered_prefix(snapshot: &StreetSnapshot, history: &[(Seat, Action)]) -> usize {
     let index = index_materialized(&snapshot.tree.materialized);
     let mut frontier: Vec<Vec<Action>> = vec![vec![]];
@@ -124,7 +125,7 @@ pub fn covered_prefix(snapshot: &StreetSnapshot, history: &[(Seat, Action)]) -> 
         for chips in &frontier {
             // The mapped line must still name a decision node of the skeleton, and that node must be exported.
             let Some(ordinal) = resolve_chip_path_indexed(&index, chips) else { return count };
-            if node_by_path(snapshot, &ordinal).is_none() {
+            if snapshot_node_at(snapshot, &ordinal).is_none() {
                 return count;
             }
             let node = *index.get(ordinal.as_slice()).expect("a resolved ordinal path names an indexed node");
@@ -153,8 +154,19 @@ pub fn covered_prefix(snapshot: &StreetSnapshot, history: &[(Seat, Action)]) -> 
 /// every later action: a compatible snapshot covering none of the line is still a candidate.
 /// `None` when no snapshot is compatible.
 pub fn select_snapshot<'a>(snapshots: &'a [StreetSnapshot], key: &CompatKey, history: &[(Seat, Action)]) -> Option<&'a StreetSnapshot> {
-    snapshots
-        .iter()
+    select_among(snapshots, key, history)
+}
+
+/// [`select_snapshot`] over any candidates by reference: the one implementation of spec section
+/// 9.2's selection order. The postflop walk passes the candidates whose solved root the model can
+/// reproduce (a failed reconstruction makes a candidate incompatible, P3.T15).
+pub(crate) fn select_among<'a>(
+    candidates: impl IntoIterator<Item = &'a StreetSnapshot>,
+    key: &CompatKey,
+    history: &[(Seat, Action)],
+) -> Option<&'a StreetSnapshot> {
+    candidates
+        .into_iter()
         .filter(|s| compatible(&s.key, key))
         .map(|s| (covered_prefix(s, history), s))
         .max_by(|(pa, a), (pb, b)| {
@@ -178,21 +190,22 @@ pub fn street_number(s: Street) -> u8 {
 /// The observed actions of `street`, in order, as `(seat, action)` pairs: every seat's, including
 /// the actions of players who have folded. This is not the domain of a snapshot's `solved_prefix`,
 /// which holds a street root's history (spec section 10.2 drops the actions of players who folded on
-/// the street from a projected root; see `decision_roots`). Task 15's walk consumes it.
+/// the street from a projected root; see `decision_roots`). The postflop walk consumes it.
 pub fn street_history(s: &HandState, street: Street) -> Vec<(Seat, Action)> {
     s.actions.iter().filter(|a| a.street == street).map(|a| (a.seat, a.action)).collect()
 }
 
 /// `street`'s root board as the state records it: the first `street.board_len()` cards, or every
 /// card on record when the board is shorter (a street not dealt yet, which then matches no
-/// snapshot's root board). Task 15's walk consumes it too.
+/// snapshot's root board). The postflop walk consumes it too.
 pub fn root_board(s: &HandState, street: Street) -> Vec<Card> {
     s.board.iter().take(street.board_len()).copied().collect()
 }
 
 /// The street root of every hero decision on `street` that `state`'s history passes through, in
 /// cutoff order: the model-based cutoff recovery that ruling 14-I1 makes the shared approach for
-/// invalidation (rule (4) of [`SnapshotStore::invalidate`]) and for Task 15's `snapshot_root`.
+/// invalidation (rule (4) of [`SnapshotStore::invalidate`]) and for the postflop walk's
+/// `snapshot_root` (P3.T15).
 ///
 /// For each cutoff of the street's observed actions, from none of them to all of them, the hand is
 /// truncated there with the board on record up to `street`'s root board, and the model replays it
@@ -231,9 +244,12 @@ pub(crate) fn decision_roots(state: &HandState, street: Street) -> Vec<StreetRoo
         .collect()
 }
 
-/// Task 15's `snapshot_node_at`, forward-declared under a private name: the exported strategy at
-/// ordinal `path`, found through `covered_paths` (which lists the exported nodes in order).
-fn node_by_path<'a>(s: &'a StreetSnapshot, path: &[u8]) -> Option<&'a NodeStrategy> {
+/// The exported strategy of the node at ordinal `path` of `s`'s materialized tree, found through
+/// `covered_paths` (which lists the ordinal path of every exported node, in `nodes` order); `None`
+/// when that node is not exported (spec section 9.2 case 3). Named `snapshot_node_at`, not
+/// `node_at`: Plan 2's `engine::tree::node_at(&[MaterializedNode], &[u8])` answers a different
+/// question (the materialized node, exported or not).
+pub fn snapshot_node_at<'a>(s: &'a StreetSnapshot, path: &[u8]) -> Option<&'a NodeStrategy> {
     s.covered_paths.iter().position(|p| p.as_slice() == path).and_then(|i| s.nodes.get(i))
 }
 
@@ -257,7 +273,7 @@ fn wager_to(a: &Action) -> Option<u32> {
 /// street along the path (0 at an opening node). It is the `own + call` of Task 10's
 /// `wager_fraction` at that node: the actor's street contribution plus what it owes. `None` if the
 /// path does not walk the skeleton (never for a path [`resolve_chip_path_indexed`] returned).
-fn wager_level(index: &MaterializedIndex<'_>, ordinal: &[u8], street: Street) -> Option<u32> {
+pub(crate) fn wager_level(index: &MaterializedIndex<'_>, ordinal: &[u8], street: Street) -> Option<u32> {
     let mut level = 0;
     for (k, &i) in ordinal.iter().enumerate() {
         let parent = index.get(&ordinal[..k])?;
@@ -284,8 +300,9 @@ fn wager_level(index: &MaterializedIndex<'_>, ordinal: &[u8], street: Street) ->
 /// identically, which is all `interpolate`'s choice of indices depends on: the same exact match, the
 /// same clamp, the same bracketing pair. Strictly inside a bracket both coefficients are positive in
 /// either representation (`0 < f_A < 1`), so the set of children with a nonzero coefficient is the
-/// same; the coefficients themselves are the walk's, not needed to count coverage.
-fn translated_children(node: &MaterializedNode, level: u32, observed: &Action) -> Option<Vec<usize>> {
+/// same; the coefficients themselves are the walk's, not needed to count coverage (the postflop
+/// walk's unit tests check that its mapped parent's `own + call` is this `level`).
+pub(crate) fn translated_children(node: &MaterializedNode, level: u32, observed: &Action) -> Option<Vec<usize>> {
     let beyond = |to: u32| to.checked_sub(level).map(f64::from);
     let s = beyond(wager_to(observed)?)?;
     let menu = node
@@ -365,12 +382,14 @@ impl SnapshotStore {
     /// (`apply_action`, `set_board`, `set_hero_cards`, `undo`). Four rules, in this order: (1) a
     /// snapshot of another hand is dropped; (2) every snapshot of a street later than the state's
     /// current or awaited street is dropped; (3) a snapshot whose `root_board` no longer matches its
-    /// street's board on record is dropped; (4) a snapshot survives iff its `solved_prefix` is still
-    /// a prefix of the new history in the domain it was registered in (ruling 14-I1): the history of
-    /// a street root recovered by the model at one of the street's cutoffs (`decision_roots`), which
-    /// for a spec section 10.2 projection omits the actions of the players who folded on the street.
-    /// So an append-only mutation or a change of hero's cards keeps the snapshot, and an undo across
-    /// its solved decision (or across the projection that admitted it) removes it. Retained
+    /// street's board on record is dropped; (4) a snapshot survives iff its `solved_prefix` **equals**
+    /// the history of a street root the model recovers at one of the street's cutoffs
+    /// (`decision_roots`, ruling 14-I1). That is the new history cut at the decision the snapshot
+    /// was solved for, in the domain it was registered in, which for a spec section 10.2 projection
+    /// omits the actions of the players who folded on the street. It is equality, not `starts_with`:
+    /// a later decision whose projected history merely extends the prefix does not stand in for the
+    /// solved one. So an append-only mutation or a change of hero's cards keeps the snapshot, and an
+    /// undo across its solved decision (or across the projection that admitted it) removes it. Retained
     /// snapshots keep their original immutable provenance: an undo assigns a new hand revision but
     /// never rewrites `identity_at_solve`.
     pub fn invalidate(&mut self, state: &HandState) {

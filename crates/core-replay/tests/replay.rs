@@ -823,10 +823,10 @@ fn a_seat_blocked_out_of_its_range_is_invalid() {
 // Completed streets without snapshots, and the preflop stop's scope.
 // ---------------------------------------------------------------------------------------------
 
-/// Task 13's complete fallback for a completed postflop street (no snapshot is consumed yet):
-/// `UnconditionedPriorStreet{cause: "no compatible snapshot"}` per actual acting seat, the
-/// preflop masses retained, each root blocked in order. The preflop stop clears on entering the
-/// flop (section 9.3 scopes it to the preflop street).
+/// A completed postflop street with no snapshot (none registered; hero folded preflop, so no hero
+/// decision was ever solved on it): `UnconditionedPriorStreet{cause: "no compatible snapshot"}` per
+/// actual acting seat, the preflop masses retained, each root blocked in order. The preflop stop
+/// clears on entering the flop (section 9.3 scopes it to the preflop street).
 #[test]
 fn a_completed_street_falls_back_unconditioned_and_blocks_each_root() {
     let store = full_store();
@@ -881,6 +881,47 @@ fn a_completed_street_falls_back_unconditioned_and_blocks_each_root() {
     }
     assert_eq!(out.folded_ranges, vec![out.ranges[0].clone().unwrap(), out.ranges[1].clone().unwrap(), out.ranges[4].clone().unwrap(), out.ranges[5].clone().unwrap()]);
     assert_eq!(out.unsupported, None);
+}
+
+/// P3.T15: a completed street without a compatible heads-up snapshot keeps every mass the earlier
+/// streets left and names why, for each seat that acted on it, in order of first action. Played
+/// three-way from its root with no hero decision ever heads-up, the cause is `multiway prior
+/// street`; heads-up with hero deciding but nothing registered, `no compatible snapshot` (replay
+/// holds no engine failure, deadline or no-request provenance to be more specific). No preflop
+/// source: every seat enters the flop uniform.
+#[test]
+fn a_completed_street_without_a_snapshot_names_multiway_or_no_snapshot() {
+    let cfg = config_at(10);
+    let none = PreflopStore::from_sources(vec![]);
+    let seated = table_with(&cfg, BB, Some(hand("AsAd")));
+
+    // UTG and HJ fold, CO limps, BTN folds, SB completes, BB checks: SB, BB and CO see the flop.
+    let limped = act(&seated, &[Action::Fold, Action::Fold, Action::Call, Action::Fold, Action::Call, Action::Check]);
+    let flop = deal(&limped, "Kh7d2c");
+    let turn = deal(&act(&flop, &[Action::Check, Action::Check, Action::Check]), "Kh7d2c4c");
+    let out = run(&none, &turn);
+    let multiway = |seat| unconditioned(Street::Flop, seat, "multiway prior street");
+    let flop_reasons: Vec<&ApproxReason> =
+        out.reasons.iter().filter(|r| matches!(r, ApproxReason::UnconditionedPriorStreet { street: Street::Flop, .. })).collect();
+    assert_eq!(flop_reasons, vec![&multiway(SB), &multiway(BB), &multiway(CO)]);
+    let at_root = run(&none, &flop);
+    assert_eq!(out.branches.len(), 1);
+    assert_eq!(out.branches[0].q.to_bits(), at_root.branches[0].q.to_bits(), "nothing is conditioned");
+    for (s, z) in out.branches[0].seats.iter().zip(&at_root.branches[0].seats) {
+        assert_eq!(s.mass, z.mass, "seat {:?} keeps its flop-root masses", s.seat);
+    }
+    assert_eq!(out.log_reach, at_root.log_reach);
+
+    // Heads-up: SB raises to 50, BB (hero) calls, both check the flop; nothing was registered.
+    let heads_up = act(&seated, &[Action::Fold, Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 50 }, Action::Call]);
+    let turn = deal(&act(&deal(&heads_up, "Kh7d2c"), &[Action::Check, Action::Check]), "Kh7d2c4c");
+    let out = run(&none, &turn);
+    let flop_reasons: Vec<&ApproxReason> =
+        out.reasons.iter().filter(|r| matches!(r, ApproxReason::UnconditionedPriorStreet { street: Street::Flop, .. })).collect();
+    assert_eq!(
+        flop_reasons,
+        vec![&unconditioned(Street::Flop, SB, "no compatible snapshot"), &unconditioned(Street::Flop, BB, "no compatible snapshot")]
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

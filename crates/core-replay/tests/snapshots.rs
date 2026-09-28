@@ -710,3 +710,1102 @@ fn street_numbers_order_the_streets() {
         [0, 1, 2, 3]
     );
 }
+
+// =============================================================================================
+// P3.T15 -- the postflop walk over partial snapshot exports (spec sections 8.4, 9.2 and 9.3;
+// section 13.1's `replay_snapshot_prefix_reuse`).
+//
+// Every hand below is built by Plan 1's `begin_hand`/`apply_action`/`set_board`. There is no
+// preflop source, so the preflop walk stops at the first action (`missing node no bundle`), the
+// stop clears on the flop, and every seat enters the flop with uniform masses on all 1326 combos.
+// Every expected branch weight, mass, marginal and `log_reach` is computed independently of the
+// crate's kernel with the Task 11 formulas (`Expected`, plain f64 sums). No worker is used.
+// =============================================================================================
+
+use core_preflop::PreflopStore;
+use core_replay::{board_mask, marginal, replay, ReplayInput, ReplayOutput, SnapshotKey, SnapshotProvenance};
+use proto::worker::NodeStrategy;
+use proto::{ApproxReason, EffectiveTree, MaterializedNode, OrdinalPath, COMBOS};
+
+const SB: Seat = Seat(0);
+
+/// The walk's hand: the table above with hero the BB. UTG, HJ, CO and BTN fold, the SB raises to 50
+/// and the BB calls: a heads-up flop Kh 7d 2c with a 100-chip root pot, the SB out of position and
+/// first to act, the BB (hero) in position; 950 chips behind each.
+fn walk_flop() -> HandState {
+    let s = act(&table(BB), &[Action::Fold, Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 50 }, Action::Call]);
+    let s = core_model::set_board(&s, &flop_board()).expect("the flop");
+    assert_eq!((s.derived.to_act, s.derived.pot), (Some(SB), 100));
+    s
+}
+
+/// `line` on the flop of [`walk_flop`], then the turn 4c.
+fn walked_turn(line: &[Action]) -> HandState {
+    core_model::set_board(&act(&walk_flop(), line), &turn_board()).expect("the turn")
+}
+
+/// Section 13.1's flop line: the SB checks, the BB bets 73 into 100, the SB calls.
+fn check_bet73_call() -> Vec<Action> {
+    vec![Action::Check, Action::Bet { to: 73 }, Action::Call]
+}
+
+/// Replays `state` with no preflop source and the given registered snapshots.
+fn replay_with(state: &HandState, snapshots: &[StreetSnapshot]) -> ReplayOutput {
+    let store = PreflopStore::from_sources(vec![]);
+    replay(ReplayInput { cfg: &state.config, state, store: &store, snapshots })
+}
+
+/// The combos `board` leaves: the `available` set of every exported node solved on it.
+fn live_on(board: &[Card]) -> Vec<bool> {
+    board_mask(board).0.iter().map(|w| *w > 0.0).collect()
+}
+
+/// The combos the flop leaves.
+fn flop_live() -> Vec<bool> {
+    live_on(&flop_board())
+}
+
+/// One node of a walk fixture's materialized tree. It is exported when it carries probabilities:
+/// one `[even, odd]` pair per menu action, a combo taking the entry of its index's parity.
+struct TreeNode {
+    path: OrdinalPath,
+    actor: &'static str,
+    actions: Vec<Action>,
+    terminal: Vec<Option<u32>>,
+    probs: Option<Vec<[f32; 2]>>,
+}
+
+fn tree_node(path: &[u8], actor: &'static str, actions: Vec<Action>, terminal: Vec<Option<u32>>, probs: Option<&[[f32; 2]]>) -> TreeNode {
+    assert_eq!(actions.len(), terminal.len());
+    if let Some(p) = probs {
+        assert_eq!(p.len(), actions.len());
+    }
+    TreeNode { path: path.to_vec(), actor, actions, terminal, probs: probs.map(|p| p.to_vec()) }
+}
+
+/// A menu action's likelihood column over 1326 combos: its parity entry on every `live` combo, 0
+/// on every other (unavailable to the solve).
+fn column_on(live: &[bool], pairs: &[[f32; 2]], a: usize) -> Vec<f64> {
+    (0..COMBOS).map(|c| if live[c] { f64::from(pairs[a][c % 2]) } else { 0.0 }).collect()
+}
+
+/// [`column_on`] the combos the flop leaves.
+fn column(pairs: &[[f32; 2]], a: usize) -> Vec<f64> {
+    column_on(&flop_live(), pairs, a)
+}
+
+/// The root: the SB checks or bets 100 with probability .5 each.
+const ROOT: [[f32; 2]; 2] = [[0.5, 0.5], [0.5, 0.5]];
+/// The BB after the check, menu Check / Bet50 / Bet100 (the brief's `(.9, .3)` and `(.1, .5)`).
+const IP_MENU: [[f32; 2]; 3] = [[0.0, 0.2], [0.9, 0.3], [0.1, 0.5]];
+/// The SB facing 50: Fold / Call `(.5, 1)`.
+const AFTER_50: [[f32; 2]; 2] = [[0.5, 0.0], [0.5, 1.0]];
+/// The SB facing 100: Fold / Call `(.2, .8)`.
+const AFTER_100: [[f32; 2]; 2] = [[0.8, 0.2], [0.2, 0.8]];
+/// The BB facing the SB's 100-chip bet (off the observed line).
+const FACING_ROOT_BET: [[f32; 2]; 2] = [[0.5, 0.5], [0.5, 0.5]];
+/// The BB after the check with 73 inserted: Check / Bet50 / Bet73 `(.4, .2)` / Bet100.
+const INSERTED_MENU: [[f32; 2]; 4] = [[0.1, 0.3], [0.4, 0.3], [0.4, 0.2], [0.1, 0.2]];
+/// The same node forced to Bet73 with probability 1.
+const FORCED_MENU: [[f32; 2]; 4] = [[0.0, 0.0], [0.0, 0.0], [1.0, 1.0], [0.0, 0.0]];
+/// The SB facing 73: Fold / Call `(.3, .6)`.
+const AFTER_73: [[f32; 2]; 2] = [[0.7, 0.4], [0.3, 0.6]];
+
+/// The prefix-reuse skeleton (menu Bet50/Bet100 after the check), exporting exactly `exported`.
+fn menu_tree(exported: &[&[u8]]) -> Vec<TreeNode> {
+    let probs = |path: &[u8], pairs: &'static [[f32; 2]]| exported.contains(&path).then_some(pairs);
+    vec![
+        tree_node(&[], "oop", vec![Action::Check, Action::Bet { to: 100 }], vec![None, None], probs(&[], &ROOT)),
+        tree_node(&[1], "ip", vec![Action::Fold, Action::Call], vec![Some(200), Some(300)], probs(&[1], &FACING_ROOT_BET)),
+        tree_node(&[0], "ip", vec![Action::Check, Action::Bet { to: 50 }, Action::Bet { to: 100 }], vec![Some(100), None, None], probs(&[0], &IP_MENU)),
+        tree_node(&[0, 1], "oop", vec![Action::Fold, Action::Call], vec![Some(150), Some(200)], probs(&[0, 1], &AFTER_50)),
+        tree_node(&[0, 2], "oop", vec![Action::Fold, Action::Call], vec![Some(200), Some(300)], probs(&[0, 2], &AFTER_100)),
+    ]
+}
+
+/// The same street with 73 inserted into the BB's menu after the check, every node exported.
+fn inserted_tree(ip_menu: &[[f32; 2]; 4]) -> Vec<TreeNode> {
+    vec![
+        tree_node(&[], "oop", vec![Action::Check, Action::Bet { to: 100 }], vec![None, None], Some(&ROOT)),
+        tree_node(&[1], "ip", vec![Action::Fold, Action::Call], vec![Some(200), Some(300)], Some(&FACING_ROOT_BET)),
+        tree_node(
+            &[0],
+            "ip",
+            vec![Action::Check, Action::Bet { to: 50 }, Action::Bet { to: 73 }, Action::Bet { to: 100 }],
+            vec![Some(100), None, None, None],
+            Some(ip_menu),
+        ),
+        tree_node(&[0, 1], "oop", vec![Action::Fold, Action::Call], vec![Some(150), Some(200)], Some(&AFTER_50)),
+        tree_node(&[0, 2], "oop", vec![Action::Fold, Action::Call], vec![Some(173), Some(246)], Some(&AFTER_73)),
+        tree_node(&[0, 3], "oop", vec![Action::Fold, Action::Call], vec![Some(200), Some(300)], Some(&AFTER_100)),
+    ]
+}
+
+/// The provenance reason every walk fixture snapshot carries, to be inherited by the replay.
+fn inherited() -> ApproxReason {
+    ApproxReason::DeadlineBestSoFar { reached_bp: 80, target_bp: 50 }
+}
+
+/// The public ranges this replay computes at the flop root, hashed as the engine keys a snapshot:
+/// `[OOP, IP]`.
+fn flop_root_hashes(oop: Seat, ip: Seat) -> [[u8; 32]; 2] {
+    let incoming = replay_with(&walk_flop(), &[]);
+    let hash = |seat: Seat| core_ranges::hash_scaled(incoming.ranges[usize::from(seat.0)].as_ref().expect("a dealt seat's range"));
+    [hash(oop), hash(ip)]
+}
+
+/// The snapshot hero registers at its flop decision after the SB's check (solved prefix
+/// `[SB Check]`, decision `decision_id`), keyed by the flop-root public ranges, over `nodes`: every
+/// node with probabilities is exported, rows `available` exactly on the combos the flop leaves.
+fn walk_snapshot(nodes: &[TreeNode], decision_id: u64) -> StreetSnapshot {
+    let decision = act(&walk_flop(), &[Action::Check]);
+    let root = core_model::street_root(&decision).expect("hero's decision after the check");
+    assert_eq!((root.oop, root.ip, root.pot_root, root.history.clone()), (SB, BB, 100, vec![(SB, Action::Check)]));
+    snapshot_at(&decision, nodes, &flop_live(), flop_root_hashes(SB, BB), decision_id)
+}
+
+/// The snapshot the engine registers at hero's decision in `decision` (decision `decision_id`):
+/// keyed by that street's root board and the incoming public-range `hashes` (OOP, IP), its solved
+/// prefix the street root's history, over the tree `nodes`; every node with probabilities is
+/// exported, its rows `available` exactly on the `live` combos.
+fn snapshot_at(decision: &HandState, nodes: &[TreeNode], live: &[bool], hashes: [[u8; 32]; 2], decision_id: u64) -> StreetSnapshot {
+    let root = core_model::street_root(decision).expect("a hero decision with an admitted root");
+    let at = |path: &[u8]| nodes.iter().find(|n| n.path == path).unwrap_or_else(|| panic!("the fixture has a node at {path:?}"));
+    let chips = |path: &[u8]| -> Vec<Action> { (0..path.len()).map(|k| at(&path[..k]).actions[usize::from(path[k])]).collect() };
+    let exported: Vec<&TreeNode> = nodes.iter().filter(|n| n.probs.is_some()).collect();
+    let strategies = exported
+        .iter()
+        .map(|n| {
+            let pairs = n.probs.as_ref().expect("exported");
+            let width = n.actions.len();
+            NodeStrategy {
+                path: chips(&n.path),
+                actor: n.actor.into(),
+                actions: n.actions.clone(),
+                probs: (0..COMBOS).map(|c| if live[c] { pairs.iter().map(|p| p[c % 2]).collect() } else { vec![0.0; width] }).collect(),
+                ev_chips: vec![vec![0.0; width]; COMBOS],
+                available: live.to_vec(),
+            }
+        })
+        .collect();
+    let materialized = nodes
+        .iter()
+        .map(|n| MaterializedNode { path: n.path.clone(), street: root.street, actor: n.actor.into(), actions: n.actions.clone(), terminal_pots: n.terminal.clone() })
+        .collect();
+    let inserted = if nodes.iter().any(|n| n.path == [0] && n.actions.contains(&Action::Bet { to: 73 })) {
+        vec![(vec![Action::Check], "ip".to_string(), Action::Bet { to: 73 })]
+    } else {
+        vec![]
+    };
+    StreetSnapshot {
+        key: SnapshotKey {
+            hand_id: decision.hand_id,
+            config_revision: decision.config.config_revision,
+            model_revision: 0,
+            street: root.street,
+            root_board: root.board.clone(),
+            root_range_hashes: hashes,
+            tree_signature: "walk_test_v1".into(),
+        },
+        provenance: SnapshotProvenance {
+            identity_at_solve: id(decision.hand_id, 8, decision_id),
+            solved_prefix: root.history.clone(),
+            origin: "live".into(),
+        },
+        tree: EffectiveTree {
+            rules_version: 3,
+            template_id: "walk_test_v1".into(),
+            root_street: root.street,
+            menus: std::collections::BTreeMap::new(),
+            add_allin_threshold: 0.0,
+            force_allin_threshold: 0.0,
+            merging_threshold: 0.0,
+            wager_cap: 3,
+            inserted,
+            materialized,
+        },
+        nodes: strategies,
+        covered_paths: exported.iter().map(|n| n.path.clone()).collect(),
+        exploitability_chips: 0.1,
+        reasons: vec![inherited()],
+    }
+}
+
+/// A history branch computed independently of the crate's kernel with the Task 11 formulas
+/// (plain f64 sums): its weight `q`, every seat's masses (indexed by seat id) and its mapped line.
+#[derive(Clone, Debug)]
+struct Expected {
+    q: f64,
+    masses: Vec<Vec<f64>>,
+    line: Vec<(Seat, Action)>,
+}
+
+impl Expected {
+    /// The flop root of every walk fixture: one branch, `q = 1`, uniform masses for all six seats.
+    fn start() -> Self {
+        Expected { q: 1.0, masses: vec![vec![1.0; COMBOS]; 6], line: vec![] }
+    }
+
+    /// `seat` takes `action` with likelihood `p` at interpolation weight `f`:
+    /// `M = sum_c w[c] p[c] / sum_c w[c]`, `q *= f * M`, `w[c] *= p[c] / M`; other seats unchanged.
+    fn take(&self, seat: Seat, action: Action, p: &[f64], f: f64) -> Self {
+        let slot = usize::from(seat.0);
+        let w = &self.masses[slot];
+        let m = w.iter().zip(p).map(|(w, p)| w * p).sum::<f64>() / w.iter().sum::<f64>();
+        assert!(m > 0.0, "the expected model applies only supported actions");
+        let mut next = self.clone();
+        next.q *= f * m;
+        next.masses[slot] = w.iter().zip(p).map(|(w, p)| w * p / m).collect();
+        next.line.push((seat, action));
+        next
+    }
+
+    /// `seat`'s `action` navigated through an uncovered skeleton node: recorded on the mapped line,
+    /// never applied (no likelihood, `q` and every mass unchanged).
+    fn skip(&self, seat: Seat, action: Action) -> Self {
+        let mut next = self.clone();
+        next.line.push((seat, action));
+        next
+    }
+}
+
+/// Spec section 8.4's pseudo-harmonic weights of an observed pot fraction `s` between menu
+/// fractions `a < s < b`, from the formula itself.
+fn harmonic(s: f64, a: f64, b: f64) -> (f64, f64) {
+    let fa = (b - s) * (1.0 + a) / ((b - a) * (1.0 + s));
+    (fa, 1.0 - fa)
+}
+
+/// `a` equals `b` within a relative 1e-10 (exactly, when `b` is 0): weights and masses are checked
+/// at their own magnitude, however small.
+fn close_to(a: f64, b: f64, what: &str) {
+    assert!((a - b).abs() <= 1e-10 * b.abs(), "{what}: {a} != {b}");
+}
+
+/// `a` equals `b` within an absolute 1e-10: for logarithms.
+fn close_log(a: f64, b: f64, what: &str) {
+    assert!((a - b).abs() <= 1e-10, "{what}: {a} != {b}");
+}
+
+/// [`assert_walked_at`] a replay ending at the turn root.
+fn assert_walked(out: &ReplayOutput, expected: &[Expected], what: &str) {
+    assert_walked_at(out, expected, &turn_board(), what);
+}
+
+/// Asserts that `out` (a replay ending at the street root of `board`) holds exactly the `expected`
+/// branches: in order, each branch's mapped line and weight `q` (never rescaled), and every seat's
+/// masses equal to the expected ones divided by that seat's accumulated rescale `exp(log_reach)`;
+/// and, per seat, `log_reach`, the board-free marginal and the published range equal to the
+/// expected marginal `sum_k q_k w_k` with `board` removed and scaled to maximum 1. The expected
+/// branches start from uniform masses and `log_reach = 0`.
+fn assert_walked_at(out: &ReplayOutput, expected: &[Expected], board: &[Card], what: &str) {
+    let summary: Vec<(u8, f64, &Vec<(Seat, Action)>)> = out.branches.iter().map(|b| (b.id, b.q, &b.translated)).collect();
+    assert_eq!(out.branches.len(), expected.len(), "{what}: branches {summary:?}");
+    for (b, e) in out.branches.iter().zip(expected) {
+        assert!(!b.residual && b.stopped.is_none(), "{what}: branch {} is live", b.id);
+        assert_eq!(b.translated, e.line, "{what}: branch {} mapped line", b.id);
+        close_to(b.q, e.q, &format!("{what}: branch {} q", b.id));
+        for s in &b.seats {
+            let slot = usize::from(s.seat.0);
+            let scale = out.log_reach[slot].exp();
+            for c in 0..COMBOS {
+                close_to(s.mass[c] * scale, e.masses[slot][c], &format!("{what}: branch {} seat {slot} mass[{c}]", b.id));
+            }
+        }
+    }
+    let mask = board_mask(board);
+    for slot in 0..6 {
+        let unscaled: Vec<f64> =
+            (0..COMBOS).map(|c| if mask.0[c] == 0.0 { 0.0 } else { expected.iter().map(|e| e.q * e.masses[slot][c]).sum() }).collect();
+        let peak = unscaled.iter().copied().fold(0.0_f64, f64::max);
+        assert!(peak > 0.0);
+        close_log(out.log_reach[slot], peak.ln(), &format!("{what}: seat {slot} log_reach"));
+        let got = marginal(&out.branches, Seat(slot as u8));
+        let range = out.ranges[slot].as_ref().expect("a dealt seat's range");
+        for c in 0..COMBOS {
+            let want = unscaled[c] / peak;
+            if mask.0[c] > 0.0 {
+                close_to(got[c], want, &format!("{what}: seat {slot} marginal[{c}]"));
+            }
+            assert!((f64::from(range.0[c]) - want).abs() <= 1e-6, "{what}: seat {slot} range[{c}] = {} != {want}", range.0[c]);
+        }
+    }
+}
+
+fn flop_reason(seat: Seat, cause: &str) -> ApproxReason {
+    ApproxReason::UnconditionedPriorStreet { street: Street::Flop, seat, cause: cause.into() }
+}
+
+/// Every flop `UnconditionedPriorStreet` of `out`, as `(seat, cause)`.
+fn flop_unconditioned(out: &ReplayOutput) -> Vec<(Seat, String)> {
+    out.reasons
+        .iter()
+        .filter_map(|r| match r {
+            ApproxReason::UnconditionedPriorStreet { street: Street::Flop, seat, cause } => Some((*seat, cause.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A flop `BetTranslation`'s fields: seat, observed fraction, mapped `(size, weight)`s, deviation,
+/// prominence.
+type Translation = (Seat, f32, Vec<(f32, f32)>, f32, bool);
+
+/// The flop `BetTranslation`s of `out`.
+fn flop_translations(out: &ReplayOutput) -> Vec<Translation> {
+    out.reasons
+        .iter()
+        .filter_map(|r| match r {
+            ApproxReason::BetTranslation { street: Street::Flop, seat, observed_pct, mapped, deviation, prominent } => {
+                Some((*seat, *observed_pct, mapped.clone(), *deviation, *prominent))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Section 13.1's `replay_snapshot_prefix_reuse`: the flop line [check, bet 73, call] against one
+/// snapshot solved at prefix [check] with menu 50/100, under three exports (spec section 9.2 case 3
+/// per node), plus section 13.1 T3's inserted-size clause. In every case the applied prefix is kept
+/// and nothing is re-solved, and an omitted action changes neither `q` nor any mass in its branch:
+/// each expected branch below does not apply it, and the replay must match that branch (masses up
+/// to the seat-common rescale).
+#[test]
+fn replay_snapshot_prefix_reuse() {
+    let turn = walked_turn(&check_bet73_call());
+    let (fa, fb) = harmonic(73.0 / 100.0, 0.5, 1.0);
+    let (check, bet50, bet100, call) = (Action::Check, Action::Bet { to: 50 }, Action::Bet { to: 100 }, Action::Call);
+
+    // (a) Requested-node-only: only [check] (the BB's node) is exported. The SB's check at the
+    // absent root is not applied ("uncovered path []"), the BB's 73 is translated over 50/100 from
+    // the covered node, and the SB's call at [0,1] / [0,2] is not applied either.
+    let requested = replay_with(&turn, &[walk_snapshot(&menu_tree(&[&[0]]), 1)]);
+    let root = Expected::start().skip(SB, check);
+    let expected = [
+        root.take(BB, bet50, &column(&IP_MENU, 1), fa).skip(SB, call),
+        root.take(BB, bet100, &column(&IP_MENU, 2), fb).skip(SB, call),
+    ];
+    assert_walked(&requested, &expected, "requested-node-only");
+    for b in &requested.branches {
+        let sb = &b.seats[0].mass;
+        assert!(sb.iter().all(|w| *w == sb[0]), "the SB's check and call are never applied: its masses stay uniform");
+    }
+    let unconditioned = flop_unconditioned(&requested);
+    for path in ["[]", "[0, 1]", "[0, 2]"] {
+        let reason = (SB, format!("uncovered path {path}"));
+        assert_eq!(unconditioned.iter().filter(|r| **r == reason).count(), 1, "{reason:?} in {unconditioned:?}");
+    }
+    assert_eq!(unconditioned.len(), 3, "{unconditioned:?}");
+    let translations = flop_translations(&requested);
+    assert_eq!(translations.len(), 1, "{translations:?}");
+    let (seat, observed, mapped, deviation, prominent) = &translations[0];
+    assert_eq!((*seat, *prominent), (BB, true));
+    assert!((f64::from(*observed) - 0.73).abs() < 1e-6 && (f64::from(*deviation) - 0.23).abs() < 1e-6);
+    assert_eq!(mapped.len(), 2);
+    assert!((f64::from(mapped[0].0) - 0.5).abs() < 1e-6 && (f64::from(mapped[0].1) - fa).abs() < 1e-6);
+    assert!((f64::from(mapped[1].0) - 1.0).abs() < 1e-6 && (f64::from(mapped[1].1) - fb).abs() < 1e-6);
+    assert_eq!(requested.reasons.iter().filter(|r| **r == inherited()).count(), 1, "the snapshot's reasons are inherited once");
+
+    // (b) Root-only: only [] is exported. The SB's check is conditioned from the root; the BB's 73 at
+    // the uncovered [check] has no likelihood and no guessed split; the SB's call is not applied.
+    let root_only = replay_with(&turn, &[walk_snapshot(&menu_tree(&[&[]]), 2)]);
+    let expected = [Expected::start().take(SB, check, &column(&ROOT, 0), 1.0)];
+    assert_walked(&root_only, &expected, "root-only");
+    let bb = &root_only.branches[0].seats[1].mass;
+    assert!(bb.iter().all(|w| *w == bb[0]), "the BB's uncovered bet is never applied: its masses stay uniform");
+    assert!(flop_unconditioned(&root_only).contains(&(BB, "uncovered path [0]".to_string())));
+    assert!(flop_translations(&root_only).is_empty(), "no guessed split");
+    assert_eq!(root_only.reasons.iter().filter(|r| **r == inherited()).count(), 1);
+
+    // (c) Complete street: [], [0], [0,1], [0,2]. The check, the translated 73 and the call from
+    // each covered continuation all condition their actors, each exactly once.
+    let complete = replay_with(&turn, &[walk_snapshot(&menu_tree(&[&[], &[0], &[0, 1], &[0, 2]]), 3)]);
+    let root = Expected::start().take(SB, check, &column(&ROOT, 0), 1.0);
+    let expected = [
+        root.take(BB, bet50, &column(&IP_MENU, 1), fa).take(SB, call, &column(&AFTER_50, 1), 1.0),
+        root.take(BB, bet100, &column(&IP_MENU, 2), fb).take(SB, call, &column(&AFTER_100, 1), 1.0),
+    ];
+    assert_walked(&complete, &expected, "complete");
+    assert!(flop_unconditioned(&complete).is_empty(), "{:?}", complete.reasons);
+    assert_eq!(flop_translations(&complete).len(), 1);
+
+    // (d) Section 13.1 T3: an inserted observed size is a tree action with a solved probability.
+    // With 73 on the BB's menu (solved `(.4, .2)`), the same line conditions on that probability,
+    // never on 1, and is never translated.
+    let inserted = replay_with(&turn, &[walk_snapshot(&inserted_tree(&INSERTED_MENU), 4)]);
+    let bet73 = Action::Bet { to: 73 };
+    let expected = [Expected::start()
+        .take(SB, check, &column(&ROOT, 0), 1.0)
+        .take(BB, bet73, &column(&INSERTED_MENU, 2), 1.0)
+        .take(SB, call, &column(&AFTER_73, 1), 1.0)];
+    assert_walked(&inserted, &expected, "inserted");
+    assert!(flop_translations(&inserted).is_empty() && flop_unconditioned(&inserted).is_empty(), "{:?}", inserted.reasons);
+    let turn_live = board_mask(&turn_board());
+    let ip = inserted.ranges[1].as_ref().expect("the BB's range");
+    for c in (0..COMBOS).filter(|&c| turn_live.0[c] > 0.0) {
+        assert_eq!(ip.0[c], if c % 2 == 0 { 1.0 } else { 0.5 }, "the BB's range is the .4/.2 conditioning, combo {c}");
+    }
+    // Forcing P(Bet73 | c) = 1 is a different, wrong answer: it leaves the BB's range flat.
+    let forced = replay_with(&turn, &[walk_snapshot(&inserted_tree(&FORCED_MENU), 5)]);
+    let (solved, flat) = (marginal(&inserted.branches, BB), marginal(&forced.branches, BB));
+    let gap = (0..COMBOS).filter(|&c| turn_live.0[c] > 0.0).map(|c| (solved[c] - flat[c]).abs()).fold(0.0_f64, f64::max);
+    assert!(gap > 1e-10, "forcing the inserted size to 1 must differ from its solved probability (gap {gap})");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Frozen navigation (spec section 9.2 as amended by revision 6, S14): "A branch whose mapped
+// continuation is not covered freezes navigation for that branch for the remainder of the street;
+// later observed actions in other branches are unaffected."
+// ---------------------------------------------------------------------------------------------
+
+use core_replay::{uncovered, walk_postflop, HistoryBranch};
+
+/// The flop root's replay output (no snapshot consumed), then [`walk_postflop`] over the flop of
+/// [`walk_flop`] followed by `line`, with `snapshots` registered: the walk after each prefix of a
+/// street, which the whole-hand replay only shows once the street is complete.
+fn walk_flop_line(line: &[Action], snapshots: &[StreetSnapshot]) -> ReplayOutput {
+    let mut out = replay_with(&walk_flop(), &[]);
+    let state = act(&walk_flop(), line);
+    let store = PreflopStore::from_sources(vec![]);
+    walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots }, Street::Flop, &mut out);
+    out
+}
+
+/// A branch bit for bit: id, parent, mapped line, `q`, residual and stop flags, every seat's masses.
+type Bits = (u8, Option<u8>, Vec<(Seat, Action)>, u64, bool, Option<String>, Vec<Vec<u64>>);
+
+fn bits(b: &HistoryBranch) -> Bits {
+    (
+        b.id,
+        b.parent,
+        b.translated.clone(),
+        b.q.to_bits(),
+        b.residual,
+        b.stopped.clone(),
+        b.seats.iter().map(|s| s.mass.iter().map(|w| w.to_bits()).collect()).collect(),
+    )
+}
+
+/// The branch whose mapped line holds `step`.
+fn branch_with<'a>(out: &'a ReplayOutput, step: (Seat, Action)) -> &'a HistoryBranch {
+    out.branches.iter().find(|b| b.translated.contains(&step)).unwrap_or_else(|| panic!("a branch mapped through {step:?}"))
+}
+
+/// Asserts that `later`'s copy of `b` has `b`'s `q` bit for bit and `b`'s masses up to each seat's
+/// common rescale between the two outputs (`exp` of the `log_reach` difference): the actions in
+/// between were not applied in `b`, only the seat-common factor every branch shares moved.
+fn assert_unchanged(before: &ReplayOutput, b: &HistoryBranch, later: &ReplayOutput, what: &str) {
+    let now = later.branches.iter().find(|x| x.translated == b.translated).unwrap_or_else(|| panic!("{what}: the branch survives"));
+    assert_eq!(now.q.to_bits(), b.q.to_bits(), "{what}: q");
+    for (s, z) in now.seats.iter().zip(&b.seats) {
+        let slot = usize::from(s.seat.0);
+        let factor = (later.log_reach[slot] - before.log_reach[slot]).exp();
+        for c in 0..COMBOS {
+            close_to(s.mass[c] * factor, z.mass[c], &format!("{what}: seat {slot} mass[{c}]"));
+        }
+    }
+}
+
+/// Root-only export: the BB's 73 at the unexported [check] is off that node's menu, so the walk
+/// has neither a likelihood nor a unique next ordinal. The branch keeps `q` and every mass (bit for
+/// bit: nothing is applied, so nothing is rescaled) for the rest of the street, and each later action
+/// on it is disclosed with the cause that froze it ("OOP's call is uncovered too", section 13.1).
+#[test]
+fn an_uncovered_off_menu_wager_freezes_its_branch_for_the_rest_of_the_street() {
+    assert_eq!(uncovered(Street::Flop, BB, &[0]), flop_reason(BB, "uncovered path [0]"));
+    assert_eq!(uncovered(Street::Turn, SB, &[]), ApproxReason::UnconditionedPriorStreet { street: Street::Turn, seat: SB, cause: "uncovered path []".into() });
+    let snapshots = [walk_snapshot(&menu_tree(&[&[]]), 2)];
+    let checked = walk_flop_line(&[Action::Check], &snapshots);
+    let bet = walk_flop_line(&[Action::Check, Action::Bet { to: 73 }], &snapshots);
+    let called = walk_flop_line(&check_bet73_call(), &snapshots);
+    assert_eq!(checked.branches.len(), 1);
+    assert_eq!(checked.branches[0].translated, vec![(SB, Action::Check)]);
+    for (later, what) in [(&bet, "after the bet"), (&called, "after the call")] {
+        assert_eq!(later.branches.iter().map(bits).collect::<Vec<_>>(), checked.branches.iter().map(bits).collect::<Vec<_>>(), "{what}");
+        assert_eq!(later.log_reach, checked.log_reach, "{what}: nothing applied, nothing rescaled");
+        assert!(flop_translations(later).is_empty(), "{what}: no guessed split");
+        assert!(later.reasons.contains(&uncovered(Street::Flop, BB, &[0])), "{what}: {:?}", later.reasons);
+    }
+    assert!(!bet.reasons.contains(&flop_reason(SB, "uncovered path [0]")));
+    assert!(called.reasons.contains(&flop_reason(SB, "uncovered path [0]")), "the SB's call on the frozen branch: {:?}", called.reasons);
+    assert_eq!(flop_unconditioned(&called).len(), 2, "{:?}", called.reasons);
+}
+
+/// Off the observed line: the SB's raise over the BB's 50.
+const RAISE_OVER_100: [[f32; 2]; 3] = [[0.5, 0.2], [0.3, 0.3], [0.2, 0.5]];
+/// The BB facing the SB's raise to 300: Fold / Call `(.6, .9)`.
+const CALL_300: [[f32; 2]; 2] = [[0.4, 0.1], [0.6, 0.9]];
+
+/// The sibling fixture: [0,1] (the SB facing 50) is not exported, [0,2] (facing 100) is, and each
+/// holds one raise size.
+fn sibling_tree() -> Vec<TreeNode> {
+    let raise = |to: u32| vec![Action::Fold, Action::Call, Action::Raise { to }];
+    vec![
+        tree_node(&[], "oop", vec![Action::Check, Action::Bet { to: 100 }], vec![None, None], Some(&ROOT)),
+        tree_node(&[1], "ip", vec![Action::Fold, Action::Call], vec![Some(200), Some(300)], None),
+        tree_node(&[0], "ip", vec![Action::Check, Action::Bet { to: 50 }, Action::Bet { to: 100 }], vec![Some(100), None, None], Some(&IP_MENU)),
+        tree_node(&[0, 1], "oop", raise(150), vec![Some(150), Some(200), None], None),
+        tree_node(&[0, 2], "oop", raise(300), vec![Some(200), Some(300), None], Some(&RAISE_OVER_100)),
+        tree_node(&[0, 1, 2], "ip", vec![Action::Fold, Action::Call], vec![Some(250), Some(400)], None),
+        tree_node(&[0, 2, 2], "ip", vec![Action::Fold, Action::Call], vec![Some(400), Some(700)], Some(&CALL_300)),
+    ]
+}
+
+/// Spec section 9.2 (S14) with two branches on one street: the BB's 73 splits into Bet50 ([0,1],
+/// unexported) and Bet100 ([0,2], exported). The SB's raise to 250 is off both menus: in the Bet50
+/// branch it meets an unexported node, so that branch freezes (no likelihood, no next ordinal); in
+/// the Bet100 branch it is translated (clamped onto 300, below the only size) and conditions the
+/// SB. The BB's call then conditions the BB in the Bet100 branch only; the frozen branch keeps its
+/// `q` bit for bit and its masses up to the seat-common rescale, and the call is disclosed there.
+#[test]
+fn a_frozen_branch_keeps_its_weights_while_a_defined_sibling_keeps_conditioning() {
+    let line = [Action::Check, Action::Bet { to: 73 }, Action::Raise { to: 250 }, Action::Call];
+    let snapshots = [walk_snapshot(&sibling_tree(), 6)];
+    let (fa, fb) = harmonic(0.73, 0.5, 1.0);
+    let (bet50, bet100) = (Action::Bet { to: 50 }, Action::Bet { to: 100 });
+
+    let out = replay_with(&walked_turn(&line), &snapshots);
+    let root = Expected::start().take(SB, Action::Check, &column(&ROOT, 0), 1.0);
+    let expected = [
+        root.take(BB, bet50, &column(&IP_MENU, 1), fa),
+        root.take(BB, bet100, &column(&IP_MENU, 2), fb)
+            .take(SB, Action::Raise { to: 300 }, &column(&RAISE_OVER_100, 2), 1.0)
+            .take(BB, Action::Call, &column(&CALL_300, 1), 1.0),
+    ];
+    assert_walked(&out, &expected, "frozen sibling");
+    let unconditioned = flop_unconditioned(&out);
+    assert_eq!(unconditioned, vec![(SB, "uncovered path [0, 1]".to_string()), (BB, "uncovered path [0, 1]".to_string())]);
+    let translations = flop_translations(&out);
+    assert_eq!(translations.len(), 2, "{translations:?}");
+    let (seat, observed, mapped, deviation, prominent) = &translations[1];
+    assert_eq!((*seat, *prominent, mapped.len()), (SB, true, 1));
+    assert!((f64::from(*observed) - 0.5).abs() < 1e-6, "(250 - 100) / (200 + 100)");
+    assert!((f64::from(mapped[0].0) - 2.0 / 3.0).abs() < 1e-6 && mapped[0].1 == 1.0, "clamped onto 300: (300 - 100) / 300");
+    assert!((f64::from(*deviation) - 1.0 / 6.0).abs() < 1e-6);
+
+    // Action by action: the frozen branch's `q` never moves again, its masses only by the common
+    // rescale; the defined sibling's `q` moves at each of the two later actions.
+    let after_bet = walk_flop_line(&line[..2], &snapshots);
+    let after_raise = walk_flop_line(&line[..3], &snapshots);
+    let after_call = walk_flop_line(&line, &snapshots);
+    let frozen = branch_with(&after_bet, (BB, bet50));
+    assert_unchanged(&after_bet, frozen, &after_raise, "the frozen branch across the raise");
+    assert_unchanged(&after_bet, frozen, &after_call, "the frozen branch across the call");
+    let sibling_q = |o: &ReplayOutput| branch_with(o, (BB, bet100)).q;
+    assert!(sibling_q(&after_raise) < sibling_q(&after_bet) && sibling_q(&after_call) < sibling_q(&after_raise));
+}
+
+/// The turn root: the SB checks `(.6, .3)` or bets 150.
+const TURN_ROOT: [[f32; 2]; 2] = [[0.6, 0.3], [0.4, 0.7]];
+
+fn river_board() -> Vec<Card> {
+    vec![Card(46), Card(21), Card(0), Card(8), Card(12)]
+}
+
+/// A path frozen on the flop is scoped to the flop: the turn is walked from its own snapshot's
+/// root. Here the flop freezes at the BB's 73 (root-only export), and on the turn the SB's check
+/// at the exported turn root still conditions the SB; the BB's check at the unexported [check]
+/// advances without a likelihood.
+#[test]
+fn a_frozen_flop_branch_restarts_at_the_next_street_root() {
+    let flop = [walk_snapshot(&menu_tree(&[&[]]), 2)];
+    let turn_root = walked_turn(&check_bet73_call());
+    let incoming = replay_with(&turn_root, &flop);
+    let hash = |seat: Seat| core_ranges::hash_scaled(incoming.ranges[usize::from(seat.0)].as_ref().expect("a dealt seat's range"));
+    let turn_tree = vec![
+        tree_node(&[], "oop", vec![Action::Check, Action::Bet { to: 150 }], vec![None, None], Some(&TURN_ROOT)),
+        tree_node(&[1], "ip", vec![Action::Fold, Action::Call], vec![Some(396), Some(546)], None),
+        tree_node(&[0], "ip", vec![Action::Check, Action::Bet { to: 150 }], vec![Some(246), None], None),
+    ];
+    let turn = snapshot_at(&act(&turn_root, &[Action::Check]), &turn_tree, &live_on(&turn_board()), [hash(SB), hash(BB)], 9);
+    assert_eq!((turn.key.street, turn.provenance.solved_prefix.clone()), (Street::Turn, vec![(SB, Action::Check)]));
+    let river = core_model::set_board(&act(&turn_root, &[Action::Check, Action::Check]), &river_board()).expect("the river");
+
+    let out = replay_with(&river, &[flop[0].clone(), turn]);
+    let expected = [Expected::start()
+        .take(SB, Action::Check, &column(&ROOT, 0), 1.0)
+        .take(SB, Action::Check, &column_on(&live_on(&turn_board()), &TURN_ROOT, 0), 1.0)
+        .skip(BB, Action::Check)];
+    assert_walked_at(&out, &expected, &river_board(), "flop frozen, turn walked");
+    assert!(out.reasons.contains(&uncovered(Street::Flop, BB, &[0])));
+    assert!(out.reasons.contains(&flop_reason(SB, "uncovered path [0]")), "{:?}", out.reasons);
+    assert!(out.reasons.contains(&uncovered(Street::Turn, BB, &[0])));
+}
+
+/// The walk of section 13.1's `replay_missing_continuation` (postflop half; the preflop half is
+/// `tests/replay.rs`): every observed action is a skeleton action, but the strategy of one node,
+/// [0,1] (the SB facing 50), is not exported. The SB's raise there is not applied in that branch
+/// (reason "uncovered path [0, 1]", masses as conditioned so far, `q` unchanged, no invented
+/// likelihood) and the branch advances along its exact ordinal; the BB's re-raise at the covered
+/// [0,1,2] conditions the BB, the SB's later call at the covered [0,1,2,2] conditions the SB again,
+/// and the other branch conditions every action.
+const RAISE_AFTER_100: [[f32; 2]; 3] = [[0.5, 0.3], [0.3, 0.3], [0.2, 0.4]];
+const RERAISE_A: [[f32; 2]; 3] = [[0.2, 0.5], [0.3, 0.3], [0.5, 0.2]];
+const RERAISE_B: [[f32; 2]; 3] = [[0.4, 0.4], [0.4, 0.2], [0.2, 0.4]];
+const CALL_A: [[f32; 2]; 2] = [[0.1, 0.6], [0.9, 0.4]];
+const CALL_B: [[f32; 2]; 2] = [[0.3, 0.7], [0.7, 0.3]];
+
+#[test]
+fn replay_missing_continuation_postflop() {
+    let menu = |to: u32| vec![Action::Fold, Action::Call, Action::Raise { to }];
+    let tree = vec![
+        tree_node(&[], "oop", vec![Action::Check, Action::Bet { to: 100 }], vec![None, None], Some(&ROOT)),
+        tree_node(&[1], "ip", vec![Action::Fold, Action::Call], vec![Some(200), Some(300)], None),
+        tree_node(&[0], "ip", vec![Action::Check, Action::Bet { to: 50 }, Action::Bet { to: 100 }], vec![Some(100), None, None], Some(&IP_MENU)),
+        tree_node(&[0, 1], "oop", menu(300), vec![Some(150), Some(200), None], None),
+        tree_node(&[0, 2], "oop", menu(300), vec![Some(200), Some(300), None], Some(&RAISE_AFTER_100)),
+        tree_node(&[0, 1, 2], "ip", menu(900), vec![Some(350), Some(700), None], Some(&RERAISE_A)),
+        tree_node(&[0, 2, 2], "ip", menu(900), vec![Some(400), Some(700), None], Some(&RERAISE_B)),
+        tree_node(&[0, 1, 2, 2], "oop", vec![Action::Fold, Action::Call], vec![Some(1000), Some(1900)], Some(&CALL_A)),
+        tree_node(&[0, 2, 2, 2], "oop", vec![Action::Fold, Action::Call], vec![Some(1000), Some(1900)], Some(&CALL_B)),
+    ];
+    let line = [Action::Check, Action::Bet { to: 73 }, Action::Raise { to: 300 }, Action::Raise { to: 900 }, Action::Call];
+    let out = replay_with(&walked_turn(&line), &[walk_snapshot(&tree, 7)]);
+    let (fa, fb) = harmonic(0.73, 0.5, 1.0);
+    let (raise, reraise) = (Action::Raise { to: 300 }, Action::Raise { to: 900 });
+    let root = Expected::start().take(SB, Action::Check, &column(&ROOT, 0), 1.0);
+    let expected = [
+        root.take(BB, Action::Bet { to: 50 }, &column(&IP_MENU, 1), fa)
+            .skip(SB, raise)
+            .take(BB, reraise, &column(&RERAISE_A, 2), 1.0)
+            .take(SB, Action::Call, &column(&CALL_A, 1), 1.0),
+        root.take(BB, Action::Bet { to: 100 }, &column(&IP_MENU, 2), fb)
+            .take(SB, raise, &column(&RAISE_AFTER_100, 2), 1.0)
+            .take(BB, reraise, &column(&RERAISE_B, 2), 1.0)
+            .take(SB, Action::Call, &column(&CALL_B, 1), 1.0),
+    ];
+    assert_walked(&out, &expected, "missing continuation");
+    assert_eq!(flop_unconditioned(&out), vec![(SB, "uncovered path [0, 1]".to_string())], "{:?}", out.reasons);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Zero support, missing or unreproducible snapshots, the current street, the financial root,
+// and T6 through snapshot nodes (plan 3 Task 15 Step 5).
+// ---------------------------------------------------------------------------------------------
+
+use core_replay::{initial, posterior, publish, snapshot_node_at, snapshot_root};
+use proto::{StreetRootSnapshot, UnsupportedReason};
+
+/// The complete-street skeleton with the root's `(Check, Bet100)` probabilities replaced.
+fn complete_tree(root: &'static [[f32; 2]]) -> Vec<TreeNode> {
+    let mut tree = menu_tree(&[&[0], &[0, 1], &[0, 2]]);
+    tree[0].probs = Some(root.to_vec());
+    tree
+}
+
+/// Section 9.2's zero-support rule inside the walk: the SB never checks at the exported root, yet
+/// the SB checked. Every pre-action `q` and mass survives (bit for bit), the cause is `zero support
+/// after Check`, and navigation stays truthful without a guessed action: the observed check is on
+/// the root's menu, so the branch still advances along it, and the BB's 73 and the SB's call are
+/// conditioned from the covered nodes after it. A positive likelihood of 1e-30 is support.
+#[test]
+fn a_covered_action_without_support_is_rejected_and_the_walk_continues() {
+    const NEVER_CHECKS: [[f32; 2]; 2] = [[0.0, 0.0], [1.0, 1.0]];
+    const RARELY_CHECKS: [[f32; 2]; 2] = [[1e-30, 1e-30], [1.0, 1.0]];
+    let (fa, fb) = harmonic(0.73, 0.5, 1.0);
+    let (check, call) = (Action::Check, Action::Call);
+    let turn = walked_turn(&check_bet73_call());
+
+    let zero = [walk_snapshot(&complete_tree(&NEVER_CHECKS), 12)];
+    let out = replay_with(&turn, &zero);
+    let root = Expected::start().skip(SB, check);
+    let expected = [
+        root.take(BB, Action::Bet { to: 50 }, &column(&IP_MENU, 1), fa).take(SB, call, &column(&AFTER_50, 1), 1.0),
+        root.take(BB, Action::Bet { to: 100 }, &column(&IP_MENU, 2), fb).take(SB, call, &column(&AFTER_100, 1), 1.0),
+    ];
+    assert_walked(&out, &expected, "zero support");
+    assert_eq!(flop_unconditioned(&out), vec![(SB, "zero support after Check".to_string())]);
+    assert_eq!(core_replay::zero_reason(Street::Flop, SB, &check), flop_reason(SB, "zero support after Check"));
+    let incoming = replay_with(&walk_flop(), &[]);
+    let rejected = walk_flop_line(&[check], &zero);
+    assert_eq!(rejected.branches.iter().map(bits).collect::<Vec<_>>(), incoming.branches.iter().map(|b| {
+        let mut b = b.clone();
+        b.translated.push((SB, check));
+        bits(&b)
+    }).collect::<Vec<_>>(), "every pre-action q and mass survives; only the observed check is recorded");
+    assert_eq!(rejected.log_reach, incoming.log_reach);
+
+    let tiny = replay_with(&turn, &[walk_snapshot(&complete_tree(&RARELY_CHECKS), 13)]);
+    let root = Expected::start().take(SB, check, &column(&RARELY_CHECKS, 0), 1.0);
+    let expected = [
+        root.take(BB, Action::Bet { to: 50 }, &column(&IP_MENU, 1), fa).take(SB, call, &column(&AFTER_50, 1), 1.0),
+        root.take(BB, Action::Bet { to: 100 }, &column(&IP_MENU, 2), fb).take(SB, call, &column(&AFTER_100, 1), 1.0),
+    ];
+    assert_walked(&tiny, &expected, "a 1e-30 likelihood");
+    assert!(flop_unconditioned(&tiny).is_empty(), "positive reach is valid at any magnitude: {:?}", tiny.reasons);
+    assert!(tiny.branches.iter().all(|b| b.q > 0.0 && b.q < 1e-29));
+}
+
+/// A compatible snapshot whose solved prefix no cutoff of the observed street reproduces is not a
+/// candidate (its financial root is unknown, and chips are never adjusted to fit); with no other,
+/// the street is unconditioned with `snapshot root not reproducible` for each actor and every mass
+/// kept as the flop root left it.
+#[test]
+fn a_snapshot_whose_root_the_model_cannot_reproduce_is_never_walked() {
+    let mut odd = walk_snapshot(&menu_tree(&[&[], &[0], &[0, 1], &[0, 2]]), 14);
+    odd.provenance.solved_prefix = vec![(SB, Action::Bet { to: 30 })];
+    let turn = walked_turn(&check_bet73_call());
+    let out = replay_with(&turn, &[odd.clone()]);
+    let cause = "snapshot root not reproducible".to_string();
+    assert_eq!(flop_unconditioned(&out), vec![(SB, cause.clone()), (BB, cause)]);
+    assert_walked(&out, &[Expected::start()], "not reproducible");
+    assert!(!out.reasons.contains(&inherited()), "an unused snapshot's reasons are not inherited");
+    assert_eq!(snapshot_root(&turn, &odd), Err(UnsupportedReason::UnsupportedHistory { reason: "snapshot root not reproducible".into() }));
+    // The reproducible one beside it is selected.
+    let good = walk_snapshot(&menu_tree(&[&[]]), 15);
+    let out = replay_with(&turn, &[odd, good]);
+    assert_eq!(out.branches[0].translated, vec![(SB, Action::Check)], "the root-only snapshot was walked");
+}
+
+/// `snapshot_root` recovers the root a snapshot was solved on from its solved prefix through the
+/// model, never from the final pot: after check, bet 73, call and the turn, the flop snapshot's root
+/// is still the 100-chip root with 950 behind each. A spec section 10.2 projection is recovered with
+/// its dead money. Another root board, an unreproducible prefix, or a state without hero's cards
+/// (ruling 14f-C2: a cutoff is a decision only with them) reproduces nothing.
+#[test]
+fn snapshot_root_recovers_the_solved_financial_root_through_the_model() {
+    let snap = walk_snapshot(&menu_tree(&[&[]]), 2);
+    let turn = walked_turn(&check_bet73_call());
+    let solved = core_model::street_root(&act(&walk_flop(), &[Action::Check])).expect("hero's decision");
+    let root = snapshot_root(&turn, &snap).expect("the solved root replays");
+    assert_eq!(root, StreetRootSnapshot { history: vec![], ..solved });
+    assert_eq!((root.pot_root, root.stack_oop_root, root.stack_ip_root, root.dead_this_street, root.oop, root.ip), (100, 950, 950, 0, SB, BB));
+    assert_eq!(turn.derived.pot, 246, "the final flop pot is not the root");
+
+    // Spec 10.2's dead-money projection: C's call closes the street; the root keeps B's 50 dead.
+    let flop = three_way_flop(BTN);
+    let at = act(&flop, &[Action::Bet { to: 50 }, Action::Call, Action::Raise { to: 150 }, Action::Raise { to: 250 }, Action::Fold]);
+    let projected = core_model::street_root(&at).expect("the admitted projection");
+    let (_, snapshot) = at_decision(&at, 30, 1);
+    let recovered = snapshot_root(&act(&at, &[Action::Call]), &snapshot).expect("the projection replays");
+    assert_eq!(recovered, StreetRootSnapshot { history: vec![], ..projected });
+    assert_eq!((recovered.dead_this_street, recovered.projected_from, recovered.oop, recovered.ip), (50, 3, BB, BTN));
+
+    let not_reproducible = Err(UnsupportedReason::UnsupportedHistory { reason: "snapshot root not reproducible".into() });
+    let mut other_board = snap.clone();
+    other_board.key.root_board = vec![Card(46), Card(21), Card(4)];
+    assert_eq!(snapshot_root(&turn, &other_board), not_reproducible);
+    let mut other_prefix = snap.clone();
+    other_prefix.provenance.solved_prefix = vec![];
+    assert_eq!(snapshot_root(&turn, &other_prefix), not_reproducible, "the root itself was the SB's decision, not hero's");
+    assert_eq!(snapshot_root(&HandState { hero_cards: None, ..turn.clone() }, &snap), not_reproducible);
+    let mut preflop = snap.clone();
+    preflop.key.street = Street::Preflop;
+    preflop.key.root_board = vec![];
+    assert_eq!(snapshot_root(&turn, &preflop), not_reproducible);
+}
+
+/// `snapshot_node_at` finds an exported node's strategy by ordinal path through `covered_paths`,
+/// and nothing for a node that is not exported.
+#[test]
+fn snapshot_node_at_reads_exported_nodes_by_ordinal_path() {
+    let snap = walk_snapshot(&menu_tree(&[&[0], &[0, 2]]), 16);
+    assert_eq!(snapshot_node_at(&snap, &[0]).map(|n| n.path.clone()), Some(vec![Action::Check]));
+    assert_eq!(snapshot_node_at(&snap, &[0, 2]).map(|n| n.path.clone()), Some(vec![Action::Check, Action::Bet { to: 100 }]));
+    assert!(snapshot_node_at(&snap, &[]).is_none());
+    assert!(snapshot_node_at(&snap, &[0, 1]).is_none());
+    assert!(snapshot_node_at(&snap, &[7]).is_none());
+}
+
+/// Only completed streets are walked: on the flop the flop's own actions are inserted exactly by
+/// Plan 2's street-root solve, so appending the BB's 73 and the SB's raise leaves every published
+/// range, branch and `log_reach` unchanged even with a covering snapshot registered, while the
+/// street root's history (the solve's effective history) grows.
+#[test]
+fn the_current_street_is_never_replayed() {
+    let snapshots = [walk_snapshot(&menu_tree(&[&[], &[0], &[0, 1], &[0, 2]]), 3)];
+    let at_check = act(&walk_flop(), &[Action::Check]);
+    let later = act(&at_check, &[Action::Bet { to: 73 }, Action::Raise { to: 250 }]);
+    let root_out = replay_with(&walk_flop(), &[]);
+    for state in [&at_check, &later] {
+        let out = replay_with(state, &snapshots);
+        assert_eq!(out.ranges, root_out.ranges);
+        assert_eq!(out.branches.iter().map(bits).collect::<Vec<_>>(), root_out.branches.iter().map(bits).collect::<Vec<_>>());
+        assert_eq!((out.log_reach.clone(), out.reasons.clone()), (root_out.log_reach.clone(), root_out.reasons.clone()));
+    }
+    let (early, late) = (core_model::street_root(&at_check).unwrap(), core_model::street_root(&later).unwrap());
+    assert_eq!(early.history, vec![(SB, Action::Check)]);
+    assert_eq!(late.history, vec![(SB, Action::Check), (BB, Action::Bet { to: 73 }), (SB, Action::Raise { to: 250 })]);
+    assert_eq!(StreetRootSnapshot { history: vec![], ..early }, StreetRootSnapshot { history: vec![], ..late }, "the same root, a longer history");
+}
+
+/// The roles and the money of the walk come from the admitted projected root, never from the
+/// preflop positions or the final pot (spec section 10.2's second worked case): A (the BB) bets 50,
+/// B (the CO) calls, C (the BTN, hero) raises to 150, A re-raises to 250, B folds; hero's snapshot
+/// was solved there (root history `A Bet 50, C Raise 150, A Raise 250`, B's 50 dead). Then C raises
+/// to 700 (off the 600 / 900 menu) and A calls. B's two actions are outside the heads-up tree:
+/// disclosed once, never applied. C's 700 is translated at its mapped parent with the dead money in
+/// the pot: `s = (700 - 150 - 100) / (35 + 50 + 400 + 100)`.
+#[test]
+fn a_projected_root_is_walked_in_its_heads_up_line_with_its_dead_money() {
+    const OPENS: [[f32; 2]; 2] = [[0.4, 0.6], [0.6, 0.4]];
+    const FACING_50: [[f32; 2]; 3] = [[0.2, 0.3], [0.5, 0.4], [0.3, 0.3]];
+    const FACING_150: [[f32; 2]; 3] = [[0.3, 0.2], [0.3, 0.5], [0.4, 0.3]];
+    const FACING_250: [[f32; 2]; 4] = [[0.1, 0.2], [0.3, 0.3], [0.4, 0.1], [0.2, 0.4]];
+    const FACING_600: [[f32; 2]; 2] = [[0.5, 0.2], [0.5, 0.8]];
+    const FACING_900: [[f32; 2]; 2] = [[0.7, 0.4], [0.3, 0.6]];
+    let flop = three_way_flop(BTN);
+    let line = [
+        Action::Bet { to: 50 },
+        Action::Call,
+        Action::Raise { to: 150 },
+        Action::Raise { to: 250 },
+        Action::Fold,
+        Action::Raise { to: 700 },
+        Action::Call,
+    ];
+    let decision = act(&flop, &line[..5]);
+    let incoming = replay_with(&flop, &[]);
+    let hash = |seat: Seat| core_ranges::hash_scaled(incoming.ranges[usize::from(seat.0)].as_ref().expect("a dealt seat's range"));
+    let wagers = |menu: Vec<Action>| {
+        let terminal = menu.iter().map(|a| if matches!(a, Action::Fold | Action::Call) { Some(0) } else { None }).collect();
+        (menu, terminal)
+    };
+    let (m1, t1) = wagers(vec![Action::Fold, Action::Call, Action::Raise { to: 150 }]);
+    let (m2, t2) = wagers(vec![Action::Fold, Action::Call, Action::Raise { to: 250 }]);
+    let (m3, t3) = wagers(vec![Action::Fold, Action::Call, Action::Raise { to: 600 }, Action::Raise { to: 900 }]);
+    let tree = vec![
+        tree_node(&[], "oop", vec![Action::Check, Action::Bet { to: 50 }], vec![None, None], Some(&OPENS)),
+        tree_node(&[0], "ip", vec![Action::Check, Action::Bet { to: 35 }], vec![Some(135), None], None),
+        tree_node(&[1], "ip", m1, t1, Some(&FACING_50)),
+        tree_node(&[1, 2], "oop", m2, t2, Some(&FACING_150)),
+        tree_node(&[1, 2, 2], "ip", m3, t3, Some(&FACING_250)),
+        tree_node(&[1, 2, 2, 2], "oop", vec![Action::Fold, Action::Call], vec![Some(0), Some(0)], Some(&FACING_600)),
+        tree_node(&[1, 2, 2, 3], "oop", vec![Action::Fold, Action::Call], vec![Some(0), Some(0)], Some(&FACING_900)),
+    ];
+    let snapshot = snapshot_at(&decision, &tree, &flop_live(), [hash(BB), hash(BTN)], 21);
+    assert_eq!(
+        snapshot.provenance.solved_prefix,
+        vec![(BB, Action::Bet { to: 50 }), (BTN, Action::Raise { to: 150 }), (BB, Action::Raise { to: 250 })]
+    );
+    let turn = core_model::set_board(&act(&flop, &line), &turn_board()).expect("the turn");
+    let out = replay_with(&turn, &[snapshot]);
+
+    let (s, a, b) = (450.0 / 585.0, 350.0 / 585.0, 650.0 / 585.0);
+    let (fa, fb) = harmonic(s, a, b);
+    let root = Expected::start()
+        .take(BB, Action::Bet { to: 50 }, &column(&OPENS, 1), 1.0)
+        .take(BTN, Action::Raise { to: 150 }, &column(&FACING_50, 2), 1.0)
+        .take(BB, Action::Raise { to: 250 }, &column(&FACING_150, 2), 1.0);
+    let expected = [
+        root.take(BTN, Action::Raise { to: 600 }, &column(&FACING_250, 2), fa).take(BB, Action::Call, &column(&FACING_600, 1), 1.0),
+        root.take(BTN, Action::Raise { to: 900 }, &column(&FACING_250, 3), fb).take(BB, Action::Call, &column(&FACING_900, 1), 1.0),
+    ];
+    assert_walked(&out, &expected, "projected root");
+    assert_eq!(flop_unconditioned(&out), vec![(CO, "not in the heads-up street root".to_string())]);
+    let translations = flop_translations(&out);
+    assert_eq!(translations.len(), 1, "{translations:?}");
+    assert_eq!(translations[0].0, BTN);
+    assert!((f64::from(translations[0].1) - s).abs() < 1e-6, "dead money is in the pot: {} vs {s}", translations[0].1);
+    assert!((f64::from(translations[0].2[0].0) - a).abs() < 1e-6 && (f64::from(translations[0].2[1].0) - b).abs() < 1e-6);
+}
+
+/// The cap runs once per action inside the walk, and each surviving branch keeps its own path.
+/// Three branches enter the flop (weights 0.5 / 0.3 / 0.2 from a combo-independent split on the
+/// UTG, so every mass stays uniform); the BB's 73 splits each into Bet50 and Bet100, six live
+/// branches, and the cap keeps the four heaviest and merges the other two into the residual. The
+/// SB's call is then conditioned in each survivor at its own node ([0,1] after Bet50, [0,2] after
+/// Bet100) and never in the frozen residual.
+#[test]
+fn the_cap_inside_the_walk_keeps_each_survivor_on_its_own_path() {
+    let snapshots = [walk_snapshot(&menu_tree(&[&[], &[0], &[0, 1], &[0, 2]]), 3)];
+    let (fa, fb) = harmonic(0.73, 0.5, 1.0);
+    let utg = Seat(2);
+    let splits = [(Action::Fold, 0.5), (Action::Call, 0.3), (Action::Raise { to: 30 }, 0.2)];
+    let walked = |line: &[Action]| {
+        let mut out = replay_with(&walk_flop(), &[]);
+        out.branches = core_replay::split_action(&out.branches, utg, &splits.iter().map(|&(a, f)| (a, f, vec![1.0; COMBOS])).collect::<Vec<_>>());
+        let state = act(&walk_flop(), line);
+        let store = PreflopStore::from_sources(vec![]);
+        walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &snapshots }, Street::Flop, &mut out);
+        out
+    };
+    let before_call = walked(&[Action::Check, Action::Bet { to: 73 }]);
+    let after_call = walked(&check_bet73_call());
+
+    // Independently: each entering branch checks, then splits.
+    let entering: Vec<Expected> = splits
+        .iter()
+        .map(|&(a, f)| Expected { q: f, masses: vec![vec![1.0; COMBOS]; 6], line: vec![(utg, a)] }.take(SB, Action::Check, &column(&ROOT, 0), 1.0))
+        .collect();
+    let a = |e: &Expected| e.take(BB, Action::Bet { to: 50 }, &column(&IP_MENU, 1), fa);
+    let b = |e: &Expected| e.take(BB, Action::Bet { to: 100 }, &column(&IP_MENU, 2), fb);
+    // Children ids 4..=9 in creation order: (4 A, 5 B) of 0.5, (6 A, 7 B) of 0.3, (8 A, 9 B) of 0.2;
+    // the heaviest four are 4, 6, 5 and 8, and 7 becomes the residual that absorbs 9.
+    let (a0, b0, a1, b1, a2, b2) = (a(&entering[0]), b(&entering[0]), a(&entering[1]), b(&entering[1]), a(&entering[2]), b(&entering[2]));
+    let lightest_survivor = [a0.q, b0.q, a1.q, a2.q].into_iter().fold(f64::INFINITY, f64::min);
+    assert!(lightest_survivor > b1.q && b1.q > b2.q, "the fixture's weights order as described");
+    let ids = |o: &ReplayOutput| o.branches.iter().map(|b| (b.id, b.residual)).collect::<Vec<_>>();
+    assert_eq!(ids(&before_call), vec![(4, false), (5, false), (6, false), (8, false), (7, true)]);
+    assert_eq!(ids(&after_call), ids(&before_call));
+    let survivors = [(&a0, &AFTER_50), (&b0, &AFTER_100), (&a1, &AFTER_50), (&a2, &AFTER_50)];
+    for (k, (e, call)) in survivors.iter().enumerate() {
+        close_to(before_call.branches[k].q, e.q, &format!("survivor {k} before the call"));
+        let called = e.take(SB, Action::Call, &column(*call, 1), 1.0);
+        close_to(after_call.branches[k].q, called.q, &format!("survivor {k} conditioned at its own node"));
+        assert_eq!(after_call.branches[k].translated, called.line);
+    }
+    let residual = &after_call.branches[4];
+    close_to(before_call.branches[4].q, b1.q + b2.q, "the residual merges the two lightest");
+    assert_eq!(residual.q.to_bits(), before_call.branches[4].q.to_bits(), "the residual is frozen through the call");
+    assert!(residual.translated.is_empty());
+}
+
+/// The engine hands replay one identity's snapshots (`SnapshotStore::for_identity`); a slice
+/// mixing model revisions is a caller bug, refused loudly rather than keyed by an arbitrary one.
+#[test]
+#[should_panic(expected = "replay takes one identity's snapshots")]
+fn a_slice_mixing_model_revisions_is_refused() {
+    let a = walk_snapshot(&menu_tree(&[&[]]), 2);
+    let mut b = walk_snapshot(&menu_tree(&[&[]]), 3);
+    b.key.model_revision = 1;
+    let _ = replay_with(&walked_turn(&check_bet73_call()), &[a, b]);
+}
+
+/// Section 13.1's T6 (`replay_cross_actor_branches`) through snapshot nodes: the villain's off-menu
+/// wager against a snapshot menu. Hero is the SB with As Ad, the villain the BB; SB raises to 75
+/// preflop, BB calls (150 in the pot, 925 behind each), flop Kh 7d 3s. Both players hold the two
+/// combos 2c2d and 2c2h with masses `(1, 1)`. Hero checks (probability 1: `M = 1`), the villain bets
+/// 100 into 150 (`s = 2/3` between 75 and 150: `f = 0.6 / 0.4`) with `P_A = (0.8, 0.1)` and
+/// `P_B = (0.1, 0.4)`, hero shoves at the unexported nodes after 75 and after 150 (not applied: each
+/// branch judges it at its own node), and the villain calls with `0.9` after 75 and `0.1` after 150.
+/// A branch with `M_X = 0` is dropped for every seat.
+#[test]
+fn replay_cross_actor_branches_through_snapshot_nodes() {
+    const HERO_CHECKS: [[f32; 2]; 3] = [[1.0, 1.0], [0.0, 0.0], [0.0, 0.0]];
+    const VILLAIN: [[f32; 2]; 3] = [[0.1, 0.5], [0.8, 0.1], [0.1, 0.4]];
+    const VILLAIN_NEVER_150: [[f32; 2]; 3] = [[0.2, 0.9], [0.8, 0.1], [0.0, 0.0]];
+    const CALLS_A: [[f32; 2]; 2] = [[0.1, 0.1], [0.9, 0.9]];
+    const CALLS_B: [[f32; 2]; 2] = [[0.9, 0.9], [0.1, 0.1]];
+    let board = vec![Card(46), Card(21), Card(7)];
+    let flop = core_model::set_board(&act(&table(SB), &[Action::Fold, Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 75 }, Action::Call]), &board)
+        .expect("the flop");
+    assert_eq!((flop.derived.to_act, flop.derived.pot), (Some(SB), 150));
+    let shove = Action::AllIn { to: 925 };
+    let line = [Action::Check, Action::Bet { to: 100 }, shove, Action::Call];
+    let tree = |villain: &'static [[f32; 2]]| {
+        let facing = |to: u32| vec![Action::Fold, Action::Call, Action::AllIn { to }];
+        vec![
+            tree_node(&[], "oop", vec![Action::Check, Action::Bet { to: 75 }, Action::Bet { to: 150 }], vec![None, None, None], Some(&HERO_CHECKS)),
+            tree_node(&[1], "ip", vec![Action::Fold, Action::Call], vec![Some(150), Some(300)], None),
+            tree_node(&[2], "ip", vec![Action::Fold, Action::Call], vec![Some(150), Some(450)], None),
+            tree_node(&[0], "ip", vec![Action::Check, Action::Bet { to: 75 }, Action::Bet { to: 150 }], vec![Some(150), None, None], Some(villain)),
+            tree_node(&[0, 1], "oop", facing(925), vec![Some(225), Some(300), None], None),
+            tree_node(&[0, 2], "oop", facing(925), vec![Some(300), Some(450), None], None),
+            tree_node(&[0, 1, 2], "ip", vec![Action::Fold, Action::Call], vec![Some(1075), Some(2000)], Some(&CALLS_A)),
+            tree_node(&[0, 2, 2], "ip", vec![Action::Fold, Action::Call], vec![Some(1150), Some(2000)], Some(&CALLS_B)),
+        ]
+    };
+    // The two-combo start, published at the flop root to key the snapshot.
+    let mut incoming = ReplayOutput { ranges: vec![None; 6], branches: initial(&flop.dealt), folded_ranges: vec![], log_reach: vec![0.0; 6], reasons: vec![], unsupported: None };
+    for s in incoming.branches[0].seats.iter_mut().filter(|s| s.seat == SB || s.seat == BB) {
+        s.mass.fill(0.0);
+        s.mass[0] = 1.0;
+        s.mass[1] = 1.0;
+    }
+    let mut published = incoming.clone();
+    publish(&mut published, &flop);
+    let hash = |seat: Seat| core_ranges::hash_scaled(published.ranges[usize::from(seat.0)].as_ref().expect("a dealt seat's range"));
+    let live: Vec<bool> = (0..COMBOS).map(|c| c < 2).collect();
+    let store = PreflopStore::from_sources(vec![]);
+    let walk = |snapshot: &StreetSnapshot, n: usize| {
+        let state = act(&flop, &line[..n]);
+        let mut out = incoming.clone();
+        walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: std::slice::from_ref(snapshot) }, Street::Flop, &mut out);
+        out
+    };
+    let near = |a: f64, b: f64| assert!((a - b).abs() < 5e-4, "{a} is not within 5e-4 of {b}");
+    let snapshot = snapshot_at(&flop, &tree(&VILLAIN), &live, [hash(SB), hash(BB)], 11);
+    assert_eq!(snapshot.provenance.solved_prefix, vec![], "hero's decision at the flop root");
+    // The exact figures come from the snapshot's own f32 probabilities, widened (0.8f32 is
+    // 0.800000011920929); the section 13.1 figures, rounded, are checked beside them.
+    let (pa, pb) = ([f64::from(0.8f32), f64::from(0.1f32)], [f64::from(0.1f32), f64::from(0.4f32)]);
+    let (fa, fb) = harmonic(100.0 / 150.0, 0.5, 1.0);
+    let (ma, mb) = ((pa[0] + pa[1]) / 2.0, (pb[0] + pb[1]) / 2.0);
+    let (qa, qb) = (fa * ma, fb * mb);
+    let villain = [fa * pa[0] + fb * pb[0], fa * pa[1] + fb * pb[1]];
+
+    // The villain's off-menu bet splits the branch: q = 0.27 / 0.10.
+    let split = walk(&snapshot, 2);
+    assert_eq!(split.branches.iter().map(|b| b.translated.clone()).collect::<Vec<_>>(), vec![
+        vec![(SB, Action::Check), (BB, Action::Bet { to: 75 })],
+        vec![(SB, Action::Check), (BB, Action::Bet { to: 150 })],
+    ]);
+    close_to(fa, 0.6, "f_A");
+    close_to(split.branches[0].q, qa, "q_A");
+    close_to(split.branches[1].q, qb, "q_B");
+    near(split.branches[0].q, 0.27);
+    near(split.branches[1].q, 0.10);
+    let (bb, sb) = (usize::from(BB.0), usize::from(SB.0));
+    let villain_a = &split.branches[0].seats[bb].mass;
+    let villain_b = &split.branches[1].seats[bb].mass;
+    let scale = split.log_reach[bb].exp();
+    for c in [0, 1] {
+        close_to(villain_a[c] * scale, pa[c] / ma, "villain mass in A");
+        close_to(villain_b[c] * scale, pb[c] / mb, "villain mass in B");
+    }
+    near(villain_a[0] * scale, 1.7778);
+    near(villain_a[1] * scale, 0.2222);
+    near(villain_b[0] * scale, 0.4);
+    near(villain_b[1] * scale, 1.6);
+    close_log(split.log_reach[bb], villain[0].ln(), "villain log_reach");
+    close_log(split.log_reach[sb], (qa + qb).ln(), "hero log_reach");
+    near(villain[0], 0.52);
+    near(qa + qb, 0.37);
+    close_to(marginal(&split.branches, BB)[1], villain[1] / villain[0], "villain marginal");
+    near(marginal(&split.branches, BB)[1], 0.4231);
+    close_to(posterior(&split.branches, BB, 0)[0], fa * pa[0] / villain[0], "villain posterior, combo 1");
+    close_to(posterior(&split.branches, BB, 1)[0], fa * pa[1] / villain[1], "villain posterior, combo 2");
+    near(posterior(&split.branches, BB, 0)[0], 0.923);
+    near(posterior(&split.branches, BB, 1)[0], 0.273);
+    for combo in [0, 1] {
+        close_to(posterior(&split.branches, SB, combo)[0], qa / (qa + qb), "hero posterior");
+        near(posterior(&split.branches, SB, combo)[0], 0.7297);
+    }
+    assert_eq!(split.branches[0].seats[sb].mass, split.branches[1].seats[sb].mass, "hero's masses are copied into both children");
+    let translation = flop_translations(&split);
+    assert_eq!(translation.len(), 1);
+    assert!((f64::from(translation[0].1) - 2.0 / 3.0).abs() < 1e-6);
+    assert!((f64::from(translation[0].2[0].1) - 0.6).abs() < 1e-6 && (f64::from(translation[0].2[1].1) - 0.4).abs() < 1e-6);
+
+    // Hero's shove is judged at each branch's own node, [0, 1] and [0, 2]: neither is exported.
+    let shoved = walk(&snapshot, 3);
+    assert_eq!(shoved.branches.iter().map(bits).collect::<Vec<_>>(), split.branches.iter().map(|b| {
+        let mut b = b.clone();
+        b.translated.push((SB, shove));
+        bits(&b)
+    }).collect::<Vec<_>>());
+    assert_eq!(flop_unconditioned(&shoved), vec![(SB, "uncovered path [0, 1]".to_string()), (SB, "uncovered path [0, 2]".to_string())]);
+
+    // The villain's later on-menu call: 0.9 in branch A, 0.1 in branch B.
+    let called = walk(&snapshot, 4);
+    let (ca, cb) = (f64::from(0.9f32), f64::from(0.1f32));
+    let (qa2, qb2) = (qa * ca, qb * cb);
+    let villain2 = [fa * pa[0] * ca + fb * pb[0] * cb, fa * pa[1] * ca + fb * pb[1] * cb];
+    close_to(called.branches[0].q, qa2, "q_A");
+    close_to(called.branches[1].q, qb2, "q_B");
+    near(called.branches[0].q, 0.243);
+    near(called.branches[1].q, 0.010);
+    close_log(called.log_reach[bb], villain2[0].ln(), "villain log_reach");
+    close_log(called.log_reach[sb], (qa2 + qb2).ln(), "hero log_reach");
+    near(villain2[0], 0.436);
+    near(villain2[1], 0.070);
+    close_to(marginal(&called.branches, BB)[1], villain2[1] / villain2[0], "villain marginal");
+    for combo in [0, 1] {
+        close_to(posterior(&called.branches, SB, combo)[0], qa2 / (qa2 + qb2), "hero posterior");
+        near(posterior(&called.branches, SB, combo)[0], 0.9605);
+    }
+    let (a, b) = (&called.branches[0].seats, &called.branches[1].seats);
+    close_to(a[bb].mass[0] / a[bb].mass[1], pa[0] / pa[1], "villain's masses keep their shape in A");
+    close_to(b[bb].mass[0] / b[bb].mass[1], pb[0] / pb[1], "villain's masses keep their shape in B");
+    near(a[bb].mass[0] / a[bb].mass[1], 8.0);
+    near(b[bb].mass[0] / b[bb].mass[1], 0.25);
+    assert_eq!(a[sb].mass, b[sb].mass, "hero's masses are untouched");
+    assert_eq!(a[sb].mass[0], a[sb].mass[1]);
+
+    // A branch with M_X = 0 is never created: the villain never bets 150 here.
+    let dropped = walk(&snapshot_at(&flop, &tree(&VILLAIN_NEVER_150), &live, [hash(SB), hash(BB)], 12), 2);
+    assert_eq!(dropped.branches.len(), 1);
+    assert_eq!(dropped.branches[0].translated, vec![(SB, Action::Check), (BB, Action::Bet { to: 75 })]);
+    close_to(dropped.branches[0].q, qa, "q_A");
+}

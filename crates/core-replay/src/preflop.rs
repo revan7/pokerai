@@ -2,8 +2,8 @@
 //!
 //! [`replay`] starts from one branch with `q = 1` and uniform masses for every dealt seat, applies
 //! every observed preflop action once in every live branch ([`walk_preflop`],
-//! [`apply_preflop_action`]), falls back to unconditioned completed postflop streets (Task 15
-//! walks them through snapshots), blocks the board on each street root's output marginal
+//! [`apply_preflop_action`]), walks each completed postflop street through its selected snapshot
+//! ([`walk_postflop`], P3.T15), blocks the board on each street root's output marginal
 //! ([`block_and_rescale`]) and publishes every dealt seat's range ([`publish`]).
 //!
 //! # One observed preflop action is one transaction
@@ -68,6 +68,7 @@ use crate::branches::{
     cap_branches, initial, marginal, missing_reason, range_output, rescale, split_batch, stop_branch, zero_reason, BranchChoice,
     HistoryBranch,
 };
+use crate::postflop::walk_postflop;
 use crate::snapshot::StreetSnapshot;
 use core_preflop::{
     interpolate, menu_step_index, ExpandedNode, Interpolation, PreflopAnswer, PreflopInvocation, PreflopNode, PreflopNodeKey,
@@ -77,8 +78,8 @@ use proto::{Action, ApproxReason, Card, HandConfig, HandState, Position, Range13
 use std::collections::BTreeMap;
 
 /// Everything one replay reads (spec section 9.1). `snapshots` are the street solutions
-/// registered for this hand; Task 13 consumes none of them (selection is Task 14, the postflop
-/// walk Task 15).
+/// registered for this hand, one identity's (see [`replay`]'s precondition); the postflop walk
+/// ([`walk_postflop`]) selects one per completed street.
 #[derive(Clone, Copy)]
 pub struct ReplayInput<'a> {
     pub cfg: &'a HandConfig,
@@ -113,12 +114,14 @@ pub struct ReplayOutput {
 /// Replays `input.state`'s public history into every dealt seat's public range (spec section 9):
 /// the start state (one branch, `q = 1`, uniform masses; hero's cards never applied), every
 /// preflop action ([`walk_preflop`]), then each completed postflop street in order -- its root
-/// blocked ([`block_and_rescale`]) and, until Task 15 consumes snapshots, left unconditioned with
-/// `UnconditionedPriorStreet{street, seat, "no compatible snapshot"}` for every seat that acted on
-/// it -- and finally the current street's root blocked and every range published ([`publish`]).
-/// The current street's own postflop actions are never replayed: Plan 2's street-root solve inserts
-/// them exactly. A preflop stop is scoped to the preflop street (spec section 9.3), so it clears
-/// once the hand has entered a postflop street; the residual never changes.
+/// blocked ([`block_and_rescale`]) and its observed actions walked through the selected snapshot
+/// ([`walk_postflop`]; with none, the street is left unconditioned with its reason) -- and finally
+/// the current street's root blocked and every range published ([`publish`]). Only completed
+/// streets are walked: for the turn the flop, for the river the flop then the turn, for the flop
+/// none. The current street's own postflop actions are never replayed (Plan 2's street-root solve
+/// inserts them exactly), and no prior street is ever solved here. A preflop stop is scoped to the
+/// preflop street (spec section 9.3), so it clears once the hand has entered a postflop street; the
+/// residual never changes.
 ///
 /// Precondition on `input.snapshots` (P3.T14): [`ReplayInput`] has no model revision, so the slice
 /// must already be filtered to one hand, config revision and model revision -- the engine passes
@@ -141,7 +144,7 @@ pub fn replay(input: ReplayInput) -> ReplayOutput {
     }
     for street in completed_streets(current) {
         block_and_rescale(&mut output, root_board(input.state, street));
-        unconditioned_street(&input, street, &mut output);
+        walk_postflop(&input, street, &mut output);
     }
     block_and_rescale(&mut output, root_board(input.state, current));
     publish(&mut output, input.state);
@@ -268,14 +271,20 @@ pub fn publish(output: &mut ReplayOutput, state: &HandState) {
     output.ranges = (0..6u8)
         .map(|i| {
             let seat = Seat(i);
-            state.dealt.contains(&seat).then(|| {
-                let r = marginal(&output.branches, seat);
-                range_output(&r.iter().zip(mask.0.iter()).map(|(w, keep)| if *keep == 0.0 { 0.0 } else { *w }).collect::<Vec<f64>>())
-            })
+            state.dealt.contains(&seat).then(|| public_range(&output.branches, seat, &mask))
         })
         .collect();
     output.folded_ranges =
         (0..6usize).filter(|&i| state.derived.folded[i]).filter_map(|i| output.ranges[i].clone()).collect();
+}
+
+/// `seat`'s published range over `branches`: its marginal with the combos `mask` blocks removed
+/// pointwise, narrowed at the output boundary ([`range_output`]). The one computation behind
+/// [`publish`] and behind the postflop walk's incoming root-range hashes (P3.T15), so a snapshot
+/// keyed by the ranges a replay published at a street root is found again by a later replay.
+pub(crate) fn public_range(branches: &[HistoryBranch], seat: Seat, mask: &Range1326) -> Range1326 {
+    let r = marginal(branches, seat);
+    range_output(&r.iter().zip(mask.0.iter()).map(|(w, keep)| if *keep == 0.0 { 0.0 } else { *w }).collect::<Vec<f64>>())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -638,9 +647,10 @@ fn source_menu(node: &PreflopNode, expanded: &ExpandedNode, parent: &SourceParen
 }
 
 /// Spec section 8.4's disclosure of one translated wager: the observed pot fraction, the mapped
-/// menu sizes (as pot fractions at the mapped source parent) with their interpolation weights,
-/// the deviation, and `prominent = d > 0.10`.
-fn translation_reason(street: Street, seat: Seat, s: f64, menu: &[(usize, f64)], t: &Interpolation) -> ApproxReason {
+/// menu sizes (as pot fractions at the mapped parent: the source parent preflop, the snapshot
+/// node's mapped financial prefix postflop) with their interpolation weights, the deviation, and
+/// `prominent = d > 0.10`.
+pub(crate) fn translation_reason(street: Street, seat: Seat, s: f64, menu: &[(usize, f64)], t: &Interpolation) -> ApproxReason {
     let size = |i: usize| menu.iter().find(|(j, _)| *j == i).map(|(_, x)| *x).expect("an interpolation choice is a menu size");
     ApproxReason::BetTranslation {
         street,
@@ -700,22 +710,6 @@ fn completed_streets(current: Street) -> Vec<Street> {
 /// A street's root board: the first `board_len` cards of the board on record.
 fn root_board(state: &HandState, street: Street) -> &[Card] {
     &state.board[..street.board_len()]
-}
-
-/// Task 13's fallback for a completed postflop street (no snapshot is consumed yet): the masses
-/// are kept exactly as the earlier streets left them, and every seat that acted on it gets
-/// `UnconditionedPriorStreet{street, seat, "no compatible snapshot"}` once, in order of its first
-/// action (spec section 9.3).
-fn unconditioned_street(input: &ReplayInput, street: Street, output: &mut ReplayOutput) {
-    let mut acted: Vec<Seat> = Vec::new();
-    for a in input.state.actions.iter().filter(|a| a.street == street) {
-        if !acted.contains(&a.seat) {
-            acted.push(a.seat);
-        }
-    }
-    for seat in acted {
-        output.reasons.push(ApproxReason::UnconditionedPriorStreet { street, seat, cause: "no compatible snapshot".into() });
-    }
 }
 
 /// Entering a postflop street ends every preflop stop (spec section 9.3 scopes it to the preflop
