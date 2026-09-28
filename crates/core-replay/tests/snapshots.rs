@@ -10,6 +10,11 @@
 //! prefix-based mutation invalidation over hands built by Plan 1's `begin_hand`/`apply_action`/
 //! `set_board` (append-only survival with the original identity, undo, later streets, a changed
 //! board, another hand), with the cache origins behaving exactly as `live`. No worker is used.
+//!
+//! Fix round 1 (ruling 14-I1): every invalidation test registers its snapshot at a genuine hero
+//! decision with the street root `core_model::street_root` returns there, and spec 10.2's two
+//! admitted multiway projections are validated in their projected history (append, hero-card change,
+//! undo across the prefix or the projection, and no blind stripping of folded players' actions).
 
 use core_model::state::BeginHand;
 use core_replay::{compatible, covered_prefix, select_snapshot, street_number, CompatKey, SnapshotStore, StreetSnapshot};
@@ -358,27 +363,53 @@ fn for_identity_filters_by_hand_config_and_model_only() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Mutation invalidation over real hands (spec section 9.2).
+// Mutation invalidation over real hands (spec sections 9.2 and 10.2).
+//
+// Every snapshot below is registered at a genuine hero decision, keyed and prefixed by the street
+// root `core_model::street_root` returns there (the history domain the engine registers in), and
+// every mutation is a state built by Plan 1's `begin_hand`/`apply_action`/`set_board`/
+// `set_hero_cards`; an undo is an earlier state under a fresh revision, as the engine's.
 // ---------------------------------------------------------------------------------------------
 
-/// A six-max table at 5/10 chips, hand 1, config revision 1; seat 5 holds the button (SB 0, BB 1,
-/// UTG 2, HJ 3, CO 4, BTN 5). UTG, HJ and CO fold, BTN opens to 25, SB folds, BB calls; the flop
-/// is Kh 7d 2c (the fixture's board), and BB (seat 1) is out of position.
-fn flop_state() -> HandState {
-    let s = core_model::set_board(&preflop_closed(), &flop_board()).expect("the flop");
-    assert_eq!(s.derived.to_act, Some(Seat(1)));
-    s
+const BB: Seat = Seat(1);
+const CO: Seat = Seat(4);
+const BTN: Seat = Seat(5);
+/// Hero's cards: As Ad (never on any board below).
+const HERO_CARDS: [Card; 2] = [Card(51), Card(49)];
+
+fn turn_board() -> Vec<Card> {
+    vec![Card(46), Card(21), Card(0), Card(8)]
 }
 
-fn table() -> HandState {
+/// A six-max table at 5/10 chips, hand 1, config revision 1, 1,000 chips each; seat 5 holds the
+/// button (SB 0, BB 1, UTG 2, HJ 3, CO 4, BTN 5); `hero` holds As Ad.
+fn table(hero: Seat) -> HandState {
     let cfg = HandConfig { config_revision: 1, sb_chips: 5, bb_chips: 10, straddle: None, rake: Rake::TimeCharge, chip_label: "$1".into() };
-    core_model::begin_hand(&cfg, BeginHand { hand_id: 1, button: Seat(5), hero: Seat(1), dealt: (0..6).map(Seat).collect(), stacks_start: vec![1000; 6], hero_cards: None })
+    core_model::begin_hand(&cfg, BeginHand { hand_id: 1, button: BTN, hero, dealt: (0..6).map(Seat).collect(), stacks_start: vec![1000; 6], hero_cards: Some(HERO_CARDS) })
         .expect("the model admits the table")
 }
 
-/// The preflop line of [`flop_state`], closed, before the flop is dealt.
+/// Heads-up: UTG, HJ and CO fold, BTN (hero) opens to 25, SB folds, BB calls; closed, before the
+/// flop is dealt.
 fn preflop_closed() -> HandState {
-    act(&table(), &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 25 }, Action::Fold, Action::Call])
+    act(&table(BTN), &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 25 }, Action::Fold, Action::Call])
+}
+
+/// The heads-up flop Kh 7d 2c (the fixture's board): BB (seat 1) is out of position and to act,
+/// hero (BTN) in position.
+fn flop_state() -> HandState {
+    let s = core_model::set_board(&preflop_closed(), &flop_board()).expect("the flop");
+    assert_eq!(s.derived.to_act, Some(BB));
+    s
+}
+
+/// Three-way: UTG and HJ fold, CO and BTN call 10, SB folds, BB checks; the flop Kh 7d 2c is dealt
+/// with a pot of 35. Postflop order is BB, CO, BTN: spec 10.2's A, B and C.
+fn three_way_flop(hero: Seat) -> HandState {
+    let s = act(&table(hero), &[Action::Fold, Action::Fold, Action::Call, Action::Call, Action::Fold, Action::Check]);
+    let s = core_model::set_board(&s, &flop_board()).expect("the flop");
+    assert_eq!((s.derived.to_act, s.derived.pot), (Some(BB), 35));
+    s
 }
 
 fn act(state: &HandState, actions: &[Action]) -> HandState {
@@ -394,30 +425,48 @@ fn undone(earlier: &HandState, revision: u32) -> HandState {
     HandState { hand_revision: revision, ..earlier.clone() }
 }
 
+/// The snapshot the engine registers at hero's decision in `state` (solved under hand revision
+/// `revision`, decision `decision_id`): keyed by the street root `core_model::street_root` returns
+/// there, with that root's `history` as the solved prefix.
+fn at_decision(state: &HandState, revision: u32, decision_id: u64) -> (DecisionIdentity, StreetSnapshot) {
+    let root = core_model::street_root(state).unwrap_or_else(|e| panic!("hero's decision has an admitted street root: {e:?}"));
+    let identity = id(state.hand_id, revision, decision_id);
+    let snapshot = solved(identity.clone(), root.street, &root.board, root.history, 0.1);
+    (identity, snapshot)
+}
+
+fn register_at(store: &mut SnapshotStore, state: &HandState, revision: u32, decision_id: u64) -> DecisionIdentity {
+    let (identity, snapshot) = at_decision(state, revision, decision_id);
+    assert!(store.register(&identity, snapshot));
+    identity
+}
+
 fn decisions(store: &SnapshotStore) -> Vec<(u64, u32)> {
     store.for_hand(1).iter().map(|s| (s.provenance.identity_at_solve.decision_id, s.provenance.identity_at_solve.hand_revision)).collect()
 }
 
 #[test]
 fn an_append_only_action_keeps_every_snapshot_whose_prefix_still_fits_with_its_original_identity() {
-    let flop = flop_state();
-    let checked = act(&flop, &[Action::Check]);
+    let checked = act(&flop_state(), &[Action::Check]);
     let mut store = SnapshotStore::new();
-    let at_root = id(1, 7, 1);
-    let after_check = id(1, 8, 2);
-    assert!(store.register(&at_root, solved(at_root.clone(), Street::Flop, &flop_board(), vec![], 0.1)));
-    assert!(store.register(&after_check, solved(after_check.clone(), Street::Flop, &flop_board(), vec![(Seat(1), Action::Check)], 0.1)));
-    // IP bets: the street history grows; both solved prefixes still prefix it.
+    let after_check = register_at(&mut store, &checked, 8, 1);
+    assert_eq!(store.for_hand(1)[0].provenance.solved_prefix, vec![(BB, Action::Check)]);
+    // Hero bets: the street history grows past the solved decision.
     let bet = act(&checked, &[Action::Bet { to: 30 }]);
     store.invalidate(&bet);
-    assert_eq!(decisions(&store), vec![(1, 7), (2, 8)], "retained with the identity they were solved under");
-    let retained = store.for_hand(1);
-    assert_eq!((retained[0].provenance.identity_at_solve.clone(), retained[1].provenance.identity_at_solve.clone()), (at_root, after_check));
-    // BB calls, the turn comes: the flop snapshots are an earlier street and stay; so does the flop's
-    // own history, which only grew.
-    let turn = core_model::set_board(&act(&bet, &[Action::Call]), &[Card(46), Card(21), Card(0), Card(8)]).expect("the turn");
+    assert_eq!(decisions(&store), vec![(1, 8)]);
+    // BB check-raises: hero's second decision on the street.
+    let raised = act(&bet, &[Action::Raise { to: 90 }]);
+    let after_raise = register_at(&mut store, &raised, 10, 2);
+    store.invalidate(&raised);
+    assert_eq!(decisions(&store), vec![(1, 8), (2, 10)], "retained with the identity they were solved under");
+    // Hero calls, the turn comes: the flop's history only grew, and the flop is an earlier street.
+    let called = act(&raised, &[Action::Call]);
+    store.invalidate(&called);
+    let turn = core_model::set_board(&called, &turn_board()).expect("the turn");
     store.invalidate(&turn);
-    assert_eq!(decisions(&store), vec![(1, 7), (2, 8)]);
+    let retained = store.for_hand(1);
+    assert_eq!((retained.len(), retained[0].provenance.identity_at_solve.clone(), retained[1].provenance.identity_at_solve.clone()), (2, after_check, after_raise));
 }
 
 #[test]
@@ -425,82 +474,194 @@ fn undo_drops_later_streets_and_same_street_snapshots_whose_prefix_no_longer_fit
     let flop = flop_state();
     let checked = act(&flop, &[Action::Check]);
     let checked_through = act(&checked, &[Action::Check]);
-    let turn_board = [Card(46), Card(21), Card(0), Card(8)];
-    let turn = core_model::set_board(&checked_through, &turn_board).expect("the turn");
+    let turn = core_model::set_board(&checked_through, &turn_board()).expect("the turn");
+    let turn_checked = act(&turn, &[Action::Check]);
     let mut store = SnapshotStore::new();
-    let (root, after_check, turn_root) = (id(1, 7, 1), id(1, 8, 2), id(1, 10, 3));
-    assert!(store.register(&root, solved(root.clone(), Street::Flop, &flop_board(), vec![], 0.1)));
-    assert!(store.register(&after_check, solved(after_check.clone(), Street::Flop, &flop_board(), vec![(Seat(1), Action::Check)], 0.1)));
-    assert!(store.register(&turn_root, solved(turn_root.clone(), Street::Turn, &turn_board, vec![], 0.1)));
-    store.invalidate(&turn);
-    assert_eq!(decisions(&store), vec![(1, 7), (2, 8), (3, 10)]);
+    register_at(&mut store, &checked, 8, 1);
+    register_at(&mut store, &turn_checked, 11, 2);
+    store.invalidate(&turn_checked);
+    assert_eq!(decisions(&store), vec![(1, 8), (2, 11)]);
 
-    // Undo the turn card: the hand awaits the turn again, and the turn snapshot's root is gone.
-    let awaiting = undone(&checked_through, 11);
+    // Undo the turn check: the turn decision was solved after it; the flop decision stays.
+    store.invalidate(&undone(&turn, 12));
+    assert_eq!(decisions(&store), vec![(1, 8)]);
+
+    // Undo the turn card: the hand awaits the turn; the flop's history still holds the decision.
+    let awaiting = undone(&checked_through, 13);
     assert!(matches!(awaiting.phase, proto::HandPhase::AwaitingBoard { street: Street::Turn }));
     store.invalidate(&awaiting);
-    assert_eq!(decisions(&store), vec![(1, 7), (2, 8)]);
+    assert_eq!(decisions(&store), vec![(1, 8)]);
 
-    // Undo back to the flop's betting after the check: the flop snapshots still fit.
-    store.invalidate(&undone(&checked, 12));
-    assert_eq!(decisions(&store), vec![(1, 7), (2, 8)]);
+    // Undo hero's check: back at the solved decision itself, under a new revision that never
+    // rewrites the snapshot's own.
+    store.invalidate(&undone(&checked, 14));
+    assert_eq!(decisions(&store), vec![(1, 8)]);
 
-    // Rule (2) on its own: a later street's snapshot is dropped by its street alone, even one whose key
-    // would pass the board and prefix rules (a turn key carrying only the flop's cards).
+    // Rule (2) on its own: a later street's snapshot is dropped by its street alone, even one whose
+    // key would pass the board rule (a turn key carrying only the flop's cards).
     let mut later = SnapshotStore::new();
-    let odd = id(1, 12, 9);
+    let odd = id(1, 14, 9);
     assert!(later.register(&odd, solved(odd.clone(), Street::Turn, &flop_board(), vec![], 0.1)));
-    later.invalidate(&undone(&checked, 12));
+    later.invalidate(&undone(&checked, 14));
     assert!(later.for_hand(1).is_empty(), "a street later than the current one is dropped");
 
-    // Undo the check: `[Check]` no longer prefixes the empty street history; the root snapshot stays,
-    // with the identity it was solved under (the undo's new revision never rewrites it).
-    let rewound = undone(&flop, 13);
-    store.invalidate(&rewound);
-    assert_eq!(decisions(&store), vec![(1, 7)]);
+    // Undo BB's check: the decision solved after it is gone.
+    store.invalidate(&undone(&flop, 15));
+    assert!(decisions(&store).is_empty());
 
-    // A different action at the same point: the root snapshot's empty prefix still fits.
-    let bet_instead = HandState { hand_revision: 14, ..act(&rewound, &[Action::Bet { to: 20 }]) };
+    // BB bets instead: a result solved before the undo is stale for the new active decision, even
+    // though its key and board fit: refused.
+    let bet_instead = undone(&act(&flop, &[Action::Bet { to: 20 }]), 16);
+    let (active, fresh) = at_decision(&bet_instead, 16, 3);
+    let (_, stale) = at_decision(&bet_instead, 15, 2);
+    assert!(!store.register(&active, stale));
+    assert!(store.register(&active, fresh));
     store.invalidate(&bet_instead);
-    assert_eq!(decisions(&store), vec![(1, 7)]);
-
-    // A result solved before the undo is stale for the new active decision, even though its empty
-    // prefix fits the new history: refused.
-    let active = id(1, 14, 4);
-    assert!(!store.register(&active, solved(id(1, 12, 3), Street::Flop, &flop_board(), vec![], 0.01)));
-    assert!(store.register(&active, solved(active.clone(), Street::Flop, &flop_board(), vec![(Seat(1), Action::Bet { to: 20 })], 0.2)));
-    assert_eq!(decisions(&store), vec![(1, 7), (4, 14)]);
+    assert_eq!(decisions(&store), vec![(3, 16)]);
 
     // Undo the flop cards: the hand awaits the flop, whose root board no longer matches.
-    let mut kept = SnapshotStore::new();
-    assert!(kept.register(&active, solved(active.clone(), Street::Flop, &flop_board(), vec![], 0.2)));
-    let awaiting_flop = undone(&preflop_closed(), 15);
+    let awaiting_flop = undone(&preflop_closed(), 17);
     assert!(matches!(awaiting_flop.phase, proto::HandPhase::AwaitingBoard { street: Street::Flop }));
-    kept.invalidate(&awaiting_flop);
-    assert!(kept.for_hand(1).is_empty());
+    store.invalidate(&awaiting_flop);
+    assert!(decisions(&store).is_empty());
 
     // Undo into the preflop betting (BB has not called yet): every postflop snapshot is a later street.
-    let before_call = undone(&act(&table(), &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 25 }, Action::Fold]), 16);
+    let mut postflop = SnapshotStore::new();
+    register_at(&mut postflop, &checked, 8, 1);
+    register_at(&mut postflop, &turn_checked, 11, 2);
+    let before_call = undone(&act(&table(BTN), &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 25 }, Action::Fold]), 18);
     assert_eq!(before_call.derived.street, Street::Preflop);
-    store.invalidate(&before_call);
-    assert!(decisions(&store).is_empty());
+    postflop.invalidate(&before_call);
+    assert!(decisions(&postflop).is_empty());
 }
 
 /// A same-street snapshot whose root board no longer matches that street's board is dropped even
 /// though its solved prefix fits; a snapshot of another hand is dropped by any mutation of this one.
 #[test]
 fn a_changed_root_board_or_another_hand_is_dropped_by_invalidate() {
-    let flop = flop_state();
-    let checked = act(&flop, &[Action::Check]);
+    let checked = act(&flop_state(), &[Action::Check]);
     let mut store = SnapshotStore::new();
-    let (ours, other_board, other_hand) = (id(1, 7, 1), id(1, 7, 2), id(2, 3, 3));
-    let prefix = vec![(Seat(1), Action::Check)];
-    assert!(store.register(&ours, solved(ours.clone(), Street::Flop, &flop_board(), prefix.clone(), 0.1)));
+    register_at(&mut store, &checked, 7, 1);
+    let (other_board, other_hand) = (id(1, 7, 2), id(2, 3, 3));
+    let prefix = vec![(BB, Action::Check)];
     assert!(store.register(&other_board, solved(other_board.clone(), Street::Flop, &[Card(46), Card(21), Card(4)], prefix.clone(), 0.1)));
     assert!(store.register(&other_hand, solved(other_hand.clone(), Street::Flop, &flop_board(), prefix.clone(), 0.1)));
     store.invalidate(&checked);
     assert_eq!(decisions(&store), vec![(1, 7)]);
     assert!(store.for_hand(2).is_empty());
+}
+
+/// Ruling 14-I1, spec 10.2's first worked case: "A bets 50, B folds, C raises to 150, A to act"
+/// projects to `A Bet(50), C Raise(150)`, and that projected history is the snapshot's solved
+/// prefix. Returns the flop, the state at A's decision, and a store holding the snapshot registered
+/// there (solved under revision 20, decision 1) with its identity.
+fn projected_case() -> (HandState, HandState, SnapshotStore, DecisionIdentity) {
+    let flop = three_way_flop(BB);
+    let at_decision_state = act(&flop, &[Action::Bet { to: 50 }, Action::Fold, Action::Raise { to: 150 }]);
+    let root = core_model::street_root(&at_decision_state).expect("spec 10.2 admits this projection");
+    assert_eq!((root.oop, root.ip, root.projected_from, root.dead_this_street), (BB, BTN, 3, 0));
+    assert_eq!(root.history, vec![(BB, Action::Bet { to: 50 }), (BTN, Action::Raise { to: 150 })]);
+    let mut store = SnapshotStore::new();
+    let identity = register_at(&mut store, &at_decision_state, 20, 1);
+    assert_eq!(store.for_hand(1)[0].provenance.solved_prefix, root.history, "the real root history is the solved prefix");
+    (flop, at_decision_state, store, identity)
+}
+
+fn identities(store: &SnapshotStore) -> Vec<DecisionIdentity> {
+    store.for_hand(1).iter().map(|s| s.provenance.identity_at_solve.clone()).collect()
+}
+
+/// 14-I1 (a): A calls. The full history interleaves B's fold; the projected one still holds the
+/// solved decision, so the snapshot is retained under its original identity, and again once the
+/// next street is dealt.
+#[test]
+fn a_projected_snapshot_survives_an_appended_action_under_its_original_identity() {
+    let (_, at_decision_state, mut store, identity) = projected_case();
+    let called = act(&at_decision_state, &[Action::Call]);
+    store.invalidate(&undone(&called, 21));
+    assert_eq!(identities(&store), vec![identity.clone()], "an appended action keeps the projected snapshot");
+    let turn = core_model::set_board(&called, &turn_board()).expect("the turn");
+    store.invalidate(&undone(&turn, 22));
+    assert_eq!(identities(&store), vec![identity]);
+}
+
+/// 14-I1 (b): only hero's cards change; public history is untouched.
+#[test]
+fn a_projected_snapshot_survives_a_hero_card_change() {
+    let (_, at_decision_state, mut store, identity) = projected_case();
+    let recarded = core_model::set_hero_cards(&at_decision_state, [Card(44), Card(45)]).expect("Kc Kd are not on the board");
+    store.invalidate(&undone(&recarded, 21));
+    assert_eq!(identities(&store), vec![identity], "a hero-card change keeps the projected snapshot");
+}
+
+/// 14-I1 (c): an undo of C's raise crosses the solved prefix; an undo of B's fold as well crosses
+/// the projection. Either removes the snapshot.
+#[test]
+fn an_undo_across_the_projected_prefix_or_the_projection_removes_the_snapshot() {
+    let (flop, _, mut store, _) = projected_case();
+    store.invalidate(&undone(&act(&flop, &[Action::Bet { to: 50 }, Action::Fold]), 22));
+    assert!(decisions(&store).is_empty(), "an undo across the solved prefix removes it");
+    let (flop, _, mut store, _) = projected_case();
+    store.invalidate(&undone(&act(&flop, &[Action::Bet { to: 50 }]), 23));
+    assert!(decisions(&store).is_empty(), "an undo across the projection removes it");
+}
+
+/// Spec 10.2's second worked case, with dead money: "A bets 50, B calls 50, C raises to 150, A
+/// raises to 250, B folds, C to act" projects to `A Bet(50), C Raise(150), A Raise(250)` (B's 50
+/// dead). Hero is C; the projected snapshot survives C's call and a hero-card change, and an undo of
+/// B's fold (across the projection) removes it.
+#[test]
+fn a_projected_root_with_dead_money_is_validated_in_its_projected_history() {
+    let flop = three_way_flop(BTN);
+    let line = [Action::Bet { to: 50 }, Action::Call, Action::Raise { to: 150 }, Action::Raise { to: 250 }, Action::Fold];
+    let at_decision_state = act(&flop, &line);
+    let root = core_model::street_root(&at_decision_state).expect("spec 10.2 admits this projection");
+    assert_eq!((root.projected_from, root.dead_this_street), (3, 50));
+    assert_eq!(root.history, vec![(BB, Action::Bet { to: 50 }), (BTN, Action::Raise { to: 150 }), (BB, Action::Raise { to: 250 })]);
+
+    let mut store = SnapshotStore::new();
+    let identity = register_at(&mut store, &at_decision_state, 30, 1);
+    store.invalidate(&undone(&act(&at_decision_state, &[Action::Call]), 31));
+    assert_eq!(identities(&store), vec![identity.clone()], "C's call keeps the projected snapshot");
+    store.invalidate(&undone(&core_model::set_hero_cards(&at_decision_state, [Card(44), Card(45)]).unwrap(), 32));
+    assert_eq!(identities(&store), vec![identity], "a hero-card change keeps it");
+    store.invalidate(&undone(&act(&flop, &line[..4]), 33));
+    assert!(decisions(&store).is_empty(), "an undo of B's fold crosses the projection");
+}
+
+/// The projected history is recovered by the model at a cutoff, never by stripping the actions of
+/// whoever has folded by now: here B calls A's bet, C raises, A calls and only then B folds. B's
+/// actions stripped, the history would start with the solved prefix `A Bet(50), C Raise(150)`, but
+/// A's decision after C's raise was three-way in this line (multiway, no projected root), so the
+/// decision the snapshot was solved for is not in this history and it is removed.
+#[test]
+fn a_folded_players_actions_are_never_stripped_blindly() {
+    let (flop, _, mut store, _) = projected_case();
+    let late_fold = act(&flop, &[Action::Bet { to: 50 }, Action::Call, Action::Raise { to: 150 }, Action::Call, Action::Fold]);
+    let stripped: Vec<(Seat, Action)> =
+        late_fold.actions.iter().filter(|a| a.street == Street::Flop && a.seat != CO).map(|a| (a.seat, a.action)).collect();
+    assert!(stripped.starts_with(&store.for_hand(1)[0].provenance.solved_prefix), "the stripping heuristic would keep it");
+    store.invalidate(&undone(&late_fold, 21));
+    assert!(decisions(&store).is_empty());
+}
+
+/// The solved decision itself must be in the new history, not merely a later decision whose
+/// projected history extends the solved prefix: here B calls A's bet, C raises to 150 (A's decision
+/// there is three-way, no projected root), A re-raises to 400, B folds and C raises to 900. A's
+/// decision now is an admitted projection whose history `A Bet(50), C Raise(150), A Raise(400),
+/// C Raise(900)` starts with the solved prefix `A Bet(50), C Raise(150)`, but the decision solved at
+/// that prefix does not exist in this line, so the snapshot is removed.
+#[test]
+fn a_later_decision_extending_the_prefix_does_not_stand_in_for_the_solved_one() {
+    let (flop, _, mut store, _) = projected_case();
+    let line = [Action::Bet { to: 50 }, Action::Call, Action::Raise { to: 150 }, Action::Raise { to: 400 }, Action::Fold, Action::Raise { to: 900 }];
+    let later = act(&flop, &line);
+    let root = core_model::street_root(&later).expect("the later decision is an admitted projection");
+    assert_eq!(root.projected_from, 3);
+    assert!(root.history.starts_with(&store.for_hand(1)[0].provenance.solved_prefix));
+    assert!(root.history.len() > store.for_hand(1)[0].provenance.solved_prefix.len());
+    store.invalidate(&undone(&later, 24));
+    assert!(decisions(&store).is_empty());
 }
 
 /// Step 6: a cache-origin snapshot (`cache_exact`, `cache_approximate`, `cache_provisional`)
@@ -509,11 +670,11 @@ fn a_changed_root_board_or_another_hand_is_dropped_by_invalidate() {
 fn cache_origins_behave_exactly_as_live() {
     let origins = ["cache_exact", "live", "cache_provisional", "cache_approximate"];
     let history = line(50);
+    let checked = act(&flop_state(), &[Action::Check]);
     let mut store = SnapshotStore::new();
     let mut all = vec![];
     for (i, origin) in origins.iter().enumerate() {
-        let identity = id(1, 7, 10 + i as u64);
-        let mut s = solved(identity.clone(), Street::Flop, &flop_board(), vec![(Seat(1), Action::Check)], 0.1);
+        let (identity, mut s) = at_decision(&checked, 7, 10 + i as u64);
         s.provenance.origin = (*origin).into();
         assert!(store.register(&identity, s.clone()), "{origin} registers");
         all.push(s);
@@ -536,7 +697,7 @@ fn cache_origins_behave_exactly_as_live() {
         assert_eq!(chosen(&candidates, &key, &history), Some(10 + i as u64), "{origin}");
     }
     // Invalidation does not read the origin either.
-    store.invalidate(&act(&flop_state(), &[Action::Check, Action::Bet { to: 30 }]));
+    store.invalidate(&act(&checked, &[Action::Bet { to: 30 }]));
     assert_eq!(store.for_hand(1).len(), 4);
     store.invalidate(&flop_state());
     assert!(store.for_hand(1).is_empty());

@@ -14,7 +14,7 @@ pub use core_preflop::branches::*;
 use proto::{Action, ApproxReason, Seat, Street};
 
 /// Stops branch `b` for the rest of the current street (spec section 9.3): records `cause`
-/// ("missing node <key>", or why the next action could not be mapped) and clears every seat's
+/// (`"missing node <key>"`, or why the next action could not be mapped) and clears every seat's
 /// node. `q` and every mass are left exactly as they are -- a stopped branch is frozen, which
 /// [`condition`], [`split_action`] and [`split_batch`] then honour for every later action of the
 /// street. It is the same stop [`BranchChoice::Stop`] applies inside a batch; the replay walk calls
