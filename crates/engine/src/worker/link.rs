@@ -56,6 +56,10 @@ pub trait WorkerLink: Send {
     fn kill(&mut self);
     fn ready(&self) -> Option<&Ready>;
     fn peak_working_set_bytes(&self) -> u64 { 0 }
+    /// The worker's latest stderr output, bounded (§3.4: drained into a 64 KiB ring, `process::STDERR_RING`), across
+    /// launches: what the engine's diagnostics log records with every kill, restart and `tree_mismatch` (final review
+    /// M2). Empty for a link with no worker process behind it.
+    fn stderr_tail(&self) -> String { String::new() }
     /// The permanent `ready` refusal this link stands for, when it is a degraded engine's (`RefusedWorker`): every
     /// request is then answered with it and nothing is launched (spec 12). `None` for a link that can launch a worker.
     fn refused(&self) -> Option<&ReadyRefusal> { None }

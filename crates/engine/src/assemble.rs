@@ -65,11 +65,11 @@ pub fn accumulate(base: Coverage, more: Vec<ApproxReason>) -> Coverage {
 /// at all; otherwise `Approximate` with the inherited reasons, plus `DeadlineBestSoFar` when the solve
 /// was stopped by its deadline (`best_so_far`).
 ///
-/// The comparison is raw, never on rounded basis points (spec 4.4), and exact: it is evaluated as
-/// `exploitability * 10_000 <= target_bp * pot` in `f64`, where both products are exact (an `f32`
-/// significand times 10^4 needs at most 38 bits, `u16 * u32` at most 48). `reached_bp` is display
-/// only; a value above `u16::MAX` bp (6.5535 times the pot, or 655.35%) is shown as `u16::MAX`,
-/// and no comparison ever reads it.
+/// The comparison is raw, never on rounded basis points (spec 4.4), and exact: it is
+/// `proto::worker::meets_target` (`exploitability * 10_000 <= target_bp * pot` in `f64`, where both
+/// products are exact), the one definition the solve client, the bench and the worker share (final
+/// review M3). `reached_bp` is display only; a value above `u16::MAX` bp (6.5535 times the pot, or
+/// 655.35%) is shown as `u16::MAX`, and no comparison ever reads it.
 ///
 /// # Panics
 /// If `pot` is 0 or `exploitability_chips` is not finite and non-negative (the worker's result is
@@ -78,7 +78,7 @@ pub fn coverage_for_solve(exploitability_chips: f32, pot: u32, target_bp: u16, b
     assert!(pot > 0, "coverage_for_solve: the solved pot is 0 chips");
     assert!(exploitability_chips.is_finite() && exploitability_chips >= 0.0, "coverage_for_solve: exploitability {exploitability_chips} chips is not finite and non-negative");
     let raw = f64::from(exploitability_chips);
-    let at_target = raw * 10_000.0 <= f64::from(target_bp) * f64::from(pot);
+    let at_target = proto::worker::meets_target(exploitability_chips, pot, target_bp);
     let mut reasons = inherited;
     if best_so_far {
         let bp = (raw * 10_000.0 / f64::from(pot)).round();

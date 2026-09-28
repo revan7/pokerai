@@ -15,7 +15,7 @@ use engine::clock::Clock;
 use engine::deadline::{extraction_margin_ms, final_delivery_ms, street_budget_ms, DELIVERY_MARGIN_MS, PIPE_MARGIN_MS};
 use engine::tree::{materialize_at, Templates};
 use engine::worker::link::WorkerLink;
-use proto::worker::{AckStatus, EngineMessage, ResultStatus, SolveRequest, Stage, WorkerError, WorkerMessage};
+use proto::worker::{meets_target, AckStatus, EngineMessage, ResultStatus, SolveRequest, Stage, WorkerError, WorkerMessage};
 use proto::{Rake, Range1326, Street};
 use std::time::Duration;
 
@@ -48,7 +48,7 @@ pub struct SpotResult {
     pub status: String,
     /// Display only: the reached exploitability in bp of the pot, rounded; never compared with anything.
     pub reached_bp: Option<u16>,
-    /// A solution arrived whose raw exploitability meets the raw target (`reached_target`).
+    /// A solution arrived whose raw exploitability meets the raw target (`proto::worker::meets_target`).
     pub at_target: bool,
     pub iterations: u32,
     pub memory_bytes: u64,
@@ -152,13 +152,6 @@ pub fn budget_summary(street: Street) -> String {
     )
 }
 
-/// The raw target comparison of spec 4.4/5 step 7, never on rounded basis points: `exploitability_chips / pot <=
-/// target_bp / 10_000`, evaluated as `exploitability * 10_000 <= target_bp * pot` in `f64`, where both products are
-/// exact. The same comparison as `engine::assemble::coverage_for_solve`.
-pub fn reached_target(exploitability_chips: f32, pot: u32, target_bp: u16) -> bool {
-    f64::from(exploitability_chips) * 10_000.0 <= f64::from(target_bp) * f64::from(pot)
-}
-
 /// Whether a first-attempt terminal on `street` that arrived `wall_ms` after the send violates the street contract:
 /// - late: after the §7 street budget, on every street;
 /// - on the river and the turn, also a *delivered* solution (`ok` or `best_so_far`) short of the raw target
@@ -232,7 +225,8 @@ pub fn request(spot: &Spot, deadline_ms: u32) -> SolveRequest {
         target_bp: spot.target_bp,
         deadline_ms,
         extraction_margin_ms: extraction_margin_ms(spot.root_street),
-        memory_limit_bytes: 10 << 30,
+        // The engine's own default on every live `solve` (§10.3), never a copy of its value (final review M11).
+        memory_limit_bytes: engine::core::DEFAULT_MEMORY_LIMIT_BYTES,
         background: false,
     };
     req.spot = engine::bench_support::spot_identity(&req);
@@ -276,7 +270,9 @@ pub fn run_spot(worker: &mut dyn WorkerLink, clock: &dyn Clock, spot: &Spot, rep
     };
     let wall_ms = clock.now_ms() - t0;
     let ack_ms = ack_ms.expect("a terminal before the ack returned above");
-    let at_target = solution.as_ref().is_some_and(|s| reached_target(s.exploitability_chips, pot, target_bp));
+    // The raw target comparison of spec 4.4/5 step 7 (`proto::worker::meets_target`, the one definition the engine and
+    // the worker share: final review M3), never on rounded basis points.
+    let at_target = solution.as_ref().is_some_and(|s| meets_target(s.exploitability_chips, pot, target_bp));
     // Display only (§4.4 accuracy vocabulary): the reached exploitability in bp of the pot, saturating at u16::MAX.
     let reached_bp = solution.as_ref().map(|s| {
         let bp = (f64::from(s.exploitability_chips) * 10_000.0 / f64::from(pot)).round();
@@ -449,6 +445,15 @@ mod tests {
         assert_eq!(a.spot, c.spot, "the deadline is a solve parameter, not part of the structural identity");
     }
 
+    /// Final review M11: a bench request carries the engine's default memory limit, the one constant a live `solve` sends
+    /// (`engine::core::DEFAULT_MEMORY_LIMIT_BYTES`), so the bench measures the admission the engine applies.
+    #[test]
+    fn a_bench_request_carries_the_engines_memory_limit() {
+        for s in [river(), turn()] {
+            assert_eq!(request(&s, 1_850).memory_limit_bytes, engine::core::DEFAULT_MEMORY_LIMIT_BYTES, "{}", s.id);
+        }
+    }
+
     #[test]
     fn structurally_different_spots_sharing_a_display_id_get_distinct_identities() {
         let across_suites: HashSet<String> =
@@ -463,12 +468,12 @@ mod tests {
 
     #[test]
     fn the_raw_target_comparison_never_reads_display_bp() {
-        assert!(reached_target(1.0, 241, 50));
-        assert!(reached_target(0.5, 100, 50), "exactly at the raw target reaches it");
-        assert!(!reached_target(0.5001, 100, 50));
+        assert!(meets_target(1.0, 241, 50));
+        assert!(meets_target(0.5, 100, 50), "exactly at the raw target reaches it");
+        assert!(!meets_target(0.5001, 100, 50));
         // 1.21 chips of a 241-chip pot is 50.2 bp, displayed as 50 bp, yet above the raw target of 1.205 chips.
         assert_eq!((10_000.0f64 * 1.21 / 241.0).round(), 50.0);
-        assert!(!reached_target(1.21, 241, 50));
+        assert!(!meets_target(1.21, 241, 50));
     }
 
     #[test]

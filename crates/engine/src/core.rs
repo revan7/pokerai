@@ -82,14 +82,18 @@ pub struct EngineCore {
     pub worker: Box<dyn WorkerLink>,
     pub clock: Arc<dyn Clock>,
     pub identity: Arc<Mutex<IdentityState>>,
-    pub watchdog: Watchdog,
+    /// Shared with `Engine`, which arms each request's generation at admission (final review I1), before `engine-main`
+    /// gets to it; `engine-main` retires it (`Watchdog::disarm`) and stops the watchdog at the teardown.
+    pub watchdog: Arc<Watchdog>,
     pub log: DecisionLog,
     /// The id of the next request sent to the worker (`solve`, `cancel`, `lock`, `shutdown` all take one), a decimal
     /// string on the wire (§4.5). Never reused within this core.
     pub next_request_id: u64,
     pub memory_limit_bytes: u64,
-    /// The furthest stage the live request has reached, shared with the watchdog (`watchdog::Armed::stage`), which
-    /// reports it in `Unsupported{DeadlineExceeded{stage}}`.
+    /// The furthest stage the request being served has reached, shared with its watchdog (`watchdog::Armed::stage`),
+    /// which reports it in `Unsupported{DeadlineExceeded{stage}}`. Each request has a slot of its own, made at its
+    /// admission (`serve::admit`, `"queued"` until `engine-main` starts it): `serve_request` installs it here as it
+    /// starts the request, so a request waiting behind another never reports the other's stage (final review I1).
     pub stage: Arc<Mutex<String>>,
     /// `core_replay::SnapshotStore` (re-exported by `crate::snapshots`, plan 3 Task 14). Shared with `Engine` so a
     /// mutation can invalidate snapshots without waiting for a running request.
@@ -104,6 +108,10 @@ pub struct EngineCore {
     /// The `fast-path` threads the core's requests started (ruling 29-I2), joined by `shutdown`. Shared so that a test can
     /// see, once the engine is shut down, that none is left unjoined.
     pub tasks: Arc<Tasks>,
+    /// A cancel sent for a superseded job whose confirmation is still awaited (spec 7, 12): the wait gave way to a newer
+    /// decision's request (final review I1), and is settled before anything more is sent to the worker (`run_solve`)
+    /// or while `engine-main` is idle. Cleared by the job's `result{cancelled}` and by any kill or restart.
+    pub(crate) pending_cancel: Option<crate::solve::PendingCancel>,
     /// `shutdown` has run.
     shut_down: bool,
 }
@@ -112,7 +120,7 @@ impl EngineCore {
     /// Takes the decision log from the start (Task 21), so this constructor never changes arity (cross-plan section 4).
     pub fn new(worker: Box<dyn WorkerLink>, clock: Arc<dyn Clock>, identity: Arc<Mutex<IdentityState>>, log: DecisionLog) -> Self {
         Self {
-            watchdog: Watchdog::new(clock.clone()),
+            watchdog: Arc::new(Watchdog::new(clock.clone())),
             worker,
             clock,
             identity,
@@ -125,6 +133,7 @@ impl EngineCore {
             range_source: Arc::new(Mutex::new(Box::new(ExplicitRanges { oop: None, ip: None }))),
             equity_cancel: Arc::new(Mutex::new(None)),
             tasks: Arc::default(),
+            pending_cancel: None,
             shut_down: false,
         }
     }
@@ -176,7 +185,7 @@ impl EngineCore {
         }
     }
 
-    /// Starts a new request at `s`; only `serve_request` calls this, at admission.
+    /// Starts the request being served at `s`, in its own stage slot; only `serve_request` calls this, as it starts a request.
     pub fn reset_stage(&self, s: &str) {
         *self.stage.lock().unwrap() = s.to_string();
     }

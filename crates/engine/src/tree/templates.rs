@@ -66,8 +66,15 @@ impl Templates {
     fn base() -> &'static [TemplateSpec] { static T: OnceLock<Vec<TemplateSpec>> = OnceLock::new(); T.get_or_init(build) }
     /// Replaces the extra registrations with `extra` (pass `&[]` to clear). Each entry is leaked once so
     /// `get` can keep returning `&'static`; test harnesses call this a handful of times per process.
+    ///
+    /// The registrations are process-global (every test of the binary sees them), so an extra may add an id and never
+    /// override a base one (final review M10): a harness that shadowed `river_std_v1` would change it for every other
+    /// test. Asserted, before anything is registered.
     #[cfg(any(test, feature = "test-templates"))]
     pub fn with_extra(extra: &[TemplateSpec]) {
+        for t in extra {
+            assert!(Self::base().iter().all(|b| b.id != t.id), "Templates::with_extra: {:?} is a base template id; an extra never overrides one", t.id);
+        }
         let leaked: Vec<&'static TemplateSpec> = extra.iter().cloned().map(|t| &*Box::leak(Box::new(t))).collect();
         *EXTRA.write().unwrap() = leaked;
     }
@@ -75,7 +82,7 @@ impl Templates {
     fn extra() -> Vec<&'static TemplateSpec> { EXTRA.read().unwrap().clone() }
     #[cfg(not(any(test, feature = "test-templates")))]
     fn extra() -> Vec<&'static TemplateSpec> { Vec::new() }
-    /// Extra registrations shadow the base set, so a harness can also override a production template.
+    /// A base template, or an extra registration (`with_extra`, which never shares an id with a base template).
     pub fn get(id: &str) -> Option<&'static TemplateSpec> {
         Self::extra().into_iter().find(|t| t.id == id).or_else(|| Self::base().iter().find(|t| t.id == id))
     }
@@ -128,5 +135,15 @@ mod tests {
         assert_eq!(Templates::base_ids().len(), 9, "the production registry is never enlarged by with_extra");
         Templates::with_extra(&[]);   // idempotent reset
         assert!(Templates::get("check_only_test_v1").is_none());
+    }
+
+    /// Final review M10: the extra registrations are process-global, so an extra that overrode a production id would
+    /// change that template for every other test of the binary. `with_extra` refuses one, before it registers anything.
+    #[test]
+    #[should_panic(expected = "Templates::with_extra: \"river_std_v1\" is a base template id")]
+    fn an_extra_template_never_overrides_a_base_id() {
+        let mut shadow = Templates::get("river_std_v1").unwrap().clone();
+        shadow.wager_cap = 1;
+        Templates::with_extra(&[shadow]);
     }
 }

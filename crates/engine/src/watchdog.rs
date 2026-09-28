@@ -14,16 +14,20 @@
 //! watchdog wakes, and one on time is not a violation even when it is published after. The watchdog's own record, that
 //! the live generation reached the deadline, decides only while no terminal has been published.
 //!
-//! Generations. Only the most recent generation is live: `arm` retires the one before it, and `disarm` retires the
-//! live one. A retired generation does nothing at its times, not even its street-deadline record, and its thread ends
-//! at its next wake-up: a retired thread still waits until its next deadline (at most the flop's `5 s +
-//! flop_budget_s`) before it ends, unless the watchdog is stopped first.
+//! Generations. Only the most recent generation is live: `arm` retires the one before it and returns the new one, and
+//! `disarm(generation)` retires that generation if it is still live. Arming happens at admission (final review I1:
+//! `Engine::recommend` arms a request before `engine-main` gets to it), so a request can be retired by its successor's
+//! `arm` while `engine-main` still serves it; its own `disarm` then leaves the successor live. A retired generation does
+//! nothing at its times, not even its street-deadline record, and its thread ends at its next wake-up: a retired
+//! thread still waits until its next deadline (at most the flop's `5 s + flop_budget_s`) before it ends, unless the
+//! watchdog is stopped first.
 //!
 //! Threads (ruling 29-I2: the engine owns every thread it causes). The watchdog keeps the handle of every generation
 //! thread it starts; `arm` joins those already ended, and `stop` wakes every one still waiting on the clock (the
 //! `Clock`'s interruptible wait, `wait_until_or_stopped`), joins them all and returns only once each has ended. A
 //! stopped generation emits nothing and records nothing, a fire already in progress completes its emission first, and a
-//! stopped watchdog is never armed again (asserted). `stop` is the engine's teardown (`EngineCore::shutdown`).
+//! stopped watchdog is never armed again (`arm` asserts it, `try_arm` refuses it). `stop` is the engine's teardown
+//! (`EngineCore::shutdown`).
 //!
 //! One `Final` per request. `delivered` is shared with the engine's own delivery path: whichever side swaps it from
 //! false to true first delivers, and the other stays silent. A request whose `Final` was already delivered is never
@@ -35,10 +39,10 @@
 //! the check `serve_request` makes) and only then claims `delivered`, in one step, the step `serve_request`'s own
 //! acceptance makes under the same lock. A decision no longer active emits nothing, records nothing (neither `fired`
 //! nor the identity the watchdog fired for), leaves `delivered` unclaimed, and its thread ends: the watchdog has retired
-//! for it. Supersession therefore needs no retirement hook. A newer request's `arm` retires the older generation as
-//! before, and a supersession without a new arm (an undo, a newer decision whose request still waits behind its
-//! predecessor's 1.5 s cancel window, any other invalidating call of `IdentityState`) is linearized with the fire by the
-//! identity lock: once the invalidating call has returned, no fire of an earlier decision claims or emits anything; a
+//! for it. Supersession therefore needs no retirement hook. A newer request's `arm` (at its admission) retires the
+//! older generation as before, and a supersession without a new arm (an undo, a cancel, any other invalidating call of
+//! `IdentityState`) is linearized with the fire by the identity lock: once the invalidating call has returned, no fire
+//! of an earlier decision claims or emits anything; a
 //! fire that claimed first delivers the `Final` of a decision active at its claim, as `serve_request`'s own delivery
 //! does when a mutation lands between its acceptance and its sink callback (the UI refuses that one by identity). A
 //! decision still active behaves exactly as before. The identity lock is released before the `Final` is handed to the
@@ -219,11 +223,24 @@ impl Watchdog {
     }
 
     /// Starts a new generation for `a`, retiring the previous one, on a thread of its own, whose handle the watchdog
-    /// keeps (see "Threads" above). The thread lock is held from the stop check through the handle's registration, so a
-    /// `stop` either finds this thread's handle or makes this `arm` a bug. Lock order: threads, then generation.
-    pub fn arm(&self, a: Armed) {
+    /// keeps (see "Threads" above), and returns the new generation (the one `disarm` retires). Arming a stopped
+    /// watchdog is a bug (asserted; `try_arm` refuses it instead).
+    pub fn arm(&self, a: Armed) -> u64 {
+        match self.try_arm(a) {
+            Ok(generation) => generation,
+            Err(a) => panic!("watchdog armed for decision {:?} after it was stopped", a.identity),
+        }
+    }
+
+    /// `arm`, refused (`Err` with `a` back, nothing started) once the watchdog is stopped: what `Engine::recommend` calls
+    /// at admission (final review I1), where a stopped watchdog means `engine-main` has ended (final review I3). The
+    /// thread lock is held from the stop check through the handle's registration, so a `stop` either finds this
+    /// thread's handle or refuses this `arm`. Lock order: threads, then generation.
+    pub fn try_arm(&self, a: Armed) -> Result<u64, Armed> {
         let mut threads = lock(&self.threads);
-        assert!(!self.stop.load(Ordering::SeqCst), "watchdog armed for decision {:?} after it was stopped", a.identity);
+        if self.stop.load(Ordering::SeqCst) {
+            return Err(a);
+        }
         assert!(
             !a.delivered.load(Ordering::SeqCst),
             "watchdog armed for decision {:?} after its Final was delivered",
@@ -279,6 +296,7 @@ impl Watchdog {
         }
         *threads = running;
         threads.push(handle);
+        Ok(generation)
     }
 
     /// Stops the watchdog (ruling 29-I2): wakes every generation thread still waiting on the clock, joins every one,
@@ -297,11 +315,15 @@ impl Watchdog {
         }
     }
 
-    /// Retires the live generation: it emits nothing and records nothing from now on. Once `disarm` returns, no fire
-    /// of an earlier generation is in progress.
-    pub fn disarm(&self) {
+    /// Retires `generation` (what its `arm` returned) if it is still the live one: it emits nothing and records nothing
+    /// from now on. A generation already retired by a newer `arm` (a request admitted while this one was still served,
+    /// final review I1) stays retired, and the newer one is left live. Either way, once `disarm` returns no fire of
+    /// `generation` is in progress: the generation lock is taken, which a fire holds through its emission.
+    pub fn disarm(&self, generation: u64) {
         let mut g = lock(&self.generations);
-        g.live = g.live.checked_add(1).expect("watchdog generation counter overflowed u64");
+        if g.live == generation {
+            g.live = g.live.checked_add(1).expect("watchdog generation counter overflowed u64");
+        }
     }
 }
 

@@ -4,12 +4,21 @@
 //!
 //! Deadlines. The request's deadlines are absolute on the engine's clock (`Deadlines`, Task 20). The worker receives
 //! the relative `deadline_ms` computed at send time from what is left until the street deadline (`worker_deadline_ms`);
-//! a request with no room for one iteration is never sent. Every receive is given only what is left until the earlier of
+//! a request with no room for one iteration is never sent (a first attempt then gives way to the `_min` retry under
+//! admission, as a worker `no_iteration` would: final review M8). Every receive is given only what is left until the earlier of
 //! the attempt's hang bound (`deadline_ms` + the delivery and pipe margins + `RESULT_GRACE_MS` after the send) and the
 //! watchdog's fire (`final delivery - 100 ms`), so the client never waits past either: the link's `recv` keeps that bound
 //! for the whole call, exit confirmation included (ruling 18-I1).
 //!
-//! The watchdog. The client does not arm the watchdog (`serve_request` does, Task 28): it runs beside it. It shares the
+//! Receive slices (final review I1 and M1, orchestrator ruling F-I1). No receive lasts more than
+//! `clock::WAIT_SLICE_MS` (100 ms): after each, the identity and every deadline are judged again, so a decision
+//! superseded by a newer request is noticed within one slice, not at the attempt's hang bound, and a suspend makes the
+//! client at most one slice late. An unconfirmed end of stdout (`Eof`) returned by a slice is not yet the attempt's
+//! end: the client goes on receiving, to confirm the exit, until the bound one receive of the whole bound would have
+//! had (P2T23-I1), and the hang bound and the heartbeat do not apply to it meanwhile.
+//!
+//! The watchdog. The client does not arm the watchdog (`serve::admit` does, at the request's admission, final review
+//! I1): it runs beside it. It shares the
 //! request's furthest stage through `EngineCore::stage` (the watchdog's `Armed::stage`), advancing it as the worker
 //! reports its stages, so a watchdog `Final` names the stage reached; it stops waiting at the watchdog's fire, when the
 //! watchdog delivers the request's one `Final` independently (§7); and it judges the street deadline as the watchdog's
@@ -39,9 +48,19 @@
 //! Resilience (§7, §12). While the worker reports `Solving`, no `progress` for `HEARTBEAT_MS` ends the attempt as a hung
 //! worker, judged like the hang bound (at the top of the loop and on every reply observed). A decision superseded after
 //! its request was sent is cancelled (`cancel_or_kill`): the worker has `CANCEL_KILL_MS` to confirm with the job's
-//! `result{cancelled}`, else it is killed and restarted; one superseded before the send, or after its terminal arrived,
-//! has nothing to cancel; one superseded with a link failure in the same receive restarts the worker at once, as
-//! `cancel_or_kill` does for a link failure in its window (ruling 23-N1). A failed attempt is classified by `classify`:
+//! `result{cancelled}`, else it is killed and restarted; one superseded before the send, or once its own terminal (or
+//! its `ack{rejected}`) was received, has nothing to cancel, even when that reply comes in the receive that observes the
+//! supersession (final review I2; spec 4.5, admission is released by the job's terminal); one superseded with a link
+//! failure in the same receive restarts the worker at once, as `cancel_or_kill` does for a link failure in its window
+//! (ruling 23-N1).
+//!
+//! The cancel window gives way to a newer decision (final review I1; spec 7, the newer request's `Fast` within 0.3 s).
+//! The window is waited in slices, and when a newer decision is active (the request that superseded this one waits for
+//! `engine-main`), the wait stops and the cancel is left pending (`EngineCore::pending_cancel`): `engine-main` serves the
+//! newer request's fast phase at once, and the pending cancel is settled before anything more is sent to the worker (at
+//! the start of the next `run_solve`) or while `engine-main` is idle, with the same window and the same kill at its end.
+//! A decision superseded by a mutation alone (no newer request) waits out its window as before. A failed attempt is
+//! classified by `classify`:
 //! the worker is restarted (kill, reap, respawn) when
 //! it exited, broke the protocol, hung or missed the heartbeat, and its new `ready` is validated again; then, only after
 //! the first attempt, only when the failure allows it and a `_min` template exists, one retry on that template is sent
@@ -53,15 +72,16 @@
 //! stops and cleans nothing up: the watchdog delivers the `Final`, and the kill and restart of a still-busy worker after
 //! it are `serve_request`'s, which it conditions on `SolveOutcome::outstanding_job` (ruling 28-I3).
 
-use crate::bench_support::spot_identity;
+use crate::clock::WAIT_SLICE_MS;
 use crate::core::EngineCore;
 use crate::deadline::{retry_admitted, Deadlines, DELIVERY_MARGIN_MS, PIPE_MARGIN_MS};
+use crate::log::DiagnosticRecord;
 use crate::serve::deliver;
 use crate::tree::{build_tree_full, TemplateSelection, TreeBuild};
 use crate::watchdog::{SharedSink, StreetDeadline};
 use crate::worker::link::WorkerLinkError;
 use crate::worker::ready::validate_ready;
-use proto::worker::{validate_solution, AckStatus, EngineMessage, ResultStatus, SolveRequest, Stage, StreetSolution, WorkerError, WorkerMessage, FAILURE_CODES};
+use proto::worker::{meets_target, validate_solution, AckStatus, EngineMessage, ResultStatus, SolveRequest, Stage, StreetSolution, WorkerError, WorkerMessage, FAILURE_CODES};
 use proto::{DecisionIdentity, EffectiveTree, OrdinalPath, Rake, RecommendationEvent, SolveInput, UnsupportedReason};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -76,24 +96,30 @@ pub const CANCEL_KILL_MS: u64 = 1_500;
 const RESULT_GRACE_MS: u64 = 500;
 
 /// One live solve: the decision it answers, its absolute deadlines and the request's shared street deadline, the
-/// template and its `_min` retry (§10.1), the rake, hero's role at the decision node, and whether the job is a
-/// pre-solver `background` job (plan 4 sends `true`).
+/// template and its `_min` retry (§10.1), the rake, hero's role at the decision node, and the wire's `background` flag.
+///
+/// `run_solve` serves a live decision only (final review M5): its identity must be the active decision (checked before
+/// anything is built, before the send and on every reply), its deadlines are `Deadlines::for_request`'s street budgets
+/// and its progress goes to the decision's sink. It cannot run plan 4's pre-solver jobs (`background: true`, 600 s,
+/// no decision), whose executor needs a transport and bookkeeping of its own (plan 4 Tasks 11 and 16).
 #[derive(Clone)]
 pub struct SolvePlan {
     pub identity: DecisionIdentity,
     pub deadlines: Deadlines,
     /// The request's street deadline, shared with its watchdog (`watchdog::Armed::street_deadline`, ruling 20-I1): the
     /// client publishes the first attempt's terminal arrival to it at receipt (ruling 22-I4). It is the street deadline
-    /// of `deadlines` (`run_solve` asserts it). A job no watchdog watches (plan 4's `background`) still gets one.
+    /// of `deadlines` (`run_solve` asserts it).
     pub street_deadline: Arc<StreetDeadline>,
     pub template_id: String,
     pub retry_template_id: Option<String>,
     pub rake: Rake,
     pub hero_actor: String,
+    /// The `SolveRequest.background` wire flag, copied into every request as it is (§4.5), and nothing more: a live
+    /// decision sends `false`. It does not make `run_solve` a background executor (see the type's doc).
     pub background: bool,
     /// The request's once-only `Final` claim, shared with its watchdog (`watchdog::Armed::delivered`): no `Progress` is
-    /// forwarded once it is taken (ruling 28-N1, re-review observation O5; see "Progress" above). `None` for a job no
-    /// watchdog watches (plan 4's `background`), whose progress has no `Final` to follow.
+    /// forwarded once it is taken (ruling 28-N1, re-review observation O5; see "Progress" above). `None` when no
+    /// watchdog shares the request's claim (the solve client's own tests), whose progress has no `Final` to follow.
     pub final_claim: Option<Arc<AtomicBool>>,
 }
 
@@ -131,7 +157,8 @@ pub struct SolveOutcome {
     /// at receipt (ruling 22-I4); `None` when no terminal of the first attempt was received. Never a retry's.
     pub first_terminal_ms: Option<u64>,
     /// The worker restarts this solve made, failed ones included: the relaunch of a missing worker before the request,
-    /// the restart after a failed attempt, and the kill-and-restart answering an unconfirmed cancel.
+    /// the restart after a failed attempt, and the kill-and-restart answering an unconfirmed cancel (this solve's, or one an
+    /// earlier request left pending and this solve settled before its send, final review I1).
     pub restarts: u8,
     /// Display only: the raw exploitability in basis points of the solved pot, rounded (§4.4).
     pub reached_bp: Option<u16>,
@@ -143,11 +170,48 @@ pub struct SolveOutcome {
     pub outstanding_job: bool,
 }
 
-/// Spec 4.5 `solve.spot`: the lowercase sha256 hex of the structural identity of the game `req` solves, the string a
-/// staged lock is matched against (ruling 22-S). It is `bench_support::spot_identity`, the one implementation in the
-/// workspace: the tree signature, the chip scale (pot and both stacks), the rake, the board and both scaled range
-/// hashes, and none of the solve parameters (id, deadline, target, history). The brief's `spot_hash(tree, pot, board,
-/// ranges)` could not see the stacks or the rake, so two games that differ only there would have shared one identity.
+/// Spec 4.5 `SolveRequest.spot`: the lowercase sha256 hex of the structural identity of the game `req` solves, the
+/// string a staged lock is matched against (ruling 22-S). The one implementation in the workspace, owned here by the
+/// production solve client (final review M4) and re-exported by `bench_support` for the bench. Two requests that solve
+/// the same game get the same identity, and every input that makes two games differ enters it:
+/// - the §4.6 `tree_signature` of `req.tree` at `req.pot` (rules version, template, root street, nominal menus,
+///   thresholds, wager cap, inserted sizes as reduced rationals of the root pot);
+/// - the chip scale the signature deliberately leaves out, which fixes the realized tree: `pot`, `stack_oop` and
+///   `stack_ip` (two spots that differ only in their stacks, such as a 100bb and a 200bb spot on one board, are
+///   different games with different all-in nodes), and the rake (`rake_rate` bits, `-0.0` read as `0.0`, and
+///   `rake_cap_mchips`);
+/// - the board's card ids in order, and the §2 scaled hashes of `oop_range` then `ip_range`.
+///
+/// Solve parameters are not the game and never enter it: `id`, `spot` itself, `history` (the requested node),
+/// `target_bp`, `deadline_ms`, `extraction_margin_ms`, `memory_limit_bytes`, `background`. The preimage is
+/// domain-tagged and every part is fixed-width except the board, whose length is written first.
+///
+/// Plan 2 Task 22's listing sketches `spot_hash(tree, pot, board, ranges)` without the stacks and the rake, which would
+/// give the two spots above one identity.
+///
+/// Panics as `tree_signature` does (a zero pot, an inserted path that does not resolve): both are engine bugs.
+pub fn spot_identity(req: &SolveRequest) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"pokerai/solve-spot/v1\0");
+    h.update(crate::tree::tree_signature(&req.tree, req.pot).as_bytes());
+    for chips in [req.pot, req.stack_oop, req.stack_ip] {
+        h.update(chips.to_le_bytes());
+    }
+    let rake_rate = if req.rake_rate == 0.0 { 0.0f32 } else { req.rake_rate };
+    h.update(rake_rate.to_bits().to_le_bytes());
+    h.update(req.rake_cap_mchips.to_le_bytes());
+    let board_len = u8::try_from(req.board.len()).expect("a board has at most five cards");
+    h.update([board_len]);
+    for card in &req.board {
+        h.update([card.0]);
+    }
+    h.update(core_ranges::hash_scaled(&req.oop_range));
+    h.update(core_ranges::hash_scaled(&req.ip_range));
+    hex::encode(h.finalize())
+}
+
+/// Plan 2 Task 22's name for `spot_identity`, kept for its callers: the same function.
 pub fn spot_hash(req: &SolveRequest) -> String { spot_identity(req) }
 
 fn stage_name(s: Stage) -> &'static str { match s { Stage::Building => "building", Stage::Solving => "solving", Stage::Extracting => "extracting" } }
@@ -186,13 +250,6 @@ fn ms_between(from: u64, to: u64) -> u32 {
     u32::try_from(span).unwrap_or_else(|_| panic!("a solve span of {span} ms does not fit u32"))
 }
 
-/// Ruling 26-Q4: the raw comparison of spec 4.4 and 5 step 7, `exploitability_chips / pot <= target_bp / 10_000`,
-/// evaluated exactly as `expl * 10_000 <= target_bp * pot` in `f64` (an `f32` significand times 10^4 and a `u16` times a
-/// `u32` are both exact there): the predicate `assemble::coverage_for_solve` uses for `Exact`.
-fn meets_target(exploitability_chips: f32, pot: u32, target_bp: u16) -> bool {
-    f64::from(exploitability_chips) * 10_000.0 <= f64::from(target_bp) * f64::from(pot)
-}
-
 /// Display only (§4.4): the raw exploitability in basis points of `pot`, rounded; above `u16::MAX` bp (6.5535 times
 /// the pot) shown as `u16::MAX`, as `assemble::coverage_for_solve` shows it. No comparison ever reads it.
 fn reached_bp(exploitability_chips: f32, pot: u32) -> u16 {
@@ -201,11 +258,12 @@ fn reached_bp(exploitability_chips: f32, pot: u32) -> u16 {
 }
 
 /// The terminal of a validated `ok` or `best_so_far` solution (rulings 26-Q4 and 22-I3). Target compliance is the raw
-/// comparison (`meets_target`): `Ok` iff the raw target is met, whatever the worker's status. `BestSoFar`, which
+/// comparison (`proto::worker::meets_target`, the one definition, final review M3): `Ok` iff the raw target is met,
+/// whatever the worker's status. `BestSoFar`, which
 /// assembly labels `DeadlineBestSoFar`, is reserved for a genuine deadline stop, a worker `best_so_far` (§7: the
 /// measured solution at the stop point), that misses it: only reasons actually incurred (§2). A worker `ok` that misses
 /// it breaks the worker's contract (`ok` means the target was met, §7). Since follow-up P2.W1 the worker stops on this
-/// same raw predicate (`solver-worker`'s `solve_loop::meets_target`), no longer at the f32-rounded threshold
+/// same raw predicate (`proto::worker::meets_target`, re-exported by its `solve_loop`), no longer at the f32-rounded threshold
 /// `(pot * target_bp / 10_000) as f32` it used before, which could lie half an ulp above the raw target; so no such `ok`
 /// is expected, and this check stays as a defence. It is a non-retryable worker-contract `EngineError` naming the
 /// measurement and the raw target the worker's own stop applies, never `Exact` and never `DeadlineBestSoFar`.
@@ -355,41 +413,122 @@ fn exploitability_pct(chips: f32, pot: u32) -> Result<f32, String> {
     Ok(if pct == 0.0 { 0.0 } else { pct })
 }
 
+/// A cancel sent for a superseded job whose confirmation is still awaited (§7, §12): the job's `result{cancelled}` for
+/// `target` confirms it until `until_ms` (`CANCEL_KILL_MS` after the cancel was sent); from then on the worker is killed
+/// and restarted. Kept by `EngineCore::pending_cancel` while the wait gives way to a newer decision (see "The cancel
+/// window gives way to a newer decision" above).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCancel {
+    pub target: String,
+    pub until_ms: u64,
+}
+
+/// How a wait on the pending cancel ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelEnd {
+    /// No cancel was pending.
+    Idle,
+    /// The job's `result{cancelled}` arrived within the window: the worker is left running.
+    Confirmed,
+    /// The worker was restarted, successfully or not: killed at the window's end, or restarted at once after a link
+    /// failure within it.
+    Restarted,
+    /// The caller's `interrupt` asked the wait to stop: the cancel stays pending.
+    Interrupted,
+}
+
+/// Writes a diagnostics record (final review M2, `log::DiagnosticRecord`): `event` at `at_ms`, its `detail`, the decision
+/// it concerns, the worker's stderr tail as the link holds it now and, for a `tree_mismatch`, the engine's tree.
+pub(crate) fn diagnose(core: &mut EngineCore, at_ms: u64, event: &str, identity: Option<&DecisionIdentity>, detail: String, engine_tree: Option<&EffectiveTree>) {
+    let rec = DiagnosticRecord { at_ms, event: event.into(), identity: identity.cloned(), detail, stderr_tail: core.worker.stderr_tail(), engine_tree: engine_tree.cloned() };
+    core.log.diagnostic(&rec);
+}
+
+/// Kills the worker (`cause` says why); no live worker is left until a restart or the next request's relaunch. A
+/// pending cancel ends with it: its job is gone with the process. Recorded in the diagnostics log with the killed
+/// worker's stderr tail (final review M2).
+pub(crate) fn kill_worker(core: &mut EngineCore, cause: &str) {
+    let at_ms = core.clock.now_ms();
+    core.worker.kill();
+    core.pending_cancel = None;
+    diagnose(core, at_ms, "kill", None, cause.to_string(), None);
+}
+
+/// Restarts the worker (kill, reap, respawn, validate `ready`, §12; `cause` says why). A pending cancel ends with the
+/// killed process. A restart that fails leaves no live worker, which the next request relaunches once (`run_solve`).
+/// Recorded in the diagnostics log, its outcome included, with the stderr tail the link holds afterwards: the killed
+/// worker's whole output, its drain thread joined (final review M2).
+pub(crate) fn restart_worker(core: &mut EngineCore, cause: &str) -> Result<(), WorkerLinkError> {
+    let at_ms = core.clock.now_ms();
+    core.pending_cancel = None;
+    let restarted = core.worker.restart();
+    let outcome = match &restarted { Ok(()) => "restarted".to_string(), Err(e) => format!("restart failed: {e}") };
+    diagnose(core, at_ms, "restart", None, format!("{cause}; {outcome}"), None);
+    restarted
+}
+
 /// The cancel-then-kill of §7/§12, for a solve `target` superseded while the worker may still be running it (never one
-/// superseded before its send: nothing reached the worker). Sends `cancel` for it under a fresh request id and waits at
-/// most `CANCEL_KILL_MS` from the send for the job's `result{cancelled}`, the only confirmation (§12); anything else read
-/// meanwhile is discarded, a late reply of the job included. The window is judged at the engine-clock time the client
-/// observes each receive result, not by the bound the receive was given (P2T23-I2, as ruling 22-I1 for replies): a
-/// confirmation observed at or after the bound is too late. Unconfirmed by then, the worker is killed and restarted. A
-/// link failure within the window (the cancel cannot be sent, the worker exits or breaks the protocol) is answered by a
-/// restart at once. Returns whether the worker was restarted; a restart that fails leaves no live worker, which the next
-/// request relaunches (`run_solve`), and is never a panic.
+/// superseded before its send, or once its terminal arrived: nothing to cancel). Sends `cancel` for it under a fresh
+/// request id and waits for the job's `result{cancelled}`, the only confirmation (§12), at most `CANCEL_KILL_MS` from
+/// the send (`await_pending_cancel`); unconfirmed by then, the worker is killed and restarted. A cancel that cannot be
+/// sent is answered by a restart at once. The wait gives way to a newer decision (final review I1): once one is active,
+/// the cancel is left pending for `engine-main` to settle after the newer request's fast phase. Returns whether the
+/// worker was restarted here; a restart that fails leaves no live worker, which the next request relaunches
+/// (`run_solve`), and is never a panic.
 pub(crate) fn cancel_or_kill(core: &mut EngineCore, target: &str) -> bool {
     let id = core.next_id();
     if core.worker.send(&EngineMessage::Cancel { id, target: target.to_string() }).is_err() {
-        let _ = core.worker.restart();
+        let _ = restart_worker(core, &format!("the cancel of solve {target} could not be sent"));
         return true;
     }
     let sent = core.clock.now_ms();
-    let until = sent.checked_add(CANCEL_KILL_MS).unwrap_or_else(|| panic!("the kill bound of a cancel sent at {sent} ms overflows u64"));
-    let kill = |core: &mut EngineCore| {
-        core.worker.kill();
-        let _ = core.worker.restart();
-        true
-    };
+    let until_ms = sent.checked_add(CANCEL_KILL_MS).unwrap_or_else(|| panic!("the kill bound of a cancel sent at {sent} ms overflows u64"));
+    core.pending_cancel = Some(PendingCancel { target: target.to_string(), until_ms });
+    await_pending_cancel(core, &mut |core| newer_decision_waiting(core)) == CancelEnd::Restarted
+}
+
+/// Whether a decision is active while the one `engine-main` serves was superseded: a newer request was admitted and
+/// waits for `engine-main` (the active decision is only ever the newest request's, `IdentityState::next_decision`).
+fn newer_decision_waiting(core: &EngineCore) -> bool {
+    core.identity.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).active().is_some()
+}
+
+/// Waits on the pending cancel (`EngineCore::pending_cancel`) in receive slices of at most `WAIT_SLICE_MS`, asking
+/// `interrupt` before each: `Interrupted` leaves the cancel pending. Anything read meanwhile but the job's
+/// `result{cancelled}` is discarded, a late reply of the job included. The window is judged at the engine-clock time the
+/// client observes each receive result, not by the bound the receive was given (P2T23-I2, as ruling 22-I1 for replies):
+/// a confirmation observed at or after `until_ms` is too late, and the worker is then killed and restarted. An
+/// unconfirmed end of stdout spends its slice and the window goes on, so the kill at its end answers it, as a receive of
+/// the whole window would have; any other link failure (the worker exits or breaks the protocol) is answered by a
+/// restart at once.
+pub(crate) fn await_pending_cancel(core: &mut EngineCore, interrupt: &mut dyn FnMut(&EngineCore) -> bool) -> CancelEnd {
     loop {
+        let Some(PendingCancel { target, until_ms }) = core.pending_cancel.clone() else { return CancelEnd::Idle };
         let now = core.clock.now_ms();
-        if now >= until { return kill(core); }
-        // What is left of the window, never more: `recv` keeps it for the whole call.
-        let received = core.worker.recv(Duration::from_millis(until - now));
-        // Judged when observed: whatever the receive returned at or after the bound came too late.
-        if core.clock.now_ms() >= until { return kill(core); }
+        if now >= until_ms {
+            kill_worker(core, &format!("the cancel of solve {target} was not confirmed within {CANCEL_KILL_MS} ms"));
+            let _ = restart_worker(core, &format!("after the kill of the worker that did not confirm the cancel of solve {target}"));
+            return CancelEnd::Restarted;
+        }
+        if interrupt(core) {
+            return CancelEnd::Interrupted;
+        }
+        // What is left of the window, at most one slice.
+        let slice_end = until_ms.min(now.saturating_add(WAIT_SLICE_MS));
+        let received = core.worker.recv(Duration::from_millis(slice_end - now));
+        let at_ms = core.clock.now_ms();
+        // Judged when observed: whatever the receive returned at or after the bound came too late (the top of the loop kills).
+        if at_ms >= until_ms { continue; }
         match received {
-            Ok(Some(WorkerMessage::Result { id, status: ResultStatus::Cancelled, .. })) if id == target => return false,
+            Ok(Some(WorkerMessage::Result { id, status: ResultStatus::Cancelled, .. })) if id == target => {
+                core.pending_cancel = None;
+                return CancelEnd::Confirmed;
+            }
             Ok(_) => {}
-            Err(_) => {
-                let _ = core.worker.restart();
-                return true;
+            Err(WorkerLinkError::Eof) if at_ms > now => {}
+            Err(e) => {
+                let _ = restart_worker(core, &format!("the link failed while the cancel of solve {target} was awaited: {e}"));
+                return CancelEnd::Restarted;
             }
         }
     }
@@ -422,16 +561,26 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
     let fire_ms = plan.deadlines.watchdog_fire_ms();
     // While the worker reports `Solving`: when the heartbeat is due, its last `progress` + `HEARTBEAT_MS` (§12).
     let mut heartbeat_due_ms: Option<u64> = None;
+    // A slice returned an unconfirmed end of stdout (see "Receive slices" above): the client goes on receiving, to
+    // confirm the exit, until the receive bound, and the hang bound and the heartbeat do not apply to it meanwhile.
+    let mut stdout_ended = false;
     loop {
         let now = core.clock.now_ms();
-        let watch = Watch::Waiting { hang_bound_ms: expected_by, heartbeat_due_ms };
-        if let Some(end) = ended_at(core, plan, now, watch) { return (end, None); }
-        // What is left until the earliest bound, never more: `recv` keeps it for the whole call.
+        // The earliest bound, as one receive of the whole wait would have been given it.
         let bound_ms = expected_by.min(fire_ms).min(heartbeat_due_ms.unwrap_or(u64::MAX));
-        let received = core.worker.recv(Duration::from_millis(bound_ms - now));
+        if stdout_ended {
+            if let Some(end) = ended_at(core, plan, now, Watch::Failed) { return (end, None); }
+            if now >= bound_ms { return (AttemptEnd::Ended, None); }
+        } else if let Some(end) = ended_at(core, plan, now, Watch::Waiting { hang_bound_ms: expected_by, heartbeat_due_ms }) {
+            return (end, None);
+        }
+        // What is left until the earliest bound, at most one slice (final review I1, M1): the identity and the deadlines
+        // are judged again after it.
+        let slice_end = bound_ms.min(now.saturating_add(WAIT_SLICE_MS));
+        let received = core.worker.recv(Duration::from_millis(slice_end - now));
         // Identity and expiry on every receive result, at the engine-clock time the client observes it (ruling 22-I1,
         // P2T23-I1): the receive's bound limits the wait, not when the client runs again (a suspend, a stalled thread),
-        // and an unconfirmed end of stdout spends the whole bound. A mutation that landed while the reply was in flight
+        // and an unconfirmed end of stdout spends its slice. A mutation that landed while the reply was in flight
         // (or in the same receive), or a result seen at or after the watchdog's fire, ends the attempt before anything
         // of it is forwarded, validated, accepted, classified or recovered, as the top of the loop would have a moment
         // later (§4.4, §7, §12); a reply seen at or after the hang bound or the heartbeat's due time ends it the same way.
@@ -441,6 +590,12 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
             Ok(None) => continue,
             Err(e) => {
                 if let Some(end) = ended_at(core, plan, at_ms, Watch::Failed) { return (end, None); }
+                // An unconfirmed end returned by a slice that spent its time, before the bound: the exit may still be
+                // confirmed by the next slices (see "Receive slices" above).
+                if matches!(e, WorkerLinkError::Eof) && at_ms > now && at_ms < bound_ms {
+                    stdout_ended = true;
+                    continue;
+                }
                 let end = match e {
                     WorkerLinkError::Exit { code } => AttemptEnd::Exit(code),
                     WorkerLinkError::Eof | WorkerLinkError::Spawn(_) | WorkerLinkError::ReadyRefused { .. } => AttemptEnd::Ended,
@@ -450,11 +605,14 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
             }
         };
         if let Some(end) = ended_at(core, plan, at_ms, Watch::Waiting { hang_bound_ms: expected_by, heartbeat_due_ms }) {
-            // This solve's own terminal seen at the fire is not accepted, but its job has ended (ruling 28-I3); nor is its
-            // `ack{rejected}`, but the worker started no job (ruling 28-O2).
+            // This solve's own terminal, or its `ack{rejected}`, ends its job (spec 4.5: admission is released by the
+            // terminal `result`; a rejected solve started no job). Seen at the fire it is not accepted, and nothing is
+            // outstanding (rulings 28-I3, 28-O2); seen with a supersession it is not accepted either, and there is
+            // nothing left to cancel (final review I2), so neither is cancelled, killed or restarted.
+            let job_ended = matches!(&msg, WorkerMessage::Result { id, .. } | WorkerMessage::Ack { id, status: AckStatus::Rejected, .. } if *id == req.id);
             let end = match end {
-                AttemptEnd::DeadlinePassed { .. } if matches!(&msg, WorkerMessage::Result { id, .. } if *id == req.id) => AttemptEnd::DeadlinePassed { outstanding: false },
-                AttemptEnd::DeadlinePassed { .. } if matches!(&msg, WorkerMessage::Ack { id, status: AckStatus::Rejected, .. } if *id == req.id) => AttemptEnd::DeadlinePassed { outstanding: false },
+                AttemptEnd::DeadlinePassed { .. } if job_ended => AttemptEnd::DeadlinePassed { outstanding: false },
+                AttemptEnd::Superseded { running: true, .. } if job_ended => AttemptEnd::Superseded { running: false, link_failed: false },
                 end => end,
             };
             return (end, None);
@@ -551,12 +709,14 @@ pub(crate) fn classify(end: AttemptEnd, stage: &str) -> (UnsupportedReason, bool
 /// request and at most one `_min` retry under §7's admission.
 ///
 /// A solve that cannot start starts no work: a decision already superseded (checked before anything is built, ruling
-/// 22-I2), a tree that does not build, no live worker and a relaunch that fails, a worker whose `ready` is refused, or a
-/// street deadline that leaves no room for one iteration returns `Failed` without a request. A missing worker (a restart
-/// that failed earlier, a kill) is relaunched once, and its `ready` validated, before anything is sent.
+/// 22-I2), a tree that does not build, no live worker and a relaunch that fails, or a worker whose `ready` is refused
+/// returns `Failed` without a request. A missing worker (a restart that failed earlier, a kill) is relaunched once, and
+/// its `ready` validated, before anything is sent.
 ///
 /// The first attempt (`attempt_no` 0) has until the street deadline, and its terminal's arrival is published to the
-/// plan's street deadline at receipt (ruling 22-I4). A validated success ends the solve; so does a superseded decision
+/// plan's street deadline at receipt (ruling 22-I4). One with no room for an iteration at send time (a request that
+/// waited behind `engine-main`) is not sent and counts as a `no_iteration` (final review M8): the `_min` retry follows
+/// under admission. A validated success ends the solve; so does a superseded decision
 /// (its running job cancelled, `cancel_or_kill`) or the watchdog's fire (nothing cleaned up: the watchdog delivers the
 /// `Final`, and the cleanup after it is `serve_request`'s). Any other failure restarts the worker when `classify` says so,
 /// validating its new `ready`; then one retry (`attempt_no` 1) is sent on the `_min` template, only after the first
@@ -584,11 +744,19 @@ pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, si
         Ok(b) => b,
         Err(r) => return fail(core, r, &template, restarts, None),
     };
+    // A cancel the request before this one left pending, giving way to this request's fast phase (final review I1), is
+    // settled before anything is sent: confirmed, or the worker killed and restarted at the end of its window. A
+    // decision superseded meanwhile gives way in turn, and the cancel stays pending for the newer request.
+    match await_pending_cancel(core, &mut |core| !core.identity_active(&plan.identity)) {
+        CancelEnd::Idle | CancelEnd::Confirmed => {}
+        CancelEnd::Restarted => restarts += 1,
+        CancelEnd::Interrupted => return fail(core, superseded(), &template, restarts, None),
+    }
     // No live worker (a restart that failed earlier, a kill): one relaunch before anything is sent (review P2T22R). A
     // relaunch that fails is not retryable, as any failed restart (`restart_failed`, P2T23-I3).
     if core.worker.ready().is_none() {
         restarts += 1;
-        if let Err(e) = core.worker.restart() {
+        if let Err(e) = restart_worker(core, "no live worker before the request") {
             return fail(core, engine_error(format!("worker not ready: no live worker, and relaunching it failed: {e}"), false), &template, restarts, None);
         }
     }
@@ -598,58 +766,76 @@ pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, si
     for attempt_no in 0..2u8 {
         // §7: the first attempt has until the street deadline, the retry until final delivery.
         let until_ms = if attempt_no == 0 { street_deadline_ms } else { plan.deadlines.final_delivery_ms };
-        let Some(deadline_ms) = plan.deadlines.worker_deadline_ms(core.clock.now_ms(), until_ms) else {
-            let stage = core.stage();
-            return fail(core, UnsupportedReason::DeadlineExceeded { stage }, &template, restarts, first_terminal_ms);
-        };
-        // Advances only: a retry that starts at Building never rewinds the stage the first attempt reached.
-        core.set_stage("building");
-        let req = request(core, input, plan, &b, deadline_ms);
-        // Only the first attempt publishes its terminal's arrival to the request's street deadline.
-        let (end, terminal_ms) = run_attempt(core, plan, sink, &req, (attempt_no == 0).then_some(plan.street_deadline.as_ref()));
-        if attempt_no == 0 { first_terminal_ms = terminal_ms; }
-        if let AttemptEnd::Result { status: status @ (ResultStatus::Ok | ResultStatus::BestSoFar), solution: Some(sol), .. } = end {
-            let violated = street_violated(street_deadline_ms, first_terminal_ms, core.clock.now_ms());
-            let refused = |core: &EngineCore, reason: UnsupportedReason| failed(core, t_start, reason, input, &template, restarts, violated, first_terminal_ms);
-            let paths = match validate(&b, plan, &sol) { Ok(paths) => paths, Err(e) => return refused(core, engine_error(format!("invalid solution: {e}"), false)) };
-            let terminal = match terminal_for(status, sol.exploitability_chips, b.pot, input.target_bp) { Ok(terminal) => terminal, Err(reason) => return refused(core, reason) };
-            // Identity and expiry again before the success is exposed: the checks after the receive held when the
-            // result was observed, and validation can take the client past the watchdog's fire (ruling 22-I1).
-            if let Some(end) = ended_at(core, plan, core.clock.now_ms(), Watch::AfterTerminal) {
-                let (reason, _retry_allowed, _restart) = classify(end, &core.stage());
-                return refused(core, reason);
+        let (reason, retry_allowed, restart) = match plan.deadlines.worker_deadline_ms(core.clock.now_ms(), until_ms) {
+            // No room for one iteration: nothing is sent. The first attempt is treated like the worker's `no_iteration`
+            // (final review M8, ruling F-M8): the `_min` retry below, under §7's admission, with what is left until
+            // final delivery; the retry's is final.
+            None => {
+                let reason = UnsupportedReason::DeadlineExceeded { stage: core.stage() };
+                if attempt_no != 0 { return fail(core, reason, &template, restarts, first_terminal_ms); }
+                (reason, true, false)
             }
-            return succeeded(core, t_start, &b, &template, sol, paths, terminal, violated, restarts, first_terminal_ms);
-        }
-        match end {
-            // A worker whose link failed in the receive that observed the supersession is restarted at once and sent no
-            // cancel, as `cancel_or_kill` answers a link failure in its window (§12, ruling 23-N1); a restart that fails
-            // leaves no live worker, which the next request relaunches. A job the worker may still be running on a live
-            // link is cancelled (§7/§12). Before the send nothing was sent, and once its terminal arrived there is
-            // nothing left to cancel.
-            AttemptEnd::Superseded { running, link_failed } => {
-                assert!(!(running && link_failed), "a superseded attempt is either waiting on a live link or has a failed link");
-                if link_failed {
-                    restarts += 1;
-                    let _ = core.worker.restart();
-                } else if running && cancel_or_kill(core, &req.id) {
-                    restarts += 1;
+            Some(deadline_ms) => {
+                // Advances only: a retry that starts at Building never rewinds the stage the first attempt reached.
+                core.set_stage("building");
+                let req = request(core, input, plan, &b, deadline_ms);
+                // Only the first attempt publishes its terminal's arrival to the request's street deadline.
+                let (end, terminal_ms) = run_attempt(core, plan, sink, &req, (attempt_no == 0).then_some(plan.street_deadline.as_ref()));
+                if attempt_no == 0 { first_terminal_ms = terminal_ms; }
+                if let AttemptEnd::Result { status: status @ (ResultStatus::Ok | ResultStatus::BestSoFar), solution: Some(sol), .. } = end {
+                    let violated = street_violated(street_deadline_ms, first_terminal_ms, core.clock.now_ms());
+                    let refused = |core: &EngineCore, reason: UnsupportedReason| failed(core, t_start, reason, input, &template, restarts, violated, first_terminal_ms);
+                    let paths = match validate(&b, plan, &sol) { Ok(paths) => paths, Err(e) => return refused(core, engine_error(format!("invalid solution: {e}"), false)) };
+                    let terminal = match terminal_for(status, sol.exploitability_chips, b.pot, input.target_bp) { Ok(terminal) => terminal, Err(reason) => return refused(core, reason) };
+                    // Identity and expiry again before the success is exposed: the checks after the receive held when the
+                    // result was observed, and validation can take the client past the watchdog's fire (ruling 22-I1).
+                    if let Some(end) = ended_at(core, plan, core.clock.now_ms(), Watch::AfterTerminal) {
+                        let (reason, _retry_allowed, _restart) = classify(end, &core.stage());
+                        return refused(core, reason);
+                    }
+                    return succeeded(core, t_start, &b, &template, sol, paths, terminal, violated, restarts, first_terminal_ms);
                 }
-                return fail(core, superseded(), &template, restarts, first_terminal_ms);
+                match end {
+                    // A worker whose link failed in the receive that observed the supersession is restarted at once and
+                    // sent no cancel, as `cancel_or_kill` answers a link failure in its window (§12, ruling 23-N1); a
+                    // restart that fails leaves no live worker, which the next request relaunches. A job the worker may
+                    // still be running on a live link is cancelled (§7/§12). Before the send nothing was sent, and once
+                    // its terminal arrived there is nothing left to cancel (final review I2).
+                    AttemptEnd::Superseded { running, link_failed } => {
+                        assert!(!(running && link_failed), "a superseded attempt is either waiting on a live link or has a failed link");
+                        if link_failed {
+                            restarts += 1;
+                            let _ = restart_worker(core, "the link failed in the receive that observed the supersession");
+                        } else if running && cancel_or_kill(core, &req.id) {
+                            restarts += 1;
+                        }
+                        return fail(core, superseded(), &template, restarts, first_terminal_ms);
+                    }
+                    // The watchdog delivers the `Final` (§7); the cleanup after it is `serve_request`'s, not the client's.
+                    AttemptEnd::DeadlinePassed { outstanding } => {
+                        let stage = core.stage();
+                        let mut out = fail(core, UnsupportedReason::DeadlineExceeded { stage }, &template, restarts, first_terminal_ms);
+                        out.outstanding_job = outstanding;
+                        return out;
+                    }
+                    end => {
+                        // Spec 12: a `tree_mismatch` (a rules bug) is logged with both trees: the engine's, and the
+                        // worker's report of where the library's first differs (final review M2).
+                        if let AttemptEnd::Result { error: Some(e), .. } = &end {
+                            if e.code == "tree_mismatch" {
+                                let detail = format!("{}: {}", e.code, e.message);
+                                diagnose(core, core.clock.now_ms(), "tree_mismatch", Some(&plan.identity), detail, Some(&b.tree));
+                            }
+                        }
+                        classify(end, &core.stage())
+                    }
+                }
             }
-            // The watchdog delivers the `Final` (§7); the cleanup after it is `serve_request`'s, not the client's.
-            AttemptEnd::DeadlinePassed { outstanding } => {
-                let stage = core.stage();
-                let mut out = fail(core, UnsupportedReason::DeadlineExceeded { stage }, &template, restarts, first_terminal_ms);
-                out.outstanding_job = outstanding;
-                return out;
-            }
-            _ => {}
-        }
-        let (reason, retry_allowed, restart) = classify(end, &core.stage());
+        };
         if restart {
             restarts += 1;
-            if let Err(e) = core.worker.restart() { return fail(core, restart_failed(reason, &e), &template, restarts, first_terminal_ms); }
+            let cause = match &reason { UnsupportedReason::EngineError { message, .. } => message.clone(), other => format!("{other:?}") };
+            if let Err(e) = restart_worker(core, &cause) { return fail(core, restart_failed(reason, &e), &template, restarts, first_terminal_ms); }
             // §12: the restarted worker's `ready` is validated again before anything more is sent to it.
             if let Err(refused) = ready_for_requests(core) { return fail(core, refused, &template, restarts, first_terminal_ms); }
         }

@@ -64,6 +64,8 @@ const REAP: Duration = Duration::from_secs(10);
 const THREADS_END: Duration = Duration::from_secs(2);
 /// How much of an undecodable line a `Protocol` error quotes.
 const EXCERPT: usize = 200;
+/// The longest single OS wait of the link (final review M1): `clock::WAIT_SLICE_MS`.
+const SLICE: Duration = Duration::from_millis(crate::clock::WAIT_SLICE_MS);
 
 type Incoming = Result<WorkerMessage, WorkerLinkError>;
 
@@ -92,6 +94,9 @@ pub struct ProcessWorker {
     ready: Option<Ready>,
     stderr: Arc<Mutex<VecDeque<u8>>>,
     restarts: u32,
+    /// Unit tests only: a suspend's effect on the link's clock (`seam`).
+    #[cfg(test)]
+    seam: Arc<seam::Seam>,
 }
 
 /// Why one launch failed: `Refused` (a `ready` that fails validation) is final, `Failed` is retried once.
@@ -104,16 +109,10 @@ impl ProcessWorker {
     /// `spawn` with another startup timeout: the seam the startup-timeout test uses (a stand-in that never writes
     /// `ready` fails either way; the seam only keeps the test from waiting 2 x 5 s).
     pub(crate) fn spawn_with(exe: &Path, threads: u8, startup: Duration) -> Result<ProcessWorker, WorkerLinkError> {
-        let mut w = ProcessWorker { exe: exe.to_path_buf(), threads, startup, live: None, ready: None, stderr: Arc::new(Mutex::new(VecDeque::new())), restarts: 0 };
+        let mut w = ProcessWorker { exe: exe.to_path_buf(), threads, startup, live: None, ready: None, stderr: Arc::new(Mutex::new(VecDeque::new())), restarts: 0,
+            #[cfg(test)] seam: Arc::default() };
         w.start()?;
         Ok(w)
-    }
-
-    /// The last `STDERR_RING` bytes the worker wrote to stderr, across launches (lossy UTF-8).
-    pub fn stderr_tail(&self) -> String {
-        let ring = lock(&self.stderr);
-        let (a, b) = ring.as_slices();
-        String::from_utf8_lossy(&[a, b].concat()).into_owned()
     }
 
     /// How many times `restart` has been called on this link (each call launches at most `START_ATTEMPTS` times).
@@ -170,22 +169,42 @@ impl ProcessWorker {
     /// The next message of any kind (`ready` included, for `launch`). One deadline, `timeout` from now, governs the
     /// whole call: the wait for a line and, once stdout has ended, the exit confirmation, which gets only what is left
     /// (a single poll when nothing is). A confirmed exit is recorded; an unconfirmed one is `Eof` for this call only.
+    ///
+    /// Bounded slices (final review M1, `clock`'s "Bounded slices"): the wait for a line is made of OS waits of at most
+    /// `WAIT_SLICE_MS`, the deadline compared with the link's clock after each, so a suspend (whose time Windows leaves
+    /// out of wait timeouts) makes the call at most one slice late. A line already queued is returned even with a zero
+    /// timeout.
     fn recv_any(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> {
-        let deadline = Instant::now().checked_add(timeout); // `None`: a timeout too large to be a deadline at all
+        #[cfg(test)]
+        let seam = self.seam.clone();
+        // The link's monotonic clock; unit tests add a suspend's jump to it.
+        let now = || {
+            let t = Instant::now();
+            #[cfg(test)]
+            let t = t + Duration::from_millis(seam.skew_ms.load(std::sync::atomic::Ordering::SeqCst));
+            t
+        };
+        let deadline = now().checked_add(timeout); // `None`: a timeout too large to be a deadline at all
         let Some(live) = self.live.as_mut() else { return Err(WorkerLinkError::Eof) };
         if let Some(code) = live.exit { return Err(WorkerLinkError::Exit { code }); }
-        match live.lines.recv_timeout(timeout) {
-            Ok(item) => item.map(Some),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
-            Err(RecvTimeoutError::Disconnected) => {
-                let left = deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
-                match wait_for_exit(&mut live.child, left) {
-                    Some(st) => {
-                        let code = exit_code(st);
-                        live.exit = Some(code);
-                        Err(WorkerLinkError::Exit { code })
-                    }
-                    None => Err(WorkerLinkError::Eof),
+        let left = |at: Instant| deadline.map_or(Duration::MAX, |d| d.saturating_duration_since(at));
+        loop {
+            #[cfg(test)]
+            seam.note_wait();
+            match live.lines.recv_timeout(left(now()).min(SLICE)) {
+                Ok(item) => return item.map(Some),
+                Err(RecvTimeoutError::Timeout) => {
+                    if left(now()).is_zero() { return Ok(None); }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return match wait_for_exit(&mut live.child, left(now())) {
+                        Some(st) => {
+                            let code = exit_code(st);
+                            live.exit = Some(code);
+                            Err(WorkerLinkError::Exit { code })
+                        }
+                        None => Err(WorkerLinkError::Eof),
+                    };
                 }
             }
         }
@@ -232,6 +251,13 @@ impl WorkerLink for ProcessWorker {
     }
     fn ready(&self) -> Option<&Ready> { self.ready.as_ref() }
     fn peak_working_set_bytes(&self) -> u64 { self.live.as_ref().map_or(0, |l| peak_ws(&l.child)) }
+    /// The last `STDERR_RING` bytes the worker wrote to stderr, across launches (lossy UTF-8): complete for a killed
+    /// process, whose drain thread `kill` joins.
+    fn stderr_tail(&self) -> String {
+        let ring = lock(&self.stderr);
+        let (a, b) = ring.as_slices();
+        String::from_utf8_lossy(&[a, b].concat()).into_owned()
+    }
 }
 
 impl Drop for ProcessWorker {
@@ -369,17 +395,25 @@ fn no_console_window(cmd: &mut Command) {
 #[cfg(not(windows))]
 fn no_console_window(_cmd: &mut Command) {}
 
-/// The child's exit status if it has exited or exits within `bound`.
+/// The child's exit status if it has exited or exits within `bound`: OS waits of at most `SLICE`, the bound compared
+/// with the clock after each (final review M1). A zero bound is one poll.
 #[cfg(windows)]
 fn wait_for_exit(child: &mut Child, bound: Duration) -> Option<ExitStatus> {
     use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     extern "system" { fn WaitForSingleObject(handle: isize, ms: u32) -> u32; }
-    // u32::MAX is INFINITE: a bound never asks for it.
-    let ms = u32::try_from(bound.as_millis()).unwrap_or(u32::MAX).min(u32::MAX - 1);
-    // SAFETY: the child's process handle is open for as long as `child` lives; the call only waits on it.
-    unsafe { WaitForSingleObject(child.as_raw_handle() as isize, ms); }
-    child.try_wait().ok().flatten()
+    let end = Instant::now().checked_add(bound); // `None`: no bound a clock can reach
+    loop {
+        let left = end.map_or(SLICE, |e| e.saturating_duration_since(Instant::now()));
+        // Fits a u32 (and is never INFINITE): at most one slice.
+        let ms = u32::try_from(left.min(SLICE).as_millis()).expect("a slice of milliseconds fits u32");
+        // SAFETY: the child's process handle is open for as long as `child` lives; the call only waits on it.
+        unsafe { WaitForSingleObject(child.as_raw_handle() as isize, ms); }
+        let exited = child.try_wait().ok().flatten();
+        if exited.is_some() || end.is_some_and(|e| Instant::now() >= e) {
+            return exited;
+        }
+    }
 }
 #[cfg(not(windows))]
 fn wait_for_exit(child: &mut Child, bound: Duration) -> Option<ExitStatus> {
@@ -405,6 +439,45 @@ fn peak_ws(child: &Child) -> u64 {
 }
 #[cfg(not(windows))]
 fn peak_ws(_child: &Child) -> u64 { 0 }
+
+/// Unit tests only: a suspend as the link sees it (the monotonic clock jumps by `skew_ms`, no OS wait timeout moves and
+/// nothing is woken), and an acknowledgement of each OS wait a receive enters.
+#[cfg(test)]
+pub(crate) mod seam {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Condvar, Mutex};
+    use std::time::Instant;
+
+    #[derive(Default)]
+    pub(crate) struct Seam {
+        pub(crate) skew_ms: AtomicU64,
+        waits: Mutex<u64>,
+        entered: Condvar,
+    }
+
+    impl Seam {
+        pub(crate) fn note_wait(&self) {
+            *self.waits.lock().unwrap() += 1;
+            self.entered.notify_all();
+        }
+
+        /// How many waits were entered so far.
+        pub(crate) fn waits(&self) -> u64 {
+            *self.waits.lock().unwrap()
+        }
+
+        /// Blocks until `n` waits were entered; fails after the tests' liveness allowance.
+        pub(crate) fn wait_for_waits(&self, n: u64) {
+            let deadline = Instant::now() + crate::testing::ACK_LIVENESS;
+            let mut waits = self.waits.lock().unwrap();
+            while *waits < n {
+                let left = deadline.saturating_duration_since(Instant::now());
+                assert!(!left.is_zero(), "ProcessWorker: {n} wait(s) awaited, {} entered, no acknowledgement within the liveness bound", *waits);
+                waits = self.entered.wait_timeout(waits, left).unwrap().0;
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -635,6 +708,31 @@ mod stand_in_tests {
         assert_eq!(s.launches(), 1);
     }
 
+    /// Final review M1 (spec 12, suspend/resume): Windows excludes suspended time from wait timeouts while the monotonic
+    /// clock counts it, so a receive re-reads the clock after every bounded slice instead of trusting one OS timeout.
+    /// A live stand-in writes nothing after its `ready`; a receive given ten liveness allowances is inside its OS wait
+    /// when the link's clock jumps past its deadline without waking anything (a suspend). The receive notices at its
+    /// next slice and returns `Ok(None)`, well within one liveness allowance.
+    #[test]
+    fn a_receive_rereads_the_clock_after_each_bounded_slice() {
+        let s = StandIn::new("suspend", &[echo_ready(valid()), WAIT.into()]);
+        let w = ProcessWorker::spawn_with(&s.script, 4, STARTUP_TIMEOUT).unwrap();
+        let seam = w.seam.clone();
+        let launch_waits = seam.waits(); // the launch's own receives of `ready`
+        let span = 10 * crate::testing::ACK_LIVENESS;
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let mut w = w;
+            let got = w.recv(span).map(|m| m.is_none());
+            let _ = tx.send((got, w));
+        });
+        seam.wait_for_waits(launch_waits + 1);
+        seam.skew_ms.store(u64::try_from(span.as_millis()).unwrap(), std::sync::atomic::Ordering::SeqCst);
+        let (got, mut w) = rx.recv_timeout(crate::testing::ACK_LIVENESS).expect("the receive noticed the clock's jump within one slice, not at its OS timeout");
+        w.kill();
+        assert!(matches!(got, Ok(true)), "the receive timed out with nothing to report: {got:?}");
+    }
+
     /// A worker that exits with a non-zero code mid-session (the writer-fault code 3, say) is reported as
     /// `Exit{code}` by `recv` and then by `send`; a restart relaunches it.
     #[test]
@@ -686,7 +784,7 @@ mod stand_in_tests {
         let ring = Arc::new(Mutex::new(VecDeque::new()));
         let (stdin, lines, threads_done, threads) = start_threads(stdin, stdout, child.stderr.take().unwrap(), ring.clone()).unwrap();
         let live = Live { child, stdin, lines, threads_done, threads, _job: job, exit: None };
-        ProcessWorker { exe: s.script.clone(), threads: 4, startup: STARTUP_TIMEOUT, live: Some(live), ready: Some(valid()), stderr: ring, restarts: 0 }
+        ProcessWorker { exe: s.script.clone(), threads: 4, startup: STARTUP_TIMEOUT, live: Some(live), ready: Some(valid()), stderr: ring, restarts: 0, seam: Arc::default() }
     }
 
     /// A link around the live stand-in `s` whose stdout is a pipe the TEST holds the write end of: the test ends

@@ -36,12 +36,12 @@ pub fn assumptions_stub() -> proto::Assumptions {
         source_granularity: "1326 combos".into(), target_bp: 50, reached_bp: None, elapsed_ms: 0, cache: "miss".into(), translations: vec![], mappings: vec![], notes: vec![] }
 }
 
+/// Why an `Engine` command was refused. A rules refusal keeps `core_model`'s typed `RulesError` (final review M6), so a
+/// caller matches its variant (spec 12's `FormatUnsupported` for an unsupported format, say) instead of its text.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("engine error: {0}")]
     Message(String),
     #[error("rules: {0}")]
-    Rules(String),
-    #[error("overflow: pot + stacks must stay below 2^31")]
-    Overflow,
+    Rules(#[from] core_model::RulesError),
 }

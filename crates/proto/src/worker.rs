@@ -76,6 +76,17 @@ pub const SOLVER_COMMIT: &str = "9d1509fe5077d019825f833eed04b16d342dfda1";
 /// Version of the worker's library adapter (spec 4.5 `ready`, spec 10.4 cache key).
 pub const ADAPTER_VERSION: u16 = 1;
 
+/// Spec 4.4 and 5 step 7's target compliance, the raw comparison `exploitability_chips / pot <= target_bp / 10_000`,
+/// never on rounded basis points: evaluated exactly as `exploitability_chips * 10_000 <= target_bp * pot` in `f64`, where
+/// an `f32` significand times 10^4 (at most 38 bits) and a `u16` times a `u32` (at most 48 bits) are both exact. The one
+/// definition in the workspace (final review M3, after the drift between copies that caused follow-up P2.W1): the
+/// worker's stop (`solver-worker`'s `solve_loop`), the engine's terminal and coverage (`engine::solve`,
+/// `engine::assemble`) and the bench's verdicts all call it. NaN and +infinity meet no target; a non-positive
+/// measurement meets every one.
+pub fn meets_target(exploitability_chips: f32, pot: u32, target_bp: u16) -> bool {
+    f64::from(exploitability_chips) * 10_000.0 <= f64::from(target_bp) * f64::from(pot)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -293,4 +304,46 @@ pub fn validate_locks(locks: &[NodeLock], materialized: &[MaterializedNode]) -> 
         out.push(ordinal);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::meets_target;
+
+    /// The exact integer oracle: `x * 10_000 <= bp * pot` on the exact binary value of `x`, with no float arithmetic.
+    fn exact_meets(x: f32, pot: u32, bp: u16) -> bool {
+        if x.is_nan() || x == f32::INFINITY { return false; }
+        if x <= 0.0 { return true; }
+        // x = m * 2^e exactly; compare m * 10_000 * 2^e with bp * pot, both in u128.
+        let bits = x.to_bits();
+        let (exp, mant) = ((bits >> 23) & 0xff, bits & 0x7f_ffff);
+        let (m, e) = if exp == 0 { (u128::from(mant), -149i32) } else { (u128::from(mant | 0x80_0000), exp as i32 - 150) };
+        let rhs = u128::from(bp) * u128::from(pot);
+        if e >= 0 { (m * 10_000) << e <= rhs } else { m * 10_000 <= rhs << (-e) }
+    }
+
+    /// Review M3 (final review of plan 2): spec 4.4 and 5 step 7's raw target comparison, `expl / pot <= bp / 10_000`,
+    /// defined once for the engine's solve client and assembly, the bench and the worker. It is exact: inclusive at a
+    /// representable target, false one ulp above it, equal to the integer oracle on the rounded threshold and its
+    /// neighbours at every pot and target up to 200 and at the largest inputs; a non-positive measurement meets every
+    /// target, NaN and +infinity none.
+    #[test]
+    fn meets_target_is_the_one_exact_raw_comparison() {
+        for pot in 1..=200u32 {
+            for bp in 1..=200u16 {
+                let t = (f64::from(pot) * f64::from(bp) / 10_000.0) as f32;
+                for x in [f32::from_bits(t.to_bits() - 1), t, f32::from_bits(t.to_bits() + 1)] {
+                    assert_eq!(meets_target(x, pot, bp), exact_meets(x, pot, bp), "pot {pot}, {bp} bp, {:e}", f64::from(x));
+                }
+            }
+        }
+        assert!(meets_target(0.5, 100, 50) && !meets_target(f32::from_bits(0.5f32.to_bits() + 1), 100, 50));
+        assert!(!meets_target(0.3, 100, 30), "0.3f32 lies above the raw 0.3 chips");
+        let t = (f64::from(u32::MAX) * f64::from(u16::MAX) / 10_000.0) as f32;
+        for x in [f32::from_bits(t.to_bits() - 1), t, f32::from_bits(t.to_bits() + 1)] {
+            assert_eq!(meets_target(x, u32::MAX, u16::MAX), exact_meets(x, u32::MAX, u16::MAX), "{:e}", f64::from(x));
+        }
+        for x in [0.0f32, -0.0, -1e-6, f32::NEG_INFINITY] { assert!(meets_target(x, 1, 0), "{x:e}"); }
+        for x in [f32::NAN, f32::INFINITY] { assert!(!meets_target(x, u32::MAX, u16::MAX), "{x:e}"); }
+    }
 }
