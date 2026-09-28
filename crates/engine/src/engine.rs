@@ -8,8 +8,8 @@
 //! and clock).
 //!
 //! The preflop store (plan 3 Task 17, spec 5 step 1, spec 8.2). `Engine::new` loads it once, from `Paths::preflop`
-//! (`preflop::load_store`: installed bundle directories with the store's own quarantine, then the packaged chart pairs
-//! Plan 5 stages there, read-only), before the core is handed to `engine-main`; every loader banner joins the startup
+//! (`preflop::load_store`: installed bundle directories, then the packaged chart pairs Plan 5 stages there, a failing
+//! one of either quarantined `.bad`), before the core is handed to `engine-main`; every loader banner joins the startup
 //! report's, and the sources that failed validation are its `quarantined_bundles`. The core keeps the store behind an
 //! `Arc`, cloned into `Engine` for `preflop_store`, so no recommendation reads the disk. A missing or empty store is a
 //! banner, never a construction error: every preflop decision then answers `MissingPreflopNode`.

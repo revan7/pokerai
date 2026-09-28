@@ -1135,10 +1135,10 @@ mod stand_in {
     }
 
     /// Plan 3 Task 17 (spec 5 step 1, spec 8.2): `Engine::new` loads the preflop store once, from `Paths::preflop`. An
-    /// installed bundle that fails validation is renamed `.bad`, a packaged pair that fails is left in place, both are
-    /// the report's `quarantined_bundles` with a banner each, and the remaining charts stay active: hero's RFI decision
-    /// is the chart's, with no solve sent to the worker. A missing preflop directory is a banner and an empty store,
-    /// never a construction error.
+    /// installed bundle that fails validation is renamed `.bad`, and so is a packaged pair that fails (both files, ruling
+    /// 17-I1); both are the report's `quarantined_bundles` with a banner each, and the remaining charts stay active:
+    /// hero's RFI decision is the chart's, with no solve sent to the worker. A missing preflop directory is a banner and
+    /// an empty store, never a construction error.
     #[test]
     fn new_loads_the_preflop_store_once_and_reports_its_banners() {
         let s = StandIn::new("preflop-store", &FakeWorker::default_ready());
@@ -1154,7 +1154,8 @@ mod stand_in {
         assert_eq!(rep.quarantined_bundles, vec!["broken_pd".to_string(), "broken_chart".to_string()]);
         assert_eq!(rep.banners.len(), 2, "{:?}", rep.banners);
         assert!(rep.banners[0].starts_with("preflop bundle broken_pd quarantined") && rep.banners[1].contains("broken_chart"), "{:?}", rep.banners);
-        assert!(preflop.join("broken_pd.bad").is_dir() && preflop.join("broken_chart.json").is_file());
+        assert!(preflop.join("broken_pd.bad").is_dir() && preflop.join("broken_chart.manifest.json.bad").is_file() && preflop.join("broken_chart.json.bad").is_file());
+        assert!(!preflop.join("broken_chart.manifest.json").exists() && !preflop.join("broken_chart.json").exists());
         assert_eq!(e.preflop_store().bundles().iter().map(|b| b.bundle_info().bundle_id.clone()).collect::<Vec<_>>(), chart_ids());
         let (cfg, _) = cfg_1_2();
         e.set_config(cfg).unwrap();

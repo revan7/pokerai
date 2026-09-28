@@ -579,23 +579,26 @@ fn a_node_in_only_some_positive_branches_gives_known_frequencies_and_the_unresol
 }
 
 /// Row 5: hero's node is absent in every positive-posterior branch (both of HJ's nodes removed after the split
-/// open): `Unsupported{MissingPreflopNode}` with the heaviest branch's key, the replay's reasons kept in `partial`, the
-/// legal intervals with no advice, and equity only (the `Equity` event still follows).
+/// open): `Unsupported{MissingPreflopNode}` with the heaviest branch's key (the 3.5 bb path), that exact key in the
+/// assumptions too (spec 12, ruling 17-I2), the replay's reasons kept in `partial`, the legal intervals with no
+/// advice, and equity only (the `Equity` event still follows).
 #[test]
 fn a_node_in_no_positive_branch_is_missing_with_the_inherited_reasons() {
     let nodes: MemNodes = ladder_nodes().into_iter().filter(|(h, _)| h.is_empty()).collect();
     let state = act(&table(100, HJ, "AhKd"), &[Action::Raise { to: 30 }]);
     let out = replayed(&mem_store(nodes.clone()), &state);
     let heaviest = out.branches.iter().max_by(|a, b| a.q.total_cmp(&b.q)).expect("two branches");
-    let heaviest_size = match heaviest.translated[0].1 { Action::Raise { to: 25 } => "2500", Action::Raise { to: 35 } => "3500", ref other => panic!("{other:?}") };
+    assert_eq!(heaviest.translated, vec![(UTG, Action::Raise { to: 35 })], "the 3.5 bb branch is the heavier one");
     let mut r = rig("missing", mem_store(nodes));
     let id = serve(&mut r, &state);
     let served = finish(r);
     assert_eq!(kinds(&served.events), ["Fast", "Final", "Equity"], "equity only, after the Final");
     let f = the_final(&served, &id);
+    let after_35 = key(vec![(Position::Utg, raise(3500))]);
     match &f.coverage {
         Coverage::Unsupported { reason: UnsupportedReason::MissingPreflopNode { key }, partial } => {
-            assert!(key.contains(heaviest_size), "the heaviest branch's key: {key}");
+            assert_eq!(*key, after_35, "the heaviest branch's key");
+            assert!(f.assumptions.notes.contains(&format!("missing preflop node: {key}")), "the key in the assumptions: {:?}", f.assumptions.notes);
             assert!(partial.iter().any(|x| matches!(x, ApproxReason::BetTranslation { seat, .. } if *seat == UTG)), "{partial:?}");
         }
         other => panic!("{other:?}"),
@@ -874,13 +877,14 @@ fn staged_charts(tag: &str) -> PathBuf {
     dir
 }
 
-/// `load_store` reads the packaged sibling pairs of `paths.preflop` read-only and the installed bundle directories
-/// with the store's own quarantine (spec 8.2): a valid pair loads, a failing installed directory is renamed `.bad`
-/// with a banner, a failing packaged pair is left in place with a banner, both are listed as quarantined, a second
-/// bundle under an id already loaded is skipped with a banner, and every other source stays active. Synthetic
-/// fixtures are never read (nothing outside the directory is).
+/// `load_store` reads the packaged sibling pairs of `paths.preflop` and the installed bundle directories, and
+/// quarantines every failing one (spec 8.2, ruling 17-I1): a valid pair loads; a failing installed directory is
+/// renamed `.bad` (the store's own quarantine) and a failing packaged pair is renamed `.bad` too, both files, at the
+/// first free collision-safe name (here `.1.bad`, a stale `.bad` already being there), each with a banner, both listed
+/// as quarantined; a second bundle under an id already loaded is skipped with a banner; every other source stays
+/// active. A second load reads nothing quarantined. Synthetic fixtures are never read (nothing outside the directory is).
 #[test]
-fn the_store_loads_packaged_pairs_read_only_and_quarantines_installed_bundles() {
+fn the_store_loads_packaged_pairs_and_quarantines_every_failing_bundle() {
     use engine::preflop::load_store;
     let dir = staged_charts("mixed");
     let ids: Vec<String> = available_chart_depths().into_iter().map(|(_, id)| id).collect();
@@ -897,15 +901,54 @@ fn the_store_loads_packaged_pairs_read_only_and_quarantines_installed_bundles() 
     std::fs::write(dir.join("broken_chart.json"), b"{}").unwrap();
     std::fs::copy(fixtures().join(format!("charts/{}.manifest.json", ids[0])), dir.join("zz_again.manifest.json")).unwrap();
     std::fs::copy(fixtures().join(format!("charts/{}.json", ids[0])), dir.join("zz_again.json")).unwrap();
+    // A stale quarantine of an earlier broken_chart occupies the first name.
+    std::fs::write(dir.join("broken_chart.json.bad"), b"stale").unwrap();
     let loaded = load_store(&dir);
     assert_eq!(loaded.store.bundles().iter().map(|b| b.bundle_info().bundle_id.clone()).collect::<Vec<_>>(), ids, "the valid sources stay active");
     assert_eq!(loaded.quarantined, vec!["broken_pd".to_string(), "broken_chart".to_string()]);
     assert!(!broken.exists() && dir.join("broken_pd.bad").is_dir(), "the installed bundle was renamed .bad");
-    assert!(dir.join("broken_chart.manifest.json").exists() && dir.join("broken_chart.json").exists(), "a packaged pair is never renamed");
+    assert!(!dir.join("broken_chart.manifest.json").exists() && !dir.join("broken_chart.json").exists(), "the failing packaged pair is no longer under its loadable names");
+    assert_eq!(std::fs::read(dir.join("broken_chart.json.1.bad")).unwrap(), b"{}", "renamed to the first free collision-safe name, never over the stale one");
+    assert!(dir.join("broken_chart.manifest.json.1.bad").is_file() && std::fs::read(dir.join("broken_chart.json.bad")).unwrap() == b"stale");
     assert_eq!(loaded.banners.len(), 3, "{:?}", loaded.banners);
     assert!(loaded.banners[0].starts_with("preflop bundle broken_pd quarantined"), "{:?}", loaded.banners);
-    assert!(loaded.banners[1].contains("broken_chart") && loaded.banners[1].contains("left in place"), "{:?}", loaded.banners);
+    assert!(loaded.banners[1].starts_with("packaged preflop bundle broken_chart quarantined as ") && loaded.banners[1].contains("broken_chart.manifest.json.1.bad"),
+        "{:?}", loaded.banners);
     assert!(loaded.banners[2].contains("zz_again") && loaded.banners[2].contains(&ids[0]), "{:?}", loaded.banners);
+    // The next start reads nothing quarantined: only the duplicate's banner remains.
+    let again = load_store(&dir);
+    assert_eq!(again.store.bundles().iter().map(|b| b.bundle_info().bundle_id.clone()).collect::<Vec<_>>(), ids);
+    assert!(again.quarantined.is_empty(), "{:?}", again.quarantined);
+    assert_eq!(again.banners.len(), 1, "{:?}", again.banners);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ruling 17-I1: a failing packaged pair whose quarantine rename cannot be performed (its manifest is held open without
+/// delete sharing, as a file in a location the engine may not write to cannot be renamed) is still excluded, the other
+/// sources stay active, and the unsuccessful quarantine is reported as a clear, non-fatal banner; the pair stays under
+/// its names and is listed as quarantined.
+#[cfg(windows)]
+#[test]
+fn a_failing_packaged_pair_that_cannot_be_renamed_is_excluded_and_reported() {
+    use engine::preflop::load_store;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    let dir = staged_charts("unrenamable");
+    let ids: Vec<String> = available_chart_depths().into_iter().map(|(_, id)| id).collect();
+    std::fs::copy(fixtures().join(format!("charts/{}.manifest.json", ids[0])), dir.join("broken_chart.manifest.json")).unwrap();
+    std::fs::write(dir.join("broken_chart.json"), b"{}").unwrap();
+    // Readable by the loader, but no rename (delete access) while this handle lives.
+    let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(dir.join("broken_chart.manifest.json")).unwrap();
+    let loaded = load_store(&dir);
+    drop(held);
+    assert_eq!(loaded.store.bundles().iter().map(|b| b.bundle_info().bundle_id.clone()).collect::<Vec<_>>(), ids, "the valid sources stay active");
+    assert_eq!(loaded.quarantined, vec!["broken_chart".to_string()]);
+    assert_eq!(loaded.banners.len(), 1, "{:?}", loaded.banners);
+    let banner = &loaded.banners[0];
+    assert!(banner.starts_with("packaged preflop bundle broken_chart failed validation") && banner.contains("could not be quarantined") && banner.contains("excluded"),
+        "{banner}");
+    assert!(dir.join("broken_chart.manifest.json").is_file() && dir.join("broken_chart.json").is_file(), "nothing was renamed");
+    assert!(!dir.join("broken_chart.manifest.json.bad").exists() && !dir.join("broken_chart.json.bad").exists(), "no half quarantine");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -922,6 +965,8 @@ fn a_missing_preflop_directory_is_a_banner_and_an_empty_store() {
     let mut r = rig("empty_store", loaded.store);
     let id = serve(&mut r, &table(100, UTG, "AhAd"));
     let f = the_final(&finish(r), &id);
-    // The key is the lookup's own statement of the gap, never an invented one.
+    // The key is the lookup's own statement of the gap, never an invented one, and it is in the assumptions too (spec
+    // 12, ruling 17-I2).
     assert_eq!(f.coverage, Coverage::Unsupported { reason: UnsupportedReason::MissingPreflopNode { key: "no bundle".into() }, partial: vec![] });
+    assert!(f.assumptions.notes.contains(&"missing preflop node: no bundle".to_string()), "{:?}", f.assumptions.notes);
 }

@@ -55,8 +55,10 @@
 //! [`load_store`] is what `Engine::new` runs, once, on `Paths::preflop`: installed bundle directories
 //! (`<bundle_id>/manifest.json` + `nodes.json`) through `PreflopStore::open`, whose quarantine renames a failing one
 //! `.bad` with a banner, then the packaged sibling pairs (`<name>.manifest.json` + `<name>.json`) through the same
-//! validated loader (`core_preflop::load_bundle`), read-only: a failing pair is excluded with a banner and never
-//! renamed. Every other source stays active; synthetic fixtures are never loaded (nothing outside the directory is read).
+//! validated loader (`core_preflop::load_bundle`), a failing pair quarantined the same way (both files renamed `.bad`
+//! at collision-safe names, with a banner; ruling 17-I1), or, when a rename cannot be performed, excluded with a banner
+//! reporting the unsuccessful quarantine. Every other source stays active; synthetic fixtures are never loaded (nothing
+//! outside the directory is read).
 
 use crate::assemble::{self, AssemblyCtx, HeadlineSource, KnownMass};
 use crate::core::EngineCore;
@@ -277,15 +279,25 @@ impl Replayed {
                 rec.unresolved_mass = unresolved_mass;
                 rec
             }
-            // `MissingPreflopNode`: equity only, every inherited reason kept in `partial`.
+            // `MissingPreflopNode`: equity only, every inherited reason kept in `partial`, and the key the assembly
+            // selected in the assumptions too (spec 12, ruling 17-I2), exactly as `Coverage` names it.
             Some(reason) => {
                 for n in notes {
                     push_unique(&mut assumptions.notes, n);
+                }
+                if let UnsupportedReason::MissingPreflopNode { key } = &reason {
+                    push_unique(&mut assumptions.notes, missing_node_note(key));
                 }
                 assemble::unsupported(ctx, reason, [inherited, reasons].concat(), assumptions)
             }
         }
     }
+}
+
+/// Spec 12's `Unsupported{MissingPreflopNode}` "with the key in assumptions" (ruling 17-I2): the note carrying the exact
+/// key the `Final`'s coverage names.
+fn missing_node_note(key: &str) -> String {
+    format!("missing preflop node: {key}")
 }
 
 /// The seats still in the hand (dealt, not folded), by seat id.
@@ -393,8 +405,9 @@ fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
 // ---------------------------------------------------------------------------------------------
 
 /// What [`load_store`] loaded from a preflop directory: the store, one startup banner per rejected or skipped source (and
-/// one when nothing loaded), and the names of the sources that failed validation and were excluded (installed
-/// directories renamed `.bad`, packaged pairs left in place).
+/// one when nothing loaded), and the names of the sources that failed validation and were excluded: quarantined
+/// (renamed `.bad`: an installed directory, or both files of a packaged pair), or, where the rename could not be
+/// performed, excluded in place with a banner saying so.
 pub struct LoadedStore {
     pub store: PreflopStore,
     pub banners: Vec<String>,
@@ -410,10 +423,13 @@ const ACQUISITION_RECORD: &str = "sources.manifest.json";
 ///    `PreflopStore::open`: each validated on its own bytes, link safety first, a failing one renamed `.bad` with a
 ///    banner;
 /// 2. packaged bundles, the sibling pairs `<name>.manifest.json` + `<name>.json` (the chart layout Plan 5 stages here),
-///    in name order, through the same validated loader (`core_preflop::load_bundle`), read-only: a failing pair is
-///    excluded with a banner and never renamed; a pair whose file is a link is refused unread; a pair whose
-///    `bundle_id` is already loaded is skipped with a banner (the first one loaded wins, installed before packaged); the
-///    acquisition record `sources.manifest.json` is not a bundle and is skipped.
+///    in name order, through the same validated loader (`core_preflop::load_bundle`); a pair whose file is a link is
+///    refused unread. A failing pair is quarantined like a failing directory (spec 8.2, ruling 17-I1): both of its
+///    entries renamed `.bad` at the first free collision-safe names, with a banner (`quarantine_pair`); when a rename
+///    cannot be performed (an unwritable location, a file held open), the pair is still excluded and a banner reports
+///    the unsuccessful quarantine, non-fatally. A pair whose `bundle_id` is already loaded is skipped with a banner (the
+///    first one loaded wins, installed before packaged); the acquisition record `sources.manifest.json` is not a bundle
+///    and is skipped.
 ///
 /// Every other source stays active. A missing or unreadable directory, or one with nothing loadable, leaves an empty
 /// store and a banner: every preflop decision then answers `MissingPreflopNode`, never a construction error. Nothing
@@ -441,7 +457,12 @@ pub fn load_store(dir: &Path) -> LoadedStore {
                 }
             }
             Err(why) => {
-                banners.push(format!("packaged preflop bundle {stem} rejected and left in place (packaged bundles are read-only): {why}"));
+                banners.push(match quarantine_pair(dir, &name, stem) {
+                    Ok(renamed) => format!("packaged preflop bundle {stem} quarantined as {renamed}: {why}"),
+                    Err(failed) => format!(
+                        "packaged preflop bundle {stem} failed validation ({why}) and could not be quarantined ({failed}); it is excluded until it is fixed or removed"
+                    ),
+                });
                 quarantined.push(stem.to_string());
             }
         }
@@ -484,6 +505,40 @@ fn packaged_pair(dir: &Path, manifest_name: &str, stem: &str) -> Result<Box<dyn 
         }
     }
     load_bundle(&manifest, &nodes).map_err(|e| e.to_string())
+}
+
+/// Whether `path` names an existing entry, a link included, even a dangling one (never followed): a quarantine name in
+/// use (as `core_preflop`'s store judges its own quarantine names).
+fn occupied(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Spec 8.2's quarantine of a failing packaged pair (ruling 17-I1), the packaged twin of `PreflopStore::open`'s: each of
+/// its entries present in `dir` (the manifest `manifest_name`, then the nodes file `<stem>.json` when there is one) is
+/// renamed within `dir` to `<entry>.bad`, or, when either name is taken, to `<entry>.<n>.bad` with the smallest `n >= 1`
+/// free for both, so a stale quarantine is never overwritten and the pair keeps one suffix. A link is renamed as the link
+/// entry itself, never its target, and every source and target is an immediate child of `dir`. Returns the new paths;
+/// `Err` names the rename that failed (an unwritable location, a file held open) and any entry already renamed, so the
+/// caller reports the unsuccessful quarantine and still excludes the pair. The manifest goes first: while it keeps its
+/// name the pair is not half quarantined.
+fn quarantine_pair(dir: &Path, manifest_name: &str, stem: &str) -> Result<String, String> {
+    let nodes_name = format!("{stem}.json");
+    let entries: Vec<&str> = [manifest_name, nodes_name.as_str()].into_iter().filter(|name| occupied(&dir.join(name))).collect();
+    let suffix = (0u32..)
+        .map(|n| if n == 0 { ".bad".to_string() } else { format!(".{n}.bad") })
+        .find(|suffix| entries.iter().all(|name| !occupied(&dir.join(format!("{name}{suffix}")))))
+        .expect("a free quarantine name exists");
+    let mut renamed: Vec<String> = Vec::new();
+    for name in entries {
+        let (from, to) = (dir.join(name), dir.join(format!("{name}{suffix}")));
+        let done = if renamed.is_empty() { String::new() } else { format!("; already renamed: {}", renamed.join(", ")) };
+        if from.parent() != Some(dir) || to.parent() != Some(dir) {
+            return Err(format!("{} would leave the preflop directory{done}", from.display()));
+        }
+        std::fs::rename(&from, &to).map_err(|e| format!("{} could not be renamed to {}: {e}{done}", from.display(), to.display()))?;
+        renamed.push(to.display().to_string());
+    }
+    Ok(renamed.join(" and "))
 }
 
 /// A bundle `PreflopStore::open` admitted, kept in the engine's one store beside the packaged ones: it answers exactly
