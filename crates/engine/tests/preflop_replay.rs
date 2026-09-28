@@ -1085,7 +1085,7 @@ fn a_missing_preflop_directory_is_a_banner_and_an_empty_store() {
 
 use core_replay::{ReplayInput, ReplayOutput, SnapshotProvenance, SnapshotStore, StreetSnapshot};
 use core_ranges::{hash_scaled, hero_conditioned, mass, range_to_string};
-use engine::replay_bridge::{opposing_equity_ranges, snapshot_from_solution, ReplayRanges};
+use engine::replay_bridge::{opposing_equity_ranges, snapshot_from_solution, snapshot_note, ReplayRanges};
 use engine::testing::{uniform_solution, FakeReply, IdRef};
 use engine::tree::{build_tree_full, tree_signature, TemplateSelection};
 use proto::worker::{AckStatus, ResultStatus, SolveRequest, StreetSolution, WorkerError};
@@ -1181,6 +1181,11 @@ struct StreetRig {
 /// The committed chart bundles as the loaded store, `EngineCore::install_replay_ranges` as `Engine::new` runs it, the
 /// stub equity routine, and `cfg_1_2` as the session config.
 fn street_rig(tag: &str, script: Vec<FakeReply>) -> StreetRig {
+    street_rig_with(tag, script, ServeSeams::default())
+}
+
+/// `street_rig` whose `engine-main` also runs `seams` (the stub equity routine in place of theirs).
+fn street_rig_with(tag: &str, script: Vec<FakeReply>, seams: ServeSeams) -> StreetRig {
     let clock = FakeClock::new();
     let identity = Arc::new(Mutex::new(IdentityState::new()));
     let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
@@ -1190,9 +1195,25 @@ fn street_rig(tag: &str, script: Vec<FakeReply>) -> StreetRig {
     core.install_replay_ranges();
     let (snapshots, preflop) = (core.snapshots.clone(), core.preflop.clone());
     let calls: Arc<Mutex<Vec<EquityCall>>> = Arc::default();
-    let mut e = engine::Engine::with_core_and_seams(core, ServeSeams { equity: Some(stub_equity(calls.clone())), ..ServeSeams::default() });
+    let mut e = engine::Engine::with_core_and_seams(core, ServeSeams { equity: Some(stub_equity(calls.clone())), ..seams });
     e.set_config(engine::testing::cfg_1_2().0).unwrap();
     StreetRig { e, clock, fake, snapshots, preflop, calls, _log: log }
+}
+
+/// Waits on `recorder` for the `Final` of decision `id` and, when `equity` and the request emitted a `Fast`, for its
+/// `Equity` too; returns the `Final` and every event recorded by then.
+fn final_of(recorder: &engine::testing::Recorder, id: &DecisionIdentity, equity: bool) -> (Recommendation, Vec<Recorded>) {
+    let mut n = 1;
+    loop {
+        let got = recorder.wait_for(n);
+        let seen = kinds(&got);
+        if seen.contains(&"Final") && (!equity || !seen.contains(&"Fast") || seen.contains(&"Equity")) {
+            let f = got.iter().find_map(|r| match &r.event { RecommendationEvent::Final(f) => Some(f.clone()), _ => None }).expect("the Final");
+            assert_eq!(f.identity, *id);
+            return (f, got);
+        }
+        n = got.len() + 1;
+    }
 }
 
 impl StreetRig {
@@ -1217,19 +1238,14 @@ impl StreetRig {
 
     /// Recommends at the current decision and waits for its `Final` (and, when it has a `Fast`, its `Equity`).
     fn ask(&mut self) -> (DecisionIdentity, Recommendation) {
+        let (id, recorder) = self.recommend();
+        (id.clone(), final_of(&recorder, &id, true).0)
+    }
+
+    /// Recommends at the current decision, with a sink of its own.
+    fn recommend(&mut self) -> (DecisionIdentity, engine::testing::Recorder) {
         let (sink, recorder) = RecordingSink::notifying(self.clock.clone(), None);
-        let id = self.e.recommend(Box::new(sink)).unwrap();
-        let mut n = 1;
-        loop {
-            let got = recorder.wait_for(n);
-            let seen = kinds(&got);
-            if seen.contains(&"Final") && (!seen.contains(&"Fast") || seen.contains(&"Equity")) {
-                let f = got.iter().find_map(|r| match &r.event { RecommendationEvent::Final(f) => Some(f.clone()), _ => None }).expect("the Final");
-                assert_eq!(f.identity, id);
-                return (id, f);
-            }
-            n = got.len() + 1;
-        }
+        (self.e.recommend(Box::new(sink)).unwrap(), recorder)
     }
 
     /// Every `solve` the worker took, in order.
@@ -1248,6 +1264,11 @@ impl StreetRig {
     fn origins(&self, hand_id: u64) -> Vec<(Street, String)> {
         self.snapshots.lock().unwrap().for_hand(hand_id).iter().map(|s| (s.key.street, s.provenance.origin.clone())).collect()
     }
+}
+
+/// The notes of `rec` that disclose a prior street's snapshot (`replay_bridge::snapshot_note`), in order.
+fn snapshot_notes(rec: &Recommendation) -> Vec<String> {
+    rec.assumptions.notes.iter().filter(|n| n.contains(" conditioned through the ")).cloned().collect()
 }
 
 fn translated_on(rs: &[ApproxReason], street: Street, by: Seat) -> bool {
@@ -1332,7 +1353,10 @@ fn replay_feeds_street_root_solves() {
     assert_eq!(s2.provenance, SnapshotProvenance { identity_at_solve: d2.clone(), solved_prefix: vec![], origin: "live".into() });
     let sol2 = solved(&turn_root, "turn_std_v1", 0.2);
     let resolved: Vec<OrdinalPath> = sol2.covered_paths.iter().map(|p| proto::resolve_chip_path(&req2.tree.materialized, p).unwrap()).collect();
-    assert!(s2.tree == req2.tree && s2.nodes == sol2.nodes && s2.covered_paths == resolved && s2.reasons == replayed.reasons, "the worker's nodes on the tree solved");
+    assert!(s2.tree == req2.tree && s2.nodes == sol2.nodes && s2.covered_paths == resolved, "the worker's nodes on the tree solved");
+    assert_eq!(s2.reasons, r2, "the snapshot carries its solve's full coverage reasons (fix round 1, 18-I1)");
+    assert_eq!(snapshot_notes(&f2), [snapshot_note(Street::Flop, &s_flop.provenance)], "the flop snapshot's provenance and origin reach the Final (18-I3)");
+    assert!(f2.assumptions.source.starts_with("solver-worker@") && f2.assumptions.cache == "miss", "the solve's own source and cache fields stay its own");
     let hero_cards = turn.hero_cards.unwrap();
     {
         let calls = t.calls.lock().unwrap();
@@ -1394,6 +1418,10 @@ fn replay_feeds_street_root_solves() {
         "{r4:?}");
     let s4 = t.snapshot_of(&d4);
     assert_eq!((s4.provenance.origin.as_str(), s4.key.street, s4.key.root_range_hashes), ("live", Street::River, [hash_scaled(&req4.oop_range), hash_scaled(&req4.ip_range)]));
+    assert_eq!(s4.reasons, r4, "the best_so_far snapshot carries its own DeadlineBestSoFar with every inherited reason (18-I1)");
+    assert_eq!(snapshot_notes(&f4), [snapshot_note(Street::Flop, &s_flop.provenance), snapshot_note(Street::Turn, &s3.provenance)],
+        "a mixed history: the exact-cache flop and the live turn snapshot, each disclosed on the river Final (18-I3)");
+    assert!(snapshot_notes(&f4)[0].contains("cache_exact") && snapshot_notes(&f4)[1].contains("the live snapshot of decision"), "{:?}", snapshot_notes(&f4));
     let origin = |street: Street, o: &str| (street, o.to_string());
     assert_eq!(t.origins(d4.hand_id), [origin(Street::Flop, "cache_exact"), origin(Street::Turn, "live"), origin(Street::Turn, "live"), origin(Street::Turn, "live"),
         origin(Street::River, "live")], "a cache hit, three live ok Finals and a live best_so_far, all through one rule");
@@ -1477,6 +1505,127 @@ fn replay_feeds_street_root_solves_with_the_engines_cause_for_a_street_without_a
     let (_, river_final) = t.ask();
     assert_eq!(unconditioned(&river_final, Street::Flop), both("no request"));
     assert_eq!(unconditioned(&river_final, Street::Turn), both("engine error: tree_mismatch: tree_mismatch"));
+    t.e.shutdown();
+}
+
+/// The checked-down hand of the fix-round tests, to the root of `street` (the turn or the river): everyone folds to
+/// hero in the small blind, who raises to 3 bb, the big blind calls, and every street before `street` is checked through.
+fn checked_to(t: &mut StreetRig, street: Street) {
+    t.begin("KdJd");
+    t.play(&PREFLOP);
+    t.deal(FLOP);
+    t.play(&[Action::Check, Action::Check]);
+    t.deal(TURN);
+    if street == Street::River {
+        t.play(&[Action::Check, Action::Check]);
+        t.deal(RIVER);
+    }
+}
+
+fn is_best_so_far(r: &ApproxReason) -> bool {
+    matches!(r, ApproxReason::DeadlineBestSoFar { .. })
+}
+
+/// Fix round 1, ruling 18-I1 (spec 6 "reasons accumulate", spec 9.3: the accuracy reasons stored with a snapshot are
+/// carried into the current result). A best-so-far turn solve (5 chips of exploitability on a 60-chip pot, 833 bp
+/// against the 50 bp target) registers a snapshot carrying its solve's full coverage reasons, its own
+/// `DeadlineBestSoFar` included; the river solve after it meets its target, yet the river `Final` still discloses the
+/// turn's `DeadlineBestSoFar`, accumulated through the turn snapshot it was conditioned through.
+#[test]
+fn replay_feeds_street_root_solves_carrying_a_best_so_far_turn_into_the_river() {
+    let turn = line("KdJd", &[(FLOP, &[Action::Check, Action::Check]), (TURN, &[])]);
+    let river = line("KdJd", &[(FLOP, &[Action::Check, Action::Check]), (TURN, &[Action::Check, Action::Check]), (RIVER, &[])]);
+    let script = vec![ack(), answer(ResultStatus::BestSoFar, solved(&turn, "turn_std_v1", 5.0)), ack(), answer(ResultStatus::Ok, solved(&river, "river_std_v1", 0.2))];
+    let mut t = street_rig("best_so_far_turn", script);
+    checked_to(&mut t, Street::Turn);
+    let (dt, ft) = t.ask();
+    let turn_reason = ApproxReason::DeadlineBestSoFar { reached_bp: 833, target_bp: 50 };
+    assert!(reasons(&ft).contains(&turn_reason), "{:?}", ft.coverage);
+    let st = t.snapshot_of(&dt);
+    assert_eq!(st.reasons, reasons(&ft), "the turn snapshot carries its solve's full coverage reasons");
+    t.play(&[Action::Check, Action::Check]);
+    t.deal(RIVER);
+    let (_, fr) = t.ask();
+    let rr = reasons(&fr);
+    assert!(rr.contains(&turn_reason), "the river Final accumulates the turn snapshot's DeadlineBestSoFar: {rr:?}");
+    assert_eq!(rr.iter().filter(|r| is_best_so_far(r)).count(), 1, "the river's own solve met its target: {rr:?}");
+    assert!(unconditioned(&fr, Street::Turn).is_empty(), "the turn was conditioned through its snapshot: {rr:?}");
+    assert_eq!(snapshot_notes(&fr), [snapshot_note(Street::Turn, &st.provenance)], "the turn snapshot the reason came from is named (18-I3)");
+    t.e.shutdown();
+}
+
+/// Fix round 1, ruling 18-I2 (spec 9.3: an engine failure or a deadline is the cause of a street with no snapshot,
+/// never "no request"). A turn request (A) is being served, held after its `Fast`; hero asks again at the same decision
+/// (B), which waits queued behind it; B's watchdog fires while B waits and delivers B's `Final` (a deadline, at the
+/// `queued` stage). Hero then checks the turn through and asks on the river (C): B is replaced in the depth-1 slot and
+/// retired unserved. B's delivered deadline is recorded as the turn's miss at retirement, so C's replay names it for
+/// both turn actors. A (superseded, no `Final`) and B (one `Final`, its watchdog's) register no snapshot.
+#[test]
+fn replay_feeds_street_root_solves_naming_the_deadline_of_a_turn_request_retired_unserved() {
+    let river = line("KdJd", &[(FLOP, &[Action::Check, Action::Check]), (TURN, &[Action::Check, Action::Check]), (RIVER, &[])]);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(Some((entered_tx, release_rx))));
+    let hold_first: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let taken = gate.lock().unwrap().take();
+        if let Some((entered, release)) = taken {
+            entered.send(()).unwrap();
+            release.recv_timeout(engine::testing::ACK_LIVENESS).expect("the test releases the request it holds");
+        }
+    });
+    let seams = ServeSeams { after_fast: Some(hold_first), ..ServeSeams::default() };
+    let mut t = street_rig_with("retired_unserved", vec![ack(), answer(ResultStatus::Ok, solved(&river, "river_std_v1", 0.2))], seams);
+    checked_to(&mut t, Street::Turn);
+    let (a, recorder_a) = t.recommend();
+    entered_rx.recv_timeout(engine::testing::ACK_LIVENESS).expect("A is being served, held after its Fast");
+    let (b, recorder_b) = t.recommend();
+    t.clock.set_ms(engine::deadline::Deadlines::for_request(0, Street::Turn, 10).watchdog_fire_ms());
+    let (fb, _) = final_of(&recorder_b, &b, false);
+    assert!(matches!(&fb.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage }, .. } if stage == "queued"), "{:?}", fb.coverage);
+    t.play(&[Action::Check, Action::Check]);
+    t.deal(RIVER);
+    let (c, recorder_c) = t.recommend();
+    release_tx.send(()).unwrap();
+    let (fc, _) = final_of(&recorder_c, &c, true);
+    let turn = unconditioned(&fc, Street::Turn);
+    assert_eq!(turn.iter().map(|u| u.0).collect::<Vec<_>>(), [SB, BB], "{turn:?}");
+    assert!(turn.iter().all(|(_, cause)| cause == "deadline exceeded at stage queued"), "the retired request's delivered deadline: {turn:?}");
+    let (b_events, a_events) = (recorder_b.recorded(), recorder_a.recorded());
+    assert_eq!(kinds(&b_events), ["Final"], "B's one Final, its watchdog's");
+    assert!(!kinds(&a_events).contains(&"Final"), "the superseded A has no Final: {:?}", kinds(&a_events));
+    assert!(t.origins(c.hand_id).iter().all(|(street, _)| *street == Street::River), "no turn snapshot: {:?}", t.origins(c.hand_id));
+    let _ = a;
+    t.e.shutdown();
+}
+
+/// Fix round 1, ruling 18-I2 (spec 9.3). `engine-main` panics while it serves a turn request (here right after its
+/// `Fast`: an always-on assert of an internal invariant, contained at `engine-main`'s boundary): the containment
+/// delivers the request's `Unsupported{EngineError("internal: ..")}` `Final` through its claim, and records that
+/// delivered cause as the turn's miss at the request's street root, kept on the request since its classification. The
+/// river replay names it for both turn actors; the turn has one `Final` and no snapshot.
+#[test]
+fn replay_feeds_street_root_solves_naming_the_internal_error_of_a_contained_turn_panic() {
+    let river = line("KdJd", &[(FLOP, &[Action::Check, Action::Check]), (TURN, &[Action::Check, Action::Check]), (RIVER, &[])]);
+    let panicked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let panic_once: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if !panicked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            panic!("a deliberate turn panic (P3.T18 fix round 1)");
+        }
+    });
+    let seams = ServeSeams { after_fast: Some(panic_once), ..ServeSeams::default() };
+    let mut t = street_rig_with("contained_panic", vec![ack(), answer(ResultStatus::Ok, solved(&river, "river_std_v1", 0.2))], seams);
+    checked_to(&mut t, Street::Turn);
+    let (turn_id, recorder) = t.recommend();
+    let (ft, _) = final_of(&recorder, &turn_id, false);
+    let cause = "engine error: internal: a deliberate turn panic (P3.T18 fix round 1)";
+    assert!(matches!(&ft.coverage, Coverage::Unsupported { reason: UnsupportedReason::EngineError { message, retryable: false }, .. }
+        if message == "internal: a deliberate turn panic (P3.T18 fix round 1)"), "{:?}", ft.coverage);
+    t.play(&[Action::Check, Action::Check]);
+    t.deal(RIVER);
+    let (river_id, fr) = t.ask();
+    assert_eq!(unconditioned(&fr, Street::Turn), vec![(SB, cause.to_string()), (BB, cause.to_string())]);
+    assert_eq!(kinds(&recorder.recorded()).iter().filter(|k| **k == "Final").count(), 1, "one Final of the turn request");
+    assert!(t.origins(river_id.hand_id).iter().all(|(street, _)| *street == Street::River), "no turn snapshot");
     t.e.shutdown();
 }
 

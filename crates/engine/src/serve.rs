@@ -103,7 +103,7 @@ use crate::deadline::Deadlines;
 use crate::equity::{equity_summary_with_clock, pending_summary, EQUITY_BUDGET_MS};
 use crate::identity::IdentityState;
 use crate::log::{DecisionRecord, InputRecord};
-use crate::replay_bridge::{miss_cause, miss_cause_of_final, miss_for, register_accepted, snapshot_from_solution};
+use crate::replay_bridge::{miss_cause, miss_cause_of_final, miss_for, register_accepted, snapshot_from_solution, snapshot_note};
 use crate::snapshots::StreetSnapshot;
 use crate::solve::{run_solve, SolvePlan, Terminal};
 use crate::tree::{build_tree_full, tree_signature, TemplateSelection, Templates};
@@ -161,6 +161,11 @@ pub struct Watched {
     /// The `Final` `engine-main` handed to the sink, the engine-clock time it did and whether it is a `best_so_far`,
     /// recorded immediately before the handover: a panic after it logs that `Final` (ruling F2-I3).
     pub(crate) handed: Mutex<Option<(u64, Recommendation, bool)>>,
+    /// The validated heads-up street root of the request's decision, set by `serve_request` as soon as the classifier
+    /// has derived it (plan 3 Task 18, fix round 1, ruling 18-I2): kept on the request, not in a local of the frame that
+    /// may panic, so a panic's containment records the delivered cause as the street's miss at that root. `None` for a
+    /// request served at no heads-up postflop root, or not served at all.
+    pub(crate) root: Mutex<Option<proto::StreetRootSnapshot>>,
 }
 
 /// Retains `rec` for `req`'s watchdog (final fix round 2, ruling F2-N3; spec 7): at the fire the watchdog delivers the
@@ -203,7 +208,7 @@ pub fn admit(watchdog: &Watchdog, identity_state: &Arc<Mutex<IdentityState>>, co
         fallback: fallback.clone(), stage: stage.clone(), sink: sink.clone(), delivered: delivered.clone(), fired: fired.clone(), identity_state: identity_state.clone() };
     let generation = watchdog.try_arm(armed).map_err(|_| EngineError::Message("the engine is not running: its watchdog is stopped".into()))?;
     let watch = Watched { generation, street: d.street, deadlines, street_deadline, delivered, fired, fallback, retained, stage, logged: Arc::default(),
-        claimed_by_engine: AtomicBool::new(false), handed: Mutex::new(None) };
+        claimed_by_engine: AtomicBool::new(false), handed: Mutex::new(None), root: Mutex::new(None) };
     Ok(LiveRequest { identity, state, t0_ms, sink, config, watch: Some(watch) })
 }
 
@@ -303,6 +308,15 @@ fn request_assumptions(config: &GameConfig) -> Assumptions {
     let mut assumptions = assemble::empty_assumptions("");
     assumptions.target_bp = config.solver.target_bp;
     assumptions
+}
+
+/// Every reason `coverage` lists: an `Approximate`'s reasons, an `Unsupported`'s `partial`, none when `Exact`.
+fn coverage_reasons(coverage: &Coverage) -> Vec<ApproxReason> {
+    match coverage {
+        Coverage::Exact => vec![],
+        Coverage::Approximate { reasons } => reasons.clone(),
+        Coverage::Unsupported { partial, .. } => partial.clone(),
+    }
 }
 
 /// The watchdog's `Unsupported{DeadlineExceeded}` fallback for this decision with what the request knows so far: the
@@ -416,6 +430,11 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
         return;
     }
     let watch = req.watch.as_ref().unwrap_or_else(|| panic!("decision {:?}: admission found no decision point, the classifier found {class:?}", req.identity));
+    // Plan 3 Task 18 (fix round 1, ruling 18-I2): the validated heads-up street root, kept on the request from here on,
+    // so a panic's containment can record the `Final` it delivers as the street's miss.
+    if let Classification::HuStreet { root, .. } = &class {
+        *lock(&watch.root) = Some(root.clone());
+    }
     // This request's own stage slot, shared with its watchdog since admission ("queued" until now): the solve client
     // advances it from here (final review I1).
     core.stage = watch.stage.clone();
@@ -490,6 +509,10 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     let range_hashes = vec![hex::encode(hash_scaled(&ranges.oop)), hex::encode(hash_scaled(&ranges.ip))];
     let inherited: Vec<ApproxReason> = inherited.into_iter().chain(ranges.reasons.iter().cloned()).collect();
     assumptions.ranges_used = ranges.ranges_used.clone();
+    // Plan 3 Task 18 (fix round 1, ruling 18-I3; spec 9.3): every snapshot a prior street was conditioned through is
+    // disclosed, with its origin, in this request's assumptions from here on, the `Fast`, the watchdog's fallback and every
+    // `Final` alike. The solve's own `source` and `cache` stay this solve's.
+    assumptions.notes.extend(ranges.snapshots_used.iter().map(|(street, provenance)| snapshot_note(*street, provenance)));
     // Ruling 28-I6: from here on a watchdog `Final` keeps the range source's reasons and the ranges used (spec 6).
     *lock(&watch.fallback) = deadline_fallback(&ctx, &inherited, &assumptions);
     emit(core, req, Some(&*watch.delivered), RecommendationEvent::Fast(assemble::fast(&ctx, assemble::accumulate(Coverage::Exact, inherited.clone()), assumptions.clone())));
@@ -574,11 +597,14 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
                 // history (the solved prefix, the projected root's for a projection), and the tree the answering attempt
                 // solved (the `_min` retry's when it answered), whose materialized nodes the solve client resolved every
                 // wire chip path against (`solve::validate`, §2's single rule) into `out.ordinal_paths`: the nodes the
-                // worker exported, never reconstructed. Its reasons are the ones this decision inherited. Built before
-                // `assumptions` moves into the `Final`. The key's config revision is the identity's, the hand's (ruling F-I4).
+                // worker exported, never reconstructed. Its reasons are this solve's full coverage reasons (fix round 1,
+                // ruling 18-I1; spec 6, reasons accumulate; spec 9.3): every reason this decision inherited and the solve's
+                // own, a `best_so_far`'s `DeadlineBestSoFar` included, carried into every later result the snapshot
+                // conditions. Built before `assumptions` moves into the `Final`. The key's config revision is the
+                // identity's, the hand's (ruling F-I4).
                 let solved = SolveInput { root: input.root.clone(), ranges: input.ranges.clone(), tree: out.tree.clone(), target_bp: input.target_bp };
                 let snapshot = snapshot_from_solution(&req.identity, &solved, sol, out.ordinal_paths.clone(), assumptions.tree_signature.clone(), "live",
-                    inherited.clone());
+                    coverage_reasons(&coverage));
                 let rec = assemble::final_from_solution(&ctx, &sol.nodes[requested], &reach, coverage, assumptions);
                 Candidate { rec, record: Record::Snapshot(snapshot), best_so_far }
             }
@@ -850,11 +876,20 @@ fn log_watchdog_final(core: &mut EngineCore, req: &LiveRequest, watch: &Watched,
 /// A request `engine-main` never serves (final review I1: admission arms before the request is served): one dropped
 /// from the depth-1 queue by a newer request, or still queued at shutdown. Its decision was superseded; its watchdog
 /// generation is retired, and a `Final` its watchdog delivered while the decision was still active (the request waited
-/// past its fire) is logged, exactly once (ruling W3-I1; spec 5 step 10). It solved nothing, so the street deadline's
-/// verdict is the watchdog's.
+/// past its fire) is logged, exactly once (ruling W3-I1; spec 5 step 10), and recorded as its street's miss with the
+/// watchdog's cause (plan 3 Task 18, fix round 1, ruling 18-I2). It solved nothing, so the street deadline's verdict is
+/// the watchdog's.
 pub(crate) fn retire_unserved(core: &mut EngineCore, req: &LiveRequest) {
     if let Some(watch) = &req.watch {
         log_watchdog_final(core, req, watch, &Logged::unsolved(watch.street, Some(watch.street_deadline.clone()), vec![]));
+        // Plan 3 Task 18 (fix round 1, ruling 18-I2): a `Final` its watchdog delivered is the request's outcome, recorded
+        // as its street's miss with the delivered cause. The request was never served, so its street root is recovered
+        // from its state here (the classifier's own heads-up root; none at a preflop, multiway or unreproducible root).
+        if let Some(cause) = watchdog_cause(watch) {
+            if let Classification::HuStreet { root, .. } = classify(&req.state) {
+                record_delivered_miss(core, miss_for(&req.identity, &root, cause));
+            }
+        }
     }
 }
 
@@ -867,6 +902,12 @@ pub(crate) fn retire_unserved(core: &mut EngineCore, req: &LiveRequest) {
 /// 2, ruling F2-I3: `Watched::claimed_by_engine` with nothing `handed`), delivered at once under that claim, as the
 /// engine's own `Final` would have been. The `Final` delivered (the engine's handed over before the panic, this one, or
 /// the watchdog's) is logged once. Every lock here survives the panic (`lock`).
+///
+/// Plan 3 Task 18 (fix round 1, ruling 18-I2; spec 9.3): the `Final` this containment or the watchdog delivered is the
+/// request's outcome, recorded as its street's miss with the delivered cause (`engine error: internal: ..`, or the
+/// watchdog's deadline) at the street root `serve_request` kept on the request (`Watched::root`); nothing is recorded
+/// when no `Final` was delivered (a decision superseded before any claim), when the engine's own `Final` went out before
+/// the panic (its accepted claim recorded it), or when the panic came before the root was derived.
 pub(crate) fn contain_panic(core: &mut EngineCore, req: &LiveRequest, message: &str) {
     crate::solve::diagnose(core, core.clock.now_ms(), "panic", Some(&req.identity), format!("engine-main panicked serving this decision: {message}"), None);
     crate::solve::kill_worker(core, &format!("engine-main panicked serving decision {:?}", req.identity));
@@ -888,13 +929,21 @@ pub(crate) fn contain_panic(core: &mut EngineCore, req: &LiveRequest, message: &
     let at_ms = core.clock.now_ms();
     // A claim `engine-main` took is its own: the watchdog lost it, so no other `Final` went out.
     let verdict = if watch.claimed_by_engine.load(Ordering::SeqCst) { Delivery::Accepted } else { accept(&core.identity, &req.identity, Some(&watch.delivered), |_| {}) };
-    match verdict {
+    let delivered_cause = match verdict {
         Delivery::Accepted => {
             *lock(&watch.handed) = Some((at_ms, rec.clone(), false));
             lock(&req.sink).emit(RecommendationEvent::Final(rec.clone()));
             log_final(core, req, watch, Delivered { at_ms, rec: &rec, by_watchdog: false, best_so_far: false }, &logged);
+            Some(miss_cause_of_final(&rec))
         }
-        Delivery::AlreadyDelivered | Delivery::Stale => log_watchdog_final(core, req, watch, &logged),
+        Delivery::AlreadyDelivered | Delivery::Stale => {
+            log_watchdog_final(core, req, watch, &logged);
+            watchdog_cause(watch)
+        }
+    };
+    let kept_root = lock(&watch.root).clone();
+    if let (Some(cause), Some(root)) = (delivered_cause, kept_root) {
+        record_delivered_miss(core, miss_for(&req.identity, &root, cause));
     }
 }
 
@@ -903,11 +952,7 @@ pub(crate) fn contain_panic(core: &mut EngineCore, req: &LiveRequest, message: &
 /// construction (the engine's own did not come in time). Marks the request's `Final` logged.
 fn log_final(core: &mut EngineCore, req: &LiveRequest, watch: &Watched, delivered: Delivered<'_>, logged: &Logged) {
     let rec = delivered.rec;
-    let reasons = match &rec.coverage {
-        Coverage::Exact => vec![],
-        Coverage::Approximate { reasons } => reasons.clone(),
-        Coverage::Unsupported { partial, .. } => partial.clone(),
-    };
+    let reasons = coverage_reasons(&rec.coverage);
     let final_violation = delivered.by_watchdog || delivered.at_ms >= watch.deadlines.watchdog_fire_ms();
     let arrival_violation = match &logged.verdict {
         StreetVerdict::Judged(violated) => *violated,

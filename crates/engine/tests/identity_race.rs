@@ -682,6 +682,47 @@ fn a_watchdog_fire_before_the_tree_keeps_the_range_sources_reasons() {
     assert_eq!((solves(&r).len(), kills_and_restarts(&r)), (0, (0, 0)), "no room was left to send a solve");
 }
 
+/// The full public ranges, plus one snapshot a prior street was conditioned through, as the replay range source reports
+/// it (plan 3 Task 18, fix round 1: `RootRanges::snapshots_used`).
+struct WithSnapshot(Street, engine::snapshots::SnapshotProvenance);
+impl RangeSource for WithSnapshot {
+    fn ranges_at_root(&self, state: &HandState, root: &proto::StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason> {
+        let mut r = ExplicitRanges { oop: Some(Range1326([1.0; 1326])), ip: Some(Range1326([1.0; 1326])) }.ranges_at_root(state, root)?;
+        assert!(r.snapshots_used.is_empty(), "explicit ranges name no snapshot");
+        r.snapshots_used.push((self.0, self.1.clone()));
+        Ok(r)
+    }
+}
+
+/// Plan 3 Task 18 fix round 1, ruling 18-I3 (spec 9.3: a snapshot's origin is carried into the current result): the
+/// disclosure of every snapshot the range source's replay went through is in the assumptions before the watchdog's
+/// fallback is refreshed, so a watchdog `Final` fired right after the `Fast` (before the tree) carries it, as the `Fast`
+/// does, with the solve's own source and cache fields left as they were.
+#[test]
+fn a_watchdog_final_discloses_the_snapshots_the_range_sources_replay_went_through() {
+    let provenance = engine::snapshots::SnapshotProvenance {
+        identity_at_solve: DecisionIdentity { hand_id: 1, hand_revision: 3, decision_id: 2, config_revision: 1, model_revision: 0 },
+        solved_prefix: vec![(Seat(2), Action::Check)],
+        origin: "cache_approximate".into(),
+    };
+    let note = engine::replay_bridge::snapshot_note(Street::Turn, &provenance);
+    assert_eq!(note, "Turn conditioned through the cache_approximate snapshot of decision 2 (hand 1, hand revision 3, config revision 1, model revision 0), solved at \
+        [(Seat(2), Check)]");
+    let (mut r, gate) = gated_rig("snapshot_note_watchdog", vec![]);
+    *r.core.range_source.lock().unwrap() = Box::new(WithSnapshot(Street::Turn, provenance));
+    let (clock, finals_gate) = (r.clock.clone(), gate.clone());
+    let seams = ServeSeams { after_fast: Some(Arc::new(move || { clock.set_ms(14_900); wait_finals(&finals_gate, 1); })), ..ServeSeams::default() };
+    let id = serve_with(&mut r, &river_state(), seams);
+    let f = finals(&r, &id);
+    assert_eq!(f.len(), 1);
+    let (at, _, rec) = &f[0];
+    assert!(*at == 14_900 && matches!(rec.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { .. }, .. }), "{:?}", rec.coverage);
+    assert!(rec.assumptions.notes.contains(&note), "the watchdog's Final: {:?}", rec.assumptions.notes);
+    assert_eq!((rec.assumptions.cache.as_str(), rec.assumptions.source.as_str()), ("miss", "solver-worker"), "the solve's own fields");
+    let fast = events_of(&r, &id).into_iter().find_map(|e| match e.event { RecommendationEvent::Fast(x) => Some(x), _ => None }).expect("the Fast");
+    assert!(fast.assumptions.notes.contains(&note), "the Fast: {:?}", fast.assumptions.notes);
+}
+
 /// One command to an acknowledged equity runner: run the next unit of work (replying whether it stopped instead,
 /// having found its cancellation set), or finish.
 enum Step { Unit(mpsc::Sender<bool>), Finish }

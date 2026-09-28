@@ -6,8 +6,9 @@
 //! validators; this module ships `ExplicitRanges`, used by the tests and by `bench`. Hero's cards never enter a public
 //! range (spec §2): the board is the only thing blocked here.
 
+use crate::snapshots::SnapshotProvenance;
 use core_ranges::{block_public, mass, range_to_string};
-use proto::{combo_cards, ApproxReason, ComboIndex, HandState, Range1326, Seat, StreetRootSnapshot, UnsupportedReason};
+use proto::{combo_cards, ApproxReason, ComboIndex, HandState, Range1326, Seat, Street, StreetRootSnapshot, UnsupportedReason};
 
 pub struct RootRanges {
     pub oop: Range1326,
@@ -15,6 +16,10 @@ pub struct RootRanges {
     pub reasons: Vec<ApproxReason>,
     /// `(seat, range text, mass)` for OOP then IP, of the public (board-blocked) ranges handed to the solve.
     pub ranges_used: Vec<(Seat, String, f32)>,
+    /// Plan 3 Task 18 (fix round 1, ruling 18-I3; spec 9.3): the provenance of every snapshot a prior street was
+    /// conditioned through to reach these ranges, in street order (`core_replay::ReplayOutput::snapshots_used`), which
+    /// `serve` discloses in the current result's assumptions. Empty for a source that replays nothing (`ExplicitRanges`).
+    pub snapshots_used: Vec<(Street, SnapshotProvenance)>,
 }
 
 /// The only root-range provider (§9). Plan 3 implements it for a replay-backed type and installs that into
@@ -46,7 +51,7 @@ impl RangeSource for ExplicitRanges {
             return Err(UnsupportedReason::InvalidRanges);
         }
         let used = vec![(root.oop, range_to_string(&oop), mass(&oop)), (root.ip, range_to_string(&ip), mass(&ip))];
-        Ok(RootRanges { oop, ip, reasons: vec![], ranges_used: used })
+        Ok(RootRanges { oop, ip, reasons: vec![], ranges_used: used, snapshots_used: vec![] })
     }
 }
 

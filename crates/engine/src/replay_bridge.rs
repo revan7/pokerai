@@ -29,7 +29,10 @@
 //! delivered), or `no request` when no request of hero's on the street left anything (a request superseded before any
 //! `Final` leaves nothing). A street that opened multiway stays `multiway prior street`
 //! (replay's own rule), and a street whose valid snapshots do not match the replayed ranges stays `no compatible
-//! snapshot`. The selected snapshots' provenance, their `origin` included, is in `ReplayOutput::snapshots_used`.
+//! snapshot`. The selected snapshots' provenance, their `origin` included, is in `ReplayOutput::snapshots_used`, which
+//! `RootRanges::snapshots_used` hands to `serve`: it discloses each in the current result's assumptions
+//! ([`snapshot_note`], fix round 1, ruling 18-I3). A snapshot's stored reasons are its solve's full coverage reasons,
+//! the solve's own accuracy (`DeadlineBestSoFar`) included (ruling 18-I1), and the walk carries them into the result.
 //!
 //! Equity (brief decision 6). A turn or river request's `Equity` runs hero's public range against the opponent's, both
 //! the replay's published ranges exactly as the solve received them (`serve` hands them to the equity routine). The
@@ -116,8 +119,21 @@ impl RangeSource for ReplayRanges {
             return Err(UnsupportedReason::InvalidRanges);
         }
         let ranges_used = vec![(root.oop, range_to_string(&oop), mass(&oop)), (root.ip, range_to_string(&ip), mass(&ip))];
-        Ok(RootRanges { oop, ip, reasons: replayed.reasons, ranges_used })
+        Ok(RootRanges { oop, ip, reasons: replayed.reasons, ranges_used, snapshots_used: replayed.snapshots_used })
     }
+}
+
+/// Spec 9.3's disclosure, in the current result's assumptions, of one snapshot a prior `street` was conditioned through
+/// (fix round 1, ruling 18-I3): its origin (`live`, or one of the cache routes), the decision it was validated for (hand,
+/// hand revision, config and model revision) and the street history it was solved at. Its stored reasons, the solve's
+/// accuracy included, are in the result's coverage already (the walk inherits them); this note says which snapshot, and
+/// so which street, they came from.
+pub fn snapshot_note(street: Street, provenance: &SnapshotProvenance) -> String {
+    let id = &provenance.identity_at_solve;
+    format!(
+        "{street:?} conditioned through the {} snapshot of decision {} (hand {}, hand revision {}, config revision {}, model revision {}), solved at {:?}",
+        provenance.origin, id.decision_id, id.hand_id, id.hand_revision, id.config_revision, id.model_revision, provenance.solved_prefix
+    )
 }
 
 /// The replay behind a decision's root ranges: `state` over `store`, with the snapshots and misses of the decision's
