@@ -167,28 +167,33 @@ struct Hooks {
     equity: EquityRoutine,
     /// Runs on `engine-main` with a candidate `Final` assembled, immediately before its delivery is claimed.
     before_claim: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs on `engine-main` right after the `Fast` was handed over (the sink released), before the tree is built.
+    after_fast: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Hooks {
-    fn production() -> Self { Self { equity: Arc::new(equity_summary_with_clock), before_claim: None } }
+    fn production() -> Self { Self { equity: Arc::new(equity_summary_with_clock), before_claim: None, after_fast: None } }
 }
 
 /// Test seams of `serve_request` (plan 2 Task 28 fix round 1), compiled for this crate's tests and with the `testing`
 /// feature only: `equity` replaces the fast-path equity routine (ruling 28-I4's acknowledged runner); `before_claim` runs
 /// on `engine-main` with the candidate `Final` assembled, immediately before its delivery is claimed (ruling 28-I2: a
-/// watchdog fire landing there). `None` keeps production behaviour.
+/// watchdog fire landing there); `after_fast` runs on `engine-main` right after the `Fast` was handed over, the sink
+/// released, before the tree is built (ruling 28-O1b: a fire between the watchdog fallback's two refreshes). `None`
+/// keeps production behaviour.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Default)]
 pub struct ServeSeams {
     pub equity: Option<EquityRoutine>,
     pub before_claim: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub after_fast: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// `serve_request` with test seams (see `ServeSeams`).
 #[cfg(any(test, feature = "testing"))]
 pub fn serve_request_with(core: &mut EngineCore, req: LiveRequest, seams: ServeSeams) {
     let production = Hooks::production();
-    serve(core, req, &Hooks { equity: seams.equity.unwrap_or(production.equity), before_claim: seams.before_claim });
+    serve(core, req, &Hooks { equity: seams.equity.unwrap_or(production.equity), before_claim: seams.before_claim, after_fast: seams.after_fast });
 }
 
 /// §5 steps 4-10 for one request (see the module doc). `req.state` must replay (`core_model::derive`'s precondition)
@@ -273,6 +278,9 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
     // Ruling 28-I6: from here on a watchdog `Final` keeps the range source's reasons and the ranges used (spec 6).
     *fallback.lock().unwrap() = deadline_fallback(&ctx, &inherited, &assumptions);
     emit(core, &req, Some(&*delivered), RecommendationEvent::Fast(assemble::fast(&ctx, assemble::accumulate(Coverage::Exact, inherited.clone()), assumptions.clone())));
+    if let Some(after_fast) = &hooks.after_fast {
+        after_fast();
+    }
     let hero_is_oop = root.oop == req.state.hero;
     let (hero_public, opp_public) = if hero_is_oop { (&ranges.oop, &ranges.ip) } else { (&ranges.ip, &ranges.oop) };
     spawn_equity(core, &req, hero_public.clone(), (opponent, opp_public.clone()), root.board.clone(), hooks.equity.clone(), equity_cancel.clone());
@@ -429,8 +437,10 @@ enum StreetVerdict {
     /// 20-I1).
     Judged(bool),
     /// No solve was attempted. A `Final` delivered before the watchdog's fire carries no verdict; one delivered at or
-    /// after it (the request expired) carries the shared street deadline's (`StreetDeadline::violated`, ruling 28-O3).
-    /// `None` when no watchdog watches the request (the classifier's rows).
+    /// after it (the request expired) carries the shared street deadline's (`StreetDeadline::violated`, ruling 28-O3),
+    /// or, when the watchdog thread never recorded the street deadline (a suspend-style jump: the engine's own `Final`
+    /// won the claim), the clock's, as the solve client judges a no-terminal outcome: the `Final` came at or after the
+    /// street deadline (ruling 28-N3). `None` when no watchdog watches the request (the classifier's rows).
     Unattempted(Option<Arc<StreetDeadline>>),
 }
 
@@ -517,7 +527,7 @@ fn log_final(core: &mut EngineCore, req: &LiveRequest, deadlines: &Deadlines, de
     let final_violation = delivered.by_watchdog || delivered.at_ms >= deadlines.watchdog_fire_ms();
     let arrival_violation = match &logged.verdict {
         StreetVerdict::Judged(violated) => *violated,
-        StreetVerdict::Unattempted(street_deadline) => final_violation && street_deadline.as_ref().is_some_and(|d| d.violated()),
+        StreetVerdict::Unattempted(street_deadline) => final_violation && street_deadline.as_ref().is_some_and(|d| d.violated() || delivered.at_ms >= d.deadline_ms()),
     };
     // §12 "Street deadline reached": a `best_so_far` is logged as a violation on every street but the flop, whose
     // single-raised-pot miss is the designed outcome (plan 4 refines the flop by pot type).
