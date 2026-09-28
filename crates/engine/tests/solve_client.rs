@@ -65,7 +65,8 @@ fn deadline_arithmetic_and_request_fields() {
     assert_eq!(r.plan.deadlines.watchdog_fire_ms(), 14_900);
     assert_eq!(Deadlines::for_request(0, Street::Turn, 10).street_deadline_ms, 6_000);
     drop(ev);
-    // `background` is a request parameter, not an engine invariant: plan 4's pre-solver sends `true`
+    // `background` is a wire flag copied into the request as given, nothing more (final review M5: `run_solve` serves a
+    // live decision only; plan 4's pre-solver jobs need an executor of their own)
     let mut bg = rig(Street::River, vec![ack(), ok_for(Street::River, "river_std_v1", 0.3)]);
     bg.plan.background = true;
     assert_eq!(run_solve(&mut bg.core, &bg.input, &bg.plan, &bg.sink).terminal, Terminal::Ok);
@@ -104,13 +105,15 @@ fn failed_engine_error(t: &Terminal) -> (String, bool) {
 }
 fn kills_and_restarts(state: &Arc<Mutex<engine::testing::FakeState>>) -> (u32, u32) { let s = state.lock().unwrap(); (s.kills, s.restarts) }
 
-/// Spec 4.5 `solve.spot` is the structural identity of the game (ruling 22-S): the one `bench_support::spot_identity`
-/// computes, stacks and rake included; the solve parameters (id, deadline, target) never enter it.
+/// Spec 4.5 `solve.spot` is the structural identity of the game (ruling 22-S): the one `solve::spot_identity`
+/// computes (final review M4: the production solve client owns it, and the bench reaches the same function through
+/// `bench_support`'s re-export), stacks and rake included; the solve parameters (id, deadline, target) never enter it.
 #[test]
 fn the_spot_is_the_structural_identity_of_the_game() {
     let spot_of = |r: &mut Rig| { let _ = run_solve(&mut r.core, &r.input, &r.plan, &r.sink); solves(&r.state)[0].clone() };
     let mut a = rig(Street::River, vec![ack(), ok_for(Street::River, "river_std_v1", 0.3)]);
     let req = spot_of(&mut a);
+    assert_eq!(req.spot, engine::solve::spot_identity(&req));
     assert_eq!(req.spot, engine::bench_support::spot_identity(&req));
     assert_eq!(req.spot, engine::solve::spot_hash(&req));
     // the same game at another time and target: the same identity
@@ -247,16 +250,26 @@ fn receives_never_outlast_the_hang_bound_or_the_watchdog_fire() {
 }
 
 /// Identity is checked on every reply: a progress that arrives after a mutation (in the same receive) is not forwarded,
-/// and a result that races one is discarded unvalidated; nothing is emitted for a superseded identity.
+/// and a result that races one is discarded unvalidated; nothing is emitted for a superseded identity. Final review I2
+/// (spec 4.5: admission is released by the job's terminal `result`): the job whose progress was observed may still be
+/// running, so it is cancelled (unconfirmed here: killed and restarted after 1.5 s); the job whose own terminal was
+/// observed in the receive that saw the supersession has ended, so nothing is cancelled, killed or restarted. The
+/// same for this solve's `ack{rejected}` (the worker started no job).
 #[test]
 fn identity_is_checked_on_every_reply() {
     let progress = FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 4, exploitability_chips: Some(0.9), elapsed_ms: 1 };
-    for script in [vec![ack(), FakeReply::InvalidateIdentity, progress], vec![ack(), FakeReply::InvalidateIdentity, ok_for(Street::River, "river_std_v1", 0.3)]] {
+    let rejected = FakeReply::Ack { id: IdRef::Last, status: AckStatus::Rejected, reason: Some("busy".into()) };
+    let cases = [("a progress", vec![ack(), FakeReply::InvalidateIdentity, progress], (1usize, 1u32, 1u32)),
+        ("its own result", vec![ack(), FakeReply::InvalidateIdentity, ok_for(Street::River, "river_std_v1", 0.3)], (0, 0, 0)),
+        ("its own rejection", vec![FakeReply::InvalidateIdentity, rejected], (0, 0, 0))];
+    for (case, script, (cancels, kills, restarts)) in cases {
         let mut r = rig(Street::River, script);
         let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
         let (message, retryable) = failed_engine_error(&out.terminal);
-        assert!(message.contains("superseded") && !retryable, "{message}");
-        assert!(out.solution.is_none() && r.events.lock().unwrap().is_empty(), "nothing is emitted or accepted for a superseded identity");
+        assert!(message.contains("superseded") && !retryable, "{case}: {message}");
+        assert!(out.solution.is_none() && r.events.lock().unwrap().is_empty(), "{case}: nothing is emitted or accepted for a superseded identity");
+        let s = r.state.lock().unwrap();
+        assert_eq!((s.cancels.len(), s.kills, s.restarts, u32::from(out.restarts)), (cancels, kills, restarts, restarts), "{case}");
     }
 }
 
@@ -309,12 +322,33 @@ fn ready_is_validated_before_any_request() {
         assert!(message.contains(fragment) && got_retryable == retryable, "{message}");
         assert_eq!((r.clock.now_ms(), out.restarts), (0, restarts));
     }
-    // a deadline that leaves no iteration is refused before the request too (river at 1 650 ms: 200 <= 200)
-    let mut r = rig(Street::River, vec![ack(), ok_for(Street::River, "river_std_v1", 0.3)]);
+}
+
+/// Final review M8 (orchestrator ruling F-M8; spec question P6): a first attempt with no room for one iteration at send
+/// time (a river request whose solve starts at t0 + 1 650 ms: 200 <= 200, queued behind engine-main, say) sends
+/// nothing and is treated like the worker's `no_iteration`: the `_min` retry is sent under §7's retry admission, with
+/// what is left until final delivery, instead of an immediate `DeadlineExceeded`. Nothing is restarted, and the first
+/// attempt has no terminal. When the retry is not admitted either (from 12 651 ms: 2 349 ms left, 2 350 needed), the
+/// request ends `DeadlineExceeded` with the stage reached and nothing sent.
+#[test]
+fn a_first_attempt_with_no_room_is_answered_by_the_min_retry_under_admission() {
+    let mut r = rig(Street::River, vec![ack(), ok_for(Street::River, "river_min_v1", 0.3)]);
     r.clock.set_ms(1_650);
     let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
-    assert_eq!((out.terminal, out.street_violation), (Terminal::Failed(UnsupportedReason::DeadlineExceeded { stage: "fast".into() }), false));
-    assert!(solves(&r.state).is_empty());
+    let sent = solves(&r.state);
+    assert_eq!((out.terminal, out.template_used.as_str(), out.restarts, kills_and_restarts(&r.state), sent.len()), (Terminal::Ok, "river_min_v1", 0, (0, 0), 1));
+    assert_eq!((sent[0].tree.template_id.as_str(), sent[0].deadline_ms), ("river_min_v1", 15_000 - 1_650 - 150));
+    assert_eq!((out.first_terminal_ms, r.plan.street_deadline.terminal_arrival_ms(), out.street_violation), (None, None, false));
+    for (at, admitted) in [(12_650u64, true), (12_651, false)] {
+        let mut r = rig(Street::River, vec![ack(), ok_for(Street::River, "river_min_v1", 0.3)]);
+        r.clock.set_ms(at);
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        if admitted {
+            assert_eq!((out.terminal, solves(&r.state).len()), (Terminal::Ok, 1), "no room at {at} ms");
+        } else {
+            assert_eq!((out.terminal, out.street_violation, solves(&r.state).len()), (deadline_exceeded("fast"), true, 0), "no room at {at} ms");
+        }
+    }
 }
 
 /// §4.5 output validation: a solution whose requested node is not the decision node, whose requested actor is not hero,
@@ -1067,8 +1101,9 @@ fn a_link_failure_is_judged_by_identity_and_the_fire_before_it_is_classified() {
 /// Ruling 23-N1 (spec 12: a protocol error or a worker exit is answered by kill, reap, respawn): a link failure observed
 /// in the same receive as a supersession restarts the worker at once, as `cancel_or_kill` does for a link failure in its
 /// window. The outcome stays the superseded decision's, and no cancel is sent: (a) a faulty line, even when the worker
-/// would then confirm a cancel, is restarted at the failure's observation time, 1 ms; (b) an unconfirmed end of stdout,
-/// whose receive spent its whole bound, is restarted at 2 500 ms, with no 1.5 s cancel window after it. Nothing is
+/// would then confirm a cancel, is restarted at the failure's observation time, 1 ms; (b) an unconfirmed end of stdout
+/// is restarted when the receive slice that returns it ends, 100 ms (final review I1: a receive lasts at most one slice,
+/// so the supersession is noticed then, not at the 2 500 ms hang bound), with no 1.5 s cancel window after it. Nothing is
 /// emitted for the superseded decision. The live-worker path (cancel, then kill without a confirmation) is
 /// `superseded_request_cancels_then_kills_after_1_5s` and `a_cancel_is_confirmed_only_by_result_cancelled...`.
 #[test]
@@ -1078,7 +1113,7 @@ fn a_link_failure_under_supersession_restarts_the_worker_at_once() {
     let cases = [
         ("a faulty line", vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::InvalidateIdentity, FakeReply::Malformed("{".into()),
             cancel_ack, FakeReply::Delay { ms: 200 }, cancelled, FakeReply::Hang], 1u64),
-        ("an unconfirmed end of stdout", vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::InvalidateIdentity, FakeReply::Eof, FakeReply::Hang], 2_500),
+        ("an unconfirmed end of stdout", vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::InvalidateIdentity, FakeReply::Eof, FakeReply::Hang], 100),
     ];
     // (case, solves sent, cancels sent, kills, restarts, out.restarts, the clock at return), both cases compared at once
     let (mut got, mut expected) = (vec![], vec![]);

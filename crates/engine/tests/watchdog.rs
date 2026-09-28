@@ -77,11 +77,11 @@ fn ended(wd: &Arc<Watchdog>, n: u64) {
 fn received<T>(rx: &mpsc::Receiver<T>, what: &str) -> T {
     rx.recv_timeout(ACK_LIVENESS).unwrap_or_else(|e| panic!("{what}: no acknowledgement within the {ACK_LIVENESS:?} liveness bound ({e})"))
 }
-/// Runs `Watchdog::disarm` through the acknowledgement bound (ruling 20-A): a watchdog that mishandles the generation
-/// lock fails the test naming this acknowledgement, instead of hanging the gate on an unbounded call.
-fn disarmed(wd: &Arc<Watchdog>) {
+/// Runs `Watchdog::disarm(generation)` through the acknowledgement bound (ruling 20-A): a watchdog that mishandles the
+/// generation lock fails the test naming this acknowledgement, instead of hanging the gate on an unbounded call.
+fn disarmed(wd: &Arc<Watchdog>, generation: u64) {
     let wd = wd.clone();
-    acknowledged_within("Watchdog::disarm returned (the generation lock was free)", ACK_LIVENESS, move || wd.disarm());
+    acknowledged_within("Watchdog::disarm returned (the generation lock was free)", ACK_LIVENESS, move || wd.disarm(generation));
 }
 /// Runs `Watchdog::arm` through the acknowledgement bound (ruling 20-A), for the same reason as `disarmed`.
 fn armed_on(wd: &Arc<Watchdog>, a: Armed) {
@@ -150,8 +150,8 @@ fn watchdog_disarm_retires_the_generation() {
     let wd = watchdog(&clock);
     let (a, _delivered, street) = armed(sink, "solving");
     street.terminal_arrived(0);
-    wd.arm(a);
-    disarmed(&wd);
+    let generation = wd.arm(a);
+    disarmed(&wd, generation);
     clock.set_ms(20_000);
     ended(&wd, 1); // the retired thread woke at the street deadline and ended
     assert!(events.recorded().is_empty(), "a retired generation emits nothing");
@@ -164,9 +164,9 @@ fn a_retired_generation_records_no_street_deadline() {
     let (sink, events) = recording(&clock);
     let wd = watchdog(&clock);
     let (a, _delivered, street) = armed(sink, "solving");
-    wd.arm(a);
+    let generation = wd.arm(a);
     clock.wait_for_waiter(2_000);
-    disarmed(&wd);
+    disarmed(&wd, generation);
     clock.set_ms(20_000);
     ended(&wd, 1);
     assert!(events.recorded().is_empty(), "a retired generation emits nothing");
@@ -335,6 +335,45 @@ fn arming_retires_the_previous_generation() {
     assert!(!first_delivered.load(Ordering::SeqCst) && !first_street.violated(), "a retired generation touches nothing");
 }
 
+/// Final review I1: the watchdog is armed at admission, so a request can be retired by its successor's `arm` while
+/// `engine-main` still serves it. That request's own `disarm` then retires nothing: the successor stays live and
+/// delivers its `Final` at its fire, and the retired generation emits nothing. A `disarm` of the live generation
+/// retires it. A stopped watchdog refuses `try_arm` and starts nothing.
+#[test]
+fn disarming_a_retired_generation_leaves_the_newer_one_live() {
+    let clock = FakeClock::new();
+    let (sink, events) = recording(&clock);
+    let wd = watchdog(&clock);
+    let (first, first_delivered, _) = armed(sink.clone(), "building");
+    let (second, second_delivered, _) = armed(sink.clone(), "queued");
+    let first_generation = wd.arm(first);
+    let second_generation = wd.arm(second);
+    assert!(second_generation > first_generation);
+    disarmed(&wd, first_generation); // the served request retires its own generation, already retired by the newer arm
+    clock.set_ms(14_900);
+    ended(&wd, 2);
+    let ev = events.recorded();
+    assert_eq!(ev.len(), 1, "the newer generation is still live and fires");
+    assert!(matches!(&ev[0].event, RecommendationEvent::Final(r) if r.coverage == Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage: "queued".into() }, partial: vec![] }));
+    assert!(second_delivered.load(Ordering::SeqCst) && !first_delivered.load(Ordering::SeqCst));
+    // the live generation's own disarm retires it
+    let later = session();
+    let later_id = later.lock().unwrap().next_decision().unwrap(); // the watchdog already fired for `identity()`
+    let (third, third_delivered, _) = armed_at(sink.clone(), "solving", later_id, later, 20_000);
+    let third_generation = wd.arm(third);
+    disarmed(&wd, third_generation);
+    clock.set_ms(40_000);
+    ended(&wd, 3);
+    assert_eq!(events.recorded().len(), 1, "a disarmed live generation emits nothing");
+    assert!(!third_delivered.load(Ordering::SeqCst));
+    // a stopped watchdog refuses `try_arm` and starts nothing
+    let stopper = wd.clone();
+    acknowledged_within("Watchdog::stop", ACK_LIVENESS, move || stopper.stop());
+    let (late, _, _) = armed(sink, "building");
+    assert!(wd.try_arm(late).is_err(), "a stopped watchdog refuses to arm");
+    assert_eq!(wd.ended_thread_count(), 3, "no thread was started for it");
+}
+
 #[test]
 #[should_panic(expected = "after its Final was delivered")]
 fn arming_a_request_after_its_fire_is_a_bug() {
@@ -428,7 +467,7 @@ fn disarm_returns_only_after_a_fire_in_progress_has_emitted() {
     let sink: SharedSink = Arc::new(Mutex::new(Box::new(GatedSink { entered: entered_tx, release: release_rx, inner, order: order.clone() })));
     let wd = watchdog(&clock);
     let (a, _, _) = armed(sink, "solving");
-    wd.arm(a);
+    let generation = wd.arm(a);
     clock.set_ms(14_900);
     received(&entered_rx, "the fire entered emit"); // it stays there until released
     assert!(wd.retirement_would_block(), "a fire holds the generation lock through its emission, so a disarm now blocks");
@@ -437,7 +476,7 @@ fn disarm_returns_only_after_a_fire_in_progress_has_emitted() {
     let (wd_thread, order_thread) = (wd.clone(), order.clone());
     std::thread::spawn(move || {
         calling_tx.send(()).unwrap();
-        wd_thread.disarm();
+        wd_thread.disarm(generation);
         order_thread.lock().unwrap().push("disarm returned");
         returned_tx.send(()).unwrap();
     });

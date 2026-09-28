@@ -25,7 +25,8 @@ fn run(script: Vec<FakeReply>, expected_stage: &str) {
     *core.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: Some(full(&state.board)), ip: Some(full(&state.board)) });
     let (sink, events) = RecordingSink::new(clock.clone(), Some(fake.clone()));
     let id = { let mut s = identity.lock().unwrap(); s.set_config(); s.begin_hand(); s.next_decision().unwrap() };
-    serve_request(&mut core, LiveRequest { identity: id.clone(), state, t0_ms: 0, sink: Arc::new(Mutex::new(Box::new(sink))) });
+    let req = LiveRequest::admitted(&core, id.clone(), state, 0, Arc::new(Mutex::new(Box::new(sink))));
+    serve_request(&mut core, req);
     let ev = events.lock().unwrap();
     let finals: Vec<_> = ev.iter().filter(|r| matches!(r.event, RecommendationEvent::Final(_))).collect();
     assert_eq!(finals.len(), 1, "exactly one Final");

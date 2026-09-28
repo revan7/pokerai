@@ -35,8 +35,10 @@ fn identity_race_golden() {
     let sol = solution_for(&state_a);
     // Hand A: the solve is live when the undo arrives. `InvalidateIdentity` is followed by `Delay { ms: 1 }` so that
     // `FakeWorker::recv` returns `Ok(None)` and the receive loop re-checks the identity BEFORE A's late `ok` result
-    // is offered; without the delay `recv` would hand back the result in the same call and no cancel would happen.
-    // A's late result then arrives during the 1.5 s cancel window, is not a `result{cancelled}`, and the worker is killed.
+    // is offered, while the job may still be running: a cancel is sent. Without the delay `recv` would hand back A's
+    // own result in the receive that observes the supersession: the job has ended, so nothing would be cancelled or
+    // killed (final review I2: `Superseded { running: false }`, as `identity_is_checked_on_every_reply` pins).
+    // Here A's late result arrives during the 1.5 s cancel window, is not a `result{cancelled}`, and the worker is killed.
     let script = vec![
         FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None },
         FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 10, exploitability_chips: Some(0.5), elapsed_ms: 2 },
@@ -54,7 +56,8 @@ fn identity_race_golden() {
     let sink: engine::watchdog::SharedSink = Arc::new(Mutex::new(Box::new(sink)));
     let id_a = { let mut s = identity.lock().unwrap(); s.set_config(); s.begin_hand(); for _ in 0..6 { s.mutate(); } s.next_decision().unwrap() };
     assert_eq!(id_a.hand_revision, 7);
-    serve_request(&mut core, LiveRequest { identity: id_a.clone(), state: state_a.clone(), t0_ms: clock.now_ms(), sink: sink.clone() });
+    let req = LiveRequest::admitted(&core, id_a.clone(), state_a.clone(), clock.now_ms(), sink.clone());
+    serve_request(&mut core, req);
     // undo to a non-decision, then hand B; request B once, then re-request (a new decision_id)
     let (id_b1, id_b2) = { let mut s = identity.lock().unwrap(); s.mutate(); s.begin_hand(); let b1 = s.next_decision().unwrap(); let b2 = s.next_decision().unwrap(); (b1, b2) };
     // §4.3's counter is monotonic and never reused, so "hand B with the same displayed revision" is vacuous:
@@ -62,7 +65,8 @@ fn identity_race_golden() {
     assert_eq!((id_b1.hand_revision, id_b2.hand_revision), (9, 9));
     assert!(id_b1.hand_id != id_a.hand_id && id_b2.decision_id > id_b1.decision_id);
     assert!(!identity.lock().unwrap().is_active(&id_a) && !identity.lock().unwrap().is_active(&id_b1));
-    serve_request(&mut core, LiveRequest { identity: id_b2.clone(), state: state_a.clone(), t0_ms: clock.now_ms(), sink: sink.clone() });
+    let req = LiveRequest::admitted(&core, id_b2.clone(), state_a.clone(), clock.now_ms(), sink.clone());
+    serve_request(&mut core, req);
     let ev = events.lock().unwrap();
     let ids = ident(&ev);
     // A produced Fast and Progress only (its Final was never emitted); nothing carries B1; exactly one Final and it is B2's
@@ -111,7 +115,8 @@ fn rig(name: &str, script: Vec<FakeReply>) -> Rig {
 /// A new decision (of a new hand, as far as the identity goes), admitted and served now.
 fn serve(r: &mut Rig, state: &HandState) -> DecisionIdentity {
     let id = { let mut s = r.identity.lock().unwrap(); s.begin_hand(); s.next_decision().unwrap() };
-    serve_request(&mut r.core, LiveRequest { identity: id.clone(), state: state.clone(), t0_ms: r.clock.now_ms(), sink: r.sink.clone() });
+    let req = LiveRequest::admitted(&r.core, id.clone(), state.clone(), r.clock.now_ms(), r.sink.clone());
+    serve_request(&mut r.core, req);
     id
 }
 /// Every event of decision `id` but its `Equity` (the fast-path thread delivers that whenever it finishes).
@@ -193,6 +198,28 @@ fn a_river_best_so_far_is_logged_as_a_street_violation() {
     assert_eq!((recs.len(), recs[0].street_violation, recs[0].final_violation, recs[0].reached_bp), (1, true, false, Some(292)));
 }
 
+/// Final review I4 (orchestrator ruling F-I4; spec 9.2 snapshot compatibility, spec 12 "config changed mid-hand"): a
+/// settings change after a decision was solved allocates the next session revision but not for the hand in progress:
+/// the solved decision stays active, the hand's next decision keeps the hand's config revision, and the snapshot
+/// registered for the first decision stays compatible with it (`for_identity` matches by the identity's revision).
+#[test]
+fn a_mid_hand_config_change_leaves_the_hands_snapshots_compatible() {
+    let s = river_state();
+    let mut r = rig("mid_hand_config", vec![ack(), result(ResultStatus::Ok, solution_on(&s, "river_std_v1", 0.2))]);
+    let first = serve(&mut r, &s);
+    assert_eq!(finals(&r, &first).len(), 1);
+    let (still_active, second) = {
+        let mut ids = r.identity.lock().unwrap();
+        let session = ids.set_config();
+        assert_eq!(session, first.config_revision + 1);
+        (ids.is_active(&first), ids.next_decision().unwrap())
+    };
+    let compatible: Vec<DecisionIdentity> = r.core.snapshots.lock().unwrap().for_identity(&second).iter().map(|x| x.provenance.identity_at_solve.clone()).collect();
+    assert!(still_active, "the settings change does not supersede the hand's decision");
+    assert_eq!(second.config_revision, first.config_revision, "the hand keeps its config revision");
+    assert_eq!(compatible, vec![first], "the first decision's snapshot stays compatible");
+}
+
 /// Ruling 28-I5 (§4.4 "exploitability <= x"): the accuracy string is a true upper bound, the ceiling of the raw
 /// measurement in basis points of the solved pot computed in f64, never the rounded or saturated display value
 /// `reached_bp`: an exact whole number stays itself (0.8125 chips of 65 is exactly 125 bp), a value rounded down for
@@ -249,6 +276,44 @@ fn after_a_deadline_exceeded_final_the_busy_worker_is_killed_and_restarted() {
     assert_eq!(kills_and_restarts(&r), (1, 3));
 }
 
+/// The diagnostics records `serve_request` and the solve client wrote beside the decision log (final review M2).
+fn diagnostics(r: &Rig) -> Vec<engine::log::DiagnosticRecord> {
+    std::fs::read_to_string(r.log_dir.join("diagnostics.jsonl")).map(|t| t.lines().map(|l| serde_json::from_str(l).unwrap()).collect()).unwrap_or_default()
+}
+
+/// Final review M2 (ruling F-M2; spec 3.4: the worker's stderr is drained to the log; spec 12: a `tree_mismatch` is
+/// logged with both trees). Every kill and restart the engine makes writes a diagnostics record (`diagnostics.jsonl`,
+/// beside the decision log) naming its cause, with the worker's stderr tail, the bounded ring the link keeps; a restart
+/// that fails is recorded there with its failure, never only on stderr. A `tree_mismatch` writes the engine's tree, its
+/// materialized nodes included, beside the worker's report of where the library's tree first differs.
+#[test]
+fn restarts_kills_and_tree_mismatches_are_written_to_the_diagnostics_log() {
+    let s = river_state();
+    // attempt 0 hangs (restart), the retry hangs to the fire (the Final is the watchdog's), then the kill and a restart
+    // that fails
+    let mut r = rig("diagnostics", vec![ack(), FakeReply::Hang, ack(), FakeReply::Hang, FakeReply::SpawnFails("no worker binary".into())]);
+    r.state.lock().unwrap().stderr = "solver-worker: diag-marker".into();
+    let id = serve(&mut r, &s);
+    assert_eq!(finals(&r, &id).len(), 1);
+    let d = diagnostics(&r);
+    let seen: Vec<(&str, u64)> = d.iter().map(|x| (x.event.as_str(), x.at_ms)).collect();
+    assert_eq!(seen, [("restart", 2_500), ("kill", 14_900), ("restart", 14_900)], "{d:?}");
+    assert!(d.iter().all(|x| x.stderr_tail == "solver-worker: diag-marker"), "each record carries the worker's stderr tail: {d:?}");
+    assert!(d[0].detail.contains("no terminal result") && d[0].detail.ends_with("restarted"), "{}", d[0].detail);
+    assert!(d[1].detail.contains("watchdog"), "{}", d[1].detail);
+    assert!(d[2].detail.contains("restart failed") && d[2].detail.contains("no worker binary"), "{}", d[2].detail);
+    // a tree_mismatch: both trees
+    let mut r = rig("diagnostics_mismatch", vec![ack(), error("tree_mismatch", false, None)]);
+    let id = serve(&mut r, &s);
+    assert_eq!(finals(&r, &id).len(), 1);
+    let d = diagnostics(&r);
+    let root = core_model::street_root(&s).unwrap();
+    let tree = build_tree_full(&root, &TemplateSelection::from_history("river_std_v1", &root.history)).unwrap().tree;
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!((d[0].event.as_str(), d[0].identity.as_ref(), d[0].engine_tree.as_ref()), ("tree_mismatch", Some(&id), Some(&tree)));
+    assert!(d[0].detail.contains("tree_mismatch"), "the worker's report of the library's tree: {}", d[0].detail);
+}
+
 /// A `DeadlineExceeded` that is not the watchdog's fire (here the worker's `no_iteration`, on the first attempt and on
 /// its `_min` retry) leaves an idle worker: it is answered by the engine's own `Final` and nothing is killed or
 /// restarted.
@@ -274,7 +339,8 @@ fn a_request_for_a_decision_no_longer_active_emits_and_writes_nothing() {
     let mut stale = Vec::new();
     for state in [start, preflop, river_state()] {
         let id = { let mut s = r.identity.lock().unwrap(); s.begin_hand(); let id = s.next_decision().unwrap(); s.mutate(); id };
-        serve_request(&mut r.core, LiveRequest { identity: id.clone(), state, t0_ms: r.clock.now_ms(), sink: r.sink.clone() });
+        let req = LiveRequest::admitted(&r.core, id.clone(), state, r.clock.now_ms(), r.sink.clone());
+        serve_request(&mut r.core, req);
         stale.push(id);
     }
     let events = r.events.lock().unwrap().clone();
@@ -521,7 +587,8 @@ use std::time::Duration;
 
 fn serve_with(r: &mut Rig, state: &HandState, seams: ServeSeams) -> DecisionIdentity {
     let id = { let mut s = r.identity.lock().unwrap(); s.begin_hand(); s.next_decision().unwrap() };
-    serve_request_with(&mut r.core, LiveRequest { identity: id.clone(), state: state.clone(), t0_ms: r.clock.now_ms(), sink: r.sink.clone() }, seams);
+    let req = LiveRequest::admitted(&r.core, id.clone(), state.clone(), r.clock.now_ms(), r.sink.clone());
+    serve_request_with(&mut r.core, req, seams);
     id
 }
 /// A rig whose sink is a `FinalGate`, on the plain fake clock.
@@ -730,6 +797,27 @@ fn facing_an_allin_with_a_failed_solve_falls_back_to_the_analytic_answer_on_what
     let note = rec.assumptions.notes.iter().find(|n| n.starts_with("analytic all-in fallback")).unwrap_or_else(|| panic!("{:?}", rec.assumptions.notes));
     assert!(note.contains(", W 2005, R 5.00, "), "{note}");
     assert_eq!((solves(&r).len(), kills_and_restarts(&r)), (1, (0, 0)));
+}
+
+/// Final review M9 (spec 7: the equity phase is cancellable; ruling 28-I4): the analytic all-in fallback's hero-combo
+/// equity runs with the request's own cancellation token, the one a supersession sets, never a fresh token nothing can
+/// set. Probe: the token is set after the solve failed and before the fallback runs (the `after_active_check` seam); the
+/// fallback's equity then stops at once and yields nothing, so the request answers with the worker's failure
+/// (`Unsupported{EngineError(tree_mismatch)}`), not the analytic fold/call.
+#[test]
+fn the_analytic_allin_fallback_polls_the_requests_equity_token() {
+    let s = play(&river_state(), &[Action::Bet { to: 20 }, Action::AllIn { to: 970 }]);
+    let mut r = rig("allin_cancel", vec![ack(), error("tree_mismatch", false, None)]);
+    let tokens = r.core.equity_cancel.clone();
+    let seams = ServeSeams { after_active_check: Some(Arc::new(move || {
+        tokens.lock().unwrap().as_ref().expect("the request installed its equity token").store(true, std::sync::atomic::Ordering::SeqCst);
+    })), ..ServeSeams::default() };
+    let id = serve_with(&mut r, &s, seams);
+    let f = finals(&r, &id);
+    assert_eq!(f.len(), 1);
+    assert!(matches!(&f[0].2.coverage, Coverage::Unsupported { reason: UnsupportedReason::EngineError { message, retryable: false }, .. } if message.starts_with("tree_mismatch")),
+        "the cancelled fallback yields no analytic answer: {:?}", f[0].2.coverage);
+    assert!(f[0].2.assumptions.notes.iter().all(|n| !n.starts_with("analytic all-in fallback")), "{:?}", f[0].2.assumptions.notes);
 }
 
 // --- Follow-up P2.W3: the watchdog's fire checks that its decision is still the active one (F1), so a decision

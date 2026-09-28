@@ -15,11 +15,12 @@
 //! that could not be launched at all (`Spawn`: the binary missing, a launch fault, no `ready` in time), still fail
 //! construction.
 //!
-//! Identity (§4.4, §5 step 3). Every call that invalidates the active decision (`set_config`, `begin_hand`,
-//! `set_hero_cards`, `apply_action`, `set_board`, `undo`, `recommend`, `cancel` of the active decision, `finish_hand`,
-//! `abandon_hand`, `shutdown`) also cancels the `fast-path` equity of the request served last (ruling 28-I4, Task 28
-//! fix-Q1, ruling 29-I1), in the same hold of the identity lock (`supersede`), so no superseded request keeps its
-//! equity running.
+//! Identity (§4.4, §5 step 3). Every call that invalidates the active decision (`begin_hand`, `set_hero_cards`,
+//! `apply_action`, `set_board`, `undo`, `recommend`, `cancel` of the active decision, `finish_hand`, `abandon_hand`,
+//! `shutdown`) also cancels the `fast-path` equity of the request served last (ruling 28-I4, Task 28 fix-Q1, ruling
+//! 29-I1), in the same hold of the identity lock (`supersede`), so no superseded request keeps its equity running.
+//! `set_config` invalidates nothing: a config change is not applied to the hand in progress (spec 12), whose decisions
+//! keep the hand's config revision (final review I4, ruling F-I4).
 //!
 //! Ownership of the core and the threads (rulings 29-I2, 29-I3). `engine-main` owns the `EngineCore` outright: it is
 //! moved into that thread, never behind a lock, so no engine lock is held while `serve_request` runs a sink callback
@@ -31,14 +32,33 @@
 //! `engine-main` finishes the request in hand first: invalidated, it ends at its next identity check. Lock order: the
 //! identity lock, then the equity token slot (`serve_request` takes the slot alone); the snapshot store, the config
 //! and the range source are each locked alone.
+//!
+//! Admission (final review I1, orchestrator ruling F-I1; spec 7, spec 5 step 4). `recommend` supersedes the active
+//! decision, allocates the new one, stamps `t0` and admits the request (`serve::admit`): a request at a decision point
+//! is armed on the shared watchdog right there, before `engine-main` gets to it, so its `Final` comes at its fire
+//! whatever `engine-main` is busy with. The request then waits in the depth-1 slot. One it replaces there is never
+//! served: `engine-main` retires it (`serve::retire_unserved`), logging a `Final` its watchdog delivered, as it retires
+//! whatever is still queued when it stops.
+//!
+//! The scheduler (`engine-main`). In order: requests to retire, the pending request, and, with nothing else to do, a
+//! cancel left pending by a superseded job (`solve::await_pending_cancel`, final review I1), awaited in slices and given
+//! up for the next request as soon as one arrives. A superseded job's cancel window thus never delays the newer
+//! request's `Fast`.
+//!
+//! Panics (final review I3, ruling F-I3). `engine-main` serves each request inside `catch_unwind`: a panic is contained
+//! at that boundary (`serve::contain_panic`: the request's internal-error `Final` through its claim unless the watchdog
+//! delivered, its generation retired, the `Final` logged, the worker killed) and `engine-main` goes on serving. Should
+//! the loop end anyway, `recommend` refuses (the loop has finished, or its watchdog is stopped) rather than accept a
+//! request nothing would serve.
 use crate::clock::{Clock, SystemClock};
 use crate::core::EngineCore;
 use crate::identity::IdentityState;
 use crate::log::DecisionLog;
 use crate::ranges::{ExplicitRanges, RangeSource};
-use crate::serve::{serve_request, LiveRequest};
+use crate::serve::{admit, LiveRequest};
 use crate::snapshots::SnapshotStore;
 use crate::startup::StartupReport;
+use crate::watchdog::Watchdog;
 use crate::worker::link::{RefusedWorker, WorkerLink, WorkerLinkError};
 use crate::worker::process::ProcessWorker;
 use crate::{EngineError, EventSink};
@@ -66,7 +86,24 @@ fn validate_config(cfg: &GameConfig) -> Result<(), EngineError> {
     Ok(())
 }
 
-struct Slot { pending: Option<LiveRequest>, stop: bool }
+/// The request slot of depth 1: the newest request, those it replaced (never served, to retire), and the stop flag.
+struct Slot { pending: Option<LiveRequest>, dropped: Vec<LiveRequest>, stop: bool }
+
+/// What `engine-main` does next (see "The scheduler" in the module doc).
+enum Work {
+    /// Requests replaced in the slot before `engine-main` got to them.
+    Retire(Vec<LiveRequest>),
+    Serve(LiveRequest),
+    /// Nothing queued, and a superseded job's cancel still awaits its confirmation.
+    AwaitCancel,
+    /// `shutdown`: whatever is still queued is retired, then the loop ends.
+    Stop(Vec<LiveRequest>),
+}
+
+/// The text of a caught panic's payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload.downcast_ref::<&str>().map(|m| m.to_string()).or_else(|| payload.downcast_ref::<String>().cloned()).unwrap_or_else(|| "a panic with no message".into())
+}
 
 /// `engine-main`'s core, torn down (`EngineCore::shutdown`) when that thread ends, by `Engine::shutdown` or a panic.
 struct TornDown(EngineCore);
@@ -83,17 +120,35 @@ enum Server {
 }
 
 impl Server {
-    fn serve(&self, core: &mut EngineCore, req: LiveRequest) {
+    fn serve(&self, core: &mut EngineCore, req: &LiveRequest) {
         match self {
-            Server::Production => serve_request(core, req),
+            Server::Production => crate::serve::serve_admitted(core, req),
             #[cfg(any(test, feature = "testing"))]
-            Server::Seams(seams) => crate::serve::serve_request_with(core, req, seams.clone()),
+            Server::Seams(seams) => crate::serve::serve_admitted_with(core, req, seams),
         }
+    }
+
+    /// Serves `req` inside `catch_unwind` and contains a panic at that boundary (final review I3); the containment is
+    /// guarded the same way, so a panicking sink cannot end `engine-main` either.
+    fn serve_contained(&self, core: &mut EngineCore, req: &LiveRequest) {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.serve(core, req))) {
+            let message = panic_message(payload.as_ref());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::serve::contain_panic(core, req, &message)));
+        }
+    }
+}
+
+/// Retires requests `engine-main` never served (`serve::retire_unserved`), each guarded like a served one.
+fn retire_all(core: &mut EngineCore, reqs: Vec<LiveRequest>) {
+    for req in reqs {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::serve::retire_unserved(core, &req)));
     }
 }
 
 pub struct Engine {
     identity: Arc<Mutex<IdentityState>>, clock: Arc<dyn Clock>, snapshots: Arc<Mutex<SnapshotStore>>,
+    /// `EngineCore::watchdog`, shared: `recommend` arms each request at admission (final review I1).
+    watchdog: Arc<Watchdog>,
     shared_config: Arc<Mutex<GameConfig>>, range_source: Arc<Mutex<Box<dyn RangeSource>>>, startup: StartupReport,
     /// `EngineCore::equity_cancel`: the equity cancellation token of the request served last (ruling 28-I4).
     equity_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
@@ -103,6 +158,9 @@ pub struct Engine {
     /// Unit tests only: runs immediately before the equity token is set (ruling 29-M1).
     #[cfg(test)]
     before_equity_store: Option<Box<dyn Fn() + Send>>,
+    /// Unit tests only: the stage slot of the request admitted last (its own, final review I1), for the lock probes.
+    #[cfg(test)]
+    admitted_stage: Arc<Mutex<Option<Arc<Mutex<String>>>>>,
 }
 
 impl Engine {
@@ -139,27 +197,46 @@ impl Engine {
         let shared_config = core.config.clone();
         let range_source = core.range_source.clone();
         let equity_cancel = core.equity_cancel.clone();
+        let watchdog = core.watchdog.clone();
         let config = core.config();
         // Captured once, before the core is handed to `engine-main`, which owns it from then on.
         let startup = StartupReport::from_worker(core.worker.as_ref());
-        let slot = Arc::new((Mutex::new(Slot { pending: None, stop: false }), Condvar::new()));
+        let slot = Arc::new((Mutex::new(Slot { pending: None, dropped: vec![], stop: false }), Condvar::new()));
         let s2 = slot.clone();
         let main = std::thread::Builder::new().name("engine-main".into()).spawn(move || {
             // Owned here alone (ruling 29-I3), and torn down on every way out of this thread (ruling 29-I2).
             let mut owned = TornDown(core);
+            let queued = |slot: &Mutex<Slot>| { let g = lock(slot); g.pending.is_some() || !g.dropped.is_empty() || g.stop };
             loop {
-                let req = {
+                let work = {
                     let (m, cv) = &*s2;
                     let mut g = lock(m);
-                    while g.pending.is_none() && !g.stop { g = cv.wait(g).unwrap_or_else(|poisoned| poisoned.into_inner()); }
-                    if g.stop { return; }
-                    g.pending.take().expect("a pending request was just seen")
+                    loop {
+                        if g.stop {
+                            let mut rest = std::mem::take(&mut g.dropped);
+                            rest.extend(g.pending.take());
+                            break Work::Stop(rest);
+                        }
+                        if !g.dropped.is_empty() { break Work::Retire(std::mem::take(&mut g.dropped)); }
+                        if let Some(req) = g.pending.take() { break Work::Serve(req); }
+                        if owned.0.pending_cancel.is_some() { break Work::AwaitCancel; }
+                        g = cv.wait(g).unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
                 };
-                server.serve(&mut owned.0, req);
+                match work {
+                    Work::Retire(reqs) => retire_all(&mut owned.0, reqs),
+                    Work::Serve(req) => server.serve_contained(&mut owned.0, &req),
+                    // Given up as soon as anything is queued (the slot is checked between receive slices).
+                    Work::AwaitCancel => { crate::solve::await_pending_cancel(&mut owned.0, &mut |_| queued(&s2.0)); }
+                    Work::Stop(rest) => {
+                        retire_all(&mut owned.0, rest);
+                        return;
+                    }
+                }
             }
         }).expect("spawn engine-main");
-        Engine { identity, clock, snapshots, shared_config, range_source, startup, equity_cancel, slot, state: None, undo: vec![], config, queued_config: None,
-            main: Some(main), stopped: false, #[cfg(test)] before_equity_store: None }
+        Engine { identity, clock, snapshots, watchdog, shared_config, range_source, startup, equity_cancel, slot, state: None, undo: vec![], config,
+            queued_config: None, main: Some(main), stopped: false, #[cfg(test)] before_equity_store: None, #[cfg(test)] admitted_stage: Arc::default() }
     }
 
     /// §12 startup diagnostics for the UI; never blocks (the worker's `ready` is captured at construction,
@@ -168,10 +245,11 @@ impl Engine {
 
     /// §4.2 / §13.3: validates the config, allocates a revision and applies it — immediately when no hand is in
     /// progress, otherwise from the next `begin_hand` (the active hand keeps its frozen `HandConfig`). A rejected config
-    /// consumes no revision.
+    /// consumes no revision. Spec 12, "not applied to the active hand" (final review I4, ruling F-I4): the hand's
+    /// decisions keep the hand's config revision, so nothing is superseded, the decision in flight included.
     pub fn set_config(&mut self, cfg: GameConfig) -> Result<u32, EngineError> {
         validate_config(&cfg)?;
-        let rev = self.supersede(|ids| ids.set_config());
+        let rev = lock(&self.identity).set_config();
         let stamped = GameConfig { config_revision: rev, ..cfg };
         if self.state.is_some() { self.queued_config = Some(stamped); } else { self.apply_config(stamped); }
         Ok(rev)
@@ -213,10 +291,14 @@ impl Engine {
         let cfg = self.queued_config.as_ref().unwrap_or(&self.config);
         // `hand_id` is stamped below, once the admission has passed; `core_model` only stores it.
         let core_req = CoreBeginHand { hand_id: 0, button: req.button, hero: req.hero, dealt: req.dealt, stacks_start: req.stacks, hero_cards: req.hero_cards };
-        let s = begin_hand(&HandConfig::from_game(cfg), core_req).map_err(|e| EngineError::Rules(e.to_string()))?;
+        let s = begin_hand(&HandConfig::from_game(cfg), core_req).map_err(EngineError::Rules)?;
         if self.state.is_some() { self.end_hand(); }
         if let Some(c) = self.queued_config.take() { self.apply_config(c); }
-        let (hand_id, rev) = self.supersede(|ids| ids.begin_hand());
+        let ((hand_id, rev), hand_config_revision) = self.supersede(|ids| (ids.begin_hand(), ids.hand_config_revision()));
+        // The hand's identities carry the revision of the config it froze (ruling F-I4): the session's latest, which
+        // every accepted `set_config` stamps and this hand has just applied.
+        assert!(hand_config_revision == Some(s.config.config_revision),
+            "hand {hand_id} froze config revision {} but its identities carry {hand_config_revision:?}", s.config.config_revision);
         self.undo.clear();
         self.state = Some(self.stamp(s, hand_id, rev));
         Ok(self.state.clone().unwrap())
@@ -236,19 +318,19 @@ impl Engine {
     /// §5 step 3: a mutation like any other (fresh revision, in-flight work invalidated).
     pub fn set_hero_cards(&mut self, cards: [Card; 2]) -> Result<HandState, EngineError> {
         let cur = self.state.as_ref().ok_or(EngineError::Message("no hand".into()))?;
-        let next = set_hero_cards(cur, cards).map_err(|e| EngineError::Rules(e.to_string()))?;
+        let next = set_hero_cards(cur, cards).map_err(EngineError::Rules)?;
         Ok(self.mutate(next))
     }
 
     pub fn apply_action(&mut self, a: Action) -> Result<HandState, EngineError> {
         let cur = self.state.as_ref().ok_or(EngineError::Message("no hand".into()))?;
-        let next = apply_action(cur, a).map_err(|e| EngineError::Rules(e.to_string()))?;
+        let next = apply_action(cur, a).map_err(EngineError::Rules)?;
         Ok(self.mutate(next))
     }
 
     pub fn set_board(&mut self, cards: &[Card]) -> Result<HandState, EngineError> {
         let cur = self.state.as_ref().ok_or(EngineError::Message("no hand".into()))?;
-        let next = set_board(cur, cards).map_err(|e| EngineError::Rules(e.to_string()))?;
+        let next = set_board(cur, cards).map_err(EngineError::Rules)?;
         Ok(self.mutate(next))
     }
 
@@ -267,20 +349,38 @@ impl Engine {
     /// Plan 2 only: the public ranges at the street root (plan 3 installs a replay-backed `RangeSource` instead).
     pub fn set_explicit_ranges(&mut self, oop: Range1326, ip: Range1326) { *self.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: Some(oop), ip: Some(ip) }); }
 
-    /// Allocates the decision's identity, stamps `t0` and queues the request for `engine-main` (depth 1: an older
-    /// pending request is dropped); its events go to `sink`. Refused with no hand in progress, and once shut down.
+    /// Allocates the decision's identity, stamps `t0`, admits the request (`serve::admit`: a decision point is armed on
+    /// the watchdog here, final review I1) and queues it for `engine-main` (depth 1: an older pending request is
+    /// replaced, and `engine-main` retires it); its events go to `sink`. Refused with no hand in progress, once shut
+    /// down, and once `engine-main` has ended (final review I3): nothing would serve the request.
     pub fn recommend(&mut self, sink: Box<dyn EventSink>) -> Result<DecisionIdentity, EngineError> {
         if self.stopped { return Err(EngineError::Message("the engine is shut down".into())); }
+        if self.main.as_ref().is_none_or(|h| h.is_finished()) {
+            return Err(EngineError::Message("the engine is not running: engine-main has ended".into()));
+        }
         let state = self.state.clone().ok_or(EngineError::Message("no hand".into()))?;
         // The new decision supersedes the active one: allocated in the same identity-lock hold that cancels the equity
         // of the request served last (ruling 29-I1, 28-I4), not when `engine-main` gets to the new request.
         let identity = self.supersede(|ids| ids.next_decision()).ok_or(EngineError::Message("no hand in progress".into()))?;
         let t0_ms = self.clock.now_ms();
+        let req = match admit(&self.watchdog, &self.identity, self.config.clone(), identity.clone(), state, t0_ms, Arc::new(Mutex::new(sink))) {
+            Ok(req) => req,
+            Err(e) => {
+                // A stopped watchdog: `engine-main` has ended. The decision allocated above is withdrawn with the request.
+                let mut ids = lock(&self.identity);
+                if ids.is_active(&identity) { ids.cancel_active(); }
+                return Err(e);
+            }
+        };
+        #[cfg(test)]
+        { *lock(&self.admitted_stage) = req.watch.as_ref().map(|w| w.stage.clone()); }
         let (m, cv) = &*self.slot;
-        let dropped = lock(m).pending.replace(LiveRequest { identity: identity.clone(), state, t0_ms, sink: Arc::new(Mutex::new(sink)) });
+        {
+            let mut g = lock(m);
+            // Depth 1, newest wins: an older request still pending is replaced, and retired by `engine-main`.
+            if let Some(older) = g.pending.replace(req) { g.dropped.push(older); }
+        }
         cv.notify_one();
-        // Depth 1, newest wins: an older request still pending is dropped (its sink with it), outside the slot's lock.
-        drop(dropped);
         Ok(identity)
     }
 
@@ -312,15 +412,15 @@ impl Engine {
     /// `&mut self` and idempotent: Tauri managed state cannot move out of the handle (spec §3.5); a second call does
     /// nothing. In order (ruling 29-I2): the hand is invalidated and the last request's equity cancelled (one identity
     /// hold), so a request still running stops at its next identity check rather than at its deadline; scheduling stops
-    /// (a pending request is dropped); then `engine-main` is joined, holding no lock, and on its way out it tears the core
-    /// down (`EngineCore::shutdown`: the watchdog's and the requests' threads woken and joined, then the worker told to
-    /// shut down and killed). When this returns, no thread the engine started is running and the worker is gone.
+    /// (`engine-main` retires whatever is still queued, logging a `Final` a queued request's watchdog delivered); then
+    /// `engine-main` is joined, holding no lock, and on its way out it tears the core down (`EngineCore::shutdown`: the
+    /// watchdog's and the requests' threads woken and joined, then the worker told to shut down and killed). When this
+    /// returns, no thread the engine started is running and the worker is gone.
     pub fn shutdown(&mut self) {
         if self.stopped { return; }
         self.stopped = true;
         self.supersede(|ids| ids.invalidate_hand());
-        let dropped = { let (m, cv) = &*self.slot; let mut g = lock(m); g.stop = true; cv.notify_all(); g.pending.take() };
-        drop(dropped);
+        { let (m, cv) = &*self.slot; lock(m).stop = true; cv.notify_all(); }
         if let Some(h) = self.main.take() { let _ = h.join(); }
     }
 }
@@ -384,7 +484,8 @@ mod tests {
             assert_eq!(seen, vec![true; stores], "{what}: the token is set with the identity lock held");
             assert_eq!(token.load(Ordering::SeqCst), stores > 0, "{what}: the token is set exactly when the decision is superseded");
         };
-        check(&mut e, "set_config", 1, &|e| { e.set_config(cfg.clone()).unwrap(); });
+        // Ruling F-I4: a settings change supersedes nothing (the hand keeps its config revision), so it stores nothing.
+        check(&mut e, "set_config", 0, &|e| { e.set_config(cfg.clone()).unwrap(); });
         check(&mut e, "begin_hand", 1, &|e| { e.begin_hand(begin()).unwrap(); });
         check(&mut e, "begin_hand over a hand in progress", 2, &|e| { e.begin_hand(begin()).unwrap(); });
         check(&mut e, "set_hero_cards", 1, &|e| { e.set_hero_cards([Card::parse("Ks").unwrap(), Card::parse("Kd").unwrap()]).unwrap(); });
@@ -404,6 +505,39 @@ mod tests {
         check(&mut e, "set_board", 1, &|e| { e.set_board(&cards("Kh 7d 2c")).unwrap(); });
         check(&mut e, "abandon_hand", 1, &|e| e.abandon_hand());
         check(&mut e, "shutdown", 1, &|e| e.shutdown());
+    }
+
+    /// Final review I3 (ruling F-I3): once `engine-main` has ended other than by `shutdown` (a panic beyond its
+    /// containment; here its loop is stopped under the engine's feet, which tears its core down and stops the watchdog),
+    /// `recommend` refuses: nothing would serve the request. It refuses too when the watchdog is stopped while the loop
+    /// is still running (the teardown under way), and then withdraws the decision it allocated: no decision is left
+    /// active for a request nothing serves.
+    #[test]
+    fn recommend_refuses_once_engine_main_has_ended() {
+        struct Nothing;
+        impl EventSink for Nothing { fn emit(&mut self, _ev: RecommendationEvent) {} }
+        let (cfg, _) = cfg_1_2();
+        // The watchdog stopped under a running loop: the decision allocated is withdrawn.
+        let mut e = Engine::with_core(core());
+        e.set_config(cfg.clone()).unwrap();
+        e.begin_hand(begin()).unwrap();
+        for a in [Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold] { e.apply_action(a).unwrap(); } // hero to act: a decision point
+        e.watchdog.stop();
+        let refused = e.recommend(Box::new(Nothing));
+        assert!(matches!(refused, Err(EngineError::Message(ref m)) if m.contains("not running")), "{refused:?}");
+        assert!(e.identity.lock().unwrap().active().is_none(), "no decision is left active for a request nothing serves");
+        e.shutdown();
+        // The loop ended.
+        let mut e = Engine::with_core(core());
+        e.set_config(cfg).unwrap();
+        e.begin_hand(begin()).unwrap();
+        for a in [Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold] { e.apply_action(a).unwrap(); } // hero to act: a decision point
+        { let (m, cv) = &*e.slot; lock(m).stop = true; cv.notify_all(); }
+        e.main.take().expect("engine-main runs").join().expect("engine-main ended without a panic");
+        let refused = e.recommend(Box::new(Nothing));
+        assert!(matches!(refused, Err(EngineError::Message(ref m)) if m.contains("not running")), "{refused:?}");
+        assert!(e.identity.lock().unwrap().active().is_none());
+        e.shutdown();
     }
 
     /// A flop snapshot of the engine's current hand, solved for decision `decision_id` at `prefix` (plan 3 Task 14).
@@ -462,14 +596,17 @@ mod tests {
     }
 
     /// Named `try_lock` probes of every engine lock (ruling 28-I1: identity, snapshot store, config, range source, and
-    /// the equity token slot and the stage the core shares), run inside a sink callback. The `EngineCore` itself has no
-    /// lock to probe: `engine-main` owns it outright (ruling 29-I3); before that change this list also probed the
-    /// `Arc<Mutex<EngineCore>>` guard `engine-main` held across `serve_request`, and found it held.
+    /// the equity token slot and the stage slot the request shares with its watchdog: its own since admission, final
+    /// review I1), run inside a sink callback. The `EngineCore` itself has no lock to probe: `engine-main` owns it
+    /// outright (ruling 29-I3); before that change this list also probed the `Arc<Mutex<EngineCore>>` guard `engine-main`
+    /// held across `serve_request`, and found it held.
     type Probes = Vec<(&'static str, Box<dyn Fn() -> bool + Send>)>;
-    fn probes(e: &Engine, stage: &Arc<Mutex<String>>) -> Probes {
+    fn probes(e: &Engine) -> Probes {
         fn free<T: ?Sized + Send + 'static>(m: &Arc<Mutex<T>>) -> Box<dyn Fn() -> bool + Send> { let m = m.clone(); Box::new(move || m.try_lock().is_ok()) }
+        let admitted = e.admitted_stage.clone();
+        let stage: Box<dyn Fn() -> bool + Send> = Box::new(move || admitted.lock().unwrap().as_ref().expect("the request was admitted with a stage slot").try_lock().is_ok());
         vec![("identity", free(&e.identity)), ("snapshots", free(&e.snapshots)), ("config", free(&e.shared_config)), ("range source", free(&e.range_source)),
-            ("equity token slot", free(&e.equity_cancel)), ("stage", free(stage))]
+            ("equity token slot", free(&e.equity_cancel)), ("stage", stage)]
     }
     /// Runs its probes in its first callback and reports that event and which locks were free.
     type Report = (RecommendationEvent, Vec<(&'static str, bool)>);
@@ -491,13 +628,12 @@ mod tests {
     fn no_engine_lock_is_held_during_a_sink_callback() {
         let (cfg, _) = cfg_1_2();
         let core = core();
-        let stage = core.stage.clone();
         let mut e = Engine::with_core(core);
         e.set_config(cfg).unwrap();
         e.begin_hand(begin()).unwrap();
         for a in [Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold] { e.apply_action(a).unwrap(); }
         let (tx, rx) = mpsc::channel();
-        e.recommend(Box::new(Probe { probes: probes(&e, &stage), report: Some(tx) })).unwrap();
+        e.recommend(Box::new(Probe { probes: probes(&e), report: Some(tx) })).unwrap();
         let preflop_final = rx.recv_timeout(ACK_LIVENESS).expect("hero's preflop decision was answered");
         to_the_river(&mut e);
         let board = cards("Kh 7d 2c 4d 9s");
@@ -505,7 +641,7 @@ mod tests {
         for (i, w) in full.0.iter_mut().enumerate() { let [a, b] = proto::combo_cards(i as u16); if board.contains(&a) || board.contains(&b) { *w = 0.0; } }
         e.set_explicit_ranges(full.clone(), full);
         let (tx, rx) = mpsc::channel();
-        e.recommend(Box::new(Probe { probes: probes(&e, &stage), report: Some(tx) })).unwrap();
+        e.recommend(Box::new(Probe { probes: probes(&e), report: Some(tx) })).unwrap();
         let river_fast = rx.recv_timeout(ACK_LIVENESS).expect("the river request's Fast was handed over");
         e.shutdown();
         assert!(matches!(preflop_final.0, RecommendationEvent::Final(_)), "hero's preflop decision was answered by its Final: {:?}", preflop_final.0);

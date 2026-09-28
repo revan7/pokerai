@@ -6,6 +6,13 @@
 //! `EngineCore` (Task 22) owns a `DecisionLog` as its fourth constructor argument, so this module
 //! is built first and its public shape does not change afterwards (cross-plan section 4).
 //!
+//! Diagnostics (final review M2; spec 3.4, the worker's stderr is drained to the log; spec 12, a
+//! `tree_mismatch` is logged with both trees). Beside the decisions, the same directory keeps
+//! `diagnostics.jsonl` (rotated the same way): one `DiagnosticRecord` for every kill and restart
+//! of the worker the engine makes, with its cause and the worker's bounded stderr tail, for every
+//! `tree_mismatch`, with the engine's tree, and for a panic `engine-main` contained. Nothing of
+//! these paths goes to the process's stderr, which a windowed app does not show.
+//!
 //! Most fields on `DecisionRecord`/`InputRecord` are plain integer/bool/`String`s with no numeric
 //! domain of their own, or a nested `proto` type (`DecisionIdentity`, `Street`, `Coverage`,
 //! `ApproxReason`, `HandConfig`, `Seat`, `Card`, `TakenAction`) that already carries its own
@@ -37,7 +44,7 @@
 //! into range the way `f64 -> f32` narrowing can round a near-boundary value inward), so the
 //! domain check here only has to run after that already-exact deserialize.
 
-use proto::{ApproxReason, Card, Coverage, DecisionIdentity, HandConfig, HandState, Seat, Street, TakenAction};
+use proto::{ApproxReason, Card, Coverage, DecisionIdentity, EffectiveTree, HandConfig, HandState, Seat, Street, TakenAction};
 use serde::de::Error as DeError;
 use serde::ser::Error as SerError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -231,9 +238,39 @@ impl<'de> Deserialize<'de> for DecisionRecord {
     }
 }
 
+/// One diagnostics record (final review M2): what the engine did to the worker, or saw go wrong,
+/// and why, with what it knew then. `diagnostics.jsonl` beside the decisions; see the module doc.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticRecord {
+    /// Engine-clock milliseconds when it happened.
+    pub at_ms: u64,
+    /// `kill`, `restart`, `tree_mismatch` or `panic`.
+    pub event: String,
+    /// The decision concerned, when one is.
+    pub identity: Option<DecisionIdentity>,
+    /// What happened and why, in words: the cause, and a restart's outcome (`restarted`, or `restart failed: ..`); for a
+    /// `tree_mismatch`, the worker's report of where the library's realized tree first differs from the engine's.
+    pub detail: String,
+    /// The worker's stderr output at that point, bounded by the link's ring (§3.4, 64 KiB); empty when the link has
+    /// none.
+    pub stderr_tail: String,
+    /// A `tree_mismatch`'s engine tree, its materialized nodes included (spec 12: logged with both trees; the library's
+    /// side is the worker's, in `detail` and on its stderr).
+    pub engine_tree: Option<EffectiveTree>,
+}
+
+/// The two record files of a log directory, each rotated on its own (`decisions`, `diagnostics`).
+#[derive(Clone, Copy)]
+enum Stem { Decisions, Diagnostics }
+
+impl Stem {
+    fn name(self) -> &'static str { match self { Stem::Decisions => "decisions", Stem::Diagnostics => "diagnostics" } }
+}
+
 /// Appends `DecisionRecord`s as newline-delimited JSON (LF only), rotating `decisions.jsonl` at
-/// `rotate_bytes` and keeping at most `keep` files. Append-only: an existing line is never
-/// rewritten, only rotated whole-file.
+/// `rotate_bytes` and keeping at most `keep` files, and `DiagnosticRecord`s to
+/// `diagnostics.jsonl` the same way. Append-only: an existing line is never rewritten, only
+/// rotated whole-file.
 pub struct DecisionLog {
     dir: PathBuf,
     rotate_bytes: u64,
@@ -259,8 +296,9 @@ impl DecisionLog {
         Self { dir: dir.to_path_buf(), rotate_bytes, keep, failed_once: false }
     }
 
-    fn path(&self, k: usize) -> PathBuf {
-        if k == 0 { self.dir.join("decisions.jsonl") } else { self.dir.join(format!("decisions.{k}.jsonl")) }
+    fn path_of(&self, stem: Stem, k: usize) -> PathBuf {
+        let stem = stem.name();
+        if k == 0 { self.dir.join(format!("{stem}.jsonl")) } else { self.dir.join(format!("{stem}.{k}.jsonl")) }
     }
 
     /// Shifts `decisions.{k}.jsonl` -> `decisions.{k+1}.jsonl` for every kept file, dropping
@@ -274,16 +312,16 @@ impl DecisionLog {
     /// unconditionally (as a first pass did) would let `rotate` report success while the
     /// oversized file it was supposed to remove is still sitting there, so the caller's `append`
     /// would go on to write past the rotation threshold indefinitely.
-    fn rotate(&self) -> std::io::Result<()> {
-        match std::fs::remove_file(self.path(self.keep - 1)) {
+    fn rotate(&self, stem: Stem) -> std::io::Result<()> {
+        match std::fs::remove_file(self.path_of(stem, self.keep - 1)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
         for k in (1..self.keep).rev() {
-            let from = self.path(k - 1);
+            let from = self.path_of(stem, k - 1);
             if from.exists() {
-                std::fs::rename(&from, self.path(k))?;
+                std::fs::rename(&from, self.path_of(stem, k))?;
             }
         }
         Ok(())
@@ -296,19 +334,35 @@ impl DecisionLog {
     /// instance is reported to stderr, and every failure after that in the same session is
     /// silent.
     pub fn append(&mut self, rec: &DecisionRecord) {
+        let line = serde_json::to_string(rec).map_err(std::io::Error::other);
+        self.write_line(Stem::Decisions, line);
+    }
+
+    /// Appends one diagnostics record to `diagnostics.jsonl` (final review M2), rotated and reported
+    /// on failure exactly as `append` is.
+    pub fn diagnostic(&mut self, rec: &DiagnosticRecord) {
+        let line = serde_json::to_string(rec).map_err(std::io::Error::other);
+        self.write_line(Stem::Diagnostics, line);
+    }
+
+    /// One JSON line appended to `stem`'s live file, rotating it first once it is at or over the
+    /// threshold. A write failure never propagates (the log is diagnostic); the first of the session
+    /// is reported to stderr, the only place left to report the log's own directory failing.
+    fn write_line(&mut self, stem: Stem, line: std::io::Result<String>) {
         let result = (|| -> std::io::Result<()> {
+            let line = line?;
             std::fs::create_dir_all(&self.dir)?;
-            let current = self.path(0);
+            let current = self.path_of(stem, 0);
             if current.exists() && std::fs::metadata(&current)?.len() >= self.rotate_bytes {
-                self.rotate()?;
+                self.rotate(stem)?;
             }
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&current)?;
-            f.write_all(serde_json::to_string(rec).map_err(std::io::Error::other)?.as_bytes())?;
+            f.write_all(line.as_bytes())?;
             f.write_all(b"\n")
         })();
         if let Err(e) = result {
             if !self.failed_once {
-                eprintln!("decision log write failed (further failures this session are not reported): {e}");
+                eprintln!("{} log write failed (further failures this session are not reported): {e}", stem.name());
                 self.failed_once = true;
             }
         }

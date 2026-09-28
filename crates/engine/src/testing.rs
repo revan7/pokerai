@@ -337,6 +337,8 @@ pub struct FakeState {
     pub last_solve_id: Option<String>,
     /// The `target` of every `cancel` sent, in order.
     pub cancels: Vec<String>,
+    /// What the worker's stderr ring holds, set by the test: `WorkerLink::stderr_tail` answers it.
+    pub stderr: String,
 }
 
 /// Where the scripted worker process stands.
@@ -753,6 +755,8 @@ impl WorkerLink for FakeWorker {
     }
 
     fn ready(&self) -> Option<&Ready> { self.ready.as_ref() }
+
+    fn stderr_tail(&self) -> String { lock(&self.state).stderr.clone() }
 }
 
 /// One event as a `RecordingSink` saw it: when (fake clock) and how many kills the fake worker had had by then.

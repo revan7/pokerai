@@ -117,7 +117,10 @@ fn every_invalidation_cancels_the_equity_of_the_request_it_supersedes() {
     cancels(&mut e, &tokens, "set_hero_cards", |e| { e.set_hero_cards([c("Ah"), c("Ad")]).unwrap(); });
     cancels(&mut e, &tokens, "apply_action", |e| { e.apply_action(Action::Fold).unwrap(); });
     cancels(&mut e, &tokens, "undo", |e| { e.undo().unwrap(); });
-    cancels(&mut e, &tokens, "set_config", |e| { e.set_config(cfg.clone()).unwrap(); });
+    // Ruling F-I4: a settings change mid-hand supersedes nothing, so it cancels nothing.
+    let (_, token) = served(&mut e, &tokens);
+    e.set_config(cfg.clone()).unwrap();
+    assert!(!token.load(Ordering::SeqCst), "set_config: a mid-hand settings change does not cancel the decision's equity");
     let (active, token) = served(&mut e, &tokens);
     e.cancel(active.decision_id + 1);
     assert!(!token.load(Ordering::SeqCst), "cancelling a decision that is not the active one changes nothing");
@@ -283,6 +286,288 @@ fn shutdown_joins_every_thread_the_engine_started_then_kills_the_worker() {
     assert_eq!(again, (1, sent), "a second shutdown does nothing");
 }
 
+/// A recording sink whose first event holds `engine-main` inside the callback until the test releases it (bounded by
+/// the liveness allowance, and released at once if the test drops the sender); every event is recorded and acknowledged
+/// to the `Recorder`.
+struct HeldRecorder { inner: RecordingSink, entered: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>, held: bool }
+impl engine::EventSink for HeldRecorder {
+    fn emit(&mut self, ev: proto::RecommendationEvent) {
+        self.inner.emit(ev);
+        if !self.held {
+            self.held = true;
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(engine::testing::ACK_LIVENESS);
+        }
+    }
+}
+
+/// The `Final` a river request recorded: its events are its `Fast`, its `Equity` (in either order with the `Final`) and
+/// its `Final`, so the wait grows until the `Final` is among them (each wait bounded by the liveness allowance).
+fn final_of(recorder: &engine::testing::Recorder) -> Option<proto::Recommendation> {
+    (2..=3).find_map(|n| recorder.wait_for(n).into_iter().find_map(|r| match r.event { proto::RecommendationEvent::Final(f) => Some(f), _ => None }))
+}
+
+/// Final review I4 (orchestrator ruling F-I4; spec 4.2, spec 12: a config changed mid-hand is not applied to the active
+/// hand). A decision carries its hand's `HandConfig.config_revision`. A settings change landing while a river decision
+/// is in flight (held in its `Fast` callback) allocates the next session revision without cancelling that decision: it
+/// stays active, its equity is not cancelled, and its solve is answered and registered. The hand's next decision keeps
+/// the hand's revision, so the snapshot solved earlier in the hand stays compatible (plan 3's `for_identity` matches by
+/// the identity's config revision); the next hand takes the new revision and the new stakes.
+#[test]
+fn a_mid_hand_settings_change_keeps_the_hands_config_revision() {
+    use engine::testing::{uniform_solution, IdRef};
+    use proto::worker::{AckStatus, ResultStatus};
+    let state = river_state();
+    let root = core_model::street_root(&state).unwrap();
+    let build = engine::tree::build_tree_full(&root, &engine::tree::TemplateSelection::from_history("river_std_v1", &root.history)).unwrap();
+    let solution = uniform_solution(&build.tree, &build.history, 0.2);
+    let answer = || vec![FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None },
+        FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(solution.clone()), error: None, elapsed_ms: 3 }];
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let (worker, _fake) = FakeWorker::scripted(clock.clone(), identity.clone(), [answer(), answer()].concat());
+    let core = EngineCore::new(worker, clock.clone(), identity.clone(), DecisionLog::open(&std::env::temp_dir().join("pokerai_engine_api_log")));
+    let (snapshots, tokens) = (core.snapshots.clone(), core.equity_cancel.clone());
+    let mut e = Engine::with_core(core);
+    let (mut cfg, _) = cfg_1_2();
+    let rev1 = e.set_config(cfg.clone()).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let s = river_via(&mut e);
+    assert_eq!(s.config.config_revision, rev1);
+    e.set_explicit_ranges(full(&s.board), full(&s.board));
+    // decision 1, held in its `Fast` callback while the settings change lands
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let (inner, first_events) = RecordingSink::notifying(clock.clone(), None);
+    let first = e.recommend(Box::new(HeldRecorder { inner, entered: entered_tx, release: release_rx, held: false })).unwrap();
+    let reached = entered.recv_timeout(engine::testing::ACK_LIVENESS).is_ok();
+    cfg.bb_chips = 20;
+    let rev2 = e.set_config(cfg).unwrap();
+    let still_active = identity.lock().unwrap().is_active(&first);
+    let equity_cancelled = tokens.lock().unwrap().as_ref().map(|t| t.load(Ordering::SeqCst));
+    let _ = release.send(());
+    let first_final = final_of(&first_events);
+    // decision 2 of the same hand
+    let (sink, second_events) = RecordingSink::notifying(clock.clone(), None);
+    let second = e.recommend(Box::new(sink)).unwrap();
+    let compatible = snapshots.lock().unwrap().for_identity(&second).iter().map(|x| x.provenance.identity_at_solve.clone()).collect::<Vec<_>>();
+    final_of(&second_events);
+    // the next hand
+    e.finish_hand();
+    let next = e.begin_hand(begin()).unwrap();
+    let (sink, _) = RecordingSink::new(clock.clone(), None);
+    let third = e.recommend(Box::new(sink)).unwrap();
+    e.shutdown();
+    assert!(reached, "decision 1 reached its Fast callback");
+    assert_eq!((rev2, first.config_revision), (rev1 + 1, rev1));
+    assert!(still_active, "a mid-hand settings change does not cancel the decision in flight");
+    assert_eq!(equity_cancelled, Some(false), "nor its equity");
+    assert!(matches!(first_final, Some(ref f) if f.identity == first && f.coverage == proto::Coverage::Exact), "decision 1 is answered: {first_final:?}");
+    assert_eq!(second.config_revision, rev1, "the hand's next decision keeps the hand's config revision");
+    assert_eq!(compatible, vec![first.clone()], "the snapshot solved earlier in the hand stays compatible");
+    assert_eq!((next.config.config_revision, next.config.bb_chips, third.config_revision), (rev2, 20, rev2), "the next hand takes the new revision");
+}
+
+/// The scripted worker behind a link that paces `engine-main` for the admission-time watchdog tests: the first receive
+/// that returns at or after `pause_at_ms` acknowledges it (`paused`) and waits for the test (`resume`, bounded by the
+/// liveness allowance), so the test admits a request at exactly that time; and every restart first spends
+/// `restart_ms` of fake time, as a restart whose first launch misses the startup timeout and needs its retry launch
+/// does (spec 4.5: `START_ATTEMPTS` launches of up to `STARTUP_TIMEOUT` each).
+struct Paced {
+    inner: Box<dyn engine::worker::link::WorkerLink>, clock: Arc<FakeClock>, pause_at_ms: Option<u64>, restart_ms: u64,
+    paused: std::sync::mpsc::Sender<()>, resume: std::sync::mpsc::Receiver<()>,
+}
+impl engine::worker::link::WorkerLink for Paced {
+    fn send(&mut self, msg: &proto::worker::EngineMessage) -> Result<(), engine::worker::link::WorkerLinkError> { self.inner.send(msg) }
+    fn recv(&mut self, timeout: std::time::Duration) -> Result<Option<proto::worker::WorkerMessage>, engine::worker::link::WorkerLinkError> {
+        use engine::clock::Clock;
+        let got = self.inner.recv(timeout);
+        if self.pause_at_ms.is_some_and(|at| self.clock.now_ms() >= at) {
+            self.pause_at_ms = None;
+            let _ = self.paused.send(());
+            let _ = self.resume.recv_timeout(engine::testing::ACK_LIVENESS);
+        }
+        got
+    }
+    fn restart(&mut self) -> Result<(), engine::worker::link::WorkerLinkError> { self.clock.advance_ms(self.restart_ms); self.inner.restart() }
+    fn kill(&mut self) { self.inner.kill() }
+    fn ready(&self) -> Option<&proto::worker::Ready> { self.inner.ready() }
+}
+
+/// Every event of a recording's, by kind, with the fake time it was recorded at.
+fn kinds_at(events: &[engine::testing::Recorded]) -> Vec<(&'static str, u64)> {
+    events.iter().map(|r| (match r.event { proto::RecommendationEvent::Fast(_) => "Fast", proto::RecommendationEvent::Final(_) => "Final",
+        proto::RecommendationEvent::Equity { .. } => "Equity", proto::RecommendationEvent::Progress { .. } => "Progress",
+        proto::RecommendationEvent::Provisional(_) => "Provisional", proto::RecommendationEvent::NoDecision { .. } => "NoDecision" }, r.at_ms)).collect()
+}
+
+/// Final review I1 (orchestrator ruling F-I1; spec 7: `Fast` within 0.3 s, a watchdog independent of the worker client
+/// that delivers the `Final` by final delivery - 100 ms; spec 5 step 4: a newer request supersedes the one before it at
+/// request time). Request A's river solve hangs in `Building` (no progress, so no heartbeat). B is recommended at t0A +
+/// 100 ms, while A's receive is in progress. `engine-main` notices A's supersession within one receive slice, sends A's
+/// cancel, and gives way to B at once: B's `Fast` goes out at t0B, not behind A's cancel window. Before anything of B is
+/// sent, A's cancel is settled: never confirmed (the worker is hung), the worker is killed at the end of A's 1.5 s
+/// window and restarted, and the restart needs its retry launch (10 s of fake time). B's first attempt then has no room
+/// (ruling F-M8): its `_min` retry is admitted and hangs too. B's watchdog, armed when B was admitted, delivers B's
+/// `Final` at t0B + 14.9 s, `DeadlineExceeded{building}`; A gets no `Final`.
+#[test]
+fn a_request_admitted_behind_a_hung_solve_gets_its_fast_at_once_and_its_final_by_its_own_watchdog() {
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let ack = || FakeReply::Ack { id: engine::testing::IdRef::Last, status: proto::worker::AckStatus::Accepted, reason: None };
+    let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), vec![ack(), FakeReply::Hang, ack(), FakeReply::Hang]);
+    let (paused_tx, paused) = std::sync::mpsc::channel();
+    let (resume, resume_rx) = std::sync::mpsc::channel();
+    let link = Paced { inner: worker, clock: clock.clone(), pause_at_ms: Some(100), restart_ms: 10_000, paused: paused_tx, resume: resume_rx };
+    let log_dir = std::env::temp_dir().join(format!("pokerai_engine_api_i1_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let mut e = Engine::with_core(EngineCore::new(Box::new(link), clock.clone(), identity, DecisionLog::open(&log_dir)));
+    let (cfg, _) = cfg_1_2();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let s = river_via(&mut e);
+    e.set_explicit_ranges(full(&s.board), full(&s.board));
+    let (sink, a_events) = RecordingSink::notifying(clock.clone(), None);
+    let a = e.recommend(Box::new(sink)).unwrap();
+    let paused_in_a = paused.recv_timeout(engine::testing::ACK_LIVENESS).is_ok();
+    use engine::clock::Clock;
+    let t0b = clock.now_ms();
+    let (sink, b_events) = RecordingSink::notifying(clock.clone(), None);
+    let b = e.recommend(Box::new(sink)).unwrap();
+    let _ = resume.send(());
+    let b_final = final_of(&b_events);
+    let b_seen = kinds_at(&b_events.recorded());
+    e.shutdown();
+    let a_seen = kinds_at(&a_events.recorded());
+    let (kills, restarts, cancels) = { let f = fake.lock().unwrap(); (f.kills, f.restarts, f.cancels.len()) };
+    assert!(paused_in_a, "A's receive returned at 100 ms");
+    assert_eq!(t0b, 100, "B was admitted at t0A + 100 ms, while A's receive was in progress");
+    assert!(b.decision_id > a.decision_id);
+    let b_fast = b_seen.iter().find(|(k, _)| *k == "Fast").map(|(_, at)| *at);
+    assert_eq!(b_fast, Some(t0b), "B's Fast is not delayed behind A's cancel window (spec 7: within 0.3 s): {b_seen:?}");
+    let b_final = b_final.expect("B was answered");
+    let b_final_at = b_seen.iter().find(|(k, _)| *k == "Final").map(|(_, at)| *at);
+    assert_eq!((b_final_at, &b_final.coverage), (Some(t0b + 14_900), &proto::Coverage::Unsupported { reason: proto::UnsupportedReason::DeadlineExceeded { stage: "building".into() }, partial: vec![] }),
+        "B's Final at t0B + 14.9 s");
+    assert!(a_seen.iter().all(|(k, _)| *k != "Final"), "the superseded A gets no Final: {a_seen:?}");
+    assert_eq!(cancels, 1, "A's running job was cancelled");
+    assert!(kills >= 1 && restarts >= 1, "A's unconfirmed cancel ended in a kill and a restart: {kills} kills, {restarts} restarts");
+}
+
+/// Final review I1 (a) (spec 7: a watchdog independent of the worker client and of `engine-main`): the watchdog is
+/// armed when a request is admitted, not when `engine-main` gets to it. Request A (hero's preflop decision) holds
+/// `engine-main` inside its sink callback; request B, a river decision, is admitted meanwhile and waits behind it. With
+/// `engine-main` still held, B's watchdog delivers B's `Final` at t0B + 14.9 s. Released, `engine-main` serves B: nothing
+/// but an `Equity` follows B's delivered `Final` (ruling 28-N1), and the decision log records that `Final`, the
+/// watchdog's, as B's.
+#[test]
+fn a_request_waiting_behind_engine_main_is_watched_from_its_admission() {
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let (worker, _fake) = FakeWorker::scripted(clock.clone(), identity.clone(), vec![FakeReply::Hang]);
+    let log_dir = std::env::temp_dir().join(format!("pokerai_engine_api_i1a_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let mut e = Engine::with_core(EngineCore::new(worker, clock.clone(), identity, DecisionLog::open(&log_dir)));
+    let (cfg, _) = cfg_1_2();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    hero_preflop_via(&mut e);
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let (inner, _a_events) = RecordingSink::notifying(clock.clone(), None);
+    e.recommend(Box::new(HeldRecorder { inner, entered: entered_tx, release: release_rx, held: false })).unwrap();
+    let held = entered.recv_timeout(engine::testing::ACK_LIVENESS).is_ok();
+    let river = river_after_hero_preflop(&mut e);
+    e.set_explicit_ranges(full(&river.board), full(&river.board));
+    use engine::clock::Clock;
+    let t0b = clock.now_ms();
+    let (sink, b_events) = RecordingSink::notifying(clock.clone(), None);
+    let b = e.recommend(Box::new(sink)).unwrap();
+    clock.set_ms(t0b + 14_900);
+    let first = b_events.wait_for(1).into_iter().next().map(|r| (r.at_ms, r.event));
+    let _ = release.send(());
+    e.shutdown();
+    let b_seen = kinds_at(&b_events.recorded());
+    let records: Vec<engine::log::DecisionRecord> = std::fs::read_to_string(log_dir.join("decisions.jsonl")).map(|t| t.lines().map(|l| serde_json::from_str(l).unwrap()).collect()).unwrap_or_default();
+    assert!(held, "A held engine-main in its sink callback");
+    let deadline_exceeded = |r: &proto::Recommendation| matches!(r.coverage, proto::Coverage::Unsupported { reason: proto::UnsupportedReason::DeadlineExceeded { .. }, .. });
+    assert!(matches!(&first, Some((at, proto::RecommendationEvent::Final(r))) if *at == t0b + 14_900 && r.identity == b && deadline_exceeded(r)),
+        "B's watchdog delivered B's Final at t0B + 14.9 s while engine-main was held: {first:?}");
+    assert!(b_seen.iter().skip(1).all(|(k, _)| *k == "Equity"), "nothing but an Equity follows B's delivered Final: {b_seen:?}");
+    let b_record = records.iter().find(|r| r.identity == b).expect("B's Final is logged");
+    assert!(b_record.final_violation && matches!(b_record.coverage, proto::Coverage::Unsupported { reason: proto::UnsupportedReason::DeadlineExceeded { .. }, .. }),
+        "the watchdog's Final is the one logged: {b_record:?}");
+    assert_eq!(records.iter().filter(|r| r.identity == b).count(), 1, "exactly once");
+}
+
+/// Final review I3 (orchestrator ruling F-I3; spec 7: one `Final` per request by its final delivery). A panic on
+/// `engine-main` while it serves a request (a seam that panics once, right after the request's `Fast`, standing for any
+/// always-on assert of an internal invariant) is contained at the request boundary: the request is answered by a
+/// non-retryable `Unsupported{EngineError("internal: ..")}` `Final` through its claim, its legal intervals kept; its
+/// watchdog generation is retired (no second `Final` at the fire); that `Final` is logged; the worker, which may be
+/// running the request's job, is killed; and `engine-main` keeps serving: the next request is answered, its solve
+/// relaunching the worker once.
+#[test]
+fn a_panic_while_serving_is_contained_and_the_engine_keeps_serving() {
+    use engine::serve::ServeSeams;
+    use engine::testing::{uniform_solution, IdRef};
+    use proto::worker::{AckStatus, ResultStatus};
+    let state = river_state();
+    let root = core_model::street_root(&state).unwrap();
+    let build = engine::tree::build_tree_full(&root, &engine::tree::TemplateSelection::from_history("river_std_v1", &root.history)).unwrap();
+    let solution = uniform_solution(&build.tree, &build.history, 0.2);
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let script = vec![FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None },
+        FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(solution), error: None, elapsed_ms: 3 }];
+    let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
+    let log_dir = std::env::temp_dir().join(format!("pokerai_engine_api_i3_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let core = EngineCore::new(worker, clock.clone(), identity, DecisionLog::open(&log_dir));
+    let ended = core.watchdog.ended_threads();
+    let panicked = Arc::new(AtomicBool::new(false));
+    let once = panicked.clone();
+    let seams = ServeSeams { after_fast: Some(Arc::new(move || if !once.swap(true, Ordering::SeqCst) { panic!("seam: an internal invariant broke") })), ..ServeSeams::default() };
+    let mut e = Engine::with_core_and_seams(core, seams);
+    let (cfg, _) = cfg_1_2();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let s = river_via(&mut e);
+    e.set_explicit_ranges(full(&s.board), full(&s.board));
+    let (sink, first_events) = RecordingSink::notifying(clock.clone(), None);
+    let first = e.recommend(Box::new(sink)).unwrap();
+    let first_final = final_of(&first_events);
+    let (sink, second_events) = RecordingSink::notifying(clock.clone(), None);
+    let second = e.recommend(Box::new(sink)).unwrap();
+    let second_final = final_of(&second_events);
+    // Both requests' fires: the first's generation was retired by the containment, the second's by its own Final.
+    use engine::clock::Clock;
+    clock.set_ms(clock.now_ms() + 14_900);
+    ended.wait_for(2);
+    let (kills, restarts) = { let f = fake.lock().unwrap(); (f.kills, f.restarts) }; // before the teardown's own kill
+    e.shutdown();
+    let first_seen = kinds_at(&first_events.recorded());
+    let records: Vec<engine::log::DecisionRecord> = std::fs::read_to_string(log_dir.join("decisions.jsonl")).map(|t| t.lines().map(|l| serde_json::from_str(l).unwrap()).collect()).unwrap_or_default();
+    assert!(panicked.load(Ordering::SeqCst), "the seam panicked");
+    let first_final = first_final.expect("the request whose serving panicked was answered");
+    match &first_final.coverage {
+        proto::Coverage::Unsupported { reason: proto::UnsupportedReason::EngineError { message, retryable: false }, .. } =>
+            assert!(message.starts_with("internal: ") && message.contains("an internal invariant broke"), "{message}"),
+        other => panic!("expected the internal EngineError, got {other:?}"),
+    }
+    assert_eq!((first_final.identity.clone(), first_final.legal.len()), (first.clone(), s.derived.legal.len()), "the Final answers the request, with its legal intervals");
+    assert_eq!(first_seen.iter().filter(|(k, _)| *k == "Final").count(), 1, "one Final: the retired watchdog delivered none at the fire: {first_seen:?}");
+    assert!(matches!(second_final, Some(ref f) if f.identity == second && f.coverage == proto::Coverage::Exact), "engine-main kept serving: {second_final:?}");
+    assert_eq!((kills, restarts), (1, 1), "the worker was killed at the panic and relaunched by the next solve");
+    let logged: Vec<(DecisionIdentity, bool)> = records.iter().map(|r| (r.identity.clone(), matches!(r.coverage, proto::Coverage::Unsupported { .. }))).collect();
+    assert_eq!(logged, vec![(first.clone(), true), (second, false)], "both Finals are logged, once each");
+    let diagnostics: Vec<engine::log::DiagnosticRecord> = std::fs::read_to_string(log_dir.join("diagnostics.jsonl"))
+        .map(|t| t.lines().map(|l| serde_json::from_str(l).unwrap()).collect()).unwrap_or_default();
+    let events: Vec<&str> = diagnostics.iter().map(|d| d.event.as_str()).collect();
+    assert_eq!(events, ["panic", "kill", "restart"], "the panic, its kill and the next solve's relaunch are recorded (final review M2): {diagnostics:?}");
+    assert!(diagnostics[0].identity.as_ref() == Some(&first) && diagnostics[0].detail.contains("an internal invariant broke"), "{:?}", diagnostics[0]);
+}
+
 /// §12: a rejected entry leaves the state unchanged. A `begin_hand` that `core_model` refuses leaves the hand in
 /// progress as it was (its history, its undo stack) and consumes no hand id.
 #[test]
@@ -293,7 +578,12 @@ fn a_rejected_begin_hand_leaves_the_hand_in_progress_unchanged() {
     let started = e.begin_hand(begin()).unwrap();
     let folded = e.apply_action(Action::Fold).unwrap();
     let hero_not_dealt = proto::BeginHand { button: Seat(0), hero: Seat(2), dealt: vec![Seat(0), Seat(1), Seat(3), Seat(4), Seat(5)], stacks: vec![1000; 5], hero_cards: None };
-    assert!(matches!(e.begin_hand(hero_not_dealt), Err(EngineError::Rules(ref m)) if m.contains("hero is not a dealt seat")));
+    assert!(matches!(e.begin_hand(hero_not_dealt), Err(EngineError::Rules(core_model::RulesError::InvalidConfig { ref reason })) if reason.contains("hero is not a dealt seat")));
+    // Final review M6 (spec 12: `FormatUnsupported` for formats): the rules error stays typed, so a caller (plan 5) matches
+    // the variant instead of its text. Two dealt seats is an unsupported format.
+    let heads_up = proto::BeginHand { button: Seat(0), hero: Seat(0), dealt: vec![Seat(0), Seat(1)], stacks: vec![1000; 2], hero_cards: None };
+    assert!(matches!(e.begin_hand(heads_up), Err(EngineError::Rules(core_model::RulesError::FormatUnsupported { ref detail })) if detail == "two dealt seats"));
+    assert!(matches!(e.apply_action(Action::Raise { to: 1 }), Err(EngineError::Rules(core_model::RulesError::IllegalAction { .. }))), "an illegal action is typed too");
     assert_eq!(e.state(), Some(folded.clone()), "the hand in progress is unchanged");
     let undone = e.undo().unwrap();
     assert_eq!((undone.hand_id, undone.actions.len()), (started.hand_id, 0), "its undo stack is intact");

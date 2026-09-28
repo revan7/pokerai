@@ -6,16 +6,14 @@ pub struct LoopParams { pub deadline_ms: u32, pub extraction_margin_ms: u32, pub
 #[derive(Debug, Clone, Copy)]
 pub struct LoopOutcome { pub iterations: u32, pub exploitability: Option<f32>, pub reached_target: bool, pub cancelled: bool }
 
-/// Spec 4.4 and §5 step 7's target compliance, the raw comparison `exploitability_chips / pot <= target_bp / 10_000`,
-/// evaluated exactly as the engine evaluates it (`engine::solve::meets_target`, ruling 26-Q4): `expl * 10_000 <=
-/// target_bp * pot` in `f64`, where an `f32` significand times 10^4 and a `u16` times a `u32` are both exact. The §7
-/// loop's `reached_target` is this predicate (follow-up P2.W1), never a threshold narrowed to `f32`: that narrowing can
-/// round up past the raw target (0.6 chips, 30 bp of a 200-chip pot, becomes 0.60000002384185791015625), so a
-/// measurement equal to it would have been reported `ok` while missing the target. A worker `ok` therefore always meets
-/// the raw target. NaN and +infinity meet no target; a negative measurement meets every one.
-pub fn meets_target(exploitability_chips: f32, pot: u32, target_bp: u16) -> bool {
-    f64::from(exploitability_chips) * 10_000.0 <= f64::from(target_bp) * f64::from(pot)
-}
+/// Spec 4.4 and §5 step 7's target compliance, the raw comparison `exploitability_chips / pot <= target_bp / 10_000`:
+/// `proto::worker::meets_target`, the one definition the engine and the bench also call (final review M3; ruling 26-Q4),
+/// re-exported here for the loop and its tests. The §7 loop's `reached_target` is this predicate (follow-up P2.W1),
+/// never a threshold narrowed to `f32`: that narrowing can round up past the raw target (0.6 chips, 30 bp of a 200-chip
+/// pot, becomes 0.60000002384185791015625), so a measurement equal to it would have been reported `ok` while missing the
+/// target. A worker `ok` therefore always meets the raw target. NaN and +infinity meet no target; a negative measurement
+/// meets every one.
+pub use proto::worker::meets_target;
 
 /// §7 stop rule, as pure arithmetic so it can be tested without a solve: stop when
 /// `elapsed + 1.5 * max_iteration_so_far + (one more iteration if an exploitability pass is due) + margin > deadline`.
