@@ -14,8 +14,12 @@
 //! incoming hashes) whose solved root the model cannot reproduce from its `solved_prefix` is not a
 //! candidate; among the rest the longest covered prefix of the heads-up street line wins
 //! ([`crate::select_snapshot`]'s order). Its reasons are inherited. No snapshot: every seat that
-//! acted on the street gets `UnconditionedPriorStreet{street, seat, cause}` and every mass is kept
-//! as the earlier streets left it.
+//! acted on the street gets `UnconditionedPriorStreet{street, seat, cause}` once, in order of its
+//! first action, and every mass is kept as the earlier streets left it. The cause is `snapshot
+//! root not reproducible` when compatible snapshots exist but none of their roots replays;
+//! otherwise it follows how the street opened (ruling 15-I2): `multiway prior street` with three
+//! or more pot-eligible seats -- even if a later hero decision admitted a projected heads-up root,
+//! which is a financial root, not a snapshot -- and `no compatible snapshot` heads-up.
 //!
 //! # One observed action is one transaction
 //!
@@ -49,6 +53,11 @@
 //! branch records on its `translated` history every action it navigated: the observed action on a
 //! menu (applied or not) and the mapped menu size of a translated wager.
 //!
+//! At the walk's output boundary, after the street's actions, a residual the cap created or
+//! extended is disclosed as `BranchResidual{seat: hero, residual_mass_pct, cause: "cap"}` with
+//! its share of the final weights (spec section 8.4, ruling 15-I1), replacing any share an earlier
+//! boundary recorded.
+//!
 //! # The interpolation coefficients
 //!
 //! A translated wager's pot fraction is taken at the branch's **mapped financial parent**: the
@@ -64,7 +73,7 @@
 //! same children -- while only the pot fractions give spec section 8.4's coefficients, which the
 //! walk uses.
 
-use crate::branches::{cap_branches_with, rescale, split_batch, zero_reason, BatchSplit, BranchChoice, HistoryBranch};
+use crate::branches::{cap_branches_with, rescale, residual_reason, split_batch, zero_reason, BatchSplit, BranchChoice, HistoryBranch};
 use crate::preflop::{board_mask, public_range, translation_reason, ReplayInput, ReplayOutput};
 use crate::snapshot::{
     compatible, decision_roots, root_board, select_among, snapshot_node_at, street_history, street_number, CompatKey, StreetSnapshot,
@@ -76,14 +85,16 @@ use proto::{
     UnsupportedReason, COMBOS,
 };
 
-/// No compatible snapshot for the street (spec section 9.3): none registered, none for these
-/// incoming ranges, or none whose root the model reproduces. ReplayInput carries no engine
-/// failure, deadline or no-request provenance, so this is the cause replay can state.
+/// No compatible snapshot for a street that opened heads-up (spec section 9.3): none registered,
+/// or none for these incoming ranges. ReplayInput carries no engine failure, deadline or
+/// no-request provenance, so this is the cause replay can state ([`fallback_cause`]).
 const NO_SNAPSHOT: &str = "no compatible snapshot";
-/// Compatible snapshots exist, but the model reproduces none of their solved roots.
+/// Compatible snapshots exist, but the model reproduces none of their solved roots: concrete
+/// reconstruction provenance, preferred over the fallback cause.
 const NOT_REPRODUCIBLE: &str = "snapshot root not reproducible";
-/// The street opened with three or more pot-eligible seats and no hero decision on it was ever
-/// heads-up (spec section 6: nothing was solved for it).
+/// No compatible heads-up snapshot for a street that opened with three or more pot-eligible seats
+/// (brief Step 5, ruling 15-I2), whether or not a hero decision on it later admitted a projected
+/// heads-up root: a financial root is not a snapshot ([`fallback_cause`]).
 const MULTIWAY: &str = "multiway prior street";
 /// The action of a seat that folded out of the admitted projected root the snapshot was solved on.
 const OUTSIDE_ROOT: &str = "not in the heads-up street root";
@@ -120,14 +131,16 @@ pub fn snapshot_root(state: &HandState, snapshot: &StreetSnapshot) -> Result<Str
 /// Replays the completed postflop `street` of `input.state` into `output` (see the module docs).
 /// `output` must stand at the street's root: the earlier streets replayed and the street's root
 /// board blocked ([`crate::block_and_rescale`]), as [`crate::replay`] leaves it. Only the street's
-/// own recorded actions are read, and nothing is ever solved.
+/// own recorded actions are read, and nothing is ever solved. At its output boundary, after the
+/// street's actions, the cap residual is disclosed with its current share
+/// (`BranchResidual{seat: hero, residual_mass_pct, cause: "cap"}`, see the module docs).
 ///
 /// # Panics
 /// Always, if `street` is the preflop, if `input.snapshots` mixes model revisions (the caller passes
 /// one identity's snapshots, `SnapshotStore::for_identity`), if the model recovers two different
 /// seat pairs for one street, if an exported node disagrees with its skeleton node or has other than
 /// 1326 rows, or through the kernel's own invariant checks ([`crate::split_batch`] and its
-/// `condition`, [`crate::cap_branches`], [`crate::rescale`]).
+/// `condition`, [`crate::cap_branches`], [`crate::rescale`], [`crate::residual_reason`]).
 pub fn walk_postflop(input: &ReplayInput, street: Street, output: &mut ReplayOutput) {
     assert!(street != Street::Preflop, "walk_postflop: the preflop street is walked by walk_preflop");
     // A preflop stop is scoped to the preflop street (spec section 9.3), and no preflop node key
@@ -141,27 +154,53 @@ pub fn walk_postflop(input: &ReplayInput, street: Street, output: &mut ReplayOut
         }
     }
     let history = street_history(input.state, street);
-    let chosen = match choose(input, street, &history, output) {
-        Ok(chosen) => chosen,
+    match choose(input, street, &history, output) {
+        Ok(chosen) => walk_street(street, &history, &chosen, output),
         Err(cause) => {
             for seat in acting_seats(&history) {
                 output.reasons.push(ApproxReason::UnconditionedPriorStreet { street, seat, cause: cause.into() });
             }
-            return;
         }
-    };
+    }
+    disclose_cap(output, input.state.hero);
+}
+
+/// Walks `history` through the `chosen` snapshot (see the module docs).
+fn walk_street(street: Street, history: &[(Seat, Action)], chosen: &Chosen, output: &mut ReplayOutput) {
     for r in &chosen.snapshot.reasons {
         note(output, r.clone());
     }
     let walk = Walk { street, snapshot: chosen.snapshot, root: &chosen.root, tree: index_materialized(&chosen.snapshot.tree.materialized) };
     let mut paths: Vec<WalkPath> =
         output.branches.iter().map(|b| if b.residual { WalkPath::frozen(RESIDUAL) } else { WalkPath::at(vec![]) }).collect();
-    for (seat, action) in &history {
+    for (seat, action) in history {
         if *seat != walk.root.oop && *seat != walk.root.ip {
             note(output, ApproxReason::UnconditionedPriorStreet { street, seat: *seat, cause: OUTSIDE_ROOT.into() });
             continue;
         }
         paths = walk.apply(output, paths, *seat, action);
+    }
+}
+
+/// Spec section 8.4's cap disclosure at the postflop replay output boundary (ruling 15-I1): the
+/// current `BranchResidual{seat: hero, residual_mass_pct, cause: "cap"}` of the branch list
+/// ([`crate::residual_reason`]), recomputed from the weights the street leaves -- the frozen
+/// residual's share grows as later evidence shrinks the live weights -- so it replaces the
+/// disclosure an earlier boundary recorded, in place, rather than repeating it or keeping the
+/// share at the cap. No residual, no disclosure. The branches are not touched.
+fn disclose_cap(output: &mut ReplayOutput, hero: Seat) {
+    let current = residual_reason(&output.branches, hero);
+    let recorded = output
+        .reasons
+        .iter()
+        .position(|r| matches!(r, ApproxReason::BranchResidual { seat, cause, .. } if *seat == hero && cause == "cap"));
+    match (recorded, current) {
+        (Some(i), Some(r)) => output.reasons[i] = r,
+        (None, Some(r)) => output.reasons.push(r),
+        (Some(i), None) => {
+            output.reasons.remove(i);
+        }
+        (None, None) => {}
     }
 }
 
@@ -187,13 +226,7 @@ fn choose<'a>(input: &ReplayInput<'a>, street: Street, history: &[(Seat, Action)
                 && s.key.street == street
                 && s.key.root_board == board
         });
-        return Err(if for_this_street {
-            NOT_REPRODUCIBLE
-        } else if opened_multiway(input.state, street) {
-            MULTIWAY
-        } else {
-            NO_SNAPSHOT
-        });
+        return Err(if for_this_street { NOT_REPRODUCIBLE } else { fallback_cause(input.state, street) });
     };
     // Every hero decision root of one street names the same two seats: pot eligibility only
     // shrinks within a street, and each root has exactly two eligible seats.
@@ -206,7 +239,7 @@ fn choose<'a>(input: &ReplayInput<'a>, street: Street, history: &[(Seat, Action)
             r.ip
         );
     }
-    let Some(model_revision) = model_revision else { return Err(NO_SNAPSHOT) };
+    let Some(model_revision) = model_revision else { return Err(fallback_cause(input.state, street)) };
     let mask = board_mask(&board);
     let hash = |seat: Seat| core_ranges::hash_scaled(&public_range(&output.branches, seat, &mask));
     let key = CompatKey {
@@ -219,7 +252,7 @@ fn choose<'a>(input: &ReplayInput<'a>, street: Street, history: &[(Seat, Action)
     };
     let candidates: Vec<&StreetSnapshot> = input.snapshots.iter().filter(|s| compatible(&s.key, &key)).collect();
     if candidates.is_empty() {
-        return Err(NO_SNAPSHOT);
+        return Err(fallback_cause(input.state, street));
     }
     // Coverage is measured on the heads-up line, the domain the snapshot's tree was built in.
     let heads_up: Vec<(Seat, Action)> = history.iter().copied().filter(|(s, _)| *s == oop || *s == ip).collect();
@@ -250,6 +283,18 @@ fn model_revision_of(snapshots: &[StreetSnapshot]) -> Option<u32> {
         );
     }
     Some(first)
+}
+
+/// The one cause for a street with no compatible heads-up snapshot and no more concrete
+/// provenance (ruling 15-I2): `multiway prior street` when the street OPENED with three or more
+/// pot-eligible seats -- whatever its later hero decisions admitted -- and `no compatible
+/// snapshot` when it opened heads-up.
+fn fallback_cause(state: &HandState, street: Street) -> &'static str {
+    if opened_multiway(state, street) {
+        MULTIWAY
+    } else {
+        NO_SNAPSHOT
+    }
 }
 
 /// Whether `street` opened with three or more pot-eligible seats: the dealt seats that did not
