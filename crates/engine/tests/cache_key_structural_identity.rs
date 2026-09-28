@@ -43,7 +43,7 @@
 //! frequencies, doubled EV, no `SprBucketed`); `scale_check_is_exact_where_the_fractional_tree_doubles_exactly` asserts
 //! the contract's `Exact` on the one T4 template whose fractional tree does double exactly (`check_jam_test_v1`).
 
-mod support;
+pub mod support;
 
 use cache::key::{Model, Rational};
 use cache::lookup::{compare, CacheHit, CacheQuery, Lookup, MissReason};

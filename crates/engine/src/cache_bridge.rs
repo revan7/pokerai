@@ -8,16 +8,111 @@
 //! Hero's cards never reach this module (a `SolveInput` has none), and hero's seat, `bb_chips`,
 //! `target_bp` and the requested path travel on the query beside the key, never inside it. A
 //! degenerate reference state is an `Unsupported{EngineError}` answer, never a panic. Building a
-//! query performs no I/O: `cache::Cache::lookup` runs it on the request's own `fast-path` work.
+//! query performs no I/O. `serve` runs `cache::Cache::lookup` on it on `engine-main`, inside the
+//! request's own budget: the shared 500 ms cache budget of spec 7 bounds it (plan 4 Task 10,
+//! ruling 10-pre1), and the watchdog never calls it.
+//!
+//! Plan 4 Task 10 adds the other half: `canonical_perm`, the one producer of the suit permutation
+//! for queries and stored entries alike (ruling 7-Q2/7-D6), and `entry_from_solution`, the
+//! validated entry a live flop or turn solve stores.
 
 use cache::entry::SourceInputs;
 use cache::key::{spr_bucket, KeyFields, Model, RakeKey, Rational};
 use cache::lookup::CacheQuery;
 use core_iso::SuitPerm;
-use proto::{ApproxReason, Derived, Rake, SolveInput, Street, UnsupportedReason};
+use proto::{Action, ApproxReason, Card, Derived, Rake, Range1326, SolveInput, Street, UnsupportedReason};
 
 fn unsupported(message: &str) -> UnsupportedReason {
     UnsupportedReason::EngineError { message: message.into(), retryable: false }
+}
+
+/// Ruling 7-Q2/7-D6: the suit permutation of a street root's cache key, `core_iso::canonicalize`
+/// of the board and both public ranges blocked by that board (OOP then IP). The one place it is
+/// computed: `serve`'s queries and `entry_from_solution`'s entries both take it from here, and
+/// `cache::entry::validate_entry` re-checks the fixed point it produces. The ranges are public
+/// (hero's cards never enter them); blocking an already-blocked range changes nothing.
+pub fn canonical_perm(board: &[Card], oop: &Range1326, ip: &Range1326) -> SuitPerm {
+    let (mut oop, mut ip) = (oop.clone(), ip.clone());
+    core_ranges::block_public(&mut oop, board);
+    core_ranges::block_public(&mut ip, board);
+    core_iso::canonicalize(board, &[&oop, &ip]).1
+}
+
+/// Plan 4 Task 10 Step 4b: the validated `CacheEntry` of a flop or turn solve (spec 10.4 payload).
+/// `input` is the input actually solved: its tree is the answering attempt's (the `_min` retry's
+/// when it answered), never the first attempt's template. `solution` is the validated terminal
+/// solution of that tree; its combo rows are moved into canonical suits by `perm` (the same row
+/// mover the lookup inverts), then `cache::entry::normalize` turns EV into `ev_over_P` and every
+/// chip path into its ordinal path. The raw accuracy is `exploitability_chips / P`, never rounded;
+/// `reasons` are the reasons the request inherited (never the solve's own `DeadlineBestSoFar`,
+/// which certifies nothing about a later request's timing, spec 10.4); `target_bp` and
+/// `elapsed_ms` are the solve's. The key is `key_and_source`'s, so the entry and a query of the
+/// same decision can never disagree on it.
+///
+/// # Errors
+/// Every `key_and_source` error (a river root among them: river solutions are never cached), and
+/// a solution that does not normalize against `input.tree` or whose entry `validate_entry`
+/// refuses: `Unsupported{EngineError{retryable: false}}`. A refused entry is never stored.
+#[allow(clippy::too_many_arguments)]
+pub fn entry_from_solution(
+    input: &SolveInput,
+    solution: &proto::worker::StreetSolution,
+    reasons: &[ApproxReason],
+    bb_chips: u32,
+    rake: &Rake,
+    signature: &str,
+    perm: &SuitPerm,
+    elapsed_ms: u32,
+    target_bp: u16,
+) -> Result<cache::entry::CacheEntry, UnsupportedReason> {
+    let (key, source) = key_and_source(input, bb_chips, rake, signature, perm)?;
+    let pot = source.pot;
+    let mut canonical = solution.clone();
+    for node in &mut canonical.nodes {
+        if node.probs.len() != proto::COMBOS || node.ev_chips.len() != proto::COMBOS || node.available.len() != proto::COMBOS {
+            return Err(unsupported("cache normalize: a node without its 1326 rows"));
+        }
+        node.probs = cache::lookup::map_rows(&node.probs, perm);
+        node.ev_chips = cache::lookup::map_rows(&node.ev_chips, perm);
+        node.available = cache::lookup::map_flags(&node.available, perm);
+    }
+    let nodes = cache::entry::normalize(&canonical, &input.tree, pot).map_err(|e| unsupported(&format!("cache normalize: {e}")))?;
+    let fractions = input
+        .tree
+        .materialized
+        .iter()
+        .map(|n| {
+            n.actions
+                .iter()
+                .map(|a| match a {
+                    Action::Bet { to } | Action::Raise { to } | Action::AllIn { to } => Rational::new(u64::from(*to), u64::from(pot)).ok(),
+                    Action::Fold | Action::Check | Action::Call => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let entry = cache::entry::CacheEntry {
+        key,
+        source,
+        tree: input.tree.clone(),
+        fractions,
+        covered_paths: nodes.iter().map(|n| n.path.clone()).collect(),
+        nodes,
+        exploitability_over_P: f64::from(solution.exploitability_chips) / f64::from(pot),
+        target_bp,
+        iterations: solution.iterations,
+        elapsed_ms,
+        memory_bytes: solution.memory_bytes,
+        mode: solution.mode.clone(),
+        locks_applied: solution.locks_applied,
+        export: solution.export.clone(),
+        reasons: reasons.to_vec(),
+        created: now,
+        last_hit: now,
+    };
+    cache::entry::validate_entry(&entry).map_err(|e| unsupported(&format!("cache entry: {e}")))?;
+    Ok(entry)
 }
 
 /// The shared §10.4 reference state: key fields and exact source inputs for one solve input at
@@ -295,6 +390,106 @@ mod tests {
         let mut off_tree = input.clone();
         off_tree.root.history = vec![(OOP, Action::Bet { to: 37 })];
         assert!(engine_error(query(&off_tree, &signature, &perm, IP, 2, 50)).contains("requested path"));
+    }
+
+    // ===================== plan 4 Task 10: the stored entry =====================
+
+    /// A validated solution of `input`'s tree at `expl` chips whose rows differ by combo (so a suit mapping that moved
+    /// a row to the wrong combo is observable): at node `n`, combo `c` bets/raises its first action with a probability
+    /// that depends on `c`, and every non-fold EV names the node, the action and the combo; fold stays exactly 0.
+    fn varied_solution(input: &SolveInput, expl: f32) -> proto::worker::StreetSolution {
+        let mut sol = crate::testing::uniform_solution(&input.tree, &[], expl);
+        for (n, node) in sol.nodes.iter_mut().enumerate() {
+            let width = node.actions.len();
+            for c in 0..proto::COMBOS {
+                let first = (c % 7 + 1) as f32 / 8.0;
+                let rest = if width > 1 { (1.0 - first) / (width - 1) as f32 } else { 0.0 };
+                node.probs[c] = (0..width).map(|a| if width == 1 { 1.0 } else if a == 0 { first } else { rest }).collect();
+                node.ev_chips[c] = node.actions.iter().enumerate().map(|(a, action)| if *action == Action::Fold { 0.0 } else { (n * 100 + a * 10) as f32 + (c % 5) as f32 }).collect();
+            }
+        }
+        proto::worker::validate_solution(&sol, &input.tree.materialized).expect("the varied solution is valid");
+        sol
+    }
+
+    /// Ruling 7-Q2/7-D6: `canonical_perm` is the one producer of the permutation, `core_iso::canonicalize` of the board
+    /// and both public ranges blocked by the board (never the unblocked ones), for the query and the stored entry alike.
+    #[test]
+    fn canonical_perm_canonicalizes_the_board_blocked_public_ranges() {
+        let (input, _, perm) = input(root(vec![]), 50);
+        assert_eq!(canonical_perm(&input.root.board, &input.ranges[0], &input.ranges[1]), perm);
+        let mut blocked = input.ranges.clone();
+        for r in &mut blocked {
+            core_ranges::block_public(r, &input.root.board);
+        }
+        assert_eq!(canonical_perm(&input.root.board, &blocked[0], &blocked[1]), perm, "blocking twice changes nothing");
+    }
+
+    /// Plan 4 Task 10 Step 4b: the stored entry of a solve is keyed exactly as the query of the same decision
+    /// (`key_and_source` over the shared `canonical_perm`), carries the raw `exploitability_chips / P`, the solve's
+    /// target, reasons, mode and elapsed time, and its rows are forward-mapped into canonical suits: the production
+    /// lookup's reconstruction of the requested node in the query's suits gives back the solve's own rows.
+    #[test]
+    fn an_entry_from_a_solution_serves_back_the_solves_own_rows_in_the_querys_suits() {
+        // The heart deuce is the lowest flop card: canonical suits move hearts to clubs and clubs to hearts, so a row left
+        // in the query's suits would be served to another combo.
+        let (input, signature, perm) = input(StreetRootSnapshot { board: cards("Kc 7d 2h"), ..root(vec![]) }, 50);
+        assert_ne!(perm, core_iso::SuitPerm::IDENTITY, "the board is not its own canonical form");
+        let sol = varied_solution(&input, 1.9);
+        let reasons = vec![proto::ApproxReason::ChartRounded];
+        let entry = entry_from_solution(&input, &sol, &reasons, 2, &rake(), &signature, &perm, 1234, 50).expect("a valid flop solution is storable");
+        let (key, source) = key_and_source(&input, 2, &rake(), &signature, &perm).unwrap();
+        assert_eq!(entry.key.digest(), key.digest());
+        assert_eq!(entry.source.pot, source.pot);
+        assert_eq!(entry.exploitability_over_P, f64::from(1.9f32) / 110.0, "raw, never rounded");
+        assert_eq!((entry.target_bp, entry.elapsed_ms, entry.reasons.clone(), entry.mode.as_str(), entry.export.as_str()), (50, 1234, reasons, "f32", "street"));
+        assert_eq!(entry.tree, input.tree, "the tree actually solved");
+        cache::entry::validate_entry(&entry).expect("the entry validates");
+        let q = query(&input, &signature, &perm, OOP, 2, 50).unwrap();
+        let served = cache::lookup::reconstruct(&entry, &q).expect("the query serves the entry");
+        assert_eq!(served.solution.nodes.len(), sol.nodes.len());
+        for (k, (got, want)) in served.solution.nodes.iter().zip(&sol.nodes).enumerate() {
+            assert_eq!((&got.path, &got.actions, &got.probs, &got.available), (&want.path, &want.actions, &want.probs, &want.available), "node {k}");
+            for c in 0..proto::COMBOS {
+                for (x, y) in got.ev_chips[c].iter().zip(&want.ev_chips[c]) {
+                    assert!((x - y).abs() <= 1e-3 * y.abs().max(1.0), "node {k} combo {c}: EV {x} served for {y}");
+                }
+            }
+        }
+    }
+
+    /// A solution the cache cannot keep is refused with a non-retryable engine error, never stored: a river root (river
+    /// solutions are never cached), a solution of another tree than the one given, and one exporting a node of a later
+    /// street (spec 2: exports are the current street's decision nodes), which `validate_entry` refuses although the
+    /// solve client's own validation accepts it.
+    #[test]
+    fn an_unstorable_solution_is_refused_with_an_engine_error() {
+        let (input, signature, perm) = input(root(vec![]), 50);
+        let sol = varied_solution(&input, 0.4);
+        let refused = |r: Result<cache::entry::CacheEntry, UnsupportedReason>| match r {
+            Err(UnsupportedReason::EngineError { message, retryable: false }) => message,
+            Err(other) => panic!("expected a non-retryable EngineError, got {other:?}"),
+            Ok(_) => panic!("expected a refusal, got an entry"),
+        };
+        let mut river = input.clone();
+        river.root.street = Street::River;
+        assert!(refused(entry_from_solution(&river, &sol, &[], 2, &rake(), &signature, &perm, 1, 50)).contains("flop and turn"));
+        let other_tree = build_tree_full(&input.root, &TemplateSelection::from_history("flop_min_v1", &[])).unwrap().tree;
+        let wrong = SolveInput { tree: other_tree, ..input.clone() };
+        assert!(refused(entry_from_solution(&wrong, &sol, &[], 2, &rake(), &signature, &perm, 1, 50)).contains("cache"));
+        let mut later_street = sol.clone();
+        let turn_node = input.tree.materialized.iter().find(|m| m.street == Street::Turn).expect("a turn node").clone();
+        let mut exported = later_street.nodes[0].clone();
+        exported.path = cache::entry::chip_path(&input.tree.materialized, &turn_node.path).unwrap();
+        exported.actor = turn_node.actor.clone();
+        exported.actions = turn_node.actions.clone();
+        let width = exported.actions.len();
+        exported.probs = vec![vec![1.0 / width as f32; width]; proto::COMBOS];
+        exported.ev_chips = vec![exported.actions.iter().map(|a| if *a == Action::Fold { 0.0 } else { 1.0 }).collect(); proto::COMBOS];
+        later_street.covered_paths.push(exported.path.clone());
+        later_street.nodes.push(exported);
+        proto::worker::validate_solution(&later_street, &input.tree.materialized).expect("the solve client's validation accepts a later-street node");
+        assert!(refused(entry_from_solution(&input, &later_street, &[], 2, &rake(), &signature, &perm, 1, 50)).contains("cache entry"));
     }
 
     /// The reasons the request already incurred travel with the query, and the key never depends

@@ -11,8 +11,75 @@
 //! whose whole provenance (template signature, solver commit, adapter and rules versions, storage-mode policy, source
 //! lock, machine) matches the one expected; anything else keeps `FlopPolicy::from_v3(None, None)`, the conservative
 //! policy every `EngineCore` starts with. There is no table of unqualified timings.
+//!
+//! The cache route (plan 4 Task 10; spec 5 step 7, 10.4, 10.5). A flop decision probes the pre-solver's template
+//! (`PRESOLVER_TEMPLATE`) first and then its distinct live template, a turn decision its one template;
+//! `choose_cache_route` turns the probes' outcomes into the route `serve` follows: the first hit at the request's raw
+//! target is its `Final`, otherwise the most accurate above-target hit is retained as its `Provisional` while a live
+//! solve refines it. `cacheable` says which live solutions are stored and `is_street_violation` how a first terminal is
+//! logged (spec 5 step 10).
 
-use proto::{Action, HandState, Street, TakenAction};
+use cache::lookup::{CacheHit, Lookup};
+use proto::{Action, ApproxReason, HandState, Street, TakenAction};
+
+/// §10.5: the pre-solver always writes `flop_fast_v1` entries, so a flop lookup probes that template first. Task 16's
+/// `presolve::BACKGROUND_TEMPLATE` re-exports this constant, which keeps the routing free of a forward dependency on the
+/// pre-solver.
+pub const PRESOLVER_TEMPLATE: &str = "flop_fast_v1";
+
+/// An above-target hit (`Lookup::Provisional`) kept for serving: the hit, whose `coverage` is `None` (plan 4 Task 7
+/// fix round 1, ruling 7-I4: the delivery policy labels it), and the reasons its lookup incurred, which that label
+/// carries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProvisionalHit {
+    pub hit: CacheHit,
+    pub reasons: Vec<ApproxReason>,
+}
+
+/// What `serve` does with a decision's cache probes (spec 5 step 7).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CacheRoute {
+    /// A hit at the request's raw target (`Lookup::Exact` or `Lookup::Approximate`, its coverage labelled): served as
+    /// the `Final`, with no live solve.
+    Final(CacheHit),
+    /// No hit at target: a live solve, refining the retained above-target hit when there is one (served first as the
+    /// `Provisional`).
+    Refine { retained: Option<ProvisionalHit> },
+}
+
+/// Spec 10.4/10.5: over the probes' outcomes in probe order, the first at-target hit is the route's `Final`; with none,
+/// the `Provisional` of the lowest raw stored exploitability is retained (the earlier probe on a tie). A miss, whatever
+/// its reason, adds nothing.
+pub fn choose_cache_route(results: Vec<Lookup>) -> CacheRoute {
+    let mut retained: Option<ProvisionalHit> = None;
+    for result in results {
+        match result {
+            Lookup::Exact { hit } | Lookup::Approximate { hit, .. } => return CacheRoute::Final(hit),
+            Lookup::Provisional { hit, reasons } => {
+                if retained.as_ref().is_none_or(|old| hit.raw_exploitability_over_p < old.hit.raw_exploitability_over_p) {
+                    retained = Some(ProvisionalHit { hit, reasons });
+                }
+            }
+            Lookup::Miss { .. } => {}
+        }
+    }
+    CacheRoute::Refine { retained }
+}
+
+/// §5 step 7 / §10.4: only flop and turn solutions are cached; an experimental surrogate never is (plan 4 Task 11), nor
+/// a solution of the baseline model that applied locks (a locked model is keyed by its own fingerprint). River solves
+/// are never cached.
+pub fn cacheable(street: Street, experimental: bool, locks_applied: u16, baseline: bool) -> bool {
+    !experimental && matches!(street, Street::Flop | Street::Turn) && (!baseline || locks_applied == 0)
+}
+
+/// §5 step 10 / §7 / §10.6: whether a request's first terminal is logged as a street violation. A late first terminal
+/// (`late`: it arrived after the street deadline, or none arrived by it) always is; a `best_so_far` is one too, except
+/// on a single-raised-pot flop cache miss (`srp_miss`), whose `best_so_far` at the worker's deadline is the designed
+/// outcome.
+pub fn is_street_violation(street: Street, srp_miss: bool, best_so_far: bool, late: bool) -> bool {
+    late || (best_so_far && !(street == Street::Flop && srp_miss))
+}
 
 /// Whether V3 admitted `flop_min_v1` as the live single-raised-pot template (`EngineCore::flop_policy`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -292,5 +359,94 @@ mod tests {
         let e = evidence();
         let back: V3PolicyEvidence = serde_json::from_slice(&serde_json::to_vec(&e).unwrap()).unwrap();
         assert_eq!(back, e);
+    }
+
+    // ===================== plan 4 Task 10: the cache route =====================
+
+    use cache::lookup::{CacheHit, Lookup, MissReason};
+    use proto::ApproxReason;
+
+    /// A served hit whose raw stored accuracy is `raw` (the rest of the hit is a real validated flop solution, so the
+    /// route's choice is observable only through `raw` and the tag in its notes).
+    fn hit(raw: f64, tag: &str) -> CacheHit {
+        let root = proto::StreetRootSnapshot { street: Street::Flop, board: "Kh 7d 2c".split(' ').map(|c| proto::Card::parse(c).unwrap()).collect(), oop: proto::Seat(2),
+            ip: proto::Seat(0), pot_root: 100, stack_oop_root: 500, stack_ip_root: 500, dead_this_street: 0, projected_from: 2, history: vec![], bb_chips: 10 };
+        let built = crate::tree::build_tree_full(&root, &crate::tree::TemplateSelection::from_history(PRESOLVER_TEMPLATE, &[])).unwrap();
+        let solution = crate::testing::uniform_solution(&built.tree, &[], (raw * 100.0) as f32);
+        let covered_paths = solution.covered_paths.iter().map(|p| proto::resolve_chip_path(&built.tree.materialized, p).unwrap()).collect();
+        CacheHit { solution, tree: built.tree, covered_paths, coverage: None, raw_exploitability_over_p: raw, notes: vec![tag.into()], source_mode: "f32".into(),
+            tree_signature: "signature".into() }
+    }
+    fn exact(tag: &str) -> Lookup {
+        let mut h = hit(0.004, tag);
+        h.coverage = Some(proto::Coverage::Exact);
+        Lookup::Exact { hit: h }
+    }
+    fn provisional(raw: f64, tag: &str) -> Lookup {
+        Lookup::Provisional { hit: hit(raw, tag), reasons: vec![ApproxReason::ChartRounded] }
+    }
+    fn tag(h: &CacheHit) -> &str {
+        &h.notes[0]
+    }
+
+    /// Spec 10.4/10.5: the first probe whose raw accuracy meets the target (`Exact` or `Approximate`) is served as the
+    /// `Final`, whatever came before it; with none, the most accurate `Provisional` (lowest raw exploitability, the
+    /// earlier probe on a tie) is retained with its reasons for the live refinement; misses of any cause add nothing.
+    #[test]
+    fn the_route_serves_the_first_at_target_hit_or_retains_the_best_provisional() {
+        let miss = |reason| Lookup::Miss { reason };
+        match choose_cache_route(vec![provisional(0.01, "presolver"), exact("live")]) {
+            CacheRoute::Final(h) => assert_eq!(tag(&h), "live"),
+            other => panic!("an at-target hit is served: {other:?}"),
+        }
+        let mut approx = hit(0.003, "approximate");
+        approx.coverage = Some(proto::Coverage::Approximate { reasons: vec![ApproxReason::ChartRounded] });
+        match choose_cache_route(vec![Lookup::Approximate { hit: approx, reasons: vec![ApproxReason::ChartRounded] }, exact("second")]) {
+            CacheRoute::Final(h) => assert_eq!(tag(&h), "approximate", "the first terminal probe wins"),
+            other => panic!("{other:?}"),
+        }
+        match choose_cache_route(vec![provisional(0.02, "worse"), miss(MissReason::NoMatch), provisional(0.01, "better")]) {
+            CacheRoute::Refine { retained: Some(p) } => {
+                assert_eq!((tag(&p.hit), p.hit.raw_exploitability_over_p), ("better", 0.01));
+                assert_eq!(p.reasons, vec![ApproxReason::ChartRounded], "the provisional reasons travel with the retained hit");
+            }
+            other => panic!("the better provisional is retained: {other:?}"),
+        }
+        match choose_cache_route(vec![provisional(0.01, "first"), provisional(0.01, "tied")]) {
+            CacheRoute::Refine { retained: Some(p) } => assert_eq!(tag(&p.hit), "first", "a tie keeps the earlier probe"),
+            other => panic!("{other:?}"),
+        }
+        for misses in [vec![], vec![miss(MissReason::BudgetExhausted)], vec![miss(MissReason::NoMatch), miss(MissReason::ReaderUnavailable), miss(MissReason::QueueFull),
+            miss(MissReason::Rejected)]] {
+            assert!(matches!(choose_cache_route(misses), CacheRoute::Refine { retained: None }));
+        }
+    }
+
+    /// Spec 5 step 7 / 10.4: only flop and turn solutions are cached; an experimental surrogate never is, nor a solution
+    /// of a baseline model that applied locks (a locked model's own key carries its locks).
+    #[test]
+    fn only_baseline_flop_and_turn_solutions_are_cacheable() {
+        assert!(cacheable(Street::Flop, false, 0, true));
+        assert!(cacheable(Street::Turn, false, 0, true));
+        assert!(!cacheable(Street::River, false, 0, true));
+        assert!(!cacheable(Street::Preflop, false, 0, true));
+        assert!(!cacheable(Street::Flop, true, 0, true), "an experimental surrogate");
+        assert!(!cacheable(Street::Turn, false, 2, true), "a baseline solve that applied locks");
+        assert!(cacheable(Street::Turn, false, 2, false), "a locked model's solve");
+    }
+
+    /// Spec 5 step 10, 7, 10.6: a late first terminal is always a street violation; a `best_so_far` is one, except on a
+    /// single-raised-pot flop miss, the designed outcome.
+    #[test]
+    fn a_best_so_far_is_a_violation_except_on_a_single_raised_pot_flop_miss() {
+        assert!(!is_street_violation(Street::Flop, true, true, false), "the SRP flop miss");
+        assert!(is_street_violation(Street::Flop, false, true, false), "a flop best_so_far that is not an SRP miss");
+        assert!(is_street_violation(Street::Turn, true, true, false), "a turn best_so_far");
+        assert!(is_street_violation(Street::River, false, true, false));
+        assert!(is_street_violation(Street::Flop, true, true, true), "a late first terminal, even the SRP miss's");
+        assert!(is_street_violation(Street::Turn, false, false, true));
+        for street in [Street::Flop, Street::Turn, Street::River] {
+            assert!(!is_street_violation(street, false, false, false), "{street:?}: an on-time ok");
+        }
     }
 }

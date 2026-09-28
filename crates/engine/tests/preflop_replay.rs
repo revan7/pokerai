@@ -1457,6 +1457,8 @@ fn replay_feeds_street_root_solves() {
     let turn_facing = act(&turn_root, &[Action::Check, Action::Bet { to: 108 }]);
     let river_root = line(first, &[(FLOP, flop_line), (TURN, &[Action::Check, Action::Bet { to: 108 }, Action::Call]), (RIVER, &[])]);
     let script = vec![
+        ack(), FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None,
+        error: Some(WorkerError { code: "tree_mismatch".into(), message: "tree_mismatch".into(), retryable: false, estimate_bytes: None }), elapsed_ms: 1 }, // the flop: the worker fails (plan 4 Task 10: the flop reaches it)
         ack(), answer(ResultStatus::Ok, solved(&turn_root, "turn_std_v1", 0.2)),          // the turn root
         ack(), answer(ResultStatus::Ok, solved(&turn_root, "turn_std_v1", 0.2)),          // the same root, other hero cards
         ack(), answer(ResultStatus::Ok, solved(&turn_facing, "turn_std_v1", 0.1)),        // facing the 108 bet
@@ -1471,7 +1473,7 @@ fn replay_feeds_street_root_solves() {
     // The flop.
     let flop = t.state();
     let (d1, f1) = t.ask();
-    assert!(matches!(&f1.coverage, Coverage::Unsupported { reason: UnsupportedReason::EngineError { message, .. }, .. } if message.contains("no flop path")), "{:?}", f1.coverage);
+    assert!(matches!(&f1.coverage, Coverage::Unsupported { reason: UnsupportedReason::EngineError { message, .. }, .. } if message.starts_with("tree_mismatch")), "{:?}", f1.coverage);
     let s_flop = snapshot_at(&flop, &d1, &preflop, &[], "flop_full_v1", "cache_exact", 0.3);
     assert!(t.e.register_snapshot(&d1, s_flop.clone()), "the cache-hit Final of the active decision registers");
     t.play(flop_line);
@@ -1483,7 +1485,7 @@ fn replay_feeds_street_root_solves() {
     let root = core_model::street_root(&turn).unwrap();
     assert_eq!((root.oop, root.ip, root.pot_root, root.stack_oop_root, root.stack_ip_root, root.history.clone()), (SB, BB, 148, 926, 926, vec![]));
     let (d2, f2) = t.ask();
-    let req2 = t.solves()[0].clone();
+    let req2 = t.solves()[1].clone();
     let flop_only = [s_flop.clone()];
     let replayed = direct(&preflop, &turn, &flop_only, &[]);
     assert!(req2.oop_range == seat_range(&replayed, root.oop) && req2.ip_range == seat_range(&replayed, root.ip), "the solve's root ranges are the replay's, whole");
@@ -1517,7 +1519,7 @@ fn replay_feeds_street_root_solves() {
     t.e.set_hero_cards(core_model::parse_hand(second).unwrap()).unwrap();
     let turn_second = t.state();
     let (d2b, f2b) = t.ask();
-    let req2b = t.solves()[1].clone();
+    let req2b = t.solves()[2].clone();
     assert!(SolveRequest { id: String::new(), ..req2b.clone() } == SolveRequest { id: String::new(), ..req2.clone() }, "hero's cards change nothing the solve sees");
     let replayed_second = direct(&preflop, &turn_second, &flop_only, &[]);
     assert_eq!(format!("{:?}", replayed_second.branches), format!("{:?}", replayed.branches), "the branches, their weights q and their masses");
@@ -1537,7 +1539,7 @@ fn replay_feeds_street_root_solves() {
     let facing_root = core_model::street_root(&facing).unwrap();
     assert_eq!(facing_root.history, vec![(SB, Action::Check), (BB, Action::Bet { to: 108 })]);
     let (d3, f3) = t.ask();
-    let req3 = t.solves()[2].clone();
+    let req3 = t.solves()[3].clone();
     assert!(req3.oop_range == req2.oop_range && req3.ip_range == req2.ip_range, "the current street's actions never enter the root ranges");
     assert!(req3.tree.inserted.iter().any(|(_, _, a)| *a == Action::Bet { to: 108 }), "Plan 2's tree inserts the observed size exactly: {:?}", req3.tree.inserted);
     let at_decision = core_model::derive(&facing);
@@ -1551,7 +1553,7 @@ fn replay_feeds_street_root_solves() {
     let river = t.state();
     let river_root_snap = core_model::street_root(&river).unwrap();
     let (d4, f4) = t.ask();
-    let req4 = t.solves()[3].clone();
+    let req4 = t.solves()[4].clone();
     let before: Vec<StreetSnapshot> = t.snapshots.lock().unwrap().for_identity(&d4).into_iter().filter(|s| s.key.street != Street::River).collect();
     let replayed4 = direct(&preflop, &river, &before, &[]);
     assert!(req4.oop_range == seat_range(&replayed4, river_root_snap.oop) && req4.ip_range == seat_range(&replayed4, river_root_snap.ip), "the river's root ranges are the replay's");
@@ -1602,7 +1604,12 @@ fn replay_feeds_street_root_solves_listing_the_replays_translations_and_mappings
     let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let gate = Arc::new(Mutex::new(Some((entered_tx, release_rx))));
+    // The flop request's `Fast` comes first (plan 4 Task 10: the flop is served): the gate holds the turn request's.
+    let after_fasts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hold_first: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if after_fasts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
         let taken = gate.lock().unwrap().take();
         if let Some((entered, release)) = taken {
             entered.send(()).unwrap();
@@ -1610,7 +1617,8 @@ fn replay_feeds_street_root_solves_listing_the_replays_translations_and_mappings
         }
     });
     let seams = ServeSeams { after_fast: Some(hold_first), ..ServeSeams::default() };
-    let mut t = street_rig_with("assumption_lists", vec![ack(), answer(ResultStatus::Ok, solved(&turn_root, "turn_std_v1", 0.2))], seams);
+    let mut t = street_rig_with("assumption_lists", vec![ack(), FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None,
+        error: Some(WorkerError { code: "tree_mismatch".into(), message: "tree_mismatch".into(), retryable: false, estimate_bytes: None }), elapsed_ms: 1 }, ack(), answer(ResultStatus::Ok, solved(&turn_root, "turn_std_v1", 0.2))], seams);
     let preflop = t.preflop.clone();
     t.begin("KdJd");
     t.play(&PREFLOP);
@@ -1647,7 +1655,7 @@ fn replay_feeds_street_root_solves_listing_the_replays_translations_and_mappings
     assert!(matches!(engine_final.coverage, Coverage::Approximate { .. }), "{:?}", engine_final.coverage);
     assert_eq!(lists(&fast_of(&events)), (translations.clone(), mappings.clone()), "the Fast");
     assert_eq!(lists(&engine_final), (translations, mappings), "the engine's Final");
-    assert_eq!(t.solves().len(), 1, "the held request started no work once its watchdog had delivered");
+    assert_eq!(t.solves().iter().filter(|q| q.tree.root_street == Street::Turn).count(), 1, "the held request started no work once its watchdog had delivered");
     t.e.shutdown();
 }
 
@@ -1655,7 +1663,8 @@ fn replay_feeds_street_root_solves_listing_the_replays_translations_and_mappings
 /// street, never the other way round, and only the active decision registers, through `Engine::register_snapshot`.
 #[test]
 fn replay_feeds_street_root_solves_a_provisional_is_replaced_by_its_final_never_the_reverse() {
-    let mut t = street_rig("provisional", vec![]);
+    let mut t = street_rig("provisional", vec![ack(), FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None,
+        error: Some(WorkerError { code: "tree_mismatch".into(), message: "tree_mismatch".into(), retryable: false, estimate_bytes: None }), elapsed_ms: 1 }]);
     let preflop = t.preflop.clone();
     t.begin("KdJd");
     t.play(&PREFLOP);
@@ -1688,6 +1697,7 @@ fn replay_feeds_street_root_solves_with_the_engines_cause_for_a_street_without_a
     let mismatch = FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None,
         error: Some(WorkerError { code: "tree_mismatch".into(), message: "tree_mismatch".into(), retryable: false, estimate_bytes: None }), elapsed_ms: 1 };
     let script = vec![
+        ack(), mismatch.clone(),                                               // hand 1, the flop: the worker fails (plan 4 Task 10)
         ack(), FakeReply::Hang, ack(), FakeReply::Hang,                        // hand 1, the turn: both attempts hang to the fire
         ack(), answer(ResultStatus::Ok, solved(&river, "river_std_v1", 0.2)), // hand 1, the river
         ack(), mismatch,                                                       // hand 2, the turn: the worker fails
@@ -1695,7 +1705,7 @@ fn replay_feeds_street_root_solves_with_the_engines_cause_for_a_street_without_a
     ];
     let mut t = street_rig("causes", script);
     let both = |cause: &str| vec![(SB, cause.to_string()), (BB, cause.to_string())];
-    let no_flop_path = "engine error: no flop path in this build (plan 4)";
+    let flop_mismatch = "engine error: tree_mismatch: tree_mismatch";
 
     // Hand 1.
     t.begin("KdJd");
@@ -1706,11 +1716,11 @@ fn replay_feeds_street_root_solves_with_the_engines_cause_for_a_street_without_a
     t.deal(TURN);
     let (_, turn_final) = t.ask();
     assert!(matches!(turn_final.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { .. }, .. }), "{:?}", turn_final.coverage);
-    assert_eq!(unconditioned(&turn_final, Street::Flop), both(no_flop_path));
+    assert_eq!(unconditioned(&turn_final, Street::Flop), both(flop_mismatch));
     t.play(&[Action::Check, Action::Check]);
     t.deal(RIVER);
     let (_, river_final) = t.ask();
-    assert_eq!(unconditioned(&river_final, Street::Flop), both(no_flop_path));
+    assert_eq!(unconditioned(&river_final, Street::Flop), both(flop_mismatch));
     let turn_causes = unconditioned(&river_final, Street::Turn);
     assert_eq!(turn_causes.iter().map(|c| c.0).collect::<Vec<_>>(), [SB, BB]);
     assert!(turn_causes.iter().all(|(_, c)| c.starts_with("deadline exceeded")), "{turn_causes:?}");

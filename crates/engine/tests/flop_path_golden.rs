@@ -317,3 +317,479 @@ fn the_wire_deadline_at_250_ms_of_elapsed_time() {
         assert_eq!((sent.deadline_ms, sent.extraction_margin_ms), (deadline_ms, extraction_margin_ms), "{street:?} at flop_budget_s {flop_budget_s}");
     }
 }
+
+// ===================== plan 4 Task 10: flop and turn through the cache =====================
+//
+// The production `serve_request_with` over plan 2's fake worker and fake clock and a real cache (`support::FlopRig`):
+// the cache is seeded through the production entry writer, every lookup is the production `Cache::lookup` answering
+// from disk, and every snapshot, log record and stored entry is read back from the engine's own stores.
+
+use cache::entry::CacheEntry;
+use engine::flop::FlopPolicy;
+use engine::serve::ServeSeams;
+use proto::{ApproxReason, Phase, Recommendation};
+use support::{FlopRig, Seed, Served, BTN, SB};
+
+fn bsf(reached_bp: u16) -> ApproxReason {
+    ApproxReason::DeadlineBestSoFar { reached_bp, target_bp: 50 }
+}
+
+/// Every action of `rec` carries its EV.
+fn every_ev(rec: &Recommendation) -> bool {
+    !rec.actions.is_empty() && rec.actions.iter().all(|a| a.ev_bb.is_some())
+}
+
+/// A seam that runs `f` on `engine-main`.
+fn seam(f: impl Fn() + Send + Sync + 'static) -> Option<Arc<dyn Fn() + Send + Sync>> {
+    Some(Arc::new(f))
+}
+
+/// Spec 13.3 `deadline_best_so_far_labelling` (spec line 753, every clause this plan's routing drives), over the
+/// production flop path: "a `best_so_far` at raw exploitability 1.9 chips of a 100-chip pot yields
+/// `Approximate{DeadlineBestSoFar{reached_bp: 190, target_bp: 50}}` with every per-action EV present, is stored with its
+/// raw exploitability, and a repeated request at the same identity is served as `Provisional`; an `ok` at target yields
+/// no `DeadlineBestSoFar`; a single-raised-pot flop miss is logged as a miss with its reached exploitability and not as a
+/// street violation, a turn `best_so_far` is logged as a violation". Plus the brief's: a malformed payload never enters
+/// the cache.
+#[test]
+fn deadline_best_so_far_labelling() {
+    let flop = support::srp_flop(SB);
+    assert_eq!(core_model::derive(&flop).pot, 100, "the rig's flop is a 100-chip pot");
+    assert_eq!(engine::flop::preflop_wagers(&flop), 2, "a single-raised pot");
+    // The first request: a cold single-raised-pot flop (nothing stored), the live solve ends best_so_far at 1.9 chips.
+    // The repeat request: the stored entry is served as Provisional, then the live refinement answers ok at 0.4 chips.
+    let script = [support::live_script(&flop, "flop_fast_v1", 1.9, "best_so_far"), support::live_script(&flop, "flop_fast_v1", 0.4, "ok")].concat();
+    let mut rig = FlopRig::new(script);
+    let first = rig.serve(&flop);
+    assert_eq!(first.kinds(), ["Fast", "Final"]);
+    let f = first.final_rec();
+    assert_eq!(f.coverage, Coverage::Approximate { reasons: vec![bsf(190)] }, "raw 1.9 of 100 is 190 bp against the 50 bp target");
+    assert!(every_ev(f), "every per-action EV is present: {:?}", f.actions);
+    assert_eq!((f.assumptions.reached_bp, f.assumptions.cache.as_str(), f.assumptions.template_id.as_str()), (Some(190), "miss", "flop_fast_v1"));
+    let (raw, p, target) = (1.9_f32, 100_u32, 50_u16);
+    assert!(f64::from(raw) / f64::from(p) > f64::from(target) / 10_000.0);
+    assert_eq!((f64::from(raw) / f64::from(p) * 10_000.0).round() as u16, 190);
+    // Stored with its raw exploitability, never rounded, and without the request's own DeadlineBestSoFar (spec 10.4).
+    let stored = rig.stored();
+    assert_eq!(stored.len(), 1, "the live terminal is stored");
+    assert_eq!((stored[0].key.root_street, stored[0].exploitability_over_P, stored[0].target_bp), (Street::Flop, f64::from(1.9_f32) / 100.0, 50));
+    assert!(stored[0].reasons.is_empty(), "the solve's DeadlineBestSoFar certifies nothing about a later request: {:?}", stored[0].reasons);
+    // Logged as a miss with its reached exploitability, not as a street violation (the SRP flop miss is the designed outcome).
+    let records = rig.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!((records[0].cache.as_str(), records[0].reached_bp, records[0].street_violation, records[0].street), ("miss", Some(190), false, Street::Flop));
+
+    // The repeated request at the same identity (hand, hand revision, config and model; a fresh decision id) is served as
+    // Provisional before its live refinement.
+    let second = rig.serve(&flop);
+    assert_eq!(second.kinds(), ["Fast", "Provisional", "Final"]);
+    let (a, b) = (&first.id, &second.id);
+    assert_eq!((a.hand_id, a.hand_revision, a.config_revision, a.model_revision), (b.hand_id, b.hand_revision, b.config_revision, b.model_revision));
+    assert_ne!(a.decision_id, b.decision_id);
+    let provisional = second.provisionals()[0];
+    assert_eq!((provisional.phase, &provisional.identity), (Phase::Provisional, &second.id));
+    assert_eq!((provisional.assumptions.cache.as_str(), provisional.assumptions.reached_bp), ("provisional", Some(190)));
+    assert!(matches!(provisional.coverage, Coverage::Approximate { .. }), "an above-target hit is never Exact: {:?}", provisional.coverage);
+    assert!(every_ev(provisional));
+    assert_eq!(rig.solves().len(), 2, "the Provisional is refined by a live solve");
+    let refined = second.final_rec();
+    assert_eq!((&refined.identity, &refined.coverage, refined.assumptions.cache.as_str()), (&second.id, &Coverage::Exact, "provisional"),
+        "the live refinement at target replaces the Provisional");
+    assert!(rig.origins().iter().any(|(street, origin, d)| (*street, origin.as_str(), *d) == (Street::Flop, "live", b.decision_id)),
+        "the refinement's Final replaced the decision's Provisional snapshot: {:?}", rig.origins());
+    rig.core.shutdown();
+
+    // An ok at target yields no DeadlineBestSoFar.
+    let mut at_target = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 0.4, "ok"));
+    let ok = at_target.serve(&flop);
+    let ok_final = ok.final_rec();
+    assert_eq!((&ok_final.coverage, ok_final.assumptions.reached_bp, ok_final.assumptions.cache.as_str()), (&Coverage::Exact, Some(40), "miss"));
+    assert!(every_ev(ok_final));
+    assert!(!at_target.records()[0].street_violation);
+    at_target.core.shutdown();
+
+    // A turn best_so_far is logged as a street violation.
+    let turn = support::srp_turn(SB);
+    assert_eq!(core_model::derive(&turn).pot, 100);
+    let mut on_turn = FlopRig::new(support::live_script(&turn, "turn_std_v1", 1.9, "best_so_far"));
+    let t = on_turn.serve(&turn);
+    assert_eq!(t.final_rec().coverage, Coverage::Approximate { reasons: vec![bsf(190)] });
+    let turn_records = on_turn.records();
+    assert_eq!((turn_records[0].street, turn_records[0].street_violation, turn_records[0].reached_bp), (Street::Turn, true, Some(190)));
+    on_turn.core.shutdown();
+
+    // A malformed payload never enters the cache: a best_so_far exporting a node of a later street (spec 2: exports are
+    // the current street's decision nodes) passes the solve client's validation and is delivered, but its entry is
+    // refused and logged, and nothing is stored.
+    let (tree, _, _) = support::live_tree(&flop, "flop_fast_v1");
+    let mut malformed = support::varied_solution(&tree, &[], 1.9);
+    let turn_node = tree.materialized.iter().find(|m| m.street == Street::Turn).unwrap().clone();
+    let mut extra = malformed.nodes[0].clone();
+    extra.path = cache::entry::chip_path(&tree.materialized, &turn_node.path).unwrap();
+    (extra.actor, extra.actions) = (turn_node.actor.clone(), turn_node.actions.clone());
+    let width = extra.actions.len();
+    extra.probs = vec![vec![1.0 / width as f32; width]; proto::COMBOS];
+    extra.ev_chips = vec![extra.actions.iter().map(|a| if *a == Action::Fold { 0.0 } else { 1.0 }).collect(); proto::COMBOS];
+    malformed.covered_paths.push(extra.path.clone());
+    malformed.nodes.push(extra);
+    let script = vec![FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None },
+        FakeReply::Result { id: IdRef::Last, status: ResultStatus::BestSoFar, solution: Some(malformed), error: None, elapsed_ms: 5 }];
+    let mut refused = FlopRig::new(script);
+    let r = refused.serve(&flop);
+    assert_eq!(r.final_rec().coverage, Coverage::Approximate { reasons: vec![bsf(190)] }, "delivery is unaffected");
+    assert!(refused.stored().is_empty(), "nothing malformed enters the cache");
+    let rejects: Vec<serde_json::Value> = refused.diagnostics().into_iter().filter(|d| d["event"] == "cache_reject").collect();
+    assert_eq!(rejects.len(), 1, "the refusal is logged: {rejects:?}");
+    assert!(rejects[0]["detail"].as_str().unwrap().contains("cache entry"), "{rejects:?}");
+    refused.core.shutdown();
+}
+
+/// Plan 4 Task 10 Step 1: an above-target hit is emitted as the `Provisional` before the live refinement, and the one
+/// `Final` answers the same decision.
+#[test]
+fn provisional_hit_is_emitted_then_refined() {
+    let events = support::run_flop_script(vec![support::provisional_hit(0.019)], 0.4, "ok");
+    let phases = events
+        .iter()
+        .filter_map(|e| match e {
+            RecommendationEvent::Provisional(r) | RecommendationEvent::Final(r) => Some((r.phase, r.identity.clone(), r.assumptions.cache.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(phases.len(), 2);
+    assert_eq!(phases[0].0, Phase::Provisional);
+    assert_eq!(phases[1].0, Phase::Final);
+    assert_eq!(phases[0].1, phases[1].1, "identity is retained across the refinement");
+    assert_eq!(phases[0].2, "provisional");
+    assert_eq!(support::final_count(&events), 1);
+}
+
+/// Spec 4.4 `Assumptions.cache` (`miss | exact | approximate | provisional`) on the `Final` of every route.
+#[test]
+fn cache_labels_are_recorded_for_every_route() {
+    for (route, expected) in [
+        (support::exact_hit(), "exact"),
+        (support::approximate_hit(), "approximate"),
+        (support::provisional_route(), "provisional"),
+        (vec![], "miss"),
+    ] {
+        let events = support::run_flop_script(route, 0.4, "ok");
+        let last = events.iter().rev().find_map(|e| match e { RecommendationEvent::Final(r) => Some(r), _ => None }).unwrap();
+        assert_eq!(last.assumptions.cache, expected);
+        assert_eq!(support::final_count(&events), 1);
+    }
+}
+
+/// Plan 4 Task 8 carry 8-C4 (spec 13.1 T4, 9.2): a flop cache hit registers its snapshot as part of its `Final`'s
+/// accepted delivery, and after hero's bet, the button's call and a turn card, the turn root ranges the replay hands the
+/// turn solve are conditioned through that snapshot: the snapshot is disclosed with its cache origin, the flop is not
+/// unconditioned, and hero's turn range carries the stored node's per-combo betting frequencies.
+#[test]
+fn a_flop_cache_hit_registers_its_snapshot_and_conditions_the_turn_root_ranges() {
+    let flop = support::srp_flop(SB);
+    let turn = board(&play(&flop, &[Action::Bet { to: 50 }, Action::Call]), support::TURN);
+    let mut rig = FlopRig::new(support::live_script(&turn, "turn_std_v1", 0.4, "ok"));
+    rig.core.install_replay_ranges();
+    // The replay's own flop root ranges (an empty preflop store: the preflop is unconditioned), for the stored entry.
+    let root = core_model::street_root(&flop).unwrap();
+    let ranges = {
+        rig.identity.lock().unwrap().next_decision().unwrap();
+        let r = rig.core.range_source.lock().unwrap().ranges_at_root(&flop, &root).unwrap_or_else(|e| panic!("the replay answers the flop root: {e:?}"));
+        [r.oop, r.ip]
+    };
+    let entry = support::seed_entry_with(&Seed::exact("flop_fast_v1"), ranges);
+    assert!(rig.core.cache.store_tracked(&entry).wait(std::time::Duration::from_secs(60)), "seeded");
+    let hit = rig.serve(&flop);
+    let f = hit.final_rec();
+    assert_eq!((f.assumptions.cache.as_str(), f.assumptions.source.starts_with("cache@")), ("approximate", true), "the replay's reasons make the hit approximate");
+    assert!(rig.solves().is_empty(), "a hit at target starts no live solve");
+    assert_eq!(rig.origins(), vec![(Street::Flop, "cache_approximate".to_string(), hit.id.decision_id)], "the hit is registered with its Final");
+    let snapshot = rig.core.snapshots.lock().unwrap().for_hand(1)[0].clone();
+
+    // Hero bets 50, the button calls, the turn comes.
+    rig.identity.lock().unwrap().mutate();
+    let on_turn = rig.serve(&turn);
+    let t = on_turn.final_rec();
+    let fast = on_turn.events.iter().find_map(|e| match e { RecommendationEvent::Fast(r) => Some(r), _ => None }).unwrap();
+    let note = engine::replay_bridge::snapshot_note(Street::Flop, &snapshot.provenance);
+    assert!(note.contains("cache_approximate") && fast.assumptions.notes.contains(&note) && t.assumptions.notes.contains(&note), "{:?}", t.assumptions.notes);
+    let reasons = match &t.coverage { Coverage::Approximate { reasons } => reasons.clone(), other => panic!("{other:?}") };
+    assert!(!reasons.iter().any(|r| matches!(r, ApproxReason::UnconditionedPriorStreet { street: Street::Flop, .. })), "the flop is conditioned: {reasons:?}");
+    let solve = &rig.solves()[0];
+    // Hero (the small blind) bet at the flop root: combo c bet with probability (1 - (c % 7 + 1) / 8) / (width - 1), so
+    // its turn weight, normalized to its maximum, is (7 - c % 7) / 7 for every combo the board leaves.
+    let c = |a: &str, b: &str| usize::from(proto::combo_index(Card::parse(a).unwrap(), Card::parse(b).unwrap()));
+    for combo in [c("Qs", "Js"), c("Qs", "Jh"), c("Qs", "Jc"), c("Ts", "9h"), c("5s", "3h")] {
+        let expected = (7 - combo % 7) as f32 / 7.0;
+        assert!((solve.oop_range.0[combo] - expected).abs() < 1e-4, "combo {combo}: weight {} for {expected}", solve.oop_range.0[combo]);
+    }
+    rig.core.shutdown();
+}
+
+/// Ruling 28-I2 / plan-3 carry (c): a cache `Provisional` registers its snapshot only inside its own accepted delivery.
+/// A decision superseded while its cache was asked gets no `Provisional`, no `Final` and no snapshot, and starts no
+/// live solve: its stale hit is discarded (a stale `Final` hit likewise), and it records nothing.
+#[test]
+fn a_stale_cache_hit_is_discarded_and_registers_nothing() {
+    let flop = support::srp_flop(SB);
+    for seeds in [support::provisional_route(), support::exact_hit()] {
+        let mut rig = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 0.4, "ok"));
+        rig.seed(&seeds);
+        let identity = rig.identity.clone();
+        let served = rig.serve_with(&flop, ServeSeams { before_lookup: seam(move || { identity.lock().unwrap().mutate(); }), ..ServeSeams::default() });
+        assert_eq!(served.kinds(), ["Fast"], "{seeds:?}");
+        assert!(rig.origins().is_empty(), "nothing registered: {:?}", rig.origins());
+        assert!(rig.solves().is_empty() && rig.records().is_empty(), "no live solve, no Final to log");
+        assert!(rig.core.snapshots.lock().unwrap().misses_for_identity(&served.id).is_empty(), "a discarded candidate records nothing");
+        rig.core.shutdown();
+    }
+}
+
+/// Spec 7: exactly one `Final` at or before the watchdog's fire even while the cache holds `engine-main` (a reader that
+/// does not answer holds a lookup to its bound). V3 has admitted `flop_min_v1`, so the flop decision probes the
+/// pre-solver's `flop_fast_v1` (an above-target entry is stored there) and then `flop_min_v1`; the second lookup is held
+/// until the watchdog has delivered its `Final`. That `Final` is the only one; the `Provisional` found by the first
+/// probe is neither emitted nor registered after it (its delivery is refused under the identity lock, where the claim
+/// is taken), and nothing is sent to the worker.
+#[test]
+fn exactly_one_final_when_the_cache_holds_engine_main_past_the_fire() {
+    let flop = support::srp_flop(SB);
+    let mut rig = FlopRig::new(support::live_script(&flop, "flop_min_v1", 0.4, "ok"));
+    rig.core.flop_policy = FlopPolicy { min_admitted: true };
+    rig.seed(&support::provisional_route());
+    let (clock, ended, calls) = (rig.clock.clone(), rig.core.watchdog.ended_threads(), Arc::new(std::sync::atomic::AtomicU32::new(0)));
+    let held = seam(move || {
+        if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            clock.set_ms(14_900);
+            ended.wait_for(1);
+        }
+    });
+    let served = rig.serve_with(&flop, ServeSeams { before_lookup: held, ..ServeSeams::default() });
+    assert_eq!(served.kinds(), ["Fast", "Final"]);
+    assert!(matches!(served.final_rec().coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { .. }, .. }), "{:?}", served.final_rec().coverage);
+    assert!(rig.origins().is_empty(), "the Provisional refused after the watchdog's Final registers nothing: {:?}", rig.origins());
+    assert!(rig.solves().is_empty(), "nothing is sent past the fire");
+    let records = rig.records();
+    assert_eq!((records.len(), records[0].final_violation), (1, true), "the watchdog's Final, logged once");
+    rig.core.shutdown();
+}
+
+/// Spec 7 / ruling F2-N3: the promoted `Provisional` is the payload the watchdog delivers at its fire. The live
+/// refinement comes back worse than the retained hit, and the watchdog fires before the engine claims its own `Final`:
+/// the one `Final` is exactly the `Provisional`, promoted, and the decision keeps the cache snapshot it registered.
+#[test]
+fn the_watchdog_delivers_the_promoted_provisional_at_its_fire() {
+    let flop = support::srp_flop(SB);
+    let mut rig = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 5.0, "best_so_far"));
+    rig.seed(&support::provisional_route());
+    let (clock, ended) = (rig.clock.clone(), rig.core.watchdog.ended_threads());
+    let fire = seam(move || {
+        clock.set_ms(14_900);
+        ended.wait_for(1);
+    });
+    let served = rig.serve_with(&flop, ServeSeams { before_claim: fire, ..ServeSeams::default() });
+    assert_eq!(served.kinds(), ["Fast", "Provisional", "Final"]);
+    let mut promoted = served.provisionals()[0].clone();
+    promoted.phase = Phase::Final;
+    assert_eq!(served.final_rec(), &promoted, "the watchdog's Final is the retained Provisional, promoted");
+    assert_eq!(rig.origins(), vec![(Street::Flop, "cache_provisional".to_string(), served.id.decision_id)]);
+    rig.core.shutdown();
+}
+
+/// Ruling 7-Q2/7-D6 end to end: a stored live terminal is served back in the query's own suits. On a flop that is not
+/// its own canonical form (the heart deuce is the lowest card, so the canonical suits swap hearts and clubs), the
+/// repeated request's cache hit gives hero's combo exactly the frequencies and EVs of the live solve it stored (the
+/// stored rows differ by combo, so a row moved to the wrong combo is observable).
+#[test]
+fn a_stored_solution_is_served_back_in_the_querys_own_suits() {
+    let flop = board(&support::srp_preflop(SB), "Kc 7d 2h");
+    let root = core_model::street_root(&flop).unwrap();
+    assert_ne!(engine::cache_bridge::canonical_perm(&root.board, &support::full_range(), &support::full_range()), core_iso::SuitPerm::IDENTITY);
+    let mut rig = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 0.4, "ok"));
+    let live = rig.serve(&flop);
+    assert_eq!(rig.stored().len(), 1, "the live terminal is stored");
+    let hit = rig.serve(&flop);
+    assert_eq!((hit.final_rec().assumptions.cache.as_str(), rig.solves().len()), ("exact", 1), "the repeated request is a hit");
+    assert_eq!(hit.final_rec().actions, live.final_rec().actions, "hero's own row, in the query's suits");
+    rig.core.shutdown();
+}
+
+// ===================== the flop-path golden =====================
+
+/// A result's canonical projection: phase, identity, coverage and reasons, the evaluated actions with their EVs, the
+/// range mix, and the assumptions that name its source (`cache`, template, signature, source, accuracy, reached
+/// exploitability, notes, translations, mappings). Elapsed time is left out.
+fn project(rec: &Recommendation) -> serde_json::Value {
+    let a = &rec.assumptions;
+    serde_json::json!({
+        "phase": rec.phase,
+        "decision_id": rec.identity.decision_id,
+        "hand_revision": rec.identity.hand_revision,
+        "coverage": rec.coverage,
+        "actions": rec.actions,
+        "range_mix": rec.range_mix,
+        "cache": a.cache,
+        "template_id": a.template_id,
+        "tree_signature": a.tree_signature,
+        "source": a.source,
+        "source_accuracy": a.source_accuracy,
+        "reached_bp": a.reached_bp,
+        "notes": a.notes,
+        "translations": a.translations,
+        "mappings": a.mappings,
+    })
+}
+
+fn project_served(s: &Served) -> serde_json::Value {
+    serde_json::json!({
+        "kinds": s.kinds(),
+        "results": s.events.iter().filter_map(|e| match e {
+            RecommendationEvent::Provisional(r) | RecommendationEvent::Final(r) => Some(project(r)),
+            _ => None,
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn project_entry(e: &CacheEntry) -> serde_json::Value {
+    serde_json::json!({ "street": e.key.root_street, "template": e.tree.template_id, "exploitability_over_P": e.exploitability_over_P, "target_bp": e.target_bp,
+        "reasons": e.reasons, "export": e.export, "nodes": e.nodes.len(), "pot": e.source.pot })
+}
+
+/// One golden case: its served decisions, the solves sent, the snapshots registered, the entries stored and the log.
+fn project_rig(rig: &mut FlopRig, served: &[Served]) -> serde_json::Value {
+    let stored = rig.stored();
+    serde_json::json!({
+        "served": served.iter().map(project_served).collect::<Vec<_>>(),
+        "solves": rig.solves().iter().map(|q| q.tree.template_id.clone()).collect::<Vec<_>>(),
+        "snapshots": rig.origins(),
+        "stored": stored.iter().map(project_entry).collect::<Vec<_>>(),
+        "log": rig.records().iter().map(|r| serde_json::json!({ "street": r.street, "coverage": r.coverage, "cache": r.cache, "reached_bp": r.reached_bp,
+            "street_violation": r.street_violation, "final_violation": r.final_violation, "template_id": r.template_id })).collect::<Vec<_>>(),
+    })
+}
+
+/// One flop request of the rig's single-raised pot (hero the small blind) over `seeds`, the live solve answering
+/// `live_script(template, raw, status)`, with `policy`.
+fn flop_case(seeds: Vec<Seed>, policy: FlopPolicy, template: &str, raw: f32, status: &str) -> serde_json::Value {
+    let flop = support::srp_flop(SB);
+    let mut rig = FlopRig::new(support::live_script(&flop, template, raw, status));
+    rig.core.flop_policy = policy;
+    rig.seed(&seeds);
+    let served = rig.serve(&flop);
+    assert_eq!(support::final_count(&served.events), 1, "exactly one Final: {:?}", served.kinds());
+    let out = project_rig(&mut rig, &[served]);
+    rig.core.shutdown();
+    out
+}
+
+const CONSERVATIVE: FlopPolicy = FlopPolicy { min_admitted: false };
+const ADMITTED: FlopPolicy = FlopPolicy { min_admitted: true };
+
+/// Plan 4 Task 10 Step 5: every flop and turn route's canonical projection, frozen in `golden/flop_path.json` (recorded
+/// once with `POKERAI_RECORD_GOLDENS=1` and inspected, then compared).
+#[test]
+fn flop_path_golden() {
+    let mut cases = serde_json::Map::new();
+    let pre = engine::flop::PRESOLVER_TEMPLATE;
+    // Cache hits at target: served as the Final, no live solve.
+    cases.insert("exact_synthetic_hit".into(), flop_case(vec![Seed::exact(pre)], CONSERVATIVE, "flop_fast_v1", 0.4, "ok"));
+    cases.insert("chart_hit".into(), flop_case(vec![Seed::exact(pre).reasons(vec![ApproxReason::ChartRounded])], CONSERVATIVE, "flop_fast_v1", 0.4, "ok"));
+    cases.insert("menu_only".into(), flop_case(vec![Seed::exact(pre).at(200, 1910, 10_000)], CONSERVATIVE, "flop_fast_v1", 0.4, "ok"));
+    cases.insert("spr_and_menu".into(), flop_case(vec![Seed::exact(pre).at(200, 1900, 10_000)], CONSERVATIVE, "flop_fast_v1", 0.4, "ok"));
+    cases.insert("presolver_miss_live_template_hit".into(), flop_case(vec![Seed::exact("flop_min_v1")], ADMITTED, "flop_min_v1", 0.4, "ok"));
+    cases.insert("presolver_provisional_live_template_exact".into(),
+        flop_case(vec![support::provisional_hit(0.019), Seed::exact("flop_min_v1")], ADMITTED, "flop_min_v1", 0.4, "ok"));
+    // Above-target hits: the Provisional, then the live refinement.
+    cases.insert("provisional_then_ok".into(), flop_case(support::provisional_route(), CONSERVATIVE, "flop_fast_v1", 0.4, "ok"));
+    cases.insert("provisional_then_no_iteration".into(), flop_case(support::provisional_route(), CONSERVATIVE, "flop_fast_v1", 0.0, "no_iteration"));
+    cases.insert("provisional_then_worse_best_so_far".into(), flop_case(support::provisional_route(), CONSERVATIVE, "flop_fast_v1", 3.0, "best_so_far"));
+    cases.insert("two_provisionals_the_better_retained".into(),
+        flop_case(vec![support::provisional_hit(0.03), Seed::exact("flop_min_v1").raw(0.012)], ADMITTED, "flop_min_v1", 0.4, "ok"));
+    // Misses: solved live, stored.
+    cases.insert("cold_srp_best_so_far".into(), flop_case(vec![], CONSERVATIVE, "flop_fast_v1", 1.9, "best_so_far"));
+    cases.insert("cold_srp_raw_target_ok".into(), flop_case(vec![], CONSERVATIVE, "flop_fast_v1", 0.4, "ok"));
+    cases.insert("srp_live_flop_min".into(), flop_case(vec![], ADMITTED, "flop_min_v1", 0.4, "ok"));
+    {
+        // The first attempt fails with no_iteration; the `_min` retry answers on its own tree, which is what is stored.
+        let flop = support::srp_flop(SB);
+        let first = support::live_script(&flop, "flop_fast_v1", 0.0, "no_iteration")[..2].to_vec();
+        let mut rig = FlopRig::new([first, support::live_script(&flop, "flop_min_v1", 0.4, "ok")].concat());
+        let served = rig.serve(&flop);
+        cases.insert("retry_min_is_stored_on_its_own_tree".into(), project_rig(&mut rig, &[served]));
+        rig.core.shutdown();
+    }
+    {
+        // A 3-bet pot uses flop_fast_v1 live even with flop_min_v1 admitted: one probe, one template.
+        let flop = support::three_bet_flop(SB);
+        let mut rig = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 0.4, "ok"));
+        rig.core.flop_policy = ADMITTED;
+        let served = rig.serve(&flop);
+        cases.insert("three_bet_fast".into(), project_rig(&mut rig, &[served]));
+        rig.core.shutdown();
+    }
+    {
+        // The stored entry covers the root node only: hero on the button, facing a check, is a miss for that path.
+        let facing_check = play(&support::srp_flop(BTN), &[Action::Check]);
+        let mut rig = FlopRig::new(support::live_script(&facing_check, "flop_fast_v1", 0.4, "ok"));
+        rig.seed(&[Seed::exact(pre).truncated()]);
+        let served = rig.serve(&facing_check);
+        cases.insert("missed_path".into(), project_rig(&mut rig, &[served]));
+        rig.core.shutdown();
+    }
+    {
+        // The cache root is blocked (a file where its directory should be): every lookup misses, nothing is stored, the
+        // decision is answered live.
+        let dir = support::TempDir::new();
+        std::fs::write(dir.0.join("blocked"), b"not a directory").unwrap();
+        let blocked = cache::Cache::open(dir.0.join("blocked").join("v3"), cache::CACHE_QUOTA_BYTES);
+        assert!(blocked.availability_warning().is_some());
+        let flop = support::srp_flop(SB);
+        let mut rig = FlopRig::with_cache(support::live_script(&flop, "flop_fast_v1", 0.4, "ok"), blocked, dir);
+        let served = rig.serve(&flop);
+        cases.insert("disk_blocked".into(), project_rig(&mut rig, &[served]));
+        rig.core.shutdown();
+    }
+    {
+        // A stale result: the decision is superseded once its solve returned; no Final, nothing registered or stored.
+        let flop = support::srp_flop(SB);
+        let mut rig = FlopRig::new(support::live_script(&flop, "flop_fast_v1", 0.4, "ok"));
+        let identity = rig.identity.clone();
+        let served = rig.serve_with(&flop, ServeSeams { after_active_check: seam(move || { identity.lock().unwrap().mutate(); }), ..ServeSeams::default() });
+        cases.insert("stale_result".into(), project_rig(&mut rig, &[served]));
+        rig.core.shutdown();
+    }
+    {
+        // The turn: solved live and stored; the repeated request is served from the entry, with the live solve's own
+        // hero frequencies and EVs.
+        let turn = support::srp_turn(SB);
+        let mut rig = FlopRig::new(support::live_script(&turn, "turn_std_v1", 0.4, "ok"));
+        let live = rig.serve(&turn);
+        let _ = rig.stored();
+        let hit = rig.serve(&turn);
+        assert_eq!(hit.final_rec().actions, live.final_rec().actions, "the stored turn serves back the live strategy for hero's combo");
+        cases.insert("turn_store_then_hit".into(), project_rig(&mut rig, &[live, hit]));
+        rig.core.shutdown();
+    }
+    {
+        // The river: solved live, never stored.
+        let river = support::srp_river(SB);
+        let mut rig = FlopRig::new(support::live_script(&river, "river_std_v1", 0.4, "ok"));
+        let served = rig.serve(&river);
+        cases.insert("river_no_store".into(), project_rig(&mut rig, &[served]));
+        rig.core.shutdown();
+    }
+    // Compared as text parsed back by the same parser on both sides: `serde_json` does not parse every float back to the
+    // exact bits it printed (the last digit of an f64 may move), so a value built in memory is never compared with one
+    // read from the file directly.
+    let frozen: serde_json::Value = serde_json::from_slice(&serde_json::to_vec_pretty(&serde_json::Value::Object(cases)).unwrap()).unwrap();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/flop_path.json");
+    if std::env::var_os("POKERAI_RECORD_GOLDENS").is_some() {
+        std::fs::write(&path, serde_json::to_vec_pretty(&frozen).unwrap()).unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("the committed golden {} is missing ({e}); record it once with POKERAI_RECORD_GOLDENS=1 and inspect it", path.display()));
+    let expected: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    for (name, value) in frozen.as_object().unwrap() {
+        assert_eq!(Some(value), expected.get(name), "golden case {name}");
+    }
+    assert_eq!(frozen, expected);
+}

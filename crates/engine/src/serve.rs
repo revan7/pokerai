@@ -1,7 +1,7 @@
-//! Spec §5 steps 4-10 for one live request on `engine-main` (Task 28): the river and turn decision path, and (plan 3
-//! Task 17) the preflop decision path, which `crate::preflop::serve_preflop` answers at the `Classification::Preflop`
-//! arm, after the degraded-engine check, through the request's own claim (`settle`) and never with a solve. The flop
-//! path attaches at the flop guard below (plan 4).
+//! Spec §5 steps 4-10 for one live request on `engine-main` (Task 28): the river, turn and (plan 4 Task 10) flop decision
+//! path, and (plan 3 Task 17) the preflop decision path, which `crate::preflop::serve_preflop` answers at the
+//! `Classification::Preflop` arm, after the degraded-engine check, through the request's own claim (`settle`) and never
+//! with a solve.
 //!
 //! Admission (final review I1, orchestrator ruling F-I1; spec 7, a watchdog independent of the worker client; spec 5
 //! step 4). `Engine::recommend` admits a request through `admit` the moment it allocates its decision, before
@@ -15,15 +15,36 @@
 //!
 //! One request. `serve_request` classifies the decision (§6) and answers at once every row the classifier settles
 //! alone; a degraded engine (a worker whose `ready` was refused at startup, spec 12, ruling 29-I4) answers every
-//! decision that way too, with the version mismatch. For a heads-up river or turn decision it reads the public root
-//! ranges from the range source (§9: the only provider, which owns their validation, rulings 27-D3/D4; in production the
-//! replay's, plan 3 Task 18), emits `Fast` (§5 step 5), starts the `fast-path` equity thread (§3.4), solves through the
-//! solve client (`solve::run_solve`, Tasks 22-23), assembles the `Final` (§4.4, §5 step 7), registers a validated
-//! solution as a snapshot (§9.2) and logs the decision (§5 step 10). A heads-up postflop decision that ends with no
-//! solution (the flop guard, a refused range, a failed solve, the watchdog's `Final`, an unserved retirement or a panic
-//! containment) records its miss instead, with the engine's cause, under the same identity rule (plan 3 Task 18, spec
-//! 9.3): a later replay names that cause for a street left without a snapshot, and records the delivered cause as the
-//! street's miss (ruling 18-I2).
+//! decision that way too, with the version mismatch. For a heads-up flop, turn or river decision it reads the public
+//! root ranges from the range source (§9: the only provider, which owns their validation, rulings 27-D3/D4; in
+//! production the replay's, plan 3 Task 18), emits `Fast` (§5 step 5), starts the `fast-path` equity thread (§3.4), asks
+//! the cache on the flop and the turn (below), solves through the solve client (`solve::run_solve`, Tasks 22-23),
+//! assembles the `Final` (§4.4, §5 step 7), registers a validated solution as a snapshot (§9.2), stores a flop or turn
+//! solution in the cache and logs the decision (§5 step 10). A heads-up postflop decision that ends with no solution (a
+//! refused range, a tree that does not build, a failed solve with nothing retained, the watchdog's `Final`, an unserved
+//! retirement or a panic containment) records its miss instead, with the engine's cause, under the same identity rule
+//! (plan 3 Task 18, spec 9.3): a later replay names that cause for a street left without a snapshot, and records the
+//! delivered cause as the street's miss (ruling 18-I2).
+//!
+//! The cache (plan 4 Task 10; spec 5 step 7, 7, 10.4, 10.5). After the `Fast`, a flop or turn decision probes the cache
+//! (`cache_phase`): on the flop the pre-solver's template first and then the live template the flop policy picks (Task
+//! 9: `flop_min_v1` only for an admitted single-raised pot), when it differs; on the turn its one template. The probes
+//! run on `engine-main`, inside the request's own budget: together at most `CACHE_BUDGET_MS` from the start of the phase
+//! and never past the street deadline (ruling 10-pre1: the shared 500 ms cache budget of spec 7; the watchdog never
+//! asks the cache, and a lookup that holds `engine-main` to its bound cannot delay the watchdog's `Final`). The suit
+//! permutation of every key is `cache_bridge::canonical_perm`'s over the public root ranges (hero's cards enter no
+//! key). A hit at the request's raw target is its `Final` (`cache_exact` or `cache_approximate` snapshot, registered
+//! through `finish` like a live one), with no live solve. An above-target hit is its `Provisional` while a live solve
+//! refines it: the `Provisional` is accepted under the identity lock like any event, and in that same accepted delivery
+//! its `cache_provisional` snapshot is registered (`replay_bridge::register_accepted`: a `Provisional` never replaces a
+//! `Final`) and its payload, promoted to `Final`, is retained for the watchdog (`set_retained`), so a watchdog `Final`
+//! delivers exactly it. A decision already superseded, or whose `Final` the watchdog already delivered, gets no
+//! `Provisional` and registers nothing. The live refinement's `Final` replaces the `Provisional` unless the retained hit
+//! is more accurate (raw) or the refinement failed: that `Final` is then the retained payload, disclosing both
+//! accuracies. A lookup miss changes nothing but the label; only a lookup that ran out of its budget is disclosed in the
+//! notes. The live terminal of a flop or turn solve (the tree actually solved: the `_min` retry's when it answered) is
+//! stored through the non-blocking `Cache::store` once its `Final` is delivered; an entry the cache refuses is logged
+//! (`EngineCore::log_cache_reject`) and never affects delivery. River solves are never stored.
 //!
 //! Identity (ruling 28-I1). Every event goes through `deliver` (`emit` for the crate): it is accepted under the
 //! identity lock, where a decision no longer active is refused and a `Final` claims the request's once-only delivery,
@@ -72,9 +93,9 @@
 //! and the solve client (`SolvePlan::street_deadline`), which publishes the first attempt's terminal arrival to it at
 //! receipt. The logged verdict is the client's (`SolveOutcome::street_violation`), judged from that arrival and never
 //! from when processing finished; a `best_so_far` (the street deadline reached) is logged as a violation too, except on
-//! the flop, whose single-raised-pot miss is the designed outcome (§12; plan 4). A request that ends before any solve
-//! logs no verdict when answered before the fire, and the shared street deadline's once it expired (ruling 28-O3). A
-//! row the classifier settles solves no street and logs no street verdict.
+//! a single-raised-pot flop cache miss, the designed outcome (`flop::is_street_violation`; §7, §10.6). A request that
+//! ends before any solve logs no verdict when answered before the fire, and the shared street deadline's once it
+//! expired (ruling 28-O3). A row the classifier settles solves no street and logs no street verdict.
 //!
 //! After the `Final` (§7, §12, rulings 23-I1 and 28-I3). At the watchdog's fire the client stops and cleans nothing up,
 //! and reports whether it left a sent job that may still be running, or a failed link, behind
@@ -99,26 +120,31 @@
 
 use crate::allin::{facing_allin, AllInAnswer, AllInInput};
 use crate::assemble::{self, AssemblyCtx};
+use crate::cache_bridge::{canonical_perm, entry_from_solution, make_cache_query};
 use crate::clock::Clock;
 use crate::core::EngineCore;
 use crate::coverage::{classify, decision_point, seat_index, Classification};
 use crate::deadline::Deadlines;
 use crate::equity::{equity_summary_with_clock, pending_summary, EQUITY_BUDGET_MS};
+use crate::flop::{cacheable, choose_cache_route, is_street_violation, preflop_wagers, CacheRoute, ProvisionalHit, PRESOLVER_TEMPLATE};
 use crate::identity::IdentityState;
 use crate::log::{DecisionRecord, InputRecord};
+use crate::ranges::RootRanges;
 use crate::replay_bridge::{miss_cause, miss_cause_of_final, miss_for, register_accepted, snapshot_from_solution, snapshot_note};
 use crate::snapshots::StreetSnapshot;
-use crate::solve::{run_solve, SolvePlan, Terminal};
+use crate::solve::{run_solve, SolveOutcome, SolvePlan, Terminal};
 use crate::tree::{build_tree_full, tree_signature, TemplateSelection, Templates};
 use crate::watchdog::{Armed, Fired, SharedSink, StreetDeadline, Watchdog};
 use crate::EngineError;
+use cache::lookup::{CacheHit, Lookup, MissReason};
+use core_iso::SuitPerm;
 use core_model::derive;
 use core_ranges::hash_scaled;
 use core_replay::SnapshotMiss;
 use proto::worker::SOLVER_COMMIT;
 use proto::{
-    combo_index, ApproxReason, Assumptions, Card, Coverage, DecisionIdentity, Derived, EquitySummary, GameConfig, HandState, LegalAction, Phase, Range1326,
-    Recommendation, RecommendationEvent, Seat, SolveInput, Street, UnsupportedReason,
+    combo_index, ApproxReason, Assumptions, Card, Coverage, DecisionIdentity, Derived, EffectiveTree, EquitySummary, GameConfig, HandState, LegalAction, Phase,
+    Range1326, Recommendation, RecommendationEvent, Seat, SolveInput, Street, StreetRootSnapshot, UnsupportedReason,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -173,13 +199,15 @@ pub struct Watched {
 
 /// Retains `rec` for `req`'s watchdog (final fix round 2, ruling F2-N3; spec 7): at the fire the watchdog delivers the
 /// retained payload as the request's `Final` in place of its `DeadlineExceeded` fallback (`watchdog`'s fire). The
-/// handle plan 4 Task 11 Step 4a writes its validated `Provisional` (or an earlier `best_so_far`) through, for a request
-/// armed at admission: it never arms the watchdog itself (ruling F-Q2), and it emits that `Provisional` through
-/// `deliver` with `Some(&watch.delivered)` (ruling 28-N1), so nothing but an `Equity` follows a delivered `Final`. A
-/// later call replaces the payload; one landing after the fire changes nothing delivered. Takes the retained slot's
-/// lock alone, one step: never call it holding the sink, the fallback or the stage slot (`watchdog`'s lock order).
-/// `req` must be armed (a request at a decision point) and `rec` must answer its decision: either is a caller bug.
-#[allow(dead_code)] // plan 4 Task 11 Step 4a is its first caller outside this crate's tests (ruling F2-N3)
+/// handle a validated `Provisional` (or an earlier `best_so_far`) is written through, for a request armed at admission:
+/// its caller never arms the watchdog itself (ruling F-Q2). Plan 4 Task 10's cache `Provisional` is its first caller
+/// (`deliver_provisional`): the promoted payload is retained inside the `Provisional`'s accepted delivery, under the
+/// identity lock (the watchdog's lock order puts the identity lock before this slot, and the watchdog never waits on
+/// the identity lock while it holds this slot), so a watchdog that claims the `Final` after that acceptance delivers
+/// exactly it. A later call replaces the payload; one landing after the fire changes nothing delivered. Takes the
+/// retained slot's lock alone, one step: never call it holding the sink, the fallback or the stage slot (`watchdog`'s
+/// lock order). `req` must be armed (a request at a decision point) and `rec` must answer its decision: either is a
+/// caller bug.
 pub(crate) fn set_retained(req: &LiveRequest, rec: Recommendation) {
     let watch = req.watch.as_ref().unwrap_or_else(|| panic!("set_retained for decision {:?}: a request at no decision point has no watchdog", req.identity));
     assert!(rec.identity == req.identity, "set_retained for decision {:?}: a payload of decision {:?}", req.identity, rec.identity);
@@ -348,11 +376,14 @@ pub(crate) struct Hooks {
     /// Runs on `engine-main` inside the accepted claim of the engine's own `Final`, under the identity lock, immediately
     /// before a solved candidate's snapshot is registered (never before a miss is recorded).
     at_registration: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs on `engine-main` immediately before each flop or turn cache lookup (plan 4 Task 10), where a lookup holds
+    /// `engine-main` for up to its bound.
+    before_lookup: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Hooks {
     fn production() -> Self {
-        Self { equity: Arc::new(equity_summary_with_clock), before_claim: None, after_fast: None, after_active_check: None, at_registration: None }
+        Self { equity: Arc::new(equity_summary_with_clock), before_claim: None, after_fast: None, after_active_check: None, at_registration: None, before_lookup: None }
     }
 }
 
@@ -365,7 +396,9 @@ impl Hooks {
 /// between that identity read and the read of the watchdog's claim (follow-up P2.W3, re-review observation O4: a
 /// supersession and a fire landing between the two); `at_registration` runs on `engine-main` inside the accepted claim
 /// of the engine's own `Final`, under the identity lock, immediately before a solved candidate's snapshot is registered
-/// (final fix round 2, ruling F2-I3: the re-review's probe P7 site, a panic after the claim and before the handover).
+/// (final fix round 2, ruling F2-I3: the re-review's probe P7 site, a panic after the claim and before the handover);
+/// `before_lookup` runs on `engine-main` immediately before each flop or turn cache lookup (plan 4 Task 10: a lookup
+/// that holds `engine-main` to its bound, a supersession or a watchdog fire landing while the cache is asked).
 /// `None` keeps production behaviour. A seam that panics exercises `engine-main`'s containment (final review I3).
 #[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Default)]
@@ -375,6 +408,7 @@ pub struct ServeSeams {
     pub after_fast: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_active_check: Option<Arc<dyn Fn() + Send + Sync>>,
     pub at_registration: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub before_lookup: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -382,7 +416,7 @@ impl ServeSeams {
     fn hooks(&self) -> Hooks {
         let production = Hooks::production();
         Hooks { equity: self.equity.clone().unwrap_or(production.equity), before_claim: self.before_claim.clone(), after_fast: self.after_fast.clone(),
-            after_active_check: self.after_active_check.clone(), at_registration: self.at_registration.clone() }
+            after_active_check: self.after_active_check.clone(), at_registration: self.at_registration.clone(), before_lookup: self.before_lookup.clone() }
     }
 }
 
@@ -478,16 +512,9 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
         }
         Classification::HuStreet { root, reasons, facing_allin, opponent } => (root, reasons, facing_allin, opponent),
     };
-    // PLAN 4 HOOK: the flop path (cache lookup, pre-solver templates, flop budget) replaces this guard. Until then a flop
-    // decision records its engine error as the flop's miss (plan 3 Task 18, spec 9.3).
-    if root.street == Street::Flop {
-        let reason = engine_error("no flop path in this build (plan 4)");
-        let miss = miss_for(&req.identity, &root, miss_cause(&reason));
-        let candidate = Candidate::missed(assemble::unsupported(&ctx, reason, inherited, assumptions), miss);
-        finish(core, req, hooks, &claim, candidate, Logged::unsolved(root.street, None, vec![]));
-        return;
-    }
-    assert!(matches!(root.street, Street::Turn | Street::River), "a heads-up street root on {:?}", root.street);
+    // Plan 4 Task 10: the flop is served like the turn and the river, through the cache phase below (the plan-2 flop guard
+    // is gone).
+    assert!(matches!(root.street, Street::Flop | Street::Turn | Street::River), "a heads-up street root on {:?}", root.street);
     ctx.equity = pending_summary(&[opponent]);
     // Ruling 28-I6: the fallback armed at admission now carries the classifier's reasons and the opponent's pending
     // equity; it is refreshed again once the range source and the tree have answered.
@@ -532,22 +559,79 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     let (hero_public, opp_public) = if hero_is_oop { (&ranges.oop, &ranges.ip) } else { (&ranges.ip, &ranges.oop) };
     spawn_equity(core, req, hero_public.clone(), vec![(opponent, opp_public.clone())], root.board.clone(), hooks.equity.clone(), equity_cancel.clone());
 
-    // Tree and solve (§5 step 7): river and turn are rooted at the street root; the turn cache arrives in plan 4.
-    let template = if root.street == Street::River { "river_std_v1" } else { "turn_std_v1" };
+    // The template (§10.1): the river's and the turn's own; on the flop, the policy's (plan 4 Task 9), classified from the
+    // preflop history, never the ranges. The request's target travels with it (captured once, at admission).
+    let template = live_template(core, &req.state, root.street);
+    let target_bp = config.solver.target_bp;
+    let hero_actor = if hero_is_oop { "oop" } else { "ip" };
+
+    // The cache phase (§5 step 7, §10.4, §10.5; plan 4 Task 10, see "The cache" above): flop and turn only.
+    let mut perm = SuitPerm::IDENTITY;
+    let mut retained: Option<Retained> = None;
+    if matches!(root.street, Street::Flop | Street::Turn) {
+        perm = canonical_perm(&root.board, &ranges.oop, &ranges.ip);
+        let (route, probes) = cache_phase(core, hooks, &root, [&ranges.oop, &ranges.ip], &d, &req.state, &inherited, &perm, template, target_bp,
+            deadlines.street_deadline_ms);
+        assumptions.cache = cache_label_for(&probes);
+        // A lookup that ran out of its budget is the one miss disclosed: the cache was too slow, not empty.
+        assumptions.notes.extend(probes.iter().filter(|p| p.result == Lookup::Miss { reason: MissReason::BudgetExhausted }).map(|p| {
+            format!("cache lookup of {} missed: it ran out of the {CACHE_BUDGET_MS} ms cache budget", p.template_id)
+        }));
+        *lock(&watch.fallback) = deadline_fallback(&ctx, &inherited, &assumptions);
+        let cached = Cached { root: &root, ranges: &ranges, ctx: &ctx, hero_public, hero_actor, target_bp };
+        match route {
+            CacheRoute::Final(hit) => {
+                // A hit at the request's raw target: the `Final`, no live solve. Its snapshot is registered only as part of
+                // the `Final`'s accepted delivery (`finish`, the one registration rule).
+                let probe = probe_of(&probes, &hit);
+                assumptions.template_id = probe.template_id.clone();
+                assumptions.tree_signature = probe.signature.clone();
+                let label = hit.coverage.clone().unwrap_or_else(|| panic!("decision {:?}: an at-target cache hit carries its coverage", req.identity));
+                let origin = if label == Coverage::Exact { "cache_exact" } else { "cache_approximate" };
+                let rec = cached.recommendation(core, req, &hit, assemble::accumulate(label, inherited.clone()), &assumptions, Phase::Final);
+                let snapshot = cached.snapshot(req, &hit, origin, coverage_reasons(&rec.coverage));
+                let logged = Logged::unsolved(root.street, Some(street_deadline.clone()), range_hashes);
+                finish(core, req, hooks, &claim, Candidate { rec, record: Record::Snapshot(snapshot), best_so_far: false }, logged);
+                return;
+            }
+            CacheRoute::Refine { retained: Some(ProvisionalHit { hit, reasons }) } => {
+                // An above-target hit: the `Provisional`, labelled here (never `Exact`: its raw accuracy missed the
+                // target), refined by the live solve below.
+                let probe = probe_of(&probes, &hit);
+                let mut provisional = assumptions.clone();
+                provisional.template_id = probe.template_id.clone();
+                provisional.tree_signature = probe.signature.clone();
+                let rec = cached.recommendation(core, req, &hit, assemble::accumulate(Coverage::Approximate { reasons }, inherited.clone()), &provisional, Phase::Provisional);
+                let snapshot = cached.snapshot(req, &hit, "cache_provisional", coverage_reasons(&rec.coverage));
+                let mut promoted = rec.clone();
+                promoted.phase = Phase::Final;
+                if deliver_provisional(core, req, rec, snapshot, promoted.clone()) {
+                    retained = Some(Retained { hit, promoted });
+                }
+            }
+            CacheRoute::Refine { retained: None } => {}
+        }
+    }
+
+    // Tree and solve (§5 step 7): each street is rooted at its street root.
     let build = match build_tree_full(&root, &TemplateSelection::from_history(template, &root.history)) {
         Ok(b) => b,
         Err(reason) => {
             let logged = Logged::unsolved(root.street, Some(street_deadline.clone()), range_hashes);
-            let miss = miss_for(&req.identity, &root, miss_cause(&reason));
-            finish(core, req, hooks, &claim, Candidate::missed(assemble::unsupported(&ctx, reason, inherited, assumptions), miss), logged);
+            // A retained cache payload is a validated solution: it answers when no live refinement can start.
+            let candidate = match &retained {
+                Some(r) => Cached { root: &root, ranges: &ranges, ctx: &ctx, hero_public, hero_actor, target_bp }.retained_final(core, req, r, vec![],
+                    format!("live refinement could not start ({}); the retained cache payload {:.6} is delivered", miss_cause(&reason), r.hit.raw_exploitability_over_p), false),
+                None => Candidate::missed(assemble::unsupported(&ctx, reason.clone(), inherited, assumptions), miss_for(&req.identity, &root, miss_cause(&reason))),
+            };
+            finish(core, req, hooks, &claim, candidate, logged);
             return;
         }
     };
     assumptions.template_id = template.into();
     assumptions.tree_signature = tree_signature(&build.tree, build.pot);
     *lock(&watch.fallback) = deadline_fallback(&ctx, &inherited, &assumptions);
-    let hero_actor = if hero_is_oop { "oop" } else { "ip" };
-    let input = SolveInput { root: root.clone(), ranges: [ranges.oop.clone(), ranges.ip.clone()], tree: build.tree.clone(), target_bp: config.solver.target_bp };
+    let input = SolveInput { root: root.clone(), ranges: [ranges.oop.clone(), ranges.ip.clone()], tree: build.tree.clone(), target_bp };
     // `background: false`: a live decision (final review M5: the wire flag only; plan 4's pre-solver jobs need an
     // executor of their own).
     let plan = SolvePlan { identity: req.identity.clone(), deadlines, street_deadline: street_deadline.clone(), template_id: template.into(),
@@ -590,56 +674,298 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
         assumptions.source_accuracy = out.solution.as_ref()
             .map_or_else(|| "unverified".to_string(), |sol| format!("exploitability <= {} bp", accuracy_bound_bp(sol.exploitability_chips, build.pot)));
         let best_so_far = out.terminal == Terminal::BestSoFar;
-        let candidate = match &out.terminal {
-            Terminal::Ok | Terminal::BestSoFar => {
-                let sol = out.solution.as_ref().expect("run_solve: an Ok or BestSoFar outcome carries its validated solution");
-                // The template actually solved (the `_min` retry's when it answered) and its tree.
-                assumptions.template_id = out.template_used.clone();
-                assumptions.tree_signature = tree_signature(&out.tree, build.pot);
-                let coverage = assemble::coverage_for_solve(sol.exploitability_chips, build.pot, config.solver.target_bp, best_so_far, inherited.clone());
-                let requested = sol.requested as usize;
-                let reach = assemble::hero_reach(&sol.nodes, &out.ordinal_paths, requested, hero_public, hero_actor);
-                // Registered only as part of this `Final`'s accepted delivery (§9.2, ruling 28-I2), by the one registration
-                // rule (plan 3 Task 18: `replay_bridge::register_accepted`). Built by `snapshot_from_solution` from the input
-                // actually solved: the public root ranges, which are the replay's own published ranges (so a later replay
-                // finds the snapshot by their hashes, Task 15 Q4; hero's cards are in neither), the street root and its
-                // history (the solved prefix, the projected root's for a projection), and the tree the answering attempt
-                // solved (the `_min` retry's when it answered), whose materialized nodes the solve client resolved every
-                // wire chip path against (`solve::validate`, §2's single rule) into `out.ordinal_paths`: the nodes the
-                // worker exported, never reconstructed. Its reasons are this solve's full coverage reasons (fix round 1,
-                // ruling 18-I1; spec 6, reasons accumulate; spec 9.3): every reason this decision inherited and the solve's
-                // own, a `best_so_far`'s `DeadlineBestSoFar` included, carried into every later result the snapshot
-                // conditions. Built before `assumptions` moves into the `Final`. The key's config revision is the
-                // identity's, the hand's (ruling F-I4).
-                let solved = SolveInput { root: input.root.clone(), ranges: input.ranges.clone(), tree: out.tree.clone(), target_bp: input.target_bp };
-                let snapshot = snapshot_from_solution(&req.identity, &solved, sol, out.ordinal_paths.clone(), assumptions.tree_signature.clone(), "live",
-                    coverage_reasons(&coverage));
-                let rec = assemble::final_from_solution(&ctx, &sol.nodes[requested], &reach, coverage, assumptions);
-                Candidate { rec, record: Record::Snapshot(snapshot), best_so_far }
+        // Plan 4 Task 10: a retained cache payload stays the `Final` when it is more accurate than the live refinement (raw,
+        // over each one's own pot) or when the refinement has no solution. Both accuracies are disclosed, and the reasons
+        // the refinement incurred accumulate onto the payload's.
+        let live_over_p = out.solution.as_ref().map(|sol| f64::from(sol.exploitability_chips) / f64::from(build.pot));
+        let keep = match (&retained, live_over_p) {
+            (Some(r), Some(live)) if r.hit.raw_exploitability_over_p < live => Some(r),
+            (Some(r), None) => Some(r),
+            (Some(_), Some(_)) | (None, _) => None,
+        };
+        let candidate = if let Some(r) = keep {
+            let cached = Cached { root: &root, ranges: &ranges, ctx: &ctx, hero_public, hero_actor, target_bp };
+            let raw = r.hit.raw_exploitability_over_p;
+            match (&out.terminal, &out.solution) {
+                (Terminal::Ok | Terminal::BestSoFar, Some(sol)) => {
+                    let live = assemble::coverage_for_solve(sol.exploitability_chips, build.pot, target_bp, best_so_far, inherited.clone());
+                    let note = format!("live refinement reached raw {:.6}; the retained cache payload {raw:.6} is better", live_over_p.unwrap_or_default());
+                    cached.retained_final(core, req, r, coverage_reasons(&live), note, best_so_far)
+                }
+                (Terminal::Failed(reason), _) => {
+                    let note = format!("live refinement failed ({}); the retained cache payload {raw:.6} is delivered", miss_cause(reason));
+                    cached.retained_final(core, req, r, vec![], note, false)
+                }
+                (terminal, _) => unreachable!("run_solve: a {terminal:?} outcome without its solution"),
             }
-            Terminal::Failed(reason) => {
-                // §5 step 7 / §6: facing an all-in with the worker failing, the analytic fallback answers.
-                let worker_failed = matches!(reason, UnsupportedReason::EngineError { .. } | UnsupportedReason::DeadlineExceeded { .. });
-                let analytic = if facing_allin_flag && worker_failed { analytic_allin(req, &d, hero_public, opp_public, &equity_cancel) } else { None };
-                // No solution to register: the worker's failure is the street's miss (plan 3 Task 18), analytic answer or not.
-                let miss = miss_for(&req.identity, &root, miss_cause(reason));
-                Candidate::missed(match analytic {
-                    Some(a) => {
-                        let mut rec = assemble::unsupported(&ctx, reason.clone(), vec![], assumptions);
-                        rec.coverage = assemble::accumulate(Coverage::Approximate { reasons: vec![ApproxReason::UnconditionedCurrentStreet] }, inherited.clone());
-                        rec.actions = a.actions;
-                        rec.assumptions.notes.push(format!("analytic all-in fallback: equity {:.4}, W {}, R {:.2}, EV(call) {:.2} chips; headline: highest EV",
-                            a.equity, a.w, a.r, a.ev_call_chips));
-                        rec
-                    }
-                    None => assemble::unsupported(&ctx, reason.clone(), inherited.clone(), assumptions),
-                }, miss)
+        } else {
+            match &out.terminal {
+                Terminal::Ok | Terminal::BestSoFar => {
+                    let sol = out.solution.as_ref().expect("run_solve: an Ok or BestSoFar outcome carries its validated solution");
+                    // The template actually solved (the `_min` retry's when it answered) and its tree.
+                    assumptions.template_id = out.template_used.clone();
+                    assumptions.tree_signature = tree_signature(&out.tree, build.pot);
+                    let coverage = assemble::coverage_for_solve(sol.exploitability_chips, build.pot, target_bp, best_so_far, inherited.clone());
+                    let requested = sol.requested as usize;
+                    let reach = assemble::hero_reach(&sol.nodes, &out.ordinal_paths, requested, hero_public, hero_actor);
+                    // Registered only as part of this `Final`'s accepted delivery (§9.2, ruling 28-I2), by the one registration
+                    // rule (plan 3 Task 18: `replay_bridge::register_accepted`). Built by `snapshot_from_solution` from the input
+                    // actually solved: the public root ranges, which are the replay's own published ranges (so a later replay
+                    // finds the snapshot by their hashes, Task 15 Q4; hero's cards are in neither), the street root and its
+                    // history (the solved prefix, the projected root's for a projection), and the tree the answering attempt
+                    // solved (the `_min` retry's when it answered), whose materialized nodes the solve client resolved every
+                    // wire chip path against (`solve::validate`, §2's single rule) into `out.ordinal_paths`: the nodes the
+                    // worker exported, never reconstructed. Its reasons are this solve's full coverage reasons (fix round 1,
+                    // ruling 18-I1; spec 6, reasons accumulate; spec 9.3): every reason this decision inherited and the solve's
+                    // own, a `best_so_far`'s `DeadlineBestSoFar` included, carried into every later result the snapshot
+                    // conditions. Built before `assumptions` moves into the `Final`. The key's config revision is the
+                    // identity's, the hand's (ruling F-I4).
+                    let solved = SolveInput { root: input.root.clone(), ranges: input.ranges.clone(), tree: out.tree.clone(), target_bp: input.target_bp };
+                    let snapshot = snapshot_from_solution(&req.identity, &solved, sol, out.ordinal_paths.clone(), assumptions.tree_signature.clone(), "live",
+                        coverage_reasons(&coverage));
+                    let rec = assemble::final_from_solution(&ctx, &sol.nodes[requested], &reach, coverage, assumptions);
+                    Candidate { rec, record: Record::Snapshot(snapshot), best_so_far }
+                }
+                Terminal::Failed(reason) => {
+                    // §5 step 7 / §6: facing an all-in with the worker failing, the analytic fallback answers.
+                    let worker_failed = matches!(reason, UnsupportedReason::EngineError { .. } | UnsupportedReason::DeadlineExceeded { .. });
+                    let analytic = if facing_allin_flag && worker_failed { analytic_allin(req, &d, hero_public, opp_public, &equity_cancel) } else { None };
+                    // No solution to register: the worker's failure is the street's miss (plan 3 Task 18), analytic answer or not.
+                    let miss = miss_for(&req.identity, &root, miss_cause(reason));
+                    Candidate::missed(match analytic {
+                        Some(a) => {
+                            let mut rec = assemble::unsupported(&ctx, reason.clone(), vec![], assumptions);
+                            rec.coverage = assemble::accumulate(Coverage::Approximate { reasons: vec![ApproxReason::UnconditionedCurrentStreet] }, inherited.clone());
+                            rec.actions = a.actions;
+                            rec.assumptions.notes.push(format!("analytic all-in fallback: equity {:.4}, W {}, R {:.2}, EV(call) {:.2} chips; headline: highest EV",
+                                a.equity, a.w, a.r, a.ev_call_chips));
+                            rec
+                        }
+                        None => assemble::unsupported(&ctx, reason.clone(), inherited.clone(), assumptions),
+                    }, miss)
+                }
             }
         };
-        finish(core, req, hooks, &claim, candidate, logged);
+        // §5 step 7: the live terminal of a flop or turn solve is stored once its `Final` is out (non-blocking; a refused
+        // entry is logged and never affects delivery). A candidate discarded because its decision was superseded
+        // stores nothing.
+        if finish(core, req, hooks, &claim, candidate, logged) != Delivery::Stale {
+            store_live_terminal(core, req, &root, &ranges, &out, build.pot, &inherited, &perm, target_bp);
+        }
     }
     if kill_after_final {
         kill_the_busy_worker(core);
+    }
+}
+
+/// §10.1: the live template of a heads-up street root: `river_std_v1` and `turn_std_v1`, and on the flop the policy's
+/// (`EngineCore::flop_policy`, loaded once at startup, plan 4 Task 9) from the preflop history's wager count.
+fn live_template(core: &EngineCore, state: &HandState, street: Street) -> &'static str {
+    match street {
+        Street::River => "river_std_v1",
+        Street::Turn => "turn_std_v1",
+        Street::Flop => core.flop_policy.live_template(preflop_wagers(state)),
+        Street::Preflop => unreachable!("a heads-up street root is postflop"),
+    }
+}
+
+/// §7: the whole decision may spend at most this long in cache lookups, every probe together.
+pub const CACHE_BUDGET_MS: u64 = 500;
+
+/// One cache probe of a decision (plan 4 Task 10): the template asked, its effective tree at the street root and that
+/// tree's signature and pot, and the lookup's outcome.
+#[derive(Clone, Debug)]
+pub struct Probe {
+    pub template_id: String,
+    pub tree: EffectiveTree,
+    pub signature: String,
+    pub pot: u32,
+    pub result: Lookup,
+}
+
+/// One probe: `template`'s effective tree at `root` (as the live solve would build it), the §10.4 query of the decision
+/// over the public root `ranges` (OOP then IP) with the request's inherited reasons, the shared suit permutation `perm`
+/// and the request's captured `target_bp`, answered by `Cache::lookup` within `budget` (itself bounded by
+/// `cache::lookup::LOOKUP_BOUND`). `None` when the template does not build at this root or the query cannot be formed
+/// (the live solve then answers as it would without the cache).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn probe_cache(core: &EngineCore, hooks: &Hooks, root: &StreetRootSnapshot, ranges: [&Range1326; 2], d: &Derived, state: &HandState,
+    inherited: &[ApproxReason], perm: &SuitPerm, template: &str, target_bp: u16, budget: Duration) -> Option<Probe> {
+    let build = build_tree_full(root, &TemplateSelection::from_history(template, &root.history)).ok()?;
+    let signature = tree_signature(&build.tree, build.pot);
+    let input = SolveInput { root: root.clone(), ranges: [ranges[0].clone(), ranges[1].clone()], tree: build.tree.clone(), target_bp };
+    let query = make_cache_query(&input, d, state.config.bb_chips, &state.config.rake, inherited, &signature, perm, target_bp, budget).ok()?;
+    if let Some(before_lookup) = &hooks.before_lookup {
+        before_lookup();
+    }
+    let result = core.cache.lookup(&query);
+    Some(Probe { template_id: template.into(), tree: build.tree, signature, pot: build.pot, result })
+}
+
+/// §5 step 7 / §10.5: the decision's probes, the pre-solver's template first on the flop and then the live template when
+/// it is another, stopping at the first hit at target; every probe gets what is left of `CACHE_BUDGET_MS` from the
+/// start of the phase, and never more than what is left until the street deadline. Returns the route
+/// (`flop::choose_cache_route`) and the probes made. Runs on `engine-main` (ruling 10-pre1), holding no engine lock.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cache_phase(core: &EngineCore, hooks: &Hooks, root: &StreetRootSnapshot, ranges: [&Range1326; 2], d: &Derived, state: &HandState,
+    inherited: &[ApproxReason], perm: &SuitPerm, live_template: &str, target_bp: u16, street_deadline_ms: u64) -> (CacheRoute, Vec<Probe>) {
+    let mut order: Vec<&str> = Vec::new();
+    if root.street == Street::Flop {
+        order.push(PRESOLVER_TEMPLATE);
+    }
+    if !order.contains(&live_template) {
+        order.push(live_template);
+    }
+    let start_ms = core.clock.now_ms();
+    let mut probes = Vec::new();
+    for template in order {
+        let now = core.clock.now_ms();
+        let left = CACHE_BUDGET_MS.saturating_sub(now.saturating_sub(start_ms)).min(street_deadline_ms.saturating_sub(now));
+        let Some(probe) = probe_cache(core, hooks, root, ranges, d, state, inherited, perm, template, target_bp, Duration::from_millis(left)) else { continue };
+        let at_target = matches!(probe.result, Lookup::Exact { .. } | Lookup::Approximate { .. });
+        probes.push(probe);
+        if at_target {
+            break;
+        }
+    }
+    let route = choose_cache_route(probes.iter().map(|p| p.result.clone()).collect());
+    (route, probes)
+}
+
+/// §4.4 `Assumptions.cache` (`miss | exact | approximate | provisional`, review m13) of a decision's probes: the label
+/// of the hit served, `provisional` when only above-target hits were found, `miss` when nothing was.
+pub fn cache_label_for(probes: &[Probe]) -> String {
+    let mut label = "miss";
+    for p in probes {
+        label = match (&p.result, label) {
+            (Lookup::Exact { .. }, _) => "exact",
+            (Lookup::Approximate { .. }, "exact") => "exact",
+            (Lookup::Approximate { .. }, _) => "approximate",
+            (Lookup::Provisional { .. }, "miss") => "provisional",
+            _ => label,
+        };
+    }
+    label.into()
+}
+
+/// The probe a route's hit came from: the one whose tree signature the hit carries (each probe asks a template of its
+/// own, and a template's signature names it).
+fn probe_of<'a>(probes: &'a [Probe], hit: &CacheHit) -> &'a Probe {
+    probes.iter().find(|p| p.signature == hit.tree_signature).unwrap_or_else(|| panic!("a cache hit of signature {} that no probe asked for", hit.tree_signature))
+}
+
+/// A `Provisional` that was accepted: the hit, and its payload promoted to `Final` (retained for the watchdog).
+struct Retained {
+    hit: CacheHit,
+    promoted: Recommendation,
+}
+
+/// What serving a cache hit reads of the request: its street root, its public root ranges (OOP then IP: the ranges the
+/// query was keyed by, and the snapshot is), its assembly context, hero's public range and role, and its target.
+struct Cached<'a> {
+    root: &'a StreetRootSnapshot,
+    ranges: &'a RootRanges,
+    ctx: &'a AssemblyCtx,
+    hero_public: &'a Range1326,
+    hero_actor: &'a str,
+    target_bp: u16,
+}
+
+impl Cached<'_> {
+    /// The result a cache hit answers with (§4.4, §10.4): hero's frequencies and EVs at the requested node of the hit's
+    /// solution (rebuilt in the query's chips and suits), labelled `coverage`, in `phase`. The assumptions are `base`
+    /// with the cache as the source, the hit's raw accuracy as an upper bound in bp and rounded for display, the hit's
+    /// notes (the realized menu, the source storage mode) and the elapsed time.
+    fn recommendation(&self, core: &EngineCore, req: &LiveRequest, hit: &CacheHit, coverage: Coverage, base: &Assumptions, phase: Phase) -> Recommendation {
+        let requested = hit.solution.requested as usize;
+        let raw = hit.raw_exploitability_over_p;
+        assert!(raw.is_finite() && raw >= 0.0, "decision {:?}: a cache hit's raw accuracy {raw}", req.identity);
+        let mut a = base.clone();
+        a.source = format!("cache@{SOLVER_COMMIT}");
+        // §4.4 vocabulary `"exploitability <= x"`, a true bound in bp over the raw stored value (ruling 28-I5).
+        a.source_accuracy = format!("exploitability <= {} bp", (raw * 10_000.0).ceil() + 0.0);
+        let bp = (raw * 10_000.0).round();
+        a.reached_bp = Some(if bp <= f64::from(u16::MAX) { bp as u16 } else { u16::MAX });
+        a.elapsed_ms = elapsed_ms(req.t0_ms, core.clock.now_ms());
+        a.notes.extend(hit.notes.iter().cloned());
+        let reach = assemble::hero_reach(&hit.solution.nodes, &hit.covered_paths, requested, self.hero_public, self.hero_actor);
+        let mut rec = assemble::final_from_solution(self.ctx, &hit.solution.nodes[requested], &reach, coverage, a);
+        rec.phase = phase;
+        rec
+    }
+
+    /// The §9.1 snapshot of a cache hit (plan-3 carry (d)): `replay_bridge::snapshot_from_solution` over the input the hit
+    /// answers (the street root, the public root ranges, the query tree the hit was rebuilt on), its solution, its
+    /// ordinal paths and signature, `origin` (one of `replay_bridge::ORIGINS`) and the result's full coverage reasons
+    /// (ruling 18-I1).
+    fn snapshot(&self, req: &LiveRequest, hit: &CacheHit, origin: &str, reasons: Vec<ApproxReason>) -> StreetSnapshot {
+        let input = SolveInput { root: self.root.clone(), ranges: [self.ranges.oop.clone(), self.ranges.ip.clone()], tree: hit.tree.clone(), target_bp: self.target_bp };
+        snapshot_from_solution(&req.identity, &input, &hit.solution, hit.covered_paths.clone(), hit.tree_signature.clone(), origin, reasons)
+    }
+
+    /// The `Final` of a retained cache payload (plan 4 Task 10): the promoted `Provisional`, with the reasons the live
+    /// refinement incurred accumulated onto it, `note` disclosing the refinement's own outcome and the elapsed time now;
+    /// its `cache_provisional` snapshot registered again with the `Final` (the same decision's, so it replaces the
+    /// `Provisional`'s), carrying the `Final`'s full coverage reasons. `best_so_far` is the refinement's.
+    fn retained_final(&self, core: &EngineCore, req: &LiveRequest, r: &Retained, incurred: Vec<ApproxReason>, note: String, best_so_far: bool) -> Candidate {
+        let mut rec = r.promoted.clone();
+        rec.coverage = assemble::accumulate(rec.coverage, incurred);
+        rec.assumptions.notes.push(note);
+        rec.assumptions.elapsed_ms = elapsed_ms(req.t0_ms, core.clock.now_ms());
+        let snapshot = self.snapshot(req, &r.hit, "cache_provisional", coverage_reasons(&rec.coverage));
+        Candidate { rec, record: Record::Snapshot(snapshot), best_so_far }
+    }
+}
+
+/// Plan 4 Task 10 (plan-3 carry (c), rulings 28-I1/28-I2/28-N1): a cache `Provisional`'s delivery. It is accepted
+/// under the identity lock, where its decision must be active and its `Final` not yet delivered (the watchdog claims
+/// the `Final` under the same lock); in that same accepted delivery its snapshot is registered by the one registration
+/// rule (`replay_bridge::register_accepted`: a `Provisional` never replaces a `Final`) and `promoted` is retained for
+/// the watchdog (`set_retained`). The `Provisional` is then handed to the sink with no engine lock held, unless the
+/// watchdog delivered the `Final` meanwhile (which is then `promoted` itself). Returns whether it was accepted (its
+/// snapshot registered and its payload retained); a decision no longer active, or whose `Final` was delivered, gets
+/// nothing, and nothing is registered.
+fn deliver_provisional(core: &EngineCore, req: &LiveRequest, rec: Recommendation, snapshot: StreetSnapshot, promoted: Recommendation) -> bool {
+    let watch = req.watch.as_ref().unwrap_or_else(|| panic!("decision {:?}: a Provisional for a request at no decision point", req.identity));
+    let snapshots = &core.snapshots;
+    let mut pending = Some((snapshot, promoted));
+    let mut accepted = false;
+    let verdict = accept(&core.identity, &req.identity, None, |active| {
+        if watch.delivered.load(Ordering::SeqCst) {
+            return;
+        }
+        let (snapshot, promoted) = pending.take().expect("an acceptance runs once");
+        register_accepted(&mut lock(snapshots), active, snapshot);
+        set_retained(req, promoted);
+        accepted = true;
+    });
+    if verdict == Delivery::Accepted && accepted {
+        let mut sink = lock(&req.sink);
+        if !watch.delivered.load(Ordering::SeqCst) {
+            sink.emit(RecommendationEvent::Provisional(rec));
+        }
+    }
+    accepted
+}
+
+/// §5 step 7 / §10.4: stores the live terminal of a flop or turn solve (`flop::cacheable`: never a river's, an
+/// experimental surrogate's or a locked baseline's), built by `cache_bridge::entry_from_solution` from the input
+/// actually solved (the answering attempt's tree, the `_min` retry's when it answered), the request's inherited reasons,
+/// the shared suit permutation `perm` and the request's target, through the non-blocking `Cache::store`. An entry the
+/// cache refuses is logged (`EngineCore::log_cache_reject`) and stored nowhere.
+#[allow(clippy::too_many_arguments)]
+fn store_live_terminal(core: &mut EngineCore, req: &LiveRequest, root: &StreetRootSnapshot, ranges: &RootRanges, out: &SolveOutcome, pot: u32,
+    inherited: &[ApproxReason], perm: &SuitPerm, target_bp: u16) {
+    let (Terminal::Ok | Terminal::BestSoFar, Some(sol)) = (&out.terminal, &out.solution) else { return };
+    // Phase 1 solves the baseline model only (§10.4 `model = baseline`); experimental surrogates never reach here.
+    if !cacheable(root.street, false, sol.locks_applied, true) {
+        return;
+    }
+    let solved = SolveInput { root: root.clone(), ranges: [ranges.oop.clone(), ranges.ip.clone()], tree: out.tree.clone(), target_bp };
+    let signature = tree_signature(&out.tree, pot);
+    match entry_from_solution(&solved, sol, inherited, req.state.config.bb_chips, &req.state.config.rake, &signature, perm, out.elapsed_ms, target_bp) {
+        Ok(entry) => core.cache.store(&entry),
+        Err(reason) => core.log_cache_reject(&req.identity, &reason),
     }
 }
 
@@ -796,7 +1122,7 @@ fn watchdog_final(fired: &Mutex<Option<Fired>>) -> Fired {
 /// A `Final` the classifier settles alone, or the preflop path's (plan 3 Task 17): through the request's claim, shared
 /// with its watchdog since admission. It solves no street, so it logs no street verdict.
 pub(crate) fn settle(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, claim: &Claim<'_>, street: Street, rec: Recommendation) {
-    finish(core, req, hooks, claim, Candidate::unsolved(rec), Logged::unsolved(street, None, vec![]));
+    let _ = finish(core, req, hooks, claim, Candidate::unsolved(rec), Logged::unsolved(street, None, vec![]));
 }
 
 /// The one `Final` path (§5 steps 7, 9, 10; ruling 28-I2). The candidate's delivery is claimed under the identity lock:
@@ -809,8 +1135,9 @@ pub(crate) fn settle(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, cl
 /// solved candidate's snapshot by the one registration rule, an unsolved heads-up postflop decision's miss), hands the
 /// `Final` to the sink with no engine lock held, and logs it. The claim and the handover are recorded on the request
 /// (`Watched::claimed_by_engine`, `Watched::handed`) for a panic's containment (ruling F2-I3). The request's watchdog
-/// generation is retired in every case.
-fn finish(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, claim: &Claim<'_>, candidate: Candidate, logged: Logged) {
+/// generation is retired in every case. Returns how the claim ended (plan 4 Task 10: a stale candidate's solution is
+/// not stored in the cache).
+fn finish(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, claim: &Claim<'_>, candidate: Candidate, logged: Logged) -> Delivery {
     if let Some(before_claim) = &hooks.before_claim {
         before_claim();
     }
@@ -857,6 +1184,7 @@ fn finish(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, claim: &Claim
             log_final(core, req, claim.watch, Delivered { at_ms, rec: &rec, by_watchdog: false, best_so_far }, &logged);
         }
     }
+    verdict
 }
 
 /// A stale exit (§4.4, §12; ruling W3-I1): the request's decision is no longer active. Its equity is cancelled (ruling
@@ -957,9 +1285,12 @@ pub(crate) fn contain_panic(core: &mut EngineCore, req: &LiveRequest, message: &
     }
 }
 
-/// Logs the `Final` delivered (§5 step 10): its coverage, reasons, template and reached exploitability, the time it was
-/// delivered at, and the deadline verdicts. A `Final` the watchdog delivered is a final-delivery violation by
-/// construction (the engine's own did not come in time). Marks the request's `Final` logged.
+/// Logs the `Final` delivered (§5 step 10): its coverage, reasons, cache result (its `assumptions.cache`), template and
+/// reached exploitability, the time it was delivered at, and the deadline verdicts. A `Final` the watchdog delivered is a
+/// final-delivery violation by construction (the engine's own did not come in time). The street verdict is
+/// `flop::is_street_violation`'s: a late first terminal always, and a `best_so_far` except on a single-raised-pot flop
+/// cache miss (fewer than three preflop wagers, `cache == "miss"`), the designed outcome (§7, §10.6). Marks the
+/// request's `Final` logged.
 fn log_final(core: &mut EngineCore, req: &LiveRequest, watch: &Watched, delivered: Delivered<'_>, logged: &Logged) {
     let rec = delivered.rec;
     let reasons = coverage_reasons(&rec.coverage);
@@ -968,13 +1299,14 @@ fn log_final(core: &mut EngineCore, req: &LiveRequest, watch: &Watched, delivere
         StreetVerdict::Judged(violated) => *violated,
         StreetVerdict::Unattempted(street_deadline) => final_violation && street_deadline.as_ref().is_some_and(|d| d.violated() || delivered.at_ms >= d.deadline_ms()),
     };
-    // §12 "Street deadline reached": a `best_so_far` is logged as a violation on every street but the flop, whose
-    // single-raised-pot miss is the designed outcome (plan 4 refines the flop by pot type).
+    // §12 "Street deadline reached": a `best_so_far` is logged as a violation on every street but a single-raised-pot
+    // flop cache miss, the designed outcome (plan 4 Task 10; ruling 10-B2: the brief's `< 3` preflop wagers).
     let best_so_far = delivered.best_so_far;
-    let street_violation = if logged.street == Street::Flop { arrival_violation && !best_so_far } else { arrival_violation || best_so_far };
+    let srp_miss = logged.street == Street::Flop && preflop_wagers(&req.state) < 3 && rec.assumptions.cache == "miss";
+    let street_violation = is_street_violation(logged.street, srp_miss, best_so_far, arrival_violation);
     watch.logged.store(true, Ordering::SeqCst);
     core.log.append(&DecisionRecord { identity: req.identity.clone(), street: logged.street, coverage: rec.coverage.clone(), reasons,
-        elapsed_ms: elapsed_ms(req.t0_ms, delivered.at_ms), cache: "miss".into(), presolver_scenario: None, tier: None, reached_bp: rec.assumptions.reached_bp,
+        elapsed_ms: elapsed_ms(req.t0_ms, delivered.at_ms), cache: rec.assumptions.cache.clone(), presolver_scenario: None, tier: None, reached_bp: rec.assumptions.reached_bp,
         street_violation, final_violation, template_id: rec.assumptions.template_id.clone(), input: InputRecord::from_state(&req.state, logged.range_hashes.clone()) });
 }
 

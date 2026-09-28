@@ -216,10 +216,10 @@ pub fn entry_for(s: &Scenario) -> CacheEntry {
 }
 
 /// A per-rig temporary directory, unique per process and call, removed on drop.
-struct TempDir(PathBuf);
+pub struct TempDir(pub PathBuf);
 
 impl TempDir {
-    fn new() -> TempDir {
+    pub fn new() -> TempDir {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("pokerai-cache-rig-{}-{n}", std::process::id()));
@@ -318,7 +318,6 @@ impl Drop for CacheRig {
 /// Plan 4 Task 9: an `Engine` started by `Engine::with_core` over plan 2's rigs, a `FakeWorker` that never replies
 /// (`FakeReply::Hang`) and a `FakeClock` at 0 ms, with the core's default session config and no hand in progress. Its
 /// decision log goes to a per-process, per-call temporary directory nothing else writes.
-#[allow(dead_code)] // `cache_key_structural_identity.rs` declares this module privately (`mod support;`) and never calls it
 pub fn engine_with_fake_worker() -> engine::Engine {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -332,7 +331,392 @@ pub fn engine_with_fake_worker() -> engine::Engine {
 
 /// Plan 4 Task 9: the session `GameConfig` of plan 2's `testing::cfg_1_2()` (blinds 5/10 chips, 5% pot rake capped at 5
 /// chips, no straddle, solver preferences 16 threads / 50 bp / `flop_budget_s` 10).
-#[allow(dead_code)] // `cache_key_structural_identity.rs` declares this module privately (`mod support;`) and never calls it
 pub fn game_config() -> proto::GameConfig {
     engine::testing::cfg_1_2().0
+}
+
+// ===================== plan 4 Task 10: the flop-path harness =====================
+//
+// `FlopRig` is plan 2's fake worker and fake clock under the production `serve_request_with`, over a real cache in a
+// temporary directory the rig owns. The cache is seeded through the production entry writer (`entry_from_solution`,
+// `canonical_perm`, `Cache::store_tracked`), so every lookup a decision makes is the production `Cache::lookup`
+// answering from disk; nothing of the engine's result is mocked. The root ranges are explicit and full (the board
+// blocks them, hero's cards never do), so no reason is inherited unless a stored entry carries one. The fast-path
+// equity routine is a stub that answers at once: the equity is not under test here, and a real one on a full flop range
+// would run against a frozen fake clock.
+//
+// The table: `cfg_1_2` (blinds 5/10, 5% rake capped at 5000 mchips), six seats of 1000 chips, the button on seat 0. The
+// button opens to 45, the small blind (seat 1) calls and the big blind folds: a 100-chip single-raised pot, stacks 955,
+// with the small blind out of position (spec 13.3's `1.9` chips of a 100-chip pot is exactly 190 bp).
+
+use engine::clock::Clock;
+use engine::core::EngineCore;
+use engine::identity::IdentityState;
+use engine::log::{DecisionLog, DecisionRecord};
+use engine::ranges::ExplicitRanges;
+use engine::serve::{serve_request_with, EquityRoutine, LiveRequest, ServeSeams};
+use engine::testing::{board, hand, play, FakeClock, FakeReply, FakeState, FakeWorker, IdRef, RecordingSink};
+use proto::worker::{AckStatus, EngineMessage, ResultStatus, SolveRequest, StreetSolution, WorkerError};
+use proto::{ApproxReason, DecisionIdentity, HandState, RecommendationEvent};
+use std::sync::{Arc, Mutex};
+
+/// The button (seat 0), IP on every postflop street of the rig's pot.
+pub const BTN: Seat = Seat(0);
+/// The small blind (seat 1), OOP on every postflop street of the rig's pot.
+pub const SB: Seat = Seat(1);
+/// The flop, turn and river of the rig's hand.
+pub const FLOP: &str = "Kh 7d 2c";
+pub const TURN: &str = "Kh 7d 2c 4d";
+pub const RIVER: &str = "Kh 7d 2c 4d 9s";
+
+/// Hero's cards: never in a public range, a solve input, a snapshot or a cache key.
+pub fn hero_cards() -> [Card; 2] {
+    [Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()]
+}
+
+/// The rig's preflop with `hero` in `hero`'s seat: the button opens to 45, the small blind calls, the big blind folds
+/// (two preflop wagers: a single-raised pot of 100 chips).
+pub fn srp_preflop(hero: Seat) -> HandState {
+    let s = hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), BTN, hero, Some(hero_cards()));
+    play(&s, &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 45 }, Action::Call, Action::Fold])
+}
+/// The flop street root of the single-raised pot, the small blind (OOP) to act.
+pub fn srp_flop(hero: Seat) -> HandState {
+    board(&srp_preflop(hero), FLOP)
+}
+/// The turn street root after a checked-through flop, the small blind to act.
+pub fn srp_turn(hero: Seat) -> HandState {
+    board(&play(&srp_flop(hero), &[Action::Check, Action::Check]), TURN)
+}
+/// The river street root after a checked-through turn, the small blind to act.
+pub fn srp_river(hero: Seat) -> HandState {
+    board(&play(&srp_turn(hero), &[Action::Check, Action::Check]), RIVER)
+}
+/// A 3-bet pot's flop: the button opens to 25, the small blind 3-bets to 90, the big blind folds, the button calls
+/// (three preflop wagers), the small blind to act.
+pub fn three_bet_flop(hero: Seat) -> HandState {
+    let s = hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), BTN, hero, Some(hero_cards()));
+    board(&play(&s, &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 25 }, Action::Raise { to: 90 }, Action::Fold, Action::Call]), FLOP)
+}
+
+/// The rig's public root range for both seats: every combo, blocked by the board inside the range source.
+pub fn full_range() -> Range1326 {
+    Range1326([1.0; 1326])
+}
+
+/// The effective tree `template` materializes at `state`'s street root (the production builder), and the root.
+pub fn live_tree(state: &HandState, template: &str) -> (proto::EffectiveTree, StreetRootSnapshot, u32) {
+    let root = core_model::street_root(state).expect("a heads-up street root");
+    let built = build_tree_full(&root, &TemplateSelection::from_history(template, &root.history)).unwrap_or_else(|e| panic!("{template}: {e:?}"));
+    (built.tree, root, built.pot)
+}
+
+/// A valid solution of `tree` requested at `requested` with `expl` chips, whose rows differ by combo so a suit mapping
+/// that moved a row to the wrong combo is observable: at exported node `n`, combo `c` plays its first action with
+/// probability `(c % 7 + 1) / 8` and the others evenly, and every non-fold action `a` has EV `n * 100 + a * 10 + c % 5`
+/// chips; a fold's EV is exactly 0.
+pub fn varied_solution(tree: &proto::EffectiveTree, requested: &[Action], expl: f32) -> StreetSolution {
+    let mut sol = engine::testing::uniform_solution(tree, requested, expl);
+    for (n, node) in sol.nodes.iter_mut().enumerate() {
+        let width = node.actions.len();
+        for c in 0..proto::COMBOS {
+            let first = (c % 7 + 1) as f32 / 8.0;
+            let rest = if width > 1 { (1.0 - first) / (width - 1) as f32 } else { 0.0 };
+            node.probs[c] = (0..width).map(|a| if width == 1 { 1.0 } else if a == 0 { first } else { rest }).collect();
+            node.ev_chips[c] =
+                node.actions.iter().enumerate().map(|(a, action)| if *action == Action::Fold { 0.0 } else { (n * 100 + a * 10) as f32 + (c % 5) as f32 }).collect();
+        }
+    }
+    proto::worker::validate_solution(&sol, &tree.materialized).expect("the varied solution is valid");
+    sol
+}
+
+/// The live worker's answer to one solve: `"ok"` / `"best_so_far"` with a varied solution at `raw` chips of the live
+/// tree of `state` on `template`, or `"no_iteration"` (the worker's `error{no_iteration}` to the first attempt and to
+/// its `_min` retry), or `"hang"` (no terminal ever).
+pub fn live_script(state: &HandState, template: &str, raw: f32, status: &str) -> Vec<FakeReply> {
+    let (tree, root, _) = live_tree(state, template);
+    let history: Vec<Action> = root.history.iter().map(|(_, a)| *a).collect();
+    let ack = || FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None };
+    let answer = |status| FakeReply::Result { id: IdRef::Last, status, solution: Some(varied_solution(&tree, &history, raw)), error: None, elapsed_ms: 5 };
+    let no_iteration = || FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None,
+        error: Some(WorkerError { code: "no_iteration".into(), message: "no_iteration".into(), retryable: false, estimate_bytes: None }), elapsed_ms: 5 };
+    match status {
+        "ok" => vec![ack(), answer(ResultStatus::Ok)],
+        "best_so_far" => vec![ack(), answer(ResultStatus::BestSoFar)],
+        "no_iteration" => vec![ack(), no_iteration(), ack(), no_iteration()],
+        "hang" => vec![ack(), FakeReply::Hang],
+        other => panic!("live_script: unknown status {other:?}"),
+    }
+}
+
+/// One entry the rig stores before a decision is asked: the solve of `template` at a street root on `board` with
+/// reference pot `pot`, both stacks `eff` and rake cap `cap_mchips` (5% rake, the rig's ranges), whose raw stored
+/// accuracy is `raw_over_p` and whose inherited reasons are `reasons`; `truncated` exports the root node alone.
+#[derive(Clone, Debug)]
+pub struct Seed {
+    pub template: &'static str,
+    pub board: &'static str,
+    pub pot: u32,
+    pub eff: u32,
+    pub cap_mchips: u32,
+    pub raw_over_p: f64,
+    pub reasons: Vec<ApproxReason>,
+    pub truncated: bool,
+}
+
+impl Seed {
+    /// The rig's own flop decision (pot 100, stacks 955, cap 5000 mchips) on `template`, at 40 bp (inside the 50 bp
+    /// target), no reasons, every root-street node exported: served `Exact`.
+    pub fn exact(template: &'static str) -> Seed {
+        Seed { template, board: FLOP, pot: 100, eff: 955, cap_mchips: 5000, raw_over_p: 0.004, reasons: vec![], truncated: false }
+    }
+    /// This seed at another reference state.
+    pub fn at(self, pot: u32, eff: u32, cap_mchips: u32) -> Seed {
+        Seed { pot, eff, cap_mchips, ..self }
+    }
+    /// This seed with raw stored accuracy `raw_over_p`.
+    pub fn raw(self, raw_over_p: f64) -> Seed {
+        Seed { raw_over_p, ..self }
+    }
+    /// This seed carrying `reasons` as its inherited reasons.
+    pub fn reasons(self, reasons: Vec<ApproxReason>) -> Seed {
+        Seed { reasons, ..self }
+    }
+    /// This seed exporting its root node only (`export: "truncated"`).
+    pub fn truncated(self) -> Seed {
+        Seed { truncated: true, ..self }
+    }
+    /// This seed on the turn street root of the rig's checked-through flop.
+    pub fn on_turn(self) -> Seed {
+        Seed { board: TURN, template: "turn_std_v1", ..self }
+    }
+}
+
+/// The brief's `provisional_hit`: the rig's flop decision stored on the pre-solver template at raw `raw_over_p` (above
+/// the 50 bp target when over 0.005), carrying `ChartRounded`.
+pub fn provisional_hit(raw_over_p: f64) -> Seed {
+    Seed::exact(engine::flop::PRESOLVER_TEMPLATE).raw(raw_over_p).reasons(vec![ApproxReason::ChartRounded])
+}
+/// The rig's flop decision stored at 40 bp with no reason: served `Exact`.
+pub fn exact_hit() -> Vec<Seed> {
+    vec![Seed::exact(engine::flop::PRESOLVER_TEMPLATE)]
+}
+/// The rig's flop decision stored at 40 bp carrying `ChartRounded`: served `Approximate{ChartRounded}`.
+pub fn approximate_hit() -> Vec<Seed> {
+    vec![Seed::exact(engine::flop::PRESOLVER_TEMPLATE).reasons(vec![ApproxReason::ChartRounded])]
+}
+/// The rig's flop decision stored at 190 bp: served `Provisional`, then refined live.
+pub fn provisional_route() -> Vec<Seed> {
+    vec![provisional_hit(0.019)]
+}
+
+/// The entry `seed` describes, written by the production entry writer (`entry_from_solution` over the shared
+/// `canonical_perm`) from a varied solution at `raw_over_p * pot` chips, over the rig's full public ranges.
+pub fn seed_entry(seed: &Seed) -> CacheEntry {
+    seed_entry_with(seed, [full_range(), full_range()])
+}
+
+/// `seed_entry` over the public root ranges `ranges` (OOP then IP; blocked by the board, never by hero's cards).
+pub fn seed_entry_with(seed: &Seed, ranges: [Range1326; 2]) -> CacheEntry {
+    let cards = cards(seed.board);
+    let street = if cards.len() == 3 { Street::Flop } else { Street::Turn };
+    let root = StreetRootSnapshot { street, board: cards, oop: SB, ip: BTN, pot_root: seed.pot, stack_oop_root: seed.eff, stack_ip_root: seed.eff, dead_this_street: 0,
+        projected_from: 2, history: vec![], bb_chips: 10 };
+    let built = build_tree_full(&root, &TemplateSelection::from_history(seed.template, &[])).unwrap_or_else(|e| panic!("seed {seed:?}: {e:?}"));
+    let signature = tree_signature(&built.tree, built.pot);
+    let perm = engine::cache_bridge::canonical_perm(&root.board, &ranges[0], &ranges[1]);
+    let mut sol = varied_solution(&built.tree, &[], (seed.raw_over_p * f64::from(built.pot)) as f32);
+    if seed.truncated {
+        sol.nodes.truncate(1);
+        sol.covered_paths.truncate(1);
+        sol.export = "truncated".into();
+    }
+    let input = SolveInput { root, ranges, tree: built.tree, target_bp: 50 };
+    let rake = Rake::PotRake { rate: RATE, cap_mchips: seed.cap_mchips, no_flop_no_drop: false };
+    engine::cache_bridge::entry_from_solution(&input, &sol, &seed.reasons, 10, &rake, &signature, &perm, 100, 50).unwrap_or_else(|e| panic!("seed {seed:?}: {e:?}"))
+}
+
+/// A fast-path equity routine that answers at once (the equity is not under test here).
+pub fn stub_equity() -> EquityRoutine {
+    Arc::new(|_clock: &dyn Clock, _hero: Option<[Card; 2]>, _hero_public: &Range1326, opponents: &[(Seat, Range1326)], _board: &[Card], _budget: Duration,
+        _cancel: &std::sync::atomic::AtomicBool| {
+        let ready = || proto::EquityEstimate { value: Some(0.5), availability: proto::Availability::Ready, method: Some(proto::EquityMethod::Exact) };
+        proto::EquitySummary {
+            hero_combo_vs_each: opponents.iter().map(|(s, _)| (*s, ready())).collect(),
+            hero_range_vs_each: opponents.iter().map(|(s, _)| (*s, ready())).collect(),
+            per_pot_shares: vec![],
+        }
+    })
+}
+
+/// A decision the rig served: its identity and its events in emission order, `Equity` and `Progress` left out (they
+/// are not under test here, and `Equity` comes from the `fast-path` thread at a time of its own).
+pub struct Served {
+    pub id: DecisionIdentity,
+    pub events: Vec<RecommendationEvent>,
+}
+
+impl Served {
+    /// The one `Final`; panics naming the events if there is not exactly one.
+    pub fn final_rec(&self) -> &proto::Recommendation {
+        let finals: Vec<&proto::Recommendation> = self.events.iter().filter_map(|e| match e { RecommendationEvent::Final(r) => Some(r), _ => None }).collect();
+        assert_eq!(finals.len(), 1, "exactly one Final: {:?}", self.kinds());
+        finals[0]
+    }
+    /// The `Provisional`s, in order.
+    pub fn provisionals(&self) -> Vec<&proto::Recommendation> {
+        self.events.iter().filter_map(|e| match e { RecommendationEvent::Provisional(r) => Some(r), _ => None }).collect()
+    }
+    /// The events' kinds, in order.
+    pub fn kinds(&self) -> Vec<&'static str> {
+        self.events.iter().map(|e| match e {
+            RecommendationEvent::Fast(_) => "Fast",
+            RecommendationEvent::Provisional(_) => "Provisional",
+            RecommendationEvent::Final(_) => "Final",
+            RecommendationEvent::NoDecision { .. } => "NoDecision",
+            RecommendationEvent::Equity { .. } => "Equity",
+            RecommendationEvent::Progress { .. } => "Progress",
+        }).collect()
+    }
+}
+
+/// The spec 13.3 flop-path rig (see the section doc above).
+pub struct FlopRig {
+    pub core: EngineCore,
+    pub clock: Arc<FakeClock>,
+    pub identity: Arc<Mutex<IdentityState>>,
+    pub worker: Arc<Mutex<FakeState>>,
+    /// The key digest of the sentinel entry `flush` stores, left out of `stored`.
+    sentinel: Option<[u8; 32]>,
+    // Field order is drop order: the core (with its cache) goes before the directories.
+    cache_dir: TempDir,
+    log_dir: TempDir,
+}
+
+impl FlopRig {
+    /// A rig over a fresh cache directory whose fake worker answers `script`, the session config `cfg_1_2`'s, the
+    /// conservative flop policy, and a hand begun (hand 1, config revision 1: the hand builders' own).
+    pub fn new(script: Vec<FakeReply>) -> FlopRig {
+        let cache_dir = TempDir::new();
+        let cache = Cache::open(cache_dir.0.clone(), cache::CACHE_QUOTA_BYTES);
+        FlopRig::with_cache(script, cache, cache_dir)
+    }
+
+    /// A rig whose cache is `cache` (a disabled one, say), with `cache_dir` as the directory `stored` lists.
+    pub fn with_cache(script: Vec<FakeReply>, cache: Cache, cache_dir: TempDir) -> FlopRig {
+        let clock = FakeClock::new();
+        let identity = Arc::new(Mutex::new(IdentityState::new()));
+        let (worker_link, worker) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
+        let log_dir = TempDir::new();
+        let core = EngineCore::new(worker_link, clock.clone(), identity.clone(), DecisionLog::open(&log_dir.0)).with_cache(cache);
+        core.set_config(game_config());
+        *core.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: Some(full_range()), ip: Some(full_range()) });
+        {
+            let mut ids = identity.lock().unwrap();
+            ids.set_config();
+            ids.begin_hand();
+        }
+        FlopRig { core, clock, identity, worker, sentinel: None, cache_dir, log_dir }
+    }
+
+    /// Stores `seeds` through the rig's own cache, each confirmed on disk by the writer before the next.
+    pub fn seed(&self, seeds: &[Seed]) {
+        for seed in seeds {
+            assert!(self.core.cache.store_tracked(&seed_entry(seed)).wait(Duration::from_secs(60)), "the writer stores seed {seed:?}");
+        }
+    }
+
+    /// Serves `state` as the next decision of the hand, with the stub equity and `seams`.
+    pub fn serve_with(&mut self, state: &HandState, seams: ServeSeams) -> Served {
+        let id = self.identity.lock().unwrap().next_decision().expect("a hand is in progress");
+        let (sink, events) = RecordingSink::new(self.clock.clone(), Some(self.worker.clone()));
+        let sink: engine::watchdog::SharedSink = Arc::new(Mutex::new(Box::new(sink)));
+        let req = LiveRequest::admitted(&self.core, id.clone(), state.clone(), self.clock.now_ms(), sink);
+        serve_request_with(&mut self.core, req, ServeSeams { equity: Some(seams.equity.clone().unwrap_or_else(stub_equity)), ..seams });
+        let events = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| !matches!(r.event, RecommendationEvent::Equity { .. } | RecommendationEvent::Progress { .. }))
+            .map(|r| r.event.clone())
+            .collect();
+        Served { id, events }
+    }
+
+    /// Serves `state` with the stub equity and no other seam.
+    pub fn serve(&mut self, state: &HandState) -> Served {
+        self.serve_with(state, ServeSeams::default())
+    }
+
+    /// Every `solve` the fake worker was sent, in order.
+    pub fn solves(&self) -> Vec<SolveRequest> {
+        self.worker.lock().unwrap().sent.iter().filter_map(|m| if let EngineMessage::Solve(q) = m { Some(q.clone()) } else { None }).collect()
+    }
+
+    /// Every decision record logged, in order.
+    pub fn records(&self) -> Vec<DecisionRecord> {
+        std::fs::read_to_string(self.log_dir.0.join("decisions.jsonl")).map(|t| t.lines().map(|l| serde_json::from_str(l).unwrap()).collect()).unwrap_or_default()
+    }
+
+    /// Every diagnostics record logged, in order, as JSON.
+    pub fn diagnostics(&self) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(self.log_dir.0.join("diagnostics.jsonl")).map(|t| t.lines().map(|l| serde_json::from_str(l).unwrap()).collect()).unwrap_or_default()
+    }
+
+    /// `(street, origin, decision id)` of every snapshot of hand 1, in registration order.
+    pub fn origins(&self) -> Vec<(Street, String, u64)> {
+        self.core.snapshots.lock().unwrap().for_hand(1).iter().map(|s| (s.key.street, s.provenance.origin.clone(), s.provenance.identity_at_solve.decision_id)).collect()
+    }
+
+    /// Every entry on disk once the writer has handled every command sent before this call, the sentinel of the
+    /// barrier left out. The barrier is a tracked store of a sentinel entry on another board (the writer serves its
+    /// queue in order, so its receipt comes after every store queued before it).
+    pub fn stored(&mut self) -> Vec<CacheEntry> {
+        let sentinel = seed_entry(&Seed { board: "As Qs 5h", ..Seed::exact("flop_fast_v1") });
+        self.sentinel = Some(sentinel.key.digest());
+        if self.core.cache.root().as_os_str().is_empty() {
+            return list_entries(&self.cache_dir.0);
+        }
+        assert!(self.core.cache.store_tracked(&sentinel).wait(Duration::from_secs(60)), "the writer stores the sentinel");
+        list_entries(&self.cache_dir.0).into_iter().filter(|e| Some(e.key.digest()) != self.sentinel).collect()
+    }
+
+    /// The rig's cache directory.
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir.0
+    }
+}
+
+/// Every entry of every cell under `dir` (`<key[0..2]>/<key>.bin`), in path order.
+pub fn list_entries(dir: &Path) -> Vec<CacheEntry> {
+    let mut cells = Vec::new();
+    for shard in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        for file in std::fs::read_dir(shard.path()).into_iter().flatten().flatten() {
+            if file.path().extension().is_some_and(|e| e == "bin") {
+                cells.push(file.path());
+            }
+        }
+    }
+    cells.sort();
+    cells.iter().flat_map(|p| cache::storage::read_cell(p).map(|c| c.entries).unwrap_or_default()).collect()
+}
+
+/// Spec 13.3's flop script: the rig's single-raised-pot flop decision (hero the small blind, OOP, to act at the street
+/// root) asked once, over a cache holding `seeds` and a fake worker answering the live solve of its live template
+/// (`flop_fast_v1`: V3 has admitted nothing) as `live_script(.., raw, status)` does. Returns its events (`Equity` and
+/// `Progress` left out). The brief's `cache: Vec<Lookup>` becomes the entries on disk the production lookup answers
+/// from, so a scripted route is the lookup's real outcome, never a mocked one.
+pub fn run_flop_script(seeds: Vec<Seed>, raw: f32, status: &str) -> Vec<RecommendationEvent> {
+    let state = srp_flop(SB);
+    let mut rig = FlopRig::new(live_script(&state, "flop_fast_v1", raw, status));
+    rig.seed(&seeds);
+    let served = rig.serve(&state);
+    rig.core.shutdown();
+    served.events
+}
+
+/// How many `Final`s `events` hold.
+pub fn final_count(events: &[RecommendationEvent]) -> usize {
+    events.iter().filter(|e| matches!(e, RecommendationEvent::Final(_))).count()
 }
