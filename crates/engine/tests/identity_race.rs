@@ -873,3 +873,83 @@ fn a_progress_observed_just_below_the_fire_is_not_forwarded_after_the_watchdog_f
     let recs = records(&r);
     assert_eq!((recs.len(), recs[0].final_violation, &recs[0].coverage), (1, true, &f[0].2.coverage), "the watchdog's Final is the one logged");
 }
+
+// --- P2.W3 fix round 1, ruling W3-I1 (spec 5 step 10, 7, 12): a `Final` the watchdog delivered while its decision was
+// active is logged exactly once, even when the decision is superseded after the claim, in both stale exits of
+// `serve_request`. ---
+
+/// A sink that supersedes the decision whose `Final` it receives, from the callback (a UI command handler on the
+/// delivery thread, ruling 28-I1), then acknowledges that `Final` like a `FinalGate`: its waiter resumes once the
+/// supersession is done.
+struct SupersedesOnFinal { inner: RecordingSink, identity: Arc<Mutex<IdentityState>>, finals: Finals }
+impl engine::EventSink for SupersedesOnFinal {
+    fn emit(&mut self, ev: RecommendationEvent) {
+        let is_final = matches!(ev, RecommendationEvent::Final(_));
+        self.inner.emit(ev);
+        if is_final {
+            self.identity.lock().unwrap().mutate();
+            let (count, recorded) = &*self.finals;
+            *count.lock().unwrap() += 1;
+            recorded.notify_all();
+        }
+    }
+}
+/// A rig whose sink is `SupersedesOnFinal`, on the plain fake clock.
+fn superseding_rig(name: &str, script: Vec<FakeReply>) -> (Rig, Finals) {
+    let r = rig(name, script);
+    let finals: Finals = Arc::default();
+    let (inner, events) = RecordingSink::new(r.clock.clone(), Some(r.state.clone()));
+    let sink: SharedSink = Arc::new(Mutex::new(Box::new(SupersedesOnFinal { inner, identity: r.identity.clone(), finals: finals.clone() })));
+    (Rig { sink, events, ..r }, finals)
+}
+/// The request's one `Final`, the watchdog's at 14 900 ms, and its one log record, which records that same `Final`: its
+/// delivery time (the fire's recorded `Fired::at_ms`, which the sink saw too), its coverage and reasons, and the watchdog's
+/// deadline flags (a final-delivery violation, and the street verdict `street_violation`). No snapshot of the stale
+/// candidate, if one was built, is registered.
+fn assert_the_delivered_watchdog_final_is_logged_once(r: &Rig, id: &DecisionIdentity, street_violation: bool, what: &str) {
+    assert!(!r.identity.lock().unwrap().is_active(id), "{what}: the sink superseded the decision from the Final's callback");
+    assert_eq!(kinds(r, id), ["Fast", "Final"], "{what}: one Final, the watchdog's");
+    let f = finals(r, id);
+    let (at, _, rec) = &f[0];
+    assert_eq!((*at, &rec.coverage), (14_900, &Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage: "building".into() }, partial: vec![] }), "{what}");
+    let recs = records(r);
+    assert_eq!(recs.len(), 1, "{what}: the delivered Final is logged exactly once");
+    assert_eq!((&recs[0].identity, &recs[0].coverage, &recs[0].reasons, recs[0].elapsed_ms, recs[0].reached_bp, recs[0].template_id.as_str()),
+        (id, &rec.coverage, &vec![], 14_900, None, rec.assumptions.template_id.as_str()), "{what}: the record is the delivered Final's");
+    assert_eq!((recs[0].final_violation, recs[0].street_violation), (true, street_violation), "{what}: the watchdog's deadline flags");
+    assert!(r.core.snapshots.lock().unwrap().for_hand(id.hand_id).is_empty(), "{what}: no stale candidate snapshot");
+}
+
+/// Ruling W3-I1, the post-solve stale exit. The `_min` retry hangs to the watchdog's fire; the watchdog claims the
+/// request's `Final` while the decision is active and delivers it, and the sink supersedes the decision from that
+/// callback. The link holds `engine-main`'s receive at the fire until the fire is over, so the client then finds the
+/// decision superseded (a cancel, unconfirmed, then a kill) and `serve_request` takes its post-solve stale exit: the
+/// watchdog's delivered `Final` is logged there, once, with the street deadline violated (no first-attempt terminal).
+#[test]
+fn a_watchdog_final_delivered_then_superseded_during_the_solve_is_logged_once() {
+    let (mut r, _finals) = superseding_rig("w3_i1_post_solve", vec![]);
+    let (worker, state) = FakeWorker::scripted(r.clock.clone(), r.identity.clone(), vec![ack(), FakeReply::Hang, ack(), FakeReply::Hang]);
+    let fires = Arc::new(Mutex::new(VecDeque::from([(14_900, 1)])));
+    r.core.worker = Box::new(FireDuringReceive { inner: worker, clock: r.clock.clone(), ends: r.core.watchdog.ended_threads(), fires: fires.clone() });
+    r.state = state;
+    let id = serve(&mut r, &river_state());
+    assert!(fires.lock().unwrap().is_empty(), "the fire was acknowledged inside the receive");
+    let cancels = r.state.lock().unwrap().cancels.len();
+    assert_eq!((cancels, kills_and_restarts(&r)), (1, (1, 2)), "the superseded retry is cancelled, then killed");
+    assert_the_delivered_watchdog_final_is_logged_once(&r, &id, true, "post-solve stale exit");
+}
+
+/// Ruling W3-I1, `finish`'s stale exit. The solve answers at once and its candidate is assembled; the watchdog's fire
+/// lands before the engine claims (`before_claim`): the watchdog claims while the decision is active and delivers its
+/// `Final`, and the sink supersedes the decision from that callback. The engine's claim then finds the decision stale:
+/// the candidate is neither delivered nor registered, and the watchdog's delivered `Final` is logged, once, with the
+/// street deadline met (the first attempt's terminal arrived at 0 ms).
+#[test]
+fn a_watchdog_final_delivered_then_superseded_before_the_engines_claim_is_logged_once() {
+    let s = river_state();
+    let (mut r, finals) = superseding_rig("w3_i1_finish", vec![ack(), result(ResultStatus::Ok, solution_on(&s, "river_std_v1", 0.2))]);
+    let seams = fire_before_claim(&r, &finals);
+    let id = serve_with(&mut r, &s, seams);
+    assert_eq!(kills_and_restarts(&r), (0, 0));
+    assert_the_delivered_watchdog_final_is_logged_once(&r, &id, false, "finish's stale exit");
+}
