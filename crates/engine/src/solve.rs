@@ -125,8 +125,8 @@ pub struct SolveOutcome {
     /// Ruling 28-I3: the solve ended at the watchdog's fire with a sent job that may still be running on the worker (its
     /// terminal not received), or with a failed link the client did not restart: the worker needs the cleanup after the
     /// `Final` (spec 7; spec 12 "worker restarted if a job was running"). False when nothing was sent, when the job's
-    /// terminal arrived (accepted, refused, or seen at the fire), and whenever the client already answered the worker
-    /// (a restart, a confirmed cancel, a kill).
+    /// terminal arrived (accepted, refused, or seen at the fire), when the worker rejected the request (ruling 28-O2), and
+    /// whenever the client already answered the worker (a restart, a confirmed cancel, a kill).
     pub outstanding_job: bool,
 }
 
@@ -437,9 +437,11 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
             }
         };
         if let Some(end) = ended_at(core, plan, at_ms, Watch::Waiting { hang_bound_ms: expected_by, heartbeat_due_ms }) {
-            // This solve's own terminal seen at the fire is not accepted, but its job has ended (ruling 28-I3).
+            // This solve's own terminal seen at the fire is not accepted, but its job has ended (ruling 28-I3); nor is its
+            // `ack{rejected}`, but the worker started no job (ruling 28-O2).
             let end = match end {
                 AttemptEnd::DeadlinePassed { .. } if matches!(&msg, WorkerMessage::Result { id, .. } if *id == req.id) => AttemptEnd::DeadlinePassed { outstanding: false },
+                AttemptEnd::DeadlinePassed { .. } if matches!(&msg, WorkerMessage::Ack { id, status: AckStatus::Rejected, .. } if *id == req.id) => AttemptEnd::DeadlinePassed { outstanding: false },
                 end => end,
             };
             return (end, None);
