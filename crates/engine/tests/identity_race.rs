@@ -198,7 +198,8 @@ fn a_river_best_so_far_is_logged_as_a_street_violation() {
 /// `reached_bp`: an exact whole number stays itself (0.8125 chips of 65 is exactly 125 bp), a value rounded down for
 /// display is bounded by the next whole number (1.9 chips: 292.3 bp shows 292, bounded by 293), a measurement just
 /// under the target rounds and bounds alike (0.325f32 chips: 49.99999816 bp), and one past the `u16` display domain
-/// (1 000 chips: 153 846.2 bp, displayed as 65 535) is bounded by its own value.
+/// (1 000 chips: 153 846.2 bp, displayed as 65 535) is bounded by its own value. A validated `-0.0` measurement is bounded
+/// by "0", never "-0" (ruling 28-N2).
 #[test]
 fn the_accuracy_string_is_a_true_upper_bound_on_the_raw_measurement() {
     let s = river_state();
@@ -207,6 +208,7 @@ fn the_accuracy_string_is_a_true_upper_bound_on_the_raw_measurement() {
         ("rounded_down", ResultStatus::BestSoFar, 1.9, 292, "293"),
         ("under_target", ResultStatus::Ok, 0.325, 50, "50"),
         ("over_u16", ResultStatus::BestSoFar, 1_000.0, u16::MAX, "153847"),
+        ("negative_zero", ResultStatus::Ok, -0.0, 0, "0"),
     ] {
         let mut r = rig(&format!("accuracy_{name}"), vec![ack(), result(status, solution_on(&s, "river_std_v1", chips))]);
         let id = serve(&mut r, &s);
@@ -432,7 +434,9 @@ impl RangeSource for SlowRanges {
 /// Ruling 28-I3 (spec 12: restart the worker "if a job was running"): the cleanup after a `DeadlineExceeded` `Final` is
 /// conditioned on the solve client's liveness provenance, not on the clock. A request whose range retrieval ran past the
 /// watchdog's fire reaches the solve with no room to send anything: its `DeadlineExceeded` leaves an idle worker, which
-/// is neither killed nor restarted.
+/// is neither killed nor restarted. Ruling 28-N1 (spec 7: `Final` once, after `Fast`; spec 4.4: only `Equity` enriches
+/// a delivered `Final`): the request's `Fast`, due after the range source answered, is not emitted after the watchdog's
+/// `Final`, so the request's only event but its `Equity` is that `Final`.
 #[test]
 fn a_deadline_exceeded_with_no_job_outstanding_restarts_nothing() {
     let (mut r, gate) = watchdog_first_rig("slow_ranges", vec![]);
@@ -441,6 +445,49 @@ fn a_deadline_exceeded_with_no_job_outstanding_restarts_nothing() {
     let f = finals(&r, &id);
     assert!(f.len() == 1 && matches!(&f[0].2.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { .. }, .. }), "{f:?}");
     assert_eq!((solves(&r).len(), kills_and_restarts(&r)), (0, (0, 0)), "nothing was sent, so nothing is cleaned up");
+    let kinds: Vec<&str> = events_of(&r, &id).iter().map(|e| match e.event { RecommendationEvent::Final(_) => "Final", RecommendationEvent::Fast(_) => "Fast",
+        RecommendationEvent::Progress { .. } => "Progress", RecommendationEvent::Provisional(_) => "Provisional", RecommendationEvent::NoDecision { .. } => "NoDecision",
+        RecommendationEvent::Equity { .. } => "Equity" }).collect();
+    assert_eq!(kinds, ["Final"], "the request's events but its Equity: no Fast after the delivered Final");
+}
+
+/// A range source that refuses the root ranges late: it moves the fake clock to `until_ms`, waits for the watchdog to
+/// acknowledge that point (its wait for the fire once it has recorded the street deadline, or its `Final` once it has
+/// fired), then answers `InvalidRanges`.
+struct LateRefusal { clock: Arc<FakeClock>, until_ms: u64, finals: Option<Finals> }
+impl RangeSource for LateRefusal {
+    fn ranges_at_root(&self, _state: &HandState, _root: &proto::StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason> {
+        self.clock.set_ms(self.until_ms);
+        match &self.finals {
+            Some(finals) => wait_finals(finals, 1),
+            None => self.clock.wait_for_waiter(14_900),
+        }
+        Err(UnsupportedReason::InvalidRanges)
+    }
+}
+
+/// Ruling 28-O3 (spec 7: the street deadline is violated when no first-attempt terminal arrived by it): a request that
+/// ends before any solve logs no street verdict while it is answered before the watchdog's fire, even past its street
+/// deadline (here refused at 2 500 ms, after the watchdog recorded the 2 000 ms deadline): it made no attempt to judge.
+/// Answered at or after the fire, it logs the shared street deadline's verdict, here violated: the watchdog's `Final`
+/// is the one delivered and logged, and no terminal arrived by the street deadline.
+#[test]
+fn an_early_exit_logs_the_street_verdict_only_after_the_fire() {
+    let (mut r, gate) = gated_rig("early_exit_before_fire", vec![]);
+    *r.core.range_source.lock().unwrap() = Box::new(LateRefusal { clock: r.clock.clone(), until_ms: 2_500, finals: None });
+    let id = serve(&mut r, &river_state());
+    let f = finals(&r, &id);
+    assert!(f.len() == 1 && f[0].0 == 2_500 && matches!(f[0].2.coverage, Coverage::Unsupported { reason: UnsupportedReason::InvalidRanges, .. }), "{f:?}");
+    let recs = records(&r);
+    assert_eq!((recs.len(), recs[0].street_violation, recs[0].final_violation), (1, false, false), "before the fire: no verdict");
+    drop(gate);
+    let (mut r, gate) = gated_rig("early_exit_after_fire", vec![]);
+    *r.core.range_source.lock().unwrap() = Box::new(LateRefusal { clock: r.clock.clone(), until_ms: 14_900, finals: Some(gate) });
+    let id = serve(&mut r, &river_state());
+    let f = finals(&r, &id);
+    assert!(f.len() == 1 && f[0].0 == 14_900 && matches!(f[0].2.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { .. }, .. }), "{f:?}");
+    let recs = records(&r);
+    assert_eq!((recs.len(), &recs[0].coverage, recs[0].street_violation, recs[0].final_violation), (1, &f[0].2.coverage, true, true), "after the fire: the street deadline's verdict");
 }
 
 // --- The delivery race after the solve (ruling 28-I2) and the equity's cancellation (ruling 28-I4), through the test

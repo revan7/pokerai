@@ -1179,3 +1179,25 @@ fn the_outstanding_job_is_reported_only_when_a_sent_job_may_still_run() {
         if outstanding { assert_eq!(out.terminal, deadline_exceeded("building"), "{name}"); }
     }
 }
+
+fn is_rejection(m: &WorkerMessage) -> bool { matches!(m, WorkerMessage::Ack { status: AckStatus::Rejected, .. }) }
+
+/// Ruling 28-O2: the worker's `ack{rejected}` for this solve means the worker started no work, so one observed at or
+/// after the watchdog's fire (a stall between the send and the ack) leaves no job outstanding, and the cleanup after the
+/// `Final` has nothing to kill or restart. Observed before the fire it is the ordinary rejection: no restart, no retry.
+#[test]
+fn a_rejection_observed_at_the_fire_leaves_no_job_outstanding() {
+    let rejected = FakeReply::Ack { id: IdRef::Last, status: AckStatus::Rejected, reason: Some("busy".into()) };
+    for (seen_at, at_fire) in [(2_200u64, true), (2_199, false)] {
+        let mut r = stalled_rig(vec![rejected.clone(), FakeReply::Hang], is_rejection, Some(seen_at), 0);
+        r.plan.deadlines = SHORT;
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        if at_fire {
+            assert_eq!(out.terminal, deadline_exceeded("building"), "rejection seen at {seen_at} ms");
+        } else {
+            let (message, _) = failed_engine_error(&out.terminal);
+            assert!(message.contains("solve rejected: busy"), "rejection seen at {seen_at} ms: {message}");
+        }
+        assert_eq!((out.outstanding_job, out.restarts, kills_and_restarts(&r.state)), (false, 0, (0, 0)), "rejection seen at {seen_at} ms");
+    }
+}

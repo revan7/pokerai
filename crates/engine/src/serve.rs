@@ -23,13 +23,16 @@
 //! candidate is discarded, registers nothing (and, won during the solve, no candidate or analytic fallback is even
 //! built), and the decision log records the watchdog's `Final` with its delivery time. Until the fire the watchdog's
 //! fallback is refreshed as the request learns more, so a watchdog `Final` keeps the range source's reasons and the
-//! assumptions known by then (ruling 28-I6; spec 6).
+//! assumptions known by then (ruling 28-I6; spec 6). Nothing but an `Equity` of the request follows its delivered
+//! `Final` (ruling 28-N1; spec 7, spec 4.4): the request's `Fast` carries its claim, and `deliver` drops it, under the
+//! sink lock, once the watchdog has delivered.
 //!
 //! Street verdict (ruling 20-I1). A request has one `StreetDeadline`, shared by its watchdog (`Armed::street_deadline`)
 //! and the solve client (`SolvePlan::street_deadline`), which publishes the first attempt's terminal arrival to it at
 //! receipt. The logged verdict is the client's (`SolveOutcome::street_violation`), judged from that arrival and never
 //! from when processing finished; a `best_so_far` (the street deadline reached) is logged as a violation too, except on
-//! the flop, whose single-raised-pot miss is the designed outcome (§12; plan 4).
+//! the flop, whose single-raised-pot miss is the designed outcome (§12; plan 4). A request that ends before any solve
+//! logs no verdict when answered before the fire, and the shared street deadline's once it expired (ruling 28-O3).
 //!
 //! After the `Final` (§7, §12, rulings 23-I1 and 28-I3). At the watchdog's fire the client stops and cleans nothing up,
 //! and reports whether it left a sent job that may still be running, or a failed link, behind
@@ -91,7 +94,8 @@ enum Delivery {
     Accepted,
     /// The decision is no longer active: nothing is emitted.
     Stale,
-    /// A `Final` whose request's `Final` was already claimed (by the watchdog): nothing is emitted.
+    /// The request's `Final` was already claimed (by the watchdog): a second `Final`, or a `Fast`, `Provisional` or
+    /// `Progress` after it, is not emitted (ruling 28-N1).
     AlreadyDelivered,
 }
 
@@ -111,21 +115,36 @@ fn accept(ids: &Mutex<IdentityState>, identity: &DecisionIdentity, final_claim: 
     Delivery::Accepted
 }
 
-/// Accepts `ev`, an event of decision `identity` (a `Final` against `delivered` when given), then hands an accepted
-/// event to `sink` with no engine lock held, so the sink may re-enter the engine from its callback (ruling 28-I1).
+/// Accepts `ev`, an event of decision `identity`, then hands an accepted event to `sink` with no engine lock held, so
+/// the sink may re-enter the engine from its callback (ruling 28-I1). With `delivered`, the request's once-only `Final`
+/// flag shared with its watchdog: a `Final` claims it at acceptance; a `Fast`, `Provisional` or `Progress` is dropped once
+/// the request's `Final` was delivered (ruling 28-N1; spec 7, `Final` once and last; spec 4.4, only `Equity` enriches a
+/// delivered `Final`). That check is made under the sink lock, in the same hold as the emission: the watchdog swaps
+/// `delivered` before it takes the sink lock to emit its `Final`, so either the event precedes that `Final` or it is
+/// dropped. `Equity` and `NoDecision` never take it.
 fn deliver(ids: &Mutex<IdentityState>, identity: &DecisionIdentity, sink: &SharedSink, delivered: Option<&AtomicBool>, ev: RecommendationEvent) -> Delivery {
     assert!(event_identity(&ev) == identity, "an event of decision {:?} emitted for decision {identity:?}", event_identity(&ev));
-    let claim = if matches!(ev, RecommendationEvent::Final(_)) { delivered } else { None };
+    let (claim, not_after_final) = match &ev {
+        RecommendationEvent::Final(_) => (delivered, None),
+        RecommendationEvent::Fast(_) | RecommendationEvent::Provisional(_) | RecommendationEvent::Progress { .. } => (None, delivered),
+        RecommendationEvent::Equity { .. } | RecommendationEvent::NoDecision { .. } => (None, None),
+    };
     let verdict = accept(ids, identity, claim, |_| {});
-    if verdict == Delivery::Accepted {
-        sink.lock().unwrap().emit(ev);
+    if verdict != Delivery::Accepted {
+        return verdict;
     }
-    verdict
+    let mut sink = sink.lock().unwrap();
+    if not_after_final.is_some_and(|d| d.load(Ordering::SeqCst)) {
+        return Delivery::AlreadyDelivered;
+    }
+    sink.emit(ev);
+    Delivery::Accepted
 }
 
 /// Crate-visible: plan 3 Task 17's `preflop.rs` imports this same helper (`use crate::serve::emit;`) rather than
 /// creating a second event-emission path, so the identity check stays in one place. `delivered`, when given, is the
-/// request's once-only `Final` flag, shared with its watchdog.
+/// request's once-only `Final` flag, shared with its watchdog: it is claimed by a `Final` and keeps a `Fast`,
+/// `Provisional` or `Progress` from following the delivered `Final` (see `deliver`).
 pub(crate) fn emit(core: &EngineCore, req: &LiveRequest, delivered: Option<&AtomicBool>, ev: RecommendationEvent) {
     deliver(&core.identity, &req.identity, &req.sink, delivered, ev);
 }
@@ -242,7 +261,8 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
     let ranges = match ranges {
         Ok(r) => r,
         Err(reason) => {
-            finish(core, &req, hooks, &deadlines, &claim, Candidate::unsolved(assemble::unsupported(&ctx, reason, inherited, assumptions)), Logged::unsolved(root.street, vec![]));
+            let logged = Logged::unsolved(root.street, Some(street_deadline.clone()), vec![]);
+            finish(core, &req, hooks, &deadlines, &claim, Candidate::unsolved(assemble::unsupported(&ctx, reason, inherited, assumptions)), logged);
             return;
         }
     };
@@ -252,7 +272,7 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
     assumptions.ranges_used = ranges.ranges_used.clone();
     // Ruling 28-I6: from here on a watchdog `Final` keeps the range source's reasons and the ranges used (spec 6).
     *fallback.lock().unwrap() = deadline_fallback(&ctx, &inherited, &assumptions);
-    emit(core, &req, None, RecommendationEvent::Fast(assemble::fast(&ctx, assemble::accumulate(Coverage::Exact, inherited.clone()), assumptions.clone())));
+    emit(core, &req, Some(&*delivered), RecommendationEvent::Fast(assemble::fast(&ctx, assemble::accumulate(Coverage::Exact, inherited.clone()), assumptions.clone())));
     let hero_is_oop = root.oop == req.state.hero;
     let (hero_public, opp_public) = if hero_is_oop { (&ranges.oop, &ranges.ip) } else { (&ranges.ip, &ranges.oop) };
     spawn_equity(core, &req, hero_public.clone(), (opponent, opp_public.clone()), root.board.clone(), hooks.equity.clone(), equity_cancel.clone());
@@ -262,7 +282,8 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
     let build = match build_tree_full(&root, &TemplateSelection::from_history(template, &root.history)) {
         Ok(b) => b,
         Err(reason) => {
-            finish(core, &req, hooks, &deadlines, &claim, Candidate::unsolved(assemble::unsupported(&ctx, reason, inherited, assumptions)), Logged::unsolved(root.street, range_hashes));
+            let logged = Logged::unsolved(root.street, Some(street_deadline.clone()), range_hashes);
+            finish(core, &req, hooks, &deadlines, &claim, Candidate::unsolved(assemble::unsupported(&ctx, reason, inherited, assumptions)), logged);
             return;
         }
     };
@@ -282,7 +303,7 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
     // Ruling 28-I3: the client's liveness provenance, not the clock, says whether a job was left running at the fire.
     let restart_after_final = out.outstanding_job;
 
-    let logged = Logged { street: root.street, street_violation: out.street_violation, range_hashes };
+    let logged = Logged { street: root.street, verdict: StreetVerdict::Judged(out.street_violation), range_hashes };
     if !core.identity_active(&req.identity) {
         // Superseded while it ran (§4.4): no `Final`, snapshot or log record for a decision that is no longer active,
         // and its equity is cancelled (ruling 28-I4).
@@ -402,18 +423,30 @@ impl Candidate {
     fn unsolved(rec: Recommendation) -> Self { Self { rec, snapshot: None, best_so_far: false } }
 }
 
+/// The street verdict of a request's log record (§7).
+enum StreetVerdict {
+    /// The solve client's: the first attempt's terminal arrived after the street deadline, or none arrived by it (ruling
+    /// 20-I1).
+    Judged(bool),
+    /// No solve was attempted. A `Final` delivered before the watchdog's fire carries no verdict; one delivered at or
+    /// after it (the request expired) carries the shared street deadline's (`StreetDeadline::violated`, ruling 28-O3).
+    /// `None` when no watchdog watches the request (the classifier's rows).
+    Unattempted(Option<Arc<StreetDeadline>>),
+}
+
 /// What the decision log records of how a request ended besides the `Final` delivered (§5 step 10).
 struct Logged {
     street: Street,
-    /// The first attempt's terminal arrived after the street deadline, or none arrived by it (ruling 20-I1).
-    street_violation: bool,
+    verdict: StreetVerdict,
     /// The scaled-range hashes of the public ranges solved, OOP then IP; empty when none were read.
     range_hashes: Vec<String>,
 }
 
 impl Logged {
-    /// A request answered before any solve: no attempt to judge.
-    fn unsolved(street: Street, range_hashes: Vec<String>) -> Self { Self { street, street_violation: false, range_hashes } }
+    /// A request answered before any solve, watched by the watchdog of `street_deadline` when given.
+    fn unsolved(street: Street, street_deadline: Option<Arc<StreetDeadline>>, range_hashes: Vec<String>) -> Self {
+        Self { street, verdict: StreetVerdict::Unattempted(street_deadline), range_hashes }
+    }
 }
 
 /// The `Final` that reached the sink, when and from whom: the one the decision log records.
@@ -433,7 +466,7 @@ fn watchdog_final(fired: &Mutex<Option<Fired>>) -> Fired {
 /// A `Final` the classifier settles alone, before anything is armed: its claim is its own.
 fn settle(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, deadlines: &Deadlines, equity_cancel: &AtomicBool, street: Street, rec: Recommendation) {
     let claim = Claim { delivered: &AtomicBool::new(false), fired: None, equity_cancel };
-    finish(core, req, hooks, deadlines, &claim, Candidate::unsolved(rec), Logged::unsolved(street, vec![]));
+    finish(core, req, hooks, deadlines, &claim, Candidate::unsolved(rec), Logged::unsolved(street, None, vec![]));
 }
 
 /// The one `Final` path (§5 steps 7, 9, 10; ruling 28-I2). The candidate's delivery is claimed under the identity lock:
@@ -481,11 +514,15 @@ fn log_final(core: &mut EngineCore, req: &LiveRequest, deadlines: &Deadlines, de
         Coverage::Approximate { reasons } => reasons.clone(),
         Coverage::Unsupported { partial, .. } => partial.clone(),
     };
+    let final_violation = delivered.by_watchdog || delivered.at_ms >= deadlines.watchdog_fire_ms();
+    let arrival_violation = match &logged.verdict {
+        StreetVerdict::Judged(violated) => *violated,
+        StreetVerdict::Unattempted(street_deadline) => final_violation && street_deadline.as_ref().is_some_and(|d| d.violated()),
+    };
     // §12 "Street deadline reached": a `best_so_far` is logged as a violation on every street but the flop, whose
     // single-raised-pot miss is the designed outcome (plan 4 refines the flop by pot type).
     let best_so_far = delivered.best_so_far;
-    let street_violation = if logged.street == Street::Flop { logged.street_violation && !best_so_far } else { logged.street_violation || best_so_far };
-    let final_violation = delivered.by_watchdog || delivered.at_ms >= deadlines.watchdog_fire_ms();
+    let street_violation = if logged.street == Street::Flop { arrival_violation && !best_so_far } else { arrival_violation || best_so_far };
     core.log.append(&DecisionRecord { identity: req.identity.clone(), street: logged.street, coverage: rec.coverage.clone(), reasons,
         elapsed_ms: elapsed_ms(req.t0_ms, delivered.at_ms), cache: "miss".into(), presolver_scenario: None, tier: None, reached_bp: rec.assumptions.reached_bp,
         street_violation, final_violation, template_id: rec.assumptions.template_id.clone(), input: InputRecord::from_state(&req.state, logged.range_hashes.clone()) });
@@ -503,10 +540,11 @@ fn restart_the_worker(core: &mut EngineCore) {
 /// below the raw measurement, computed in f64 from the validated `f32` measurement, never from the rounded or
 /// saturated display value `reached_bp`. `exploitability_chips * 10_000` is exact in f64 (a 24-bit significand times
 /// 10^4) and the division is correctly rounded: a whole-number ratio comes out exact, and any other lies further from a
-/// whole number than the division's rounding error, so its ceiling is the bound.
+/// whole number than the division's rounding error, so its ceiling is the bound. `+ 0.0` turns a validated `-0.0`
+/// measurement's `-0` into `0` (ruling 28-N2); the value stays an f64, never narrowed, so no bound saturates.
 fn accuracy_bound_bp(exploitability_chips: f32, pot: u32) -> f64 {
     assert!(pot > 0 && exploitability_chips.is_finite() && exploitability_chips >= 0.0, "accuracy bound of {exploitability_chips} chips of a {pot}-chip pot");
-    (f64::from(exploitability_chips) * 10_000.0 / f64::from(pot)).ceil()
+    (f64::from(exploitability_chips) * 10_000.0 / f64::from(pot)).ceil() + 0.0
 }
 
 /// Milliseconds from the request's admission to `now_ms` on the engine clock. A request ends by its final delivery (at
