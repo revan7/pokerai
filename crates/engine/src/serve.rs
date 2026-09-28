@@ -10,11 +10,15 @@
 //! Identity (ruling 28-I1). Every event goes through `deliver` (`emit` for the crate): it is accepted under the
 //! identity lock, where a decision no longer active is refused and a `Final` claims the request's once-only delivery,
 //! and an accepted event is handed to the sink only after that lock is released, so this path holds no engine lock
-//! during a sink callback and a sink may re-enter the engine (read the identity, mutate the hand); the watchdog's fire
-//! still emits under its generation lock (follow-up P2.W3). A mutation that lands between
-//! the acceptance and the callback lets that one event through; the UI refuses it by identity (§5 step 9). A request
-//! whose decision is no longer active, at admission or once its solve returns, ends with no `Final`, no snapshot and no
-//! log record, and its watchdog is retired.
+//! during a sink callback and a sink may re-enter the engine (read the identity, mutate the hand). The watchdog's fire
+//! makes the same decision under the same lock (follow-up P2.W3, `watchdog`'s "Identity at the fire"): a decision no
+//! longer active gets no watchdog `Final` and its claim stays untaken, with no retirement hook needed on supersession;
+//! the fire releases the identity lock before its sink callback and keeps only its own generation lock. A mutation that
+//! lands between the acceptance and the callback lets that one event through; the UI refuses it by identity (§5 step
+//! 9). A request whose decision is no longer active, at admission or once its solve returns, ends with no `Final`, no
+//! snapshot and no log record, and its watchdog is retired. Once the solve returns, the identity and the watchdog's
+//! claim are read in two steps; a supersession and a fire landing between them leave the claim untaken, so the
+//! engine's own claim then finds the decision stale (re-review observation O4).
 //!
 //! One `Final` (§7, ruling 28-I2). The engine's `Final` and the watchdog's race for one claim (`Armed::delivered`); the
 //! fire records what it delivered and when (`Armed::fired`). The engine claims its candidate in `finish`: the snapshot
@@ -24,8 +28,9 @@
 //! built), and the decision log records the watchdog's `Final` with its delivery time. Until the fire the watchdog's
 //! fallback is refreshed as the request learns more, so a watchdog `Final` keeps the range source's reasons and the
 //! assumptions known by then (ruling 28-I6; spec 6). Nothing but an `Equity` of the request follows its delivered
-//! `Final` (ruling 28-N1; spec 7, spec 4.4): the request's `Fast` carries its claim, and `deliver` drops it, under the
-//! sink lock, once the watchdog has delivered.
+//! `Final` (ruling 28-N1; spec 7, spec 4.4): the request's `Fast` carries its claim, and so does the solve client's
+//! `Progress` (`SolvePlan::final_claim`, re-review observation O5), and `deliver` drops either, under the sink lock,
+//! once the watchdog has delivered.
 //!
 //! Street verdict (ruling 20-I1). A request has one `StreetDeadline`, shared by its watchdog (`Armed::street_deadline`)
 //! and the solve client (`SolvePlan::street_deadline`), which publishes the first attempt's terminal arrival to it at
@@ -89,7 +94,7 @@ fn event_identity(ev: &RecommendationEvent) -> &DecisionIdentity {
 
 /// How an event's acceptance ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Delivery {
+pub(crate) enum Delivery {
     /// Accepted: the event is handed to the sink.
     Accepted,
     /// The decision is no longer active: nothing is emitted.
@@ -121,8 +126,9 @@ fn accept(ids: &Mutex<IdentityState>, identity: &DecisionIdentity, final_claim: 
 /// the request's `Final` was delivered (ruling 28-N1; spec 7, `Final` once and last; spec 4.4, only `Equity` enriches a
 /// delivered `Final`). That check is made under the sink lock, in the same hold as the emission: the watchdog swaps
 /// `delivered` before it takes the sink lock to emit its `Final`, so either the event precedes that `Final` or it is
-/// dropped. `Equity` and `NoDecision` never take it.
-fn deliver(ids: &Mutex<IdentityState>, identity: &DecisionIdentity, sink: &SharedSink, delivered: Option<&AtomicBool>, ev: RecommendationEvent) -> Delivery {
+/// dropped. `Equity` and `NoDecision` never take it. Crate-visible: the solve client forwards the worker's progress
+/// through it, with the claim its `SolvePlan::final_claim` carries (re-review observation O5).
+pub(crate) fn deliver(ids: &Mutex<IdentityState>, identity: &DecisionIdentity, sink: &SharedSink, delivered: Option<&AtomicBool>, ev: RecommendationEvent) -> Delivery {
     assert!(event_identity(&ev) == identity, "an event of decision {:?} emitted for decision {identity:?}", event_identity(&ev));
     let (claim, not_after_final) = match &ev {
         RecommendationEvent::Final(_) => (delivered, None),
@@ -169,31 +175,38 @@ struct Hooks {
     before_claim: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Runs on `engine-main` right after the `Fast` was handed over (the sink released), before the tree is built.
     after_fast: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs on `engine-main` once the solve has returned and its decision was found still active, before the watchdog's
+    /// claim is consulted.
+    after_active_check: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Hooks {
-    fn production() -> Self { Self { equity: Arc::new(equity_summary_with_clock), before_claim: None, after_fast: None } }
+    fn production() -> Self { Self { equity: Arc::new(equity_summary_with_clock), before_claim: None, after_fast: None, after_active_check: None } }
 }
 
 /// Test seams of `serve_request` (plan 2 Task 28 fix round 1), compiled for this crate's tests and with the `testing`
 /// feature only: `equity` replaces the fast-path equity routine (ruling 28-I4's acknowledged runner); `before_claim` runs
 /// on `engine-main` with the candidate `Final` assembled, immediately before its delivery is claimed (ruling 28-I2: a
 /// watchdog fire landing there); `after_fast` runs on `engine-main` right after the `Fast` was handed over, the sink
-/// released, before the tree is built (ruling 28-O1b: a fire between the watchdog fallback's two refreshes). `None`
-/// keeps production behaviour.
+/// released, before the tree is built (ruling 28-O1b: a fire between the watchdog fallback's two refreshes);
+/// `after_active_check` runs on `engine-main` once the solve has returned and its decision was found still active,
+/// between that identity read and the read of the watchdog's claim (follow-up P2.W3, re-review observation O4: a
+/// supersession and a fire landing between the two). `None` keeps production behaviour.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Default)]
 pub struct ServeSeams {
     pub equity: Option<EquityRoutine>,
     pub before_claim: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_fast: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub after_active_check: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// `serve_request` with test seams (see `ServeSeams`).
 #[cfg(any(test, feature = "testing"))]
 pub fn serve_request_with(core: &mut EngineCore, req: LiveRequest, seams: ServeSeams) {
     let production = Hooks::production();
-    serve(core, req, &Hooks { equity: seams.equity.unwrap_or(production.equity), before_claim: seams.before_claim, after_fast: seams.after_fast });
+    serve(core, req, &Hooks { equity: seams.equity.unwrap_or(production.equity), before_claim: seams.before_claim, after_fast: seams.after_fast,
+        after_active_check: seams.after_active_check });
 }
 
 /// §5 steps 4-10 for one request (see the module doc). `req.state` must replay (`core_model::derive`'s precondition)
@@ -258,7 +271,7 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
     let fallback = Arc::new(Mutex::new(deadline_fallback(&ctx, &inherited, &assumptions)));
     core.watchdog.arm(Armed { identity: req.identity.clone(), street_deadline: street_deadline.clone(), fire_ms: deadlines.watchdog_fire_ms(),
         retained: Arc::new(Mutex::new(None)), fallback: fallback.clone(), stage: core.stage.clone(), sink: req.sink.clone(), delivered: delivered.clone(),
-        fired: fired.clone() });
+        fired: fired.clone(), identity_state: core.identity.clone() });
     let claim = Claim { delivered: &delivered, fired: Some(&fired), equity_cancel: &equity_cancel };
 
     // Fast phase (§5 step 5). The range source's lock is released at the end of this statement, before any emission.
@@ -302,7 +315,8 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
     let input = SolveInput { root: root.clone(), ranges: [ranges.oop.clone(), ranges.ip.clone()], tree: build.tree.clone(), target_bp: config.solver.target_bp };
     // `background: false` is this plan's value for a live decision; plan 4's pre-solver builds the same plan with `true`.
     let plan = SolvePlan { identity: req.identity.clone(), deadlines, street_deadline: street_deadline.clone(), template_id: template.into(),
-        retry_template_id: Templates::min_variant(template).map(String::from), rake: req.state.config.rake, hero_actor: hero_actor.into(), background: false };
+        retry_template_id: Templates::min_variant(template).map(String::from), rake: req.state.config.rake, hero_actor: hero_actor.into(), background: false,
+        final_claim: Some(delivered.clone()) };
     let out = run_solve(core, &input, &plan, &req.sink);
     let returned_ms = core.clock.now_ms();
     // The client published what it returned: the first attempt's terminal arrival, which both verdicts read.
@@ -312,7 +326,11 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
     let restart_after_final = out.outstanding_job;
 
     let logged = Logged { street: root.street, verdict: StreetVerdict::Judged(out.street_violation), range_hashes };
-    if !core.identity_active(&req.identity) {
+    let active = core.identity_active(&req.identity);
+    if let (true, Some(after_active_check)) = (active, &hooks.after_active_check) {
+        after_active_check();
+    }
+    if !active {
         // Superseded while it ran (§4.4): no `Final`, snapshot or log record for a decision that is no longer active,
         // and its equity is cancelled (ruling 28-I4).
         equity_cancel.store(true, Ordering::SeqCst);

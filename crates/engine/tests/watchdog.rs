@@ -13,6 +13,7 @@
 //! clock's, and every acknowledgement arrives within microseconds of the test driving it.
 
 use engine::deadline::Deadlines;
+use engine::identity::IdentityState;
 use engine::testing::{FakeClock, Recorder, RecordingSink, ACK_LIVENESS};
 use engine::watchdog::{Armed, Fired, SharedSink, StreetDeadline, Watchdog};
 use proto::{Coverage, DecisionIdentity, EquitySummary, Phase, Recommendation, RecommendationEvent, Street, UnsupportedReason};
@@ -21,20 +22,34 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 fn identity() -> DecisionIdentity { DecisionIdentity { hand_id: 1, hand_revision: 1, decision_id: 1, config_revision: 1, model_revision: 0 } }
-fn fallback() -> Recommendation {
-    Recommendation { identity: identity(), phase: Phase::Fast,
+fn fallback() -> Recommendation { fallback_of(identity()) }
+fn fallback_of(identity: DecisionIdentity) -> Recommendation {
+    Recommendation { identity, phase: Phase::Fast,
         coverage: Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage: String::new() }, partial: vec![] },
         legal: vec![], actions: vec![], unresolved_mass: 0.0, range_mix: None,
         equity: EquitySummary { hero_combo_vs_each: vec![], hero_range_vs_each: vec![], per_pot_shares: vec![] },
         assumptions: engine::assumptions_stub(), experimental: None, exploit: None }
 }
-/// A river request at t0 = 0: street deadline 2 000 ms, fire 14 900 ms.
+/// A session whose active decision is `identity()`: config 1, hand 1 at revision 1, decision 1.
+fn session() -> Arc<Mutex<IdentityState>> {
+    let mut s = IdentityState::new();
+    s.set_config();
+    s.begin_hand();
+    assert_eq!(s.next_decision(), Some(identity()));
+    Arc::new(Mutex::new(s))
+}
+/// A river request at t0 = 0: street deadline 2 000 ms, fire 14 900 ms, for the active decision of a session of its own.
 fn armed(sink: SharedSink, stage: &str) -> (Armed, Arc<AtomicBool>, Arc<StreetDeadline>) {
-    let d = Deadlines::for_request(0, Street::River, 10);
+    armed_at(sink, stage, identity(), session(), 0)
+}
+/// A river request for decision `id` of `session`, admitted at `t0_ms`: street deadline `t0 + 2 000` ms, fire
+/// `t0 + 14 900` ms.
+fn armed_at(sink: SharedSink, stage: &str, id: DecisionIdentity, session: Arc<Mutex<IdentityState>>, t0_ms: u64) -> (Armed, Arc<AtomicBool>, Arc<StreetDeadline>) {
+    let d = Deadlines::for_request(t0_ms, Street::River, 10);
     let (delivered, street) = (Arc::new(AtomicBool::new(false)), Arc::new(StreetDeadline::new(d.street_deadline_ms)));
-    let a = Armed { identity: identity(), street_deadline: street.clone(), fire_ms: d.watchdog_fire_ms(),
-        retained: Arc::new(Mutex::new(None)), fallback: Arc::new(Mutex::new(fallback())), stage: Arc::new(Mutex::new(stage.to_string())),
-        sink, delivered: delivered.clone(), fired: Arc::default() };
+    let a = Armed { identity: id.clone(), street_deadline: street.clone(), fire_ms: d.watchdog_fire_ms(),
+        retained: Arc::new(Mutex::new(None)), fallback: Arc::new(Mutex::new(fallback_of(id))), stage: Arc::new(Mutex::new(stage.to_string())),
+        sink, delivered: delivered.clone(), fired: Arc::default(), identity_state: session };
     (a, delivered, street)
 }
 fn recording(clock: &Arc<FakeClock>) -> (SharedSink, Recorder) {
@@ -331,7 +346,8 @@ fn arming_a_request_after_its_fire_is_a_bug() {
     clock.set_ms(14_900);
     events.wait_for(1);
     // the same request (its shared state) armed again after the watchdog fired for it
-    wd.arm(Armed { identity: identity(), street_deadline: street, fire_ms: 29_900, retained, fallback: Arc::new(Mutex::new(fallback())), stage, sink, delivered, fired: Arc::default() });
+    wd.arm(Armed { identity: identity(), street_deadline: street, fire_ms: 29_900, retained, fallback: Arc::new(Mutex::new(fallback())), stage, sink, delivered, fired: Arc::default(),
+        identity_state: session() });
 }
 
 #[test]
@@ -440,6 +456,98 @@ fn arming_with_the_street_deadline_after_the_fire_is_a_bug() {
     let (mut a, _, _) = armed(sink, "solving");
     a.street_deadline = Arc::new(StreetDeadline::new(a.fire_ms + 1));
     Watchdog::new(clock.clone()).arm(a);
+}
+
+// --- Follow-up P2.W3: the fire checks that its decision is still the active one, under the identity lock and in the
+// step that claims the request's `Final`, and hands the `Final` to the sink only after that lock is released. ---
+
+/// Follow-up P2.W3 (spec 12: a stale event is discarded by engine-main; spec 13.3, the identity race): a decision
+/// superseded just before its fire with no newer arm, by an undo or by a newer decision whose request has not armed yet
+/// (it waits behind its predecessor's 1.5 s cancel window), gets nothing from its watchdog: no `Final`, its claim not
+/// taken, nothing recorded as delivered, and the fire's thread ends. The newer decision, armed afterwards, is watched as
+/// ever: its own fire delivers its `Final`.
+#[test]
+fn a_decision_superseded_just_before_its_fire_gets_no_final_and_the_newer_one_is_watched() {
+    type Supersede = fn(&mut IdentityState);
+    let cases: [(&str, Supersede); 2] = [
+        ("an undo", |s| { s.mutate(); }),
+        ("a newer decision not yet armed", |s| { s.next_decision().expect("a hand is in progress"); }),
+    ];
+    for (case, supersede) in cases {
+        let clock = FakeClock::new();
+        let (sink, events) = recording(&clock);
+        let wd = watchdog(&clock);
+        let (a, delivered, _street) = armed(sink.clone(), "solving");
+        let (session, fired) = (a.identity_state.clone(), a.fired.clone());
+        wd.arm(a);
+        clock.wait_for_waiter(2_000);
+        clock.set_ms(14_800);
+        clock.wait_for_waiter(14_900); // the watchdog waits for its fire
+        supersede(&mut session.lock().unwrap()); // 100 ms before the fire; nothing newer is armed
+        assert!(!session.lock().unwrap().is_active(&identity()), "{case}: the armed decision is superseded");
+        clock.set_ms(14_900);
+        ended(&wd, 1); // the fire is over
+        assert!(events.recorded().is_empty(), "{case}: a superseded decision gets no Final");
+        assert!(!delivered.load(Ordering::SeqCst), "{case}: its Final claim is not taken");
+        assert!(fired.lock().unwrap().is_none(), "{case}: nothing is recorded as delivered");
+        // the newer decision (issued after the undo) is requested at 14 900 ms and arms the same watchdog: fire 29 800 ms
+        let newer = { let mut s = session.lock().unwrap(); match s.active().cloned() { Some(active) => active, None => s.next_decision().expect("a hand is in progress") } };
+        let (next, next_delivered, _) = armed_at(sink, "building", newer.clone(), session, 14_900);
+        armed_on(&wd, next);
+        clock.set_ms(29_800);
+        ended(&wd, 2);
+        let ev = events.recorded();
+        assert_eq!(ev.len(), 1, "{case}: the newer decision's Final only");
+        assert_eq!(ev[0].at_ms, 29_800, "{case}");
+        assert!(matches!(&ev[0].event, RecommendationEvent::Final(r) if r.identity == newer
+            && r.coverage == Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage: "building".into() }, partial: vec![] }), "{case}: {:?}", ev[0].event);
+        assert!(next_delivered.load(Ordering::SeqCst), "{case}");
+    }
+}
+
+/// A sink that re-enters the engine from its callback, as a UI command handler on the delivery thread could: it notes
+/// whether the identity lock and the stage slot (both `EngineCore` locks) are free, reads the active decision and
+/// supersedes it. `try_lock`, so a callback run under either lock is recorded instead of deadlocking the test.
+struct ReentrantSink { session: Arc<Mutex<IdentityState>>, stage: Arc<Mutex<String>>, seen: Arc<Mutex<Vec<String>>>, inner: RecordingSink }
+impl engine::EventSink for ReentrantSink {
+    fn emit(&mut self, ev: RecommendationEvent) {
+        let stage_free = self.stage.try_lock().is_ok();
+        let seen = match self.session.try_lock() {
+            Ok(mut ids) => {
+                let active = ids.active().is_some_and(|a| *a == identity());
+                ids.mutate();
+                format!("identity lock free, {} active, stage slot free {stage_free}", if active { "decision" } else { "no decision" })
+            }
+            Err(std::sync::TryLockError::WouldBlock) => format!("the identity lock was held during the callback, stage slot free {stage_free}"),
+            Err(std::sync::TryLockError::Poisoned(p)) => panic!("identity lock poisoned: {p}"),
+        };
+        self.seen.lock().unwrap().push(seen);
+        self.inner.emit(ev);
+    }
+}
+
+/// Ruling 28-I1 at the fire (follow-up P2.W3): the identity check and the claim are made under the identity lock, and
+/// the `Final` is handed to the sink only after that lock is released (the stage slot too), so a sink may re-enter the
+/// engine from the watchdog's callback, read the active decision and supersede it: the fire completes, delivered, and
+/// nothing deadlocks.
+#[test]
+fn a_sink_that_reads_the_identity_and_supersedes_from_the_fires_callback_completes() {
+    let clock = FakeClock::new();
+    let (inner, events) = RecordingSink::notifying(clock.clone(), None);
+    let wd = watchdog(&clock);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (session, stage) = (session(), Arc::new(Mutex::new("solving".to_string())));
+    let sink: SharedSink = Arc::new(Mutex::new(Box::new(ReentrantSink { session: session.clone(), stage: stage.clone(), seen: seen.clone(), inner })));
+    let (mut a, delivered, _street) = armed(sink, "solving");
+    (a.identity_state, a.stage) = (session.clone(), stage);
+    let fired = a.fired.clone();
+    wd.arm(a);
+    clock.set_ms(14_900);
+    ended(&wd, 1);
+    assert_eq!(*seen.lock().unwrap(), ["identity lock free, decision active, stage slot free true"]);
+    assert!(matches!(&events.recorded()[..], [e] if matches!(&e.event, RecommendationEvent::Final(r) if r.identity == identity())));
+    assert!(delivered.load(Ordering::SeqCst) && fired.lock().unwrap().is_some(), "the Final was claimed and recorded before the callback");
+    assert!(!session.lock().unwrap().is_active(&identity()), "the sink's supersession completed");
 }
 
 /// Ruling 20-A: an acknowledgement that never comes fails the test, naming it, instead of hanging the gate (the zero

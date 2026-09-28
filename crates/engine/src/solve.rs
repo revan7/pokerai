@@ -18,6 +18,13 @@
 //! the watchdog's `Armed::street_deadline`) the moment the terminal is received, before it is validated or anything is
 //! recovered, and returned in `SolveOutcome::first_terminal_ms` (ruling 22-I4).
 //!
+//! Progress. A `progress` of this solve observed before the watchdog's fire is forwarded as `Progress` through the
+//! engine's one acceptance path (`serve::deliver`): its decision still active, and, when the plan carries the request's
+//! `Final` claim (`SolvePlan::final_claim`, shared with the watchdog), that claim still untaken, judged under the sink
+//! lock in the same hold as the emission. The watchdog can fire between the client's observation just below the fire
+//! and the emission; its `Final` is then already out, and no `Progress` follows it (ruling 28-N1, re-review observation
+//! O5).
+//!
 //! Replies. Identity is checked before anything is built, immediately before the request is sent, and on every reply:
 //! once the decision is no longer active the attempt ends `Superseded` without sending, forwarding, validating or
 //! accepting anything (ruling 22-I2). Expiry is judged the same way, at the engine-clock time the client observes each
@@ -49,12 +56,14 @@
 use crate::bench_support::spot_identity;
 use crate::core::EngineCore;
 use crate::deadline::{retry_admitted, Deadlines, DELIVERY_MARGIN_MS, PIPE_MARGIN_MS};
+use crate::serve::deliver;
 use crate::tree::{build_tree_full, TemplateSelection, TreeBuild};
 use crate::watchdog::{SharedSink, StreetDeadline};
 use crate::worker::link::WorkerLinkError;
 use crate::worker::ready::validate_ready;
 use proto::worker::{validate_solution, AckStatus, EngineMessage, ResultStatus, SolveRequest, Stage, StreetSolution, WorkerError, WorkerMessage, FAILURE_CODES};
 use proto::{DecisionIdentity, EffectiveTree, OrdinalPath, Rake, RecommendationEvent, SolveInput, UnsupportedReason};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,6 +91,10 @@ pub struct SolvePlan {
     pub rake: Rake,
     pub hero_actor: String,
     pub background: bool,
+    /// The request's once-only `Final` claim, shared with its watchdog (`watchdog::Armed::delivered`): no `Progress` is
+    /// forwarded once it is taken (ruling 28-N1, re-review observation O5; see "Progress" above). `None` for a job no
+    /// watchdog watches (plan 4's `background`), whose progress has no `Final` to follow.
+    pub final_claim: Option<Arc<AtomicBool>>,
 }
 
 /// `StreetDeadline` has no `Debug`; the plan shows its deadline and what has been published to it.
@@ -90,7 +103,7 @@ impl std::fmt::Debug for SolvePlan {
         let street = format!("StreetDeadline {{ deadline_ms: {}, terminal_arrival_ms: {:?} }}", self.street_deadline.deadline_ms(), self.street_deadline.terminal_arrival_ms());
         f.debug_struct("SolvePlan").field("identity", &self.identity).field("deadlines", &self.deadlines).field("street_deadline", &format_args!("{street}"))
             .field("template_id", &self.template_id).field("retry_template_id", &self.retry_template_id).field("rake", &self.rake)
-            .field("hero_actor", &self.hero_actor).field("background", &self.background).finish()
+            .field("hero_actor", &self.hero_actor).field("background", &self.background).field("final_claim", &self.final_claim).finish()
     }
 }
 
@@ -463,8 +476,11 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
                 heartbeat_due_ms = (stage == Stage::Solving).then(|| at_ms.checked_add(HEARTBEAT_MS)
                     .unwrap_or_else(|| panic!("the heartbeat due after a progress at {at_ms} ms overflows u64")));
                 core.set_stage(stage_name(stage));
-                sink.lock().unwrap().emit(RecommendationEvent::Progress { identity: plan.identity.clone(), stage: stage_name(stage).into(), iterations,
-                    exploitability_pct, elapsed_ms: ms_between(plan.deadlines.t0_ms, at_ms) });
+                // Through the one acceptance path (`serve::deliver`): not once the request's `Final` was delivered, judged
+                // under the sink lock in the same hold as the emission, since the watchdog can fire after `at_ms` was
+                // observed below its fire time (ruling 28-N1, re-review observation O5).
+                deliver(&core.identity, &plan.identity, sink, plan.final_claim.as_deref(), RecommendationEvent::Progress { identity: plan.identity.clone(),
+                    stage: stage_name(stage).into(), iterations, exploitability_pct, elapsed_ms: ms_between(plan.deadlines.t0_ms, at_ms) });
             }
             WorkerMessage::Result { id, status, solution, error, .. } if id == req.id => {
                 // This solve's terminal arrived at `at_ms`: published before anything else is made of it (ruling 22-I4).

@@ -731,3 +731,145 @@ fn facing_an_allin_with_a_failed_solve_falls_back_to_the_analytic_answer_on_what
     assert!(note.contains(", W 2005, R 5.00, "), "{note}");
     assert_eq!((solves(&r).len(), kills_and_restarts(&r)), (1, (0, 0)));
 }
+
+// --- Follow-up P2.W3: the watchdog's fire checks that its decision is still the active one (F1), so a decision
+// superseded without a newer arm gets no watchdog `Final`, and the two-step identity/claim read after the solve (O4)
+// can no longer log a superseded decision. A fire that emits nothing is acknowledged by the end of its watchdog thread
+// (`Watchdog::ended_threads`), every such wait bounded by `ACK_LIVENESS` (ruling 20-A). ---
+
+use engine::watchdog::EndedThreads;
+use engine::worker::link::{WorkerLink, WorkerLinkError};
+use proto::worker::{Ready, WorkerMessage};
+use std::collections::VecDeque;
+
+/// The request's events but its `Equity`, by kind, in order.
+fn kinds(r: &Rig, id: &DecisionIdentity) -> Vec<&'static str> {
+    events_of(r, id).iter().map(|e| match e.event { RecommendationEvent::Final(_) => "Final", RecommendationEvent::Fast(_) => "Fast",
+        RecommendationEvent::Progress { .. } => "Progress", RecommendationEvent::Provisional(_) => "Provisional", RecommendationEvent::NoDecision { .. } => "NoDecision",
+        RecommendationEvent::Equity { .. } => "Equity" }).collect()
+}
+
+/// The scripted worker behind a link that lets a watchdog fire land while `engine-main` is inside a receive: the first
+/// receive that returns at or after the next fire time queued in `fires` hands its result over only once the watchdog
+/// has ended the number of generation threads queued with it (that fire processed, whatever it did), however the
+/// threads are scheduled.
+struct FireDuringReceive { inner: Box<dyn WorkerLink>, clock: Arc<FakeClock>, ends: EndedThreads, fires: Arc<Mutex<VecDeque<(u64, u64)>>> }
+impl WorkerLink for FireDuringReceive {
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), WorkerLinkError> { self.inner.send(msg) }
+    fn recv(&mut self, timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> {
+        let got = self.inner.recv(timeout);
+        let due = {
+            let mut fires = self.fires.lock().unwrap();
+            if fires.front().is_some_and(|(fire_ms, _)| self.clock.now_ms() >= *fire_ms) { fires.pop_front() } else { None }
+        };
+        if let Some((_, ended)) = due { self.ends.wait_for(ended); }
+        got
+    }
+    fn restart(&mut self) -> Result<(), WorkerLinkError> { self.inner.restart() }
+    fn kill(&mut self) { self.inner.kill() }
+    fn ready(&self) -> Option<&Ready> { self.inner.ready() }
+}
+
+/// Follow-up P2.W3, regression (a) (spec 12: a stale event is discarded by engine-main; spec 13.3, the identity race).
+/// Request A's `_min` retry is superseded just before A's watchdog fire (an undo at 14 800 ms, seen at 14 801 ms): the
+/// client cancels and waits out the 1.5 s cancel window, and A's fire (14 900 ms) comes inside it, before anything newer
+/// is armed. The fire finds A no longer active: A gets no `Final` (its only event is its `Fast`), no record is logged,
+/// and the unconfirmed cancel ends in a kill. The newer request B, served next, is watched as ever: its worker hangs and
+/// its own watchdog delivers its `Final` at B's fire, the one record logged.
+#[test]
+fn a_decision_superseded_in_the_cancel_window_before_its_fire_gets_no_watchdog_final() {
+    let script = vec![
+        ack(), FakeReply::Hang,                                                          // A, attempt 0: hangs to 2 500 ms; restart
+        ack(), delay(12_300), FakeReply::InvalidateIdentity, delay(1), FakeReply::Hang,  // A's retry: undone at 14 800 ms
+        ack(), FakeReply::Hang, ack(), FakeReply::Hang];                                 // B: both attempts hang to B's fire
+    let mut r = rig("w3_cancel_window", vec![]);
+    let (worker, state) = FakeWorker::scripted(r.clock.clone(), r.identity.clone(), script);
+    let fires = Arc::new(Mutex::new(VecDeque::from([(14_900, 1)])));   // A's fire: A's watchdog thread ends
+    r.core.worker = Box::new(FireDuringReceive { inner: worker, clock: r.clock.clone(), ends: r.core.watchdog.ended_threads(), fires: fires.clone() });
+    r.state = state;
+    let a = serve(&mut r, &river_state());
+    let cancel_window_end = r.clock.now_ms();
+    assert_eq!((r.state.lock().unwrap().cancels.len(), cancel_window_end), (1, 14_801 + 1_500), "A's retry was cancelled at 14 801 ms, unconfirmed");
+    assert_eq!(kinds(&r, &a), ["Fast"], "the superseded decision gets no watchdog Final");
+    assert!(records(&r).is_empty(), "nothing is logged for a superseded decision");
+    // B, admitted when A's request ends, fires at its t0 + 14.9 s: its watchdog thread is the second to end
+    fires.lock().unwrap().push_back((cancel_window_end + 14_900, 2));
+    let b = serve(&mut r, &river_state());
+    let f = finals(&r, &b);
+    assert_eq!(f.len(), 1, "B's own watchdog delivers B's Final");
+    assert_eq!((f[0].0, &f[0].2.coverage), (cancel_window_end + 14_900, &Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage: "building".into() }, partial: vec![] }));
+    let recs = records(&r);
+    assert_eq!((recs.len(), &recs[0].identity, recs[0].final_violation), (1, &b, true), "the one record is B's watchdog Final");
+    assert!(fires.lock().unwrap().is_empty(), "both fires were acknowledged");
+}
+
+/// Follow-up P2.W3, regression (e) (re-review observation O4): once the solve returns, `serve_request` reads the
+/// decision's identity, then the watchdog's claim, in two steps. A supersession and the watchdog's fire landing between
+/// the two (the `after_active_check` seam) leave nothing behind: the fire of the superseded decision emits nothing and
+/// takes no claim, so the engine goes on to its own candidate, whose claim is refused as stale. The request's only event
+/// is its `Fast`; no record, no snapshot, no kill.
+#[test]
+fn a_supersession_and_a_fire_between_the_post_solve_reads_leave_no_final_and_no_record() {
+    let s = river_state();
+    let mut r = rig("w3_o4", vec![ack(), result(ResultStatus::Ok, solution_on(&s, "river_std_v1", 0.2))]);
+    let (identity, clock, ends) = (r.identity.clone(), r.clock.clone(), r.core.watchdog.ended_threads());
+    let seams = ServeSeams { after_active_check: Some(Arc::new(move || {
+        identity.lock().unwrap().mutate();   // an undo lands after the identity read...
+        clock.set_ms(14_900);                // ...and so does the watchdog's fire, before the claim is read
+        ends.wait_for(1);
+    })), ..ServeSeams::default() };
+    let id = serve_with(&mut r, &s, seams);
+    assert_eq!(kinds(&r, &id), ["Fast"], "no Final of the superseded decision, from the watchdog or the engine");
+    assert!(records(&r).is_empty(), "no record for the superseded decision");
+    assert!(r.core.snapshots.lock().unwrap().for_hand(id.hand_id).is_empty(), "no snapshot");
+    assert_eq!(kills_and_restarts(&r), (0, 0));
+}
+
+// --- Follow-up P2.W3, re-review observation O5: a `Progress` never follows the request's delivered `Final` (ruling
+// 28-N1). ---
+
+/// The engine's clock as `engine-main` sees it when a reading lands just below the watchdog's fire and the fire comes
+/// before the engine acts on it (on the real clock, a window of microseconds). The engine thread's first reading of
+/// `at_ms` moves the fake clock on to `fire_ms` and returns, still `at_ms`, only once the watchdog's `Final` is
+/// recorded. Other threads, and every other reading, see the fake clock as it is.
+struct FireAfterReading { fake: Arc<FakeClock>, engine: std::thread::ThreadId, at_ms: u64, fire_ms: u64, finals: Finals, done: AtomicBool }
+impl Clock for FireAfterReading {
+    fn now_ms(&self) -> u64 {
+        let t = self.fake.now_ms();
+        if t == self.at_ms && std::thread::current().id() == self.engine && !self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.fake.set_ms(self.fire_ms);
+            wait_finals(&self.finals, 1);
+        }
+        t
+    }
+    fn wait_until(&self, t_ms: u64) { self.fake.wait_until(t_ms) }
+}
+
+/// Ruling 28-N1 for `Progress` (re-review observation O5; spec 7, the `Final` is delivered once and last; spec 4.4, only
+/// `Equity` enriches a delivered `Final`). Request A's `_min` retry reports a progress the client observes at 14 899
+/// ms, 1 ms before the watchdog's fire, and the fire comes before the client forwards it. The progress passes the
+/// client's expiry check (it was observed before the fire), but the watchdog's `Final` has been delivered by the time the
+/// client would emit it, so it is dropped under the sink lock, as a late `Fast` is. The request's events but its
+/// `Equity` are its `Fast` and the watchdog's `Final`, in that order, and that `Final` is the one logged.
+#[test]
+fn a_progress_observed_just_below_the_fire_is_not_forwarded_after_the_watchdog_final() {
+    let progress = FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 12, exploitability_chips: Some(0.9), elapsed_ms: 1 };
+    let script = vec![ack(), FakeReply::Hang,                          // attempt 0: hangs to 2 500 ms; restart
+        ack(), delay(12_399), progress, FakeReply::Hang];              // the retry: a progress due at 14 899 ms
+    let mut r = rig("w3_o5", vec![]);
+    let gate: Finals = Arc::default();
+    let clock: Arc<dyn Clock> = Arc::new(FireAfterReading { fake: r.clock.clone(), engine: std::thread::current().id(), at_ms: 14_899, fire_ms: 14_900,
+        finals: gate.clone(), done: AtomicBool::new(false) });
+    let (worker, state) = FakeWorker::scripted(r.clock.clone(), r.identity.clone(), script);
+    let range_source = std::mem::replace(&mut *r.core.range_source.lock().unwrap(), Box::new(ExplicitRanges { oop: None, ip: None }));
+    r.core = EngineCore::new(worker, clock, r.identity.clone(), DecisionLog::open(&r.log_dir));
+    *r.core.range_source.lock().unwrap() = range_source;
+    let (inner, events) = RecordingSink::new(r.clock.clone(), Some(state.clone()));
+    let mut r = Rig { sink: Arc::new(Mutex::new(Box::new(FinalGate { inner, finals: gate }))), events, state, ..r };
+    let a = serve(&mut r, &river_state());
+    assert_eq!(kinds(&r, &a), ["Fast", "Final"], "no Progress after the delivered Final");
+    let f = finals(&r, &a);
+    assert_eq!((f[0].0, &f[0].2.coverage), (14_900, &Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage: "building".into() }, partial: vec![] }));
+    let recs = records(&r);
+    assert_eq!((recs.len(), recs[0].final_violation, &recs[0].coverage), (1, true, &f[0].2.coverage), "the watchdog's Final is the one logged");
+}
