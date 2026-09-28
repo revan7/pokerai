@@ -95,7 +95,10 @@ fn a_solve_the_wire_codec_rejects_discards_the_staged_set() {
 
 // ---- In process: the real control handlers and executor, the job held by a deterministic checkpoint barrier ----
 
-/// A liveness bound on every wait for the executor, never a placement: the barrier decides where the job is.
+/// A liveness bound on every wait that must not race the machine's own speed, never a placement: the barrier tests
+/// below decide where an in-process job is by site, not by this bound; `lock_lifecycle`'s spawned-worker shutdown
+/// exit (a concurrent gate's other builds and test binaries can starve the child process well past a short fixed
+/// timeout) is awaited the same way, generous headroom over every observed run.
 const LIVENESS: Duration = Duration::from_secs(60);
 
 /// A point of a job as the executor's hooks report it (`job::Hooks`), on the job's own thread, immediately before the
@@ -406,6 +409,7 @@ fn lock_lifecycle() {
     assert_eq!(result_of(&w, "70", 5 * S)["solution"]["locks_applied"], 0);
     w.send(r#"{"type":"shutdown","id":"71"}"#);
     assert_eq!(ack_of(&w, "71")["status"], "accepted");
-    assert_eq!(w.wait_exit(2 * S), Some(0));
+    // liveness-bounded, not a short fixed timeout: a concurrent gate can starve this exit past 2 s without a defect
+    assert_eq!(w.wait_exit(LIVENESS), Some(0));
 }
 fn lock_spot(line: &str) -> Value { serde_json::from_str::<Value>(line).unwrap()["spot"].clone() }
