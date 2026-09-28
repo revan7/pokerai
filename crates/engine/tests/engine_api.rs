@@ -369,13 +369,28 @@ fn a_mid_hand_settings_change_keeps_the_hands_config_revision() {
 }
 
 /// The scripted worker behind a link that paces `engine-main` for the admission-time watchdog tests: the first receive
-/// that returns at or after `pause_at_ms` acknowledges it (`paused`) and waits for the test (`resume`, bounded by the
-/// liveness allowance), so the test admits a request at exactly that time; and every restart first spends
-/// `restart_ms` of fake time, as a restart whose first launch misses the startup timeout and needs its retry launch
-/// does (spec 4.5: `START_ATTEMPTS` launches of up to `STARTUP_TIMEOUT` each).
+/// that returns at or after `pause_at_ms`, or the first kill when `pause_on_kill` is set, acknowledges it (`paused`) and
+/// waits for the test (`resume`, bounded by the liveness allowance), so the test admits a request at exactly that point;
+/// every kill is acknowledged with its fake time (`killed`); and every restart first spends `restart_ms` of fake time, as
+/// a restart whose first launch misses the startup timeout and needs its retry launch does (spec 4.5: `START_ATTEMPTS`
+/// launches of up to `STARTUP_TIMEOUT` each).
 struct Paced {
-    inner: Box<dyn engine::worker::link::WorkerLink>, clock: Arc<FakeClock>, pause_at_ms: Option<u64>, restart_ms: u64,
-    paused: std::sync::mpsc::Sender<()>, resume: std::sync::mpsc::Receiver<()>,
+    inner: Box<dyn engine::worker::link::WorkerLink>, clock: Arc<FakeClock>, pause_at_ms: Option<u64>, pause_on_kill: bool, restart_ms: u64,
+    paused: std::sync::mpsc::Sender<()>, resume: std::sync::mpsc::Receiver<()>, killed: std::sync::mpsc::Sender<u64>,
+}
+impl Paced {
+    /// A pacing link over `inner` and the channels its test holds: pause acknowledgements, resumes and kill times.
+    fn new(inner: Box<dyn engine::worker::link::WorkerLink>, clock: Arc<FakeClock>, pause_at_ms: Option<u64>, pause_on_kill: bool, restart_ms: u64)
+        -> (Paced, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<u64>) {
+        let (paused, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume) = std::sync::mpsc::channel();
+        let (killed, killed_rx) = std::sync::mpsc::channel();
+        (Paced { inner, clock, pause_at_ms, pause_on_kill, restart_ms, paused, resume, killed }, paused_rx, resume_tx, killed_rx)
+    }
+    fn pause(&mut self) {
+        let _ = self.paused.send(());
+        let _ = self.resume.recv_timeout(engine::testing::ACK_LIVENESS);
+    }
 }
 impl engine::worker::link::WorkerLink for Paced {
     fn send(&mut self, msg: &proto::worker::EngineMessage) -> Result<(), engine::worker::link::WorkerLinkError> { self.inner.send(msg) }
@@ -384,13 +399,19 @@ impl engine::worker::link::WorkerLink for Paced {
         let got = self.inner.recv(timeout);
         if self.pause_at_ms.is_some_and(|at| self.clock.now_ms() >= at) {
             self.pause_at_ms = None;
-            let _ = self.paused.send(());
-            let _ = self.resume.recv_timeout(engine::testing::ACK_LIVENESS);
+            self.pause();
         }
         got
     }
     fn restart(&mut self) -> Result<(), engine::worker::link::WorkerLinkError> { self.clock.advance_ms(self.restart_ms); self.inner.restart() }
-    fn kill(&mut self) { self.inner.kill() }
+    fn kill(&mut self) {
+        use engine::clock::Clock;
+        self.inner.kill();
+        let _ = self.killed.send(self.clock.now_ms());
+        if std::mem::take(&mut self.pause_on_kill) {
+            self.pause();
+        }
+    }
     fn ready(&self) -> Option<&proto::worker::Ready> { self.inner.ready() }
 }
 
@@ -406,19 +427,20 @@ fn kinds_at(events: &[engine::testing::Recorded]) -> Vec<(&'static str, u64)> {
 /// request time). Request A's river solve hangs in `Building` (no progress, so no heartbeat). B is recommended at t0A +
 /// 100 ms, while A's receive is in progress. `engine-main` notices A's supersession within one receive slice, sends A's
 /// cancel, and gives way to B at once: B's `Fast` goes out at t0B, not behind A's cancel window. Before anything of B is
-/// sent, A's cancel is settled: never confirmed (the worker is hung), the worker is killed at the end of A's 1.5 s
-/// window and restarted, and the restart needs its retry launch (10 s of fake time). B's first attempt then has no room
-/// (ruling F-M8): its `_min` retry is admitted and hangs too. B's watchdog, armed when B was admitted, delivers B's
-/// `Final` at t0B + 14.9 s, `DeadlineExceeded{building}`; A gets no `Final`.
+/// sent, A's cancel is settled (final fix round 2, ruling F2-N1, the settle before the next send): never confirmed (the
+/// worker is hung), the worker is killed at the end of A's 1.5 s window, then B's solve relaunches it (ruling F2-Q1),
+/// the relaunch needing its retry launch (10 s of fake time). B's first attempt then has no room (ruling F-M8): its
+/// `_min` retry is admitted and hangs too. B's watchdog, armed when B was admitted, delivers B's `Final` at t0B + 14.9 s,
+/// `DeadlineExceeded{building}`, and the busy worker is killed after it; A gets no `Final`. The worker's calls and the
+/// diagnostics log pin the order: A's solve, A's cancel, the kill at t_cancel + 1.5 s, the relaunch, B's retry, the kill
+/// after B's `Final`.
 #[test]
 fn a_request_admitted_behind_a_hung_solve_gets_its_fast_at_once_and_its_final_by_its_own_watchdog() {
     let clock = FakeClock::new();
     let identity = Arc::new(Mutex::new(IdentityState::new()));
     let ack = || FakeReply::Ack { id: engine::testing::IdRef::Last, status: proto::worker::AckStatus::Accepted, reason: None };
     let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), vec![ack(), FakeReply::Hang, ack(), FakeReply::Hang]);
-    let (paused_tx, paused) = std::sync::mpsc::channel();
-    let (resume, resume_rx) = std::sync::mpsc::channel();
-    let link = Paced { inner: worker, clock: clock.clone(), pause_at_ms: Some(100), restart_ms: 10_000, paused: paused_tx, resume: resume_rx };
+    let (link, paused, resume, _killed) = Paced::new(worker, clock.clone(), Some(100), false, 10_000);
     let log_dir = std::env::temp_dir().join(format!("pokerai_engine_api_i1_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&log_dir);
     let mut e = Engine::with_core(EngineCore::new(Box::new(link), clock.clone(), identity, DecisionLog::open(&log_dir)));
@@ -439,7 +461,9 @@ fn a_request_admitted_behind_a_hung_solve_gets_its_fast_at_once_and_its_final_by
     let b_seen = kinds_at(&b_events.recorded());
     e.shutdown();
     let a_seen = kinds_at(&a_events.recorded());
-    let (kills, restarts, cancels) = { let f = fake.lock().unwrap(); (f.kills, f.restarts, f.cancels.len()) };
+    let (kills, restarts, cancels, calls) = { let f = fake.lock().unwrap(); (f.kills, f.restarts, f.cancels.len(), f.calls.clone()) };
+    let diagnostics: Vec<engine::log::DiagnosticRecord> = std::fs::read_to_string(log_dir.join("diagnostics.jsonl"))
+        .map(|t| t.lines().map(|l| serde_json::from_str(l).unwrap()).collect()).unwrap_or_default();
     assert!(paused_in_a, "A's receive returned at 100 ms");
     assert_eq!(t0b, 100, "B was admitted at t0A + 100 ms, while A's receive was in progress");
     assert!(b.decision_id > a.decision_id);
@@ -451,7 +475,163 @@ fn a_request_admitted_behind_a_hung_solve_gets_its_fast_at_once_and_its_final_by
         "B's Final at t0B + 14.9 s");
     assert!(a_seen.iter().all(|(k, _)| *k != "Final"), "the superseded A gets no Final: {a_seen:?}");
     assert_eq!(cancels, 1, "A's running job was cancelled");
-    assert!(kills >= 1 && restarts >= 1, "A's unconfirmed cancel ended in a kill and a restart: {kills} kills, {restarts} restarts");
+    // Ruling F2-N1: nothing of B is sent before A's cancel is settled by the kill at the end of its window, t_cancel +
+    // 1.5 s; then B's solve relaunches the worker and sends its retry.
+    let calls: Vec<(u64, &str)> = calls.iter().map(|(at, c)| (*at, c.as_str())).collect();
+    assert_eq!(calls, [(0, "solve 1"), (100, "cancel 1"), (1_600, "kill"), (11_600, "restart"), (11_600, "solve 3"), (t0b + 14_900, "kill"), (t0b + 14_900, "kill")],
+        "A's solve, A's cancel, the kill at t_cancel + 1.5 s before anything of B, B's relaunch and retry, the kill after B's Final, the teardown's kill");
+    assert_eq!((kills, restarts), (3, 1), "the settle's kill, the post-Final kill and the teardown's; B's relaunch");
+    let seen: Vec<(&str, u64)> = diagnostics.iter().map(|d| (d.event.as_str(), d.at_ms)).collect();
+    assert_eq!(seen, [("kill", 1_600), ("restart", 1_600), ("kill", t0b + 14_900)], "the diagnostics log records the settle's kill before B's relaunch: {diagnostics:?}");
+    assert!(diagnostics[0].detail.contains("the cancel of solve 1 was not confirmed within 1500 ms"), "{}", diagnostics[0].detail);
+    assert!(diagnostics[1].detail.contains("no live worker before the request"), "{}", diagnostics[1].detail);
+}
+
+/// Final fix round 2, ruling F2-N1 (the re-review's probe P2: the settle while `engine-main` is idle). Request A's river
+/// solve hangs; B, at hero's preflop decision of a new hand, is admitted at t0A + 100 ms, while A's receive is in
+/// progress. A's cancel is sent then and left pending, `engine-main` giving way to B, which the classifier answers
+/// without a solve (no worker call). Nothing is queued after B: `engine-main`, idle, waits A's cancel window out and
+/// kills the worker at t_cancel + 1.5 s. Nothing is sent to the worker after the `cancel`, and A gets no `Final`.
+#[test]
+fn a_pending_cancel_is_settled_while_engine_main_is_idle() {
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let ack = || FakeReply::Ack { id: engine::testing::IdRef::Last, status: proto::worker::AckStatus::Accepted, reason: None };
+    let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), vec![ack(), FakeReply::Hang]);
+    let (link, paused, resume, killed) = Paced::new(worker, clock.clone(), Some(100), false, 0);
+    let log_dir = std::env::temp_dir().join(format!("pokerai_engine_api_idle_settle_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let mut e = Engine::with_core(EngineCore::new(Box::new(link), clock.clone(), identity, DecisionLog::open(&log_dir)));
+    let (cfg, _) = cfg_1_2();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let s = river_via(&mut e);
+    e.set_explicit_ranges(full(&s.board), full(&s.board));
+    let (sink, a_events) = RecordingSink::notifying(clock.clone(), None);
+    e.recommend(Box::new(sink)).unwrap();
+    let paused_in_a = paused.recv_timeout(engine::testing::ACK_LIVENESS).is_ok();
+    e.begin_hand(begin()).unwrap();
+    hero_preflop_via(&mut e);
+    let (sink, b_events) = RecordingSink::notifying(clock.clone(), None);
+    let b = e.recommend(Box::new(sink)).unwrap();
+    let _ = resume.send(());
+    let b_first = b_events.wait_for(1).into_iter().next().map(|r| (r.at_ms, r.event));
+    let killed_at = killed.recv_timeout(engine::testing::ACK_LIVENESS).ok();
+    let calls_at_kill = fake.lock().unwrap().calls.clone();
+    e.shutdown();
+    let a_seen = kinds_at(&a_events.recorded());
+    let diagnostics: Vec<engine::log::DiagnosticRecord> = std::fs::read_to_string(log_dir.join("diagnostics.jsonl"))
+        .map(|t| t.lines().map(|l| serde_json::from_str(l).unwrap()).collect()).unwrap_or_default();
+    assert!(paused_in_a, "A's receive returned at 100 ms");
+    assert!(matches!(&b_first, Some((100, proto::RecommendationEvent::Final(r))) if r.identity == b
+        && matches!(r.coverage, proto::Coverage::Unsupported { reason: proto::UnsupportedReason::EngineError { .. }, .. })),
+        "B is answered at once by the classifier's row, no solve: {b_first:?}");
+    assert_eq!(killed_at, Some(1_600), "idle, engine-main killed the worker at the end of A's cancel window, t_cancel + 1.5 s");
+    let calls: Vec<(u64, &str)> = calls_at_kill.iter().map(|(at, c)| (*at, c.as_str())).collect();
+    assert_eq!(calls, [(0, "solve 1"), (100, "cancel 1"), (1_600, "kill")], "nothing is sent to the worker after the cancel");
+    assert!(diagnostics.first().is_some_and(|d| (d.event.as_str(), d.at_ms) == ("kill", 1_600) && d.detail.contains("was not confirmed within 1500 ms")),
+        "the settle's kill is recorded: {diagnostics:?}");
+    assert!(a_seen.iter().all(|(k, _)| *k != "Final"), "the superseded A gets no Final: {a_seen:?}");
+}
+
+/// Final fix round 2, ruling F2-N1: the kill at the end of a cancel window is never skipped, only made late. Request A's
+/// river solve hangs; B, at hero's preflop decision of a new hand, is admitted at t0A + 100 ms, while A's receive is in
+/// progress, so A's cancel is sent then and left pending. B's `Final` (the classifier's, no solve) holds `engine-main`
+/// in its sink callback while the clock passes the end of A's cancel window (t_cancel + 1.5 s) by 5 s, and C, a river
+/// decision later in B's hand, is admitted meanwhile. When the callback returns, the pending cancel is settled before
+/// anything of C is sent: the worker is killed at once, at the release time, then C's solve relaunches it, and C is
+/// answered.
+#[test]
+fn the_kill_at_the_end_of_a_cancel_window_is_never_skipped() {
+    use engine::testing::{uniform_solution, IdRef};
+    use proto::worker::{AckStatus, ResultStatus};
+    let state = river_state();
+    let root = core_model::street_root(&state).unwrap();
+    let build = engine::tree::build_tree_full(&root, &engine::tree::TemplateSelection::from_history("river_std_v1", &root.history)).unwrap();
+    let solution = uniform_solution(&build.tree, &build.history, 0.2);
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let ack = || FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None };
+    let script = vec![ack(), FakeReply::Hang, ack(), FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(solution), error: None, elapsed_ms: 3 }];
+    let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
+    let (link, paused, resume, _killed) = Paced::new(worker, clock.clone(), Some(100), false, 0);
+    let mut e = Engine::with_core(EngineCore::new(Box::new(link), clock.clone(), identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_engine_api_log"))));
+    let (cfg, _) = cfg_1_2();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let s = river_via(&mut e);
+    e.set_explicit_ranges(full(&s.board), full(&s.board));
+    let (sink, _a_events) = RecordingSink::notifying(clock.clone(), None);
+    e.recommend(Box::new(sink)).unwrap();
+    let paused_in_a = paused.recv_timeout(engine::testing::ACK_LIVENESS).is_ok();
+    e.begin_hand(begin()).unwrap();
+    hero_preflop_via(&mut e);
+    let (entered_tx, entered) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let (inner, _b_events) = RecordingSink::notifying(clock.clone(), None);
+    e.recommend(Box::new(HeldRecorder { inner, entered: entered_tx, release: release_rx, held: false })).unwrap();
+    let _ = resume.send(());
+    let held = entered.recv_timeout(engine::testing::ACK_LIVENESS).is_ok();
+    clock.set_ms(6_600);
+    let river = river_after_hero_preflop(&mut e);
+    e.set_explicit_ranges(full(&river.board), full(&river.board));
+    let (sink, c_events) = RecordingSink::notifying(clock.clone(), None);
+    let c = e.recommend(Box::new(sink)).unwrap();
+    let _ = release.send(());
+    let c_final = final_of(&c_events);
+    e.shutdown();
+    let calls: Vec<(u64, String)> = fake.lock().unwrap().calls.clone();
+    assert!(paused_in_a && held, "A's receive returned at 100 ms; B's Final held engine-main");
+    let calls: Vec<(u64, &str)> = calls.iter().map(|(at, c)| (*at, c.as_str())).take(5).collect();
+    assert_eq!(calls, [(0, "solve 1"), (100, "cancel 1"), (6_600, "kill"), (6_600, "restart"), (6_600, "solve 3")],
+        "the late kill lands before anything of C is sent, never skipped");
+    assert!(matches!(c_final, Some(ref f) if f.identity == c && f.coverage == proto::Coverage::Exact), "C is answered: {c_final:?}");
+}
+
+/// Final fix round 2, ruling F2-Q1 (spec 7: `Fast` within 0.3 s; the re-review's probe P8): no worker relaunch runs on
+/// `engine-main` ahead of the next request. Request A's `_min` retry hangs to the fire, so A's watchdog delivers A's
+/// `Final` at 14.9 s and the cleanup after it kills the busy worker. B is admitted during that cleanup (the link holds
+/// `engine-main` right after the kill). The cleanup only kills: B's `Fast` goes out at t0B, and B's own solve relaunches
+/// the worker before its send (Task 23's bounded restoration; the relaunch needs its retry launch, 10 s of fake time),
+/// after which its first attempt has no room and its `_min` retry hangs: B's watchdog delivers B's `Final` at t0B + 14.9
+/// s. The worker's calls, in order: A's solve, the restart after A's hang, A's retry, the kill after A's `Final`, then B's
+/// relaunch and B's retry.
+#[test]
+fn a_request_admitted_during_a_post_final_cleanup_gets_its_fast_at_once() {
+    use engine::clock::Clock;
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let ack = || FakeReply::Ack { id: engine::testing::IdRef::Last, status: proto::worker::AckStatus::Accepted, reason: None };
+    let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), vec![ack(), FakeReply::Hang, ack(), FakeReply::Hang, ack(), FakeReply::Hang]);
+    let (link, paused, resume, _killed) = Paced::new(worker, clock.clone(), None, true, 10_000);
+    let mut e = Engine::with_core(EngineCore::new(Box::new(link), clock.clone(), identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_engine_api_log"))));
+    let (cfg, _) = cfg_1_2();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let s = river_via(&mut e);
+    e.set_explicit_ranges(full(&s.board), full(&s.board));
+    let (sink, a_events) = RecordingSink::notifying(clock.clone(), None);
+    e.recommend(Box::new(sink)).unwrap();
+    let paused_in_cleanup = paused.recv_timeout(engine::testing::ACK_LIVENESS).is_ok();
+    let t0b = clock.now_ms();
+    let (sink, b_events) = RecordingSink::notifying(clock.clone(), None);
+    e.recommend(Box::new(sink)).unwrap();
+    let _ = resume.send(());
+    let b_final = final_of(&b_events);
+    let b_seen = kinds_at(&b_events.recorded());
+    e.shutdown();
+    let a_seen = kinds_at(&a_events.recorded());
+    let calls: Vec<(u64, String)> = fake.lock().unwrap().calls.clone();
+    assert!(paused_in_cleanup, "A's post-Final cleanup killed the worker");
+    assert_eq!(a_seen.iter().filter(|(k, _)| *k == "Final").map(|(_, at)| *at).collect::<Vec<_>>(), [14_900], "A's watchdog Final at 14.9 s: {a_seen:?}");
+    assert_eq!(t0b, 14_900, "B was admitted during A's cleanup");
+    let b_fast = b_seen.iter().find(|(k, _)| *k == "Fast").map(|(_, at)| *at);
+    assert!(b_fast.is_some_and(|at| at <= t0b + 300), "B's Fast within 0.3 s of t0B (spec 7), not behind a relaunch: {b_seen:?}");
+    let b_final_at = b_seen.iter().find(|(k, _)| *k == "Final").map(|(_, at)| *at);
+    assert!(b_final.is_some() && b_final_at == Some(t0b + 14_900), "B's Final at t0B + 14.9 s: {b_seen:?}");
+    let before_teardown: Vec<(u64, &str)> = calls.iter().map(|(at, c)| (*at, c.as_str())).take(6).collect();
+    assert_eq!(before_teardown, [(0, "solve 1"), (12_500, "restart"), (12_500, "solve 2"), (14_900, "kill"), (24_900, "restart"), (24_900, "solve 3")],
+        "the cleanup after A's Final only kills; B's own solve relaunches the worker before its send: {calls:?}");
 }
 
 /// Final review I1 (a) (spec 7: a watchdog independent of the worker client and of `engine-main`): the watchdog is
@@ -566,6 +746,171 @@ fn a_panic_while_serving_is_contained_and_the_engine_keeps_serving() {
     let events: Vec<&str> = diagnostics.iter().map(|d| d.event.as_str()).collect();
     assert_eq!(events, ["panic", "kill", "restart"], "the panic, its kill and the next solve's relaunch are recorded (final review M2): {diagnostics:?}");
     assert!(diagnostics[0].identity.as_ref() == Some(&first) && diagnostics[0].detail.contains("an internal invariant broke"), "{:?}", diagnostics[0]);
+}
+
+/// The decision log and the diagnostics log a test's engine wrote under `log_dir`.
+fn logs(log_dir: &std::path::Path) -> (Vec<engine::log::DecisionRecord>, Vec<engine::log::DiagnosticRecord>) {
+    let read = |name: &str| std::fs::read_to_string(log_dir.join(name)).unwrap_or_default();
+    (read("decisions.jsonl").lines().map(|l| serde_json::from_str(l).unwrap()).collect(), read("diagnostics.jsonl").lines().map(|l| serde_json::from_str(l).unwrap()).collect())
+}
+
+/// A river request's scripted solve: its ack, then its `ok` with a uniform solution of the `river_std_v1` tree at
+/// `river_state()`'s root.
+fn river_answer() -> Vec<FakeReply> {
+    use engine::testing::{uniform_solution, IdRef};
+    use proto::worker::{AckStatus, ResultStatus};
+    let state = river_state();
+    let root = core_model::street_root(&state).unwrap();
+    let build = engine::tree::build_tree_full(&root, &engine::tree::TemplateSelection::from_history("river_std_v1", &root.history)).unwrap();
+    let solution = uniform_solution(&build.tree, &build.history, 0.2);
+    vec![FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None },
+        FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(solution), error: None, elapsed_ms: 3 }]
+}
+
+/// Final fix round 2, ruling F2-I3 (the re-review's probe P7; spec 7: one `Final` per request by its final delivery). A
+/// panic on `engine-main` after it took the request's `Final` claim and before it handed its `Final` over (a seam that
+/// panics once inside the accepted claim, under the identity lock, where the solved candidate's snapshot is registered)
+/// still answers the request: the containment finds the claim taken by `engine-main` with no emission and delivers the
+/// non-retryable internal-error `Final` itself, once, with the request's legal intervals, logged once; the watchdog,
+/// whose claim was lost and whose generation is retired, delivers nothing at the fire; nothing of the candidate is
+/// registered. The panic poisoned the identity lock: every lock on `engine-main`'s path tolerates it (ruling N2), so the
+/// next request is answered `Exact`, its solve relaunching the killed worker, and its snapshot is registered.
+#[test]
+fn a_panic_after_engine_main_took_the_final_claim_still_answers_the_request() {
+    use engine::serve::ServeSeams;
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), [river_answer(), river_answer()].concat());
+    let log_dir = std::env::temp_dir().join(format!("pokerai_engine_api_claim_panic_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let core = EngineCore::new(worker, clock.clone(), identity.clone(), DecisionLog::open(&log_dir));
+    let (ended, snapshots) = (core.watchdog.ended_threads(), core.snapshots.clone());
+    let panicked = Arc::new(AtomicBool::new(false));
+    let once = panicked.clone();
+    let seams = ServeSeams { at_registration: Some(Arc::new(move || if !once.swap(true, Ordering::SeqCst) { panic!("seam: an invariant broke after the claim") })),
+        ..ServeSeams::default() };
+    let mut e = Engine::with_core_and_seams(core, seams);
+    let (cfg, _) = cfg_1_2();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let s = river_via(&mut e);
+    e.set_explicit_ranges(full(&s.board), full(&s.board));
+    let (sink, first_events) = RecordingSink::notifying(clock.clone(), None);
+    let first = e.recommend(Box::new(sink)).unwrap();
+    let first_final = final_of(&first_events);
+    let poisoned = identity.is_poisoned();
+    let (sink, second_events) = RecordingSink::notifying(clock.clone(), None);
+    let second = e.recommend(Box::new(sink)).unwrap();
+    let second_final = final_of(&second_events);
+    // Both requests' fires: the first's generation was retired by the containment, the second's by its own Final.
+    use engine::clock::Clock;
+    clock.set_ms(clock.now_ms() + 14_900);
+    ended.wait_for(2);
+    let (kills, restarts) = { let f = fake.lock().unwrap(); (f.kills, f.restarts) }; // before the teardown's own kill
+    let registered: Vec<u64> = snapshots.lock().unwrap_or_else(|p| p.into_inner()).for_hand(first.hand_id).iter().map(|x| x.provenance.identity_at_solve.decision_id).collect();
+    e.shutdown();
+    let first_seen = kinds_at(&first_events.recorded());
+    let (records, diagnostics) = logs(&log_dir);
+    assert!(panicked.load(Ordering::SeqCst) && poisoned, "the seam panicked under the identity lock, poisoning it");
+    let first_final = first_final.expect("the request whose serving panicked after its claim was answered");
+    match &first_final.coverage {
+        proto::Coverage::Unsupported { reason: proto::UnsupportedReason::EngineError { message, retryable: false }, .. } =>
+            assert!(message.starts_with("internal: ") && message.contains("an invariant broke after the claim"), "{message}"),
+        other => panic!("expected the internal EngineError, got {other:?}"),
+    }
+    assert_eq!((first_final.identity.clone(), first_final.legal.len()), (first.clone(), s.derived.legal.len()), "the Final answers the request, with its legal intervals");
+    assert_eq!(first_seen.iter().filter(|(k, _)| *k == "Final").count(), 1, "one Final: the retired watchdog delivered none at the fire: {first_seen:?}");
+    assert!(matches!(second_final, Some(ref f) if f.identity == second && f.coverage == proto::Coverage::Exact), "engine-main kept serving: {second_final:?}");
+    assert_eq!(registered, vec![second.decision_id], "only the next request's snapshot is registered");
+    assert_eq!((kills, restarts), (1, 1), "the worker was killed at the panic and relaunched by the next solve");
+    let logged: Vec<(DecisionIdentity, bool)> = records.iter().map(|r| (r.identity.clone(), matches!(r.coverage, proto::Coverage::Unsupported { .. }))).collect();
+    assert_eq!(logged, vec![(first.clone(), true), (second, false)], "both Finals are logged, once each");
+    let events: Vec<&str> = diagnostics.iter().map(|d| d.event.as_str()).collect();
+    assert_eq!(events, ["panic", "kill", "restart"], "{diagnostics:?}");
+}
+
+/// A recording sink that panics once, right after it recorded its first `Final`: a sink callback that breaks during
+/// the engine's own handover.
+struct PanicsOnFinal(RecordingSink, bool);
+impl engine::EventSink for PanicsOnFinal {
+    fn emit(&mut self, ev: proto::RecommendationEvent) {
+        let is_final = matches!(ev, proto::RecommendationEvent::Final(_));
+        self.0.emit(ev);
+        if is_final && !std::mem::replace(&mut self.1, true) {
+            panic!("sink: the UI broke on the Final");
+        }
+    }
+}
+
+/// Final fix round 2, ruling F2-I3, after the handover: a panic once `engine-main` handed its own `Final` over (here the
+/// sink panics in that callback) is contained, and the `Final` handed over is the request's: no second `Final` goes
+/// out, not the containment's and not the watchdog's at the fire, and that `Final` is logged exactly once.
+#[test]
+fn a_panic_after_the_engines_final_was_handed_over_logs_that_final_once() {
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let (worker, _fake) = FakeWorker::scripted(clock.clone(), identity.clone(), river_answer());
+    let log_dir = std::env::temp_dir().join(format!("pokerai_engine_api_handed_panic_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let core = EngineCore::new(worker, clock.clone(), identity, DecisionLog::open(&log_dir));
+    let ended = core.watchdog.ended_threads();
+    let mut e = Engine::with_core(core);
+    let (cfg, _) = cfg_1_2();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let s = river_via(&mut e);
+    e.set_explicit_ranges(full(&s.board), full(&s.board));
+    let (inner, events) = RecordingSink::notifying(clock.clone(), None);
+    let id = e.recommend(Box::new(PanicsOnFinal(inner, false))).unwrap();
+    let answered = final_of(&events);
+    use engine::clock::Clock;
+    clock.set_ms(clock.now_ms() + 14_900);
+    ended.wait_for(1);
+    e.shutdown();
+    let seen = kinds_at(&events.recorded());
+    let (records, diagnostics) = logs(&log_dir);
+    assert!(matches!(answered, Some(ref f) if f.identity == id && f.coverage == proto::Coverage::Exact), "the engine's own Final was handed over: {answered:?}");
+    assert_eq!(seen.iter().filter(|(k, _)| *k == "Final").count(), 1, "no second Final: {seen:?}");
+    assert!(diagnostics.first().is_some_and(|d| d.event == "panic" && d.detail.contains("the UI broke on the Final")), "the panic was contained: {diagnostics:?}");
+    let logged: Vec<(DecisionIdentity, bool)> = records.iter().map(|r| (r.identity.clone(), r.coverage == proto::Coverage::Exact)).collect();
+    assert_eq!(logged, vec![(id, true)], "the Final handed over is logged, once");
+}
+
+/// Final fix round 2, ruling N2 (the re-review's probe P7): the snapshot store, the range source and the equity token
+/// slot, each poisoned by a panic elsewhere (on the caller's thread, as `core_replay`'s always-on asserts under the
+/// snapshot store's lock in `Engine::mutate` or `undo` could), stay usable on the caller's thread and on `engine-main`:
+/// a river request is answered `Exact` and its snapshot is registered, with no panic contained.
+#[test]
+fn locks_poisoned_by_a_panic_elsewhere_keep_the_engine_serving() {
+    fn poison<T: ?Sized>(m: &Mutex<T>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { let _held = m.lock(); panic!("poisoning a lock"); }));
+        assert!(m.is_poisoned());
+    }
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let (worker, _fake) = FakeWorker::scripted(clock.clone(), identity.clone(), river_answer());
+    let log_dir = std::env::temp_dir().join(format!("pokerai_engine_api_poisoned_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&log_dir);
+    let core = EngineCore::new(worker, clock.clone(), identity, DecisionLog::open(&log_dir));
+    let snapshots = core.snapshots.clone();
+    poison(&core.snapshots);
+    poison(&core.range_source);
+    poison(&core.equity_cancel);
+    let mut e = Engine::with_core(core);
+    let (cfg, _) = cfg_1_2();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let s = river_via(&mut e);
+    e.set_explicit_ranges(full(&s.board), full(&s.board));
+    let (sink, events) = RecordingSink::notifying(clock.clone(), None);
+    let id = e.recommend(Box::new(sink)).unwrap();
+    let answered = final_of(&events);
+    let registered = snapshots.lock().unwrap_or_else(|p| p.into_inner()).for_identity(&id).len();
+    e.shutdown();
+    let (_, diagnostics) = logs(&log_dir);
+    assert!(matches!(answered, Some(ref f) if f.identity == id && f.coverage == proto::Coverage::Exact), "{answered:?}");
+    assert_eq!(registered, 1, "the accepted Final's snapshot is registered in the poisoned store");
+    assert!(diagnostics.iter().all(|d| d.event != "panic"), "no panic was contained: {diagnostics:?}");
 }
 
 /// §12: a rejected entry leaves the state unchanged. A `begin_hand` that `core_model` refuses leaves the hand in

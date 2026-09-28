@@ -35,8 +35,9 @@ fn stage_rank(s: &str) -> u8 {
 }
 
 /// A lock that survives a panic elsewhere: the teardown runs while `engine-main` unwinds too, and must neither panic
-/// again nor stop short of killing the worker. Every value behind these locks stays consistent at every point a panic
-/// could interrupt it (an `Option` set or taken, a list of handles).
+/// again nor stop short of killing the worker; `engine-main` goes on serving after a contained panic (final fix round
+/// 2, ruling N2). Every value behind these locks stays consistent at every point a panic could interrupt it (an
+/// `Option` set or taken, a list of handles, the identity state, a stage or config replaced whole).
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -171,7 +172,7 @@ impl EngineCore {
 
     /// Whether `id` is still the active decision (§4.4): every reply is checked against it before it is acted on.
     pub fn identity_active(&self, id: &DecisionIdentity) -> bool {
-        self.identity.lock().unwrap().is_active(id)
+        lock(&self.identity).is_active(id)
     }
 
     /// Advances the reported stage to the worker stage `s`; never rewinds it. The watchdog reports the FURTHEST stage a
@@ -179,7 +180,7 @@ impl EngineCore {
     /// reached (§7). `s` must be a worker stage (`building`, `solving`, `extracting`): anything else is a caller bug.
     pub fn set_stage(&self, s: &str) {
         assert!(stage_rank(s) > 0, "set_stage({s:?}): not a worker stage (building, solving, extracting)");
-        let mut g = self.stage.lock().unwrap();
+        let mut g = lock(&self.stage);
         if stage_rank(s) > stage_rank(&g) {
             *g = s.to_string();
         }
@@ -187,20 +188,20 @@ impl EngineCore {
 
     /// Starts the request being served at `s`, in its own stage slot; only `serve_request` calls this, as it starts a request.
     pub fn reset_stage(&self, s: &str) {
-        *self.stage.lock().unwrap() = s.to_string();
+        *lock(&self.stage) = s.to_string();
     }
 
     pub fn stage(&self) -> String {
-        self.stage.lock().unwrap().clone()
+        lock(&self.stage).clone()
     }
 
     /// A snapshot of the session config; `serve_request` takes one per request so a mid-request change is ignored.
     pub fn config(&self) -> GameConfig {
-        self.config.lock().unwrap().clone()
+        lock(&self.config).clone()
     }
 
     pub fn set_config(&self, cfg: GameConfig) {
-        *self.config.lock().unwrap() = cfg;
+        *lock(&self.config) = cfg;
     }
 }
 

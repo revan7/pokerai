@@ -48,11 +48,18 @@
 //! Resilience (§7, §12). While the worker reports `Solving`, no `progress` for `HEARTBEAT_MS` ends the attempt as a hung
 //! worker, judged like the hang bound (at the top of the loop and on every reply observed). A decision superseded after
 //! its request was sent is cancelled (`cancel_or_kill`): the worker has `CANCEL_KILL_MS` to confirm with the job's
-//! `result{cancelled}`, else it is killed and restarted; one superseded before the send, or once its own terminal (or
-//! its `ack{rejected}`) was received, has nothing to cancel, even when that reply comes in the receive that observes the
+//! `result{cancelled}`, else it is killed; one superseded before the send, or once its own terminal (or its
+//! `ack{rejected}`) was received, has nothing to cancel, even when that reply comes in the receive that observes the
 //! supersession (final review I2; spec 4.5, admission is released by the job's terminal); one superseded with a link
-//! failure in the same receive restarts the worker at once, as `cancel_or_kill` does for a link failure in its window
+//! failure in the same receive kills the worker at once, as `cancel_or_kill` does for a link failure in its window
 //! (ruling 23-N1).
+//!
+//! Lazy relaunch (final fix round 2, ruling F2-Q1; spec 7, the next request's `Fast` within 0.3 s). A cleanup of work
+//! that is no longer wanted (a superseded job's cancel, a link failure under a supersession, the cleanup after the
+//! watchdog's `Final`) only kills the worker, and never relaunches it on `engine-main` ahead of the next request: the
+//! next solve relaunches it before its send (the bounded restoration below, its `ready` validated again), after that
+//! request's `Fast`. A restart runs synchronously only inside a request's own solve: that relaunch, and the restart
+//! after a failed attempt before its `_min` retry.
 //!
 //! The cancel window gives way to a newer decision (final review I1; spec 7, the newer request's `Fast` within 0.3 s).
 //! The window is waited in slices, and when a newer decision is active (the request that superseded this one waits for
@@ -65,12 +72,12 @@
 //! it exited, broke the protocol, hung or missed the heartbeat, and its new `ready` is validated again; then, only after
 //! the first attempt, only when the failure allows it and a `_min` template exists, one retry on that template is sent
 //! if §7's admission passes, with only what is left until final delivery. A retry never rewinds the reported stage, and
-//! its terminal is never published as the first attempt's. A request that finds no live worker (a restart that failed
-//! earlier) relaunches it once before anything is sent. A restart or relaunch that fails ends the solve with a
-//! non-retryable `EngineError` naming both causes. Identity and the watchdog's cutoff are judged on every receive
-//! result, a link failure included, before it is classified or anything is recovered. At the watchdog's fire the client
-//! stops and cleans nothing up: the watchdog delivers the `Final`, and the kill and restart of a still-busy worker after
-//! it are `serve_request`'s, which it conditions on `SolveOutcome::outstanding_job` (ruling 28-I3).
+//! its terminal is never published as the first attempt's. A request that finds no live worker (a cleanup's kill, a
+//! restart that failed earlier) relaunches it once before anything is sent. A restart or relaunch that fails ends the
+//! solve with a non-retryable `EngineError` naming both causes. Identity and the watchdog's cutoff are judged on every
+//! receive result, a link failure included, before it is classified or anything is recovered. At the watchdog's fire
+//! the client stops and cleans nothing up: the watchdog delivers the `Final`, and the kill of a still-busy worker after
+//! it is `serve_request`'s, which it conditions on `SolveOutcome::outstanding_job` (ruling 28-I3).
 
 use crate::clock::WAIT_SLICE_MS;
 use crate::core::EngineCore;
@@ -156,9 +163,9 @@ pub struct SolveOutcome {
     /// The engine-clock time the first attempt's terminal `result` arrived, as published to the plan's street deadline
     /// at receipt (ruling 22-I4); `None` when no terminal of the first attempt was received. Never a retry's.
     pub first_terminal_ms: Option<u64>,
-    /// The worker restarts this solve made, failed ones included: the relaunch of a missing worker before the request,
-    /// the restart after a failed attempt, and the kill-and-restart answering an unconfirmed cancel (this solve's, or one an
-    /// earlier request left pending and this solve settled before its send, final review I1).
+    /// The worker restarts this solve made, failed ones included: the relaunch of a missing worker before the request
+    /// (after a cleanup's kill, ruling F2-Q1, or a restart that failed earlier) and the restart after a failed attempt.
+    /// A cleanup's kill is not a restart and is not counted.
     pub restarts: u8,
     /// Display only: the raw exploitability in basis points of the solved pot, rounded (§4.4).
     pub reached_bp: Option<u16>,
@@ -366,8 +373,9 @@ pub(crate) enum AttemptEnd {
     /// The decision is no longer active. `running`: the request had reached the worker, its terminal had not been taken
     /// and the link had not failed, so the worker may still be running the job, which `run_solve` cancels
     /// (`cancel_or_kill`). `link_failed`: the receive that observed the supersession returned a link failure (an exit,
-    /// an end of stdout, a faulty line), so `run_solve` restarts the worker at once and sends no cancel (§12, ruling
-    /// 23-N1). Before the send, or once the terminal arrived, there is nothing to cancel or restart. Never both.
+    /// an end of stdout, a faulty line), so `run_solve` kills the worker at once and sends no cancel (§12, ruling
+    /// 23-N1; the next solve relaunches it, ruling F2-Q1). Before the send, or once the terminal arrived, there is
+    /// nothing to cancel or kill. Never both.
     Superseded { running: bool, link_failed: bool },
     /// The watchdog's fire time was reached (a reply observed at or after it included, ruling 22-I1; before the send:
     /// nothing was sent); the watchdog delivers the request's `Final` (§7). `outstanding`: the sent job may still be
@@ -415,8 +423,8 @@ fn exploitability_pct(chips: f32, pot: u32) -> Result<f32, String> {
 
 /// A cancel sent for a superseded job whose confirmation is still awaited (§7, §12): the job's `result{cancelled}` for
 /// `target` confirms it until `until_ms` (`CANCEL_KILL_MS` after the cancel was sent); from then on the worker is killed
-/// and restarted. Kept by `EngineCore::pending_cancel` while the wait gives way to a newer decision (see "The cancel
-/// window gives way to a newer decision" above).
+/// (the next solve relaunches it, "Lazy relaunch" above). Kept by `EngineCore::pending_cancel` while the wait gives way
+/// to a newer decision (see "The cancel window gives way to a newer decision" above).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingCancel {
     pub target: String,
@@ -430,9 +438,9 @@ pub(crate) enum CancelEnd {
     Idle,
     /// The job's `result{cancelled}` arrived within the window: the worker is left running.
     Confirmed,
-    /// The worker was restarted, successfully or not: killed at the window's end, or restarted at once after a link
-    /// failure within it.
-    Restarted,
+    /// The worker was killed: at the window's end, or at once after a link failure within it. No relaunch was made
+    /// (ruling F2-Q1): the next solve's makes it.
+    Killed,
     /// The caller's `interrupt` asked the wait to stop: the cancel stays pending.
     Interrupted,
 }
@@ -470,21 +478,20 @@ pub(crate) fn restart_worker(core: &mut EngineCore, cause: &str) -> Result<(), W
 /// The cancel-then-kill of §7/§12, for a solve `target` superseded while the worker may still be running it (never one
 /// superseded before its send, or once its terminal arrived: nothing to cancel). Sends `cancel` for it under a fresh
 /// request id and waits for the job's `result{cancelled}`, the only confirmation (§12), at most `CANCEL_KILL_MS` from
-/// the send (`await_pending_cancel`); unconfirmed by then, the worker is killed and restarted. A cancel that cannot be
-/// sent is answered by a restart at once. The wait gives way to a newer decision (final review I1): once one is active,
-/// the cancel is left pending for `engine-main` to settle after the newer request's fast phase. Returns whether the
-/// worker was restarted here; a restart that fails leaves no live worker, which the next request relaunches
-/// (`run_solve`), and is never a panic.
-pub(crate) fn cancel_or_kill(core: &mut EngineCore, target: &str) -> bool {
+/// the send (`await_pending_cancel`); unconfirmed by then, the worker is killed. A cancel that cannot be sent is
+/// answered by a kill at once. No relaunch is made here (ruling F2-Q1): the next solve relaunches the worker before its
+/// send. The wait gives way to a newer decision (final review I1): once one is active, the cancel is left pending for
+/// `engine-main` to settle after the newer request's fast phase.
+pub(crate) fn cancel_or_kill(core: &mut EngineCore, target: &str) {
     let id = core.next_id();
     if core.worker.send(&EngineMessage::Cancel { id, target: target.to_string() }).is_err() {
-        let _ = restart_worker(core, &format!("the cancel of solve {target} could not be sent"));
-        return true;
+        kill_worker(core, &format!("the cancel of solve {target} could not be sent"));
+        return;
     }
     let sent = core.clock.now_ms();
     let until_ms = sent.checked_add(CANCEL_KILL_MS).unwrap_or_else(|| panic!("the kill bound of a cancel sent at {sent} ms overflows u64"));
     core.pending_cancel = Some(PendingCancel { target: target.to_string(), until_ms });
-    await_pending_cancel(core, &mut |core| newer_decision_waiting(core)) == CancelEnd::Restarted
+    await_pending_cancel(core, &mut |core| newer_decision_waiting(core));
 }
 
 /// Whether a decision is active while the one `engine-main` serves was superseded: a newer request was admitted and
@@ -497,18 +504,18 @@ fn newer_decision_waiting(core: &EngineCore) -> bool {
 /// `interrupt` before each: `Interrupted` leaves the cancel pending. Anything read meanwhile but the job's
 /// `result{cancelled}` is discarded, a late reply of the job included. The window is judged at the engine-clock time the
 /// client observes each receive result, not by the bound the receive was given (P2T23-I2, as ruling 22-I1 for replies):
-/// a confirmation observed at or after `until_ms` is too late, and the worker is then killed and restarted. An
-/// unconfirmed end of stdout spends its slice and the window goes on, so the kill at its end answers it, as a receive of
-/// the whole window would have; any other link failure (the worker exits or breaks the protocol) is answered by a
-/// restart at once.
+/// a confirmation observed at or after `until_ms` is too late, and the worker is then killed. An unconfirmed end of
+/// stdout spends its slice and the window goes on, so the kill at its end answers it, as a receive of the whole window
+/// would have; any other link failure (the worker exits or breaks the protocol) is answered by a kill at once. Never a
+/// relaunch (ruling F2-Q1): the next solve relaunches the worker before its send. The kill at the window's end is never
+/// skipped, only made late when nothing settles the cancel before then, and nothing is sent to the worker meanwhile.
 pub(crate) fn await_pending_cancel(core: &mut EngineCore, interrupt: &mut dyn FnMut(&EngineCore) -> bool) -> CancelEnd {
     loop {
         let Some(PendingCancel { target, until_ms }) = core.pending_cancel.clone() else { return CancelEnd::Idle };
         let now = core.clock.now_ms();
         if now >= until_ms {
             kill_worker(core, &format!("the cancel of solve {target} was not confirmed within {CANCEL_KILL_MS} ms"));
-            let _ = restart_worker(core, &format!("after the kill of the worker that did not confirm the cancel of solve {target}"));
-            return CancelEnd::Restarted;
+            return CancelEnd::Killed;
         }
         if interrupt(core) {
             return CancelEnd::Interrupted;
@@ -527,8 +534,8 @@ pub(crate) fn await_pending_cancel(core: &mut EngineCore, interrupt: &mut dyn Fn
             Ok(_) => {}
             Err(WorkerLinkError::Eof) if at_ms > now => {}
             Err(e) => {
-                let _ = restart_worker(core, &format!("the link failed while the cancel of solve {target} was awaited: {e}"));
-                return CancelEnd::Restarted;
+                kill_worker(core, &format!("the link failed while the cancel of solve {target} was awaited: {e}"));
+                return CancelEnd::Killed;
             }
         }
     }
@@ -745,15 +752,14 @@ pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, si
         Err(r) => return fail(core, r, &template, restarts, None),
     };
     // A cancel the request before this one left pending, giving way to this request's fast phase (final review I1), is
-    // settled before anything is sent: confirmed, or the worker killed and restarted at the end of its window. A
-    // decision superseded meanwhile gives way in turn, and the cancel stays pending for the newer request.
-    match await_pending_cancel(core, &mut |core| !core.identity_active(&plan.identity)) {
-        CancelEnd::Idle | CancelEnd::Confirmed => {}
-        CancelEnd::Restarted => restarts += 1,
-        CancelEnd::Interrupted => return fail(core, superseded(), &template, restarts, None),
+    // settled before anything is sent: confirmed, or the worker killed at the end of its window (and relaunched just
+    // below). A decision superseded meanwhile gives way in turn, and the cancel stays pending for the newer request.
+    if let CancelEnd::Interrupted = await_pending_cancel(core, &mut |core| !core.identity_active(&plan.identity)) {
+        return fail(core, superseded(), &template, restarts, None);
     }
-    // No live worker (a restart that failed earlier, a kill): one relaunch before anything is sent (review P2T22R). A
-    // relaunch that fails is not retryable, as any failed restart (`restart_failed`, P2T23-I3).
+    // No live worker (a cleanup's kill, ruling F2-Q1; a restart that failed earlier): one relaunch before anything is
+    // sent (review P2T22R), after this request's `Fast`. A relaunch that fails is not retryable, as any failed restart
+    // (`restart_failed`, P2T23-I3).
     if core.worker.ready().is_none() {
         restarts += 1;
         if let Err(e) = restart_worker(core, "no live worker before the request") {
@@ -796,18 +802,17 @@ pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, si
                     return succeeded(core, t_start, &b, &template, sol, paths, terminal, violated, restarts, first_terminal_ms);
                 }
                 match end {
-                    // A worker whose link failed in the receive that observed the supersession is restarted at once and
-                    // sent no cancel, as `cancel_or_kill` answers a link failure in its window (§12, ruling 23-N1); a
-                    // restart that fails leaves no live worker, which the next request relaunches. A job the worker may
-                    // still be running on a live link is cancelled (§7/§12). Before the send nothing was sent, and once
-                    // its terminal arrived there is nothing left to cancel (final review I2).
+                    // A worker whose link failed in the receive that observed the supersession is killed at once and sent
+                    // no cancel, as `cancel_or_kill` answers a link failure in its window (§12, ruling 23-N1). A job the
+                    // worker may still be running on a live link is cancelled (§7/§12). Before the send nothing was
+                    // sent, and once its terminal arrived there is nothing left to cancel (final review I2). Neither
+                    // relaunches the worker (ruling F2-Q1): the next solve does, before its send.
                     AttemptEnd::Superseded { running, link_failed } => {
                         assert!(!(running && link_failed), "a superseded attempt is either waiting on a live link or has a failed link");
                         if link_failed {
-                            restarts += 1;
-                            let _ = restart_worker(core, "the link failed in the receive that observed the supersession");
-                        } else if running && cancel_or_kill(core, &req.id) {
-                            restarts += 1;
+                            kill_worker(core, "the link failed in the receive that observed the supersession");
+                        } else if running {
+                            cancel_or_kill(core, &req.id);
                         }
                         return fail(core, superseded(), &template, restarts, first_terminal_ms);
                     }

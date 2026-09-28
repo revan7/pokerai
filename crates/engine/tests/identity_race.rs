@@ -44,7 +44,7 @@ fn identity_race_golden() {
         FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 10, exploitability_chips: Some(0.5), elapsed_ms: 2 },
         FakeReply::InvalidateIdentity, FakeReply::Delay { ms: 1 },
         FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(sol.clone()), error: None, elapsed_ms: 3 },
-        FakeReply::Delay { ms: 1500 },                       // no result{cancelled} within 1.5 s: kill and restart
+        FakeReply::Delay { ms: 1500 },                       // no result{cancelled} within 1.5 s: kill (the re-request relaunches)
         // hand B, request 2 (the re-request): request 1's stale result arrives first, then request 2's
         FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None },
         FakeReply::Result { id: IdRef::Fixed("B1".into()), status: ResultStatus::Ok, solution: Some(sol.clone()), error: None, elapsed_ms: 3 },
@@ -247,17 +247,19 @@ fn the_accuracy_string_is_a_true_upper_bound_on_the_raw_measurement() {
 }
 
 /// §7 and rulings 23-I1 / decision 3 of the dispatch: at the watchdog's fire the client stops and cleans nothing up, the
-/// watchdog's `Final` goes out (at t0 + 14.9 s, before any kill), and after it the still-busy worker is killed and
-/// restarted. Here that restart fails: it is not a panic and not retried; no live worker is left, and the next request
-/// relaunches it once (the solve client's own rule) and is answered.
+/// watchdog's `Final` goes out (at t0 + 14.9 s, before any kill), and after it the still-busy worker is killed, and only
+/// killed: no relaunch runs on `engine-main` ahead of the next request (final fix round 2, ruling F2-Q1). The next
+/// request relaunches it before its send (the solve client's own rule). Here that relaunch fails: it is not a panic and
+/// not retried; that request is answered by the engine's error `Final` and no live worker is left; the request after it
+/// relaunches the worker again and is answered.
 #[test]
-fn after_a_deadline_exceeded_final_the_busy_worker_is_killed_and_restarted() {
+fn after_a_deadline_exceeded_final_the_busy_worker_is_killed_and_the_next_request_relaunches_it() {
     let s = river_state();
     let script = vec![
         ack(), FakeReply::Hang,                               // attempt 0: no terminal by its hang bound (2.5 s): restart, `_min` retry
         ack(), FakeReply::Hang,                               // the retry: still running at the watchdog's fire (14.9 s)
-        FakeReply::SpawnFails("no worker binary".into()),     // the restart after the Final fails
-        ack(), result(ResultStatus::Ok, solution_on(&s, "river_std_v1", 0.2))]; // the next request relaunches the worker
+        FakeReply::SpawnFails("no worker binary".into()),     // the second request's relaunch fails
+        ack(), result(ResultStatus::Ok, solution_on(&s, "river_std_v1", 0.2))]; // the third request's relaunch succeeds
     let mut r = rig("post_final", script);
     let first = serve(&mut r, &s);
     let f = finals(&r, &first);
@@ -265,13 +267,20 @@ fn after_a_deadline_exceeded_final_the_busy_worker_is_killed_and_restarted() {
     let (at, kills_at_emission, rec) = &f[0];
     assert_eq!(rec.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage: "building".into() }, partial: vec![] });
     assert_eq!((*at, *kills_at_emission), (14_900, 0), "delivered at the fire, before any kill");
-    assert_eq!(kills_and_restarts(&r), (1, 2), "the retry's restart, then the kill and the failed restart after the Final");
-    assert!(r.core.worker.ready().is_none(), "a failed restart leaves no live worker");
+    assert_eq!(kills_and_restarts(&r), (1, 1), "the retry's restart, then the kill after the Final and no relaunch");
+    assert!(r.core.worker.ready().is_none(), "the cleanup leaves no live worker");
     let recs = records(&r);
     assert_eq!((recs.len(), recs[0].street_violation, recs[0].final_violation), (1, true, true));
-    // the next request relaunches the worker once and is answered
+    // the next request relaunches the worker before its send; the relaunch fails and is not retried
     let second = serve(&mut r, &s);
     let f = finals(&r, &second);
+    assert!(f.len() == 1 && matches!(&f[0].2.coverage, Coverage::Unsupported { reason: UnsupportedReason::EngineError { message, .. }, .. }
+        if message.contains("relaunching it failed") && message.contains("no worker binary")), "{f:?}");
+    assert_eq!((kills_and_restarts(&r), solves(&r).len()), ((1, 2), 2), "one relaunch, failed, and nothing sent");
+    assert!(r.core.worker.ready().is_none(), "a failed relaunch leaves no live worker");
+    // the request after it relaunches the worker once and is answered
+    let third = serve(&mut r, &s);
+    let f = finals(&r, &third);
     assert!(f.len() == 1 && matches!(f[0].2.coverage, Coverage::Exact), "{f:?}");
     assert_eq!(kills_and_restarts(&r), (1, 3));
 }
@@ -289,10 +298,12 @@ fn diagnostics(r: &Rig) -> Vec<engine::log::DiagnosticRecord> {
 #[test]
 fn restarts_kills_and_tree_mismatches_are_written_to_the_diagnostics_log() {
     let s = river_state();
-    // attempt 0 hangs (restart), the retry hangs to the fire (the Final is the watchdog's), then the kill and a restart
-    // that fails
+    // attempt 0 hangs (restart), the retry hangs to the fire (the Final is the watchdog's), then the kill after it; the
+    // next request's relaunch fails (final fix round 2, ruling F2-Q1: the cleanup only kills)
     let mut r = rig("diagnostics", vec![ack(), FakeReply::Hang, ack(), FakeReply::Hang, FakeReply::SpawnFails("no worker binary".into())]);
     r.state.lock().unwrap().stderr = "solver-worker: diag-marker".into();
+    let id = serve(&mut r, &s);
+    assert_eq!(finals(&r, &id).len(), 1);
     let id = serve(&mut r, &s);
     assert_eq!(finals(&r, &id).len(), 1);
     let d = diagnostics(&r);
@@ -301,7 +312,8 @@ fn restarts_kills_and_tree_mismatches_are_written_to_the_diagnostics_log() {
     assert!(d.iter().all(|x| x.stderr_tail == "solver-worker: diag-marker"), "each record carries the worker's stderr tail: {d:?}");
     assert!(d[0].detail.contains("no terminal result") && d[0].detail.ends_with("restarted"), "{}", d[0].detail);
     assert!(d[1].detail.contains("watchdog"), "{}", d[1].detail);
-    assert!(d[2].detail.contains("restart failed") && d[2].detail.contains("no worker binary"), "{}", d[2].detail);
+    assert!(d[2].detail.contains("no live worker before the request") && d[2].detail.contains("restart failed")
+        && d[2].detail.contains("no worker binary"), "{}", d[2].detail);
     // a tree_mismatch: both trees
     let mut r = rig("diagnostics_mismatch", vec![ack(), error("tree_mismatch", false, None)]);
     let id = serve(&mut r, &s);
@@ -1023,7 +1035,7 @@ fn a_watchdog_final_delivered_then_superseded_during_the_solve_is_logged_once() 
     let id = serve(&mut r, &river_state());
     assert!(fires.lock().unwrap().is_empty(), "the fire was acknowledged inside the receive");
     let cancels = r.state.lock().unwrap().cancels.len();
-    assert_eq!((cancels, kills_and_restarts(&r)), (1, (1, 2)), "the superseded retry is cancelled, then killed");
+    assert_eq!((cancels, kills_and_restarts(&r)), (1, (1, 1)), "the superseded retry is cancelled, then killed, and not relaunched (ruling F2-Q1)");
     assert_the_delivered_watchdog_final_is_logged_once(&r, &id, true, "post-solve stale exit");
 }
 

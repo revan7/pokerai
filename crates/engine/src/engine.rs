@@ -255,7 +255,7 @@ impl Engine {
         Ok(rev)
     }
 
-    fn apply_config(&mut self, cfg: GameConfig) { self.config = cfg.clone(); *self.shared_config.lock().unwrap() = cfg; }
+    fn apply_config(&mut self, cfg: GameConfig) { self.config = cfg.clone(); *lock(&self.shared_config) = cfg; }
 
     fn stamp(&self, mut s: HandState, hand_id: u64, rev: u32) -> HandState { s.hand_id = hand_id; s.hand_revision = rev; s }
 
@@ -310,7 +310,7 @@ impl Engine {
         if let Some(prev) = self.state.take() { self.undo.push(prev); }
         let s = self.stamp(next, hand_id, rev);
         // §9.2 prefix-based invalidation against the new state: an append-only mutation keeps earlier roots.
-        self.snapshots.lock().unwrap().invalidate(&s);
+        lock(&self.snapshots).invalidate(&s);
         self.state = Some(s.clone());
         s
     }
@@ -341,13 +341,13 @@ impl Engine {
         let s = self.stamp(prev, hand_id, rev);
         // §9.2: later streets and same-street snapshots whose solved prefix no longer fits are dropped; retained ones
         // keep their original identity (the new revision never rewrites it).
-        self.snapshots.lock().unwrap().invalidate(&s);
+        lock(&self.snapshots).invalidate(&s);
         self.state = Some(s.clone());
         Ok(s)
     }
 
     /// Plan 2 only: the public ranges at the street root (plan 3 installs a replay-backed `RangeSource` instead).
-    pub fn set_explicit_ranges(&mut self, oop: Range1326, ip: Range1326) { *self.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: Some(oop), ip: Some(ip) }); }
+    pub fn set_explicit_ranges(&mut self, oop: Range1326, ip: Range1326) { *lock(&self.range_source) = Box::new(ExplicitRanges { oop: Some(oop), ip: Some(ip) }); }
 
     /// Allocates the decision's identity, stamps `t0`, admits the request (`serve::admit`: a decision point is armed on
     /// the watchdog here, final review I1) and queues it for `engine-main` (depth 1: an older pending request is
@@ -401,7 +401,7 @@ impl Engine {
     fn end_hand(&mut self) {
         let hand_id = self.state.as_ref().map(|s| s.hand_id);
         self.supersede(|ids| ids.invalidate_hand());
-        if let Some(h) = hand_id { self.snapshots.lock().unwrap().invalidate_hand(h); }
+        if let Some(h) = hand_id { lock(&self.snapshots).invalidate_hand(h); }
         self.state = None;
         self.undo.clear();
         if let Some(c) = self.queued_config.take() { self.apply_config(c); }

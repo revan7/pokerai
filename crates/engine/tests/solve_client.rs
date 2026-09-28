@@ -252,14 +252,14 @@ fn receives_never_outlast_the_hang_bound_or_the_watchdog_fire() {
 /// Identity is checked on every reply: a progress that arrives after a mutation (in the same receive) is not forwarded,
 /// and a result that races one is discarded unvalidated; nothing is emitted for a superseded identity. Final review I2
 /// (spec 4.5: admission is released by the job's terminal `result`): the job whose progress was observed may still be
-/// running, so it is cancelled (unconfirmed here: killed and restarted after 1.5 s); the job whose own terminal was
-/// observed in the receive that saw the supersession has ended, so nothing is cancelled, killed or restarted. The
-/// same for this solve's `ack{rejected}` (the worker started no job).
+/// running, so it is cancelled (unconfirmed here: killed after 1.5 s, and not relaunched: ruling F2-Q1); the job whose
+/// own terminal was observed in the receive that saw the supersession has ended, so nothing is cancelled, killed or
+/// restarted. The same for this solve's `ack{rejected}` (the worker started no job).
 #[test]
 fn identity_is_checked_on_every_reply() {
     let progress = FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 4, exploitability_chips: Some(0.9), elapsed_ms: 1 };
     let rejected = FakeReply::Ack { id: IdRef::Last, status: AckStatus::Rejected, reason: Some("busy".into()) };
-    let cases = [("a progress", vec![ack(), FakeReply::InvalidateIdentity, progress], (1usize, 1u32, 1u32)),
+    let cases = [("a progress", vec![ack(), FakeReply::InvalidateIdentity, progress], (1usize, 1u32, 0u32)),
         ("its own result", vec![ack(), FakeReply::InvalidateIdentity, ok_for(Street::River, "river_std_v1", 0.3)], (0, 0, 0)),
         ("its own rejection", vec![FakeReply::InvalidateIdentity, rejected], (0, 0, 0))];
     for (case, script, (cancels, kills, restarts)) in cases {
@@ -700,12 +700,14 @@ fn a_request_expired_while_prepared_is_never_sent() {
 
 #[test]
 fn superseded_request_cancels_then_kills_after_1_5s() {
-    // the mutation lands 100 ms after the ack; the client cancels, waits 1.5 s for result{cancelled}, then kills
+    // the mutation lands 100 ms after the ack; the client cancels, waits 1.5 s for result{cancelled}, then kills, and
+    // relaunches nothing (final fix round 2, ruling F2-Q1: a cleanup only kills; the next solve relaunches the worker before its send)
     let mut r = rig(Street::River, vec![ack(), FakeReply::Delay { ms: 100 }, FakeReply::InvalidateIdentity, FakeReply::Hang]);
     let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
     assert!(matches!(out.terminal, Terminal::Failed(UnsupportedReason::EngineError { ref message, .. }) if message.contains("superseded")));
+    assert!(r.core.worker.ready().is_none(), "killed, not relaunched");
     let s = r.state.lock().unwrap();
-    assert_eq!((s.cancels.len(), s.kills, s.restarts), (1, 1, 1));
+    assert_eq!((s.cancels.len(), s.kills, s.restarts, out.restarts), (1, 1, 0, 0));
     assert!(r.clock.now_ms() >= 100 + 1500);
     assert!(r.events.lock().unwrap().is_empty());   // nothing is emitted for a superseded identity
 }
@@ -765,8 +767,9 @@ fn error_codes_retry_policy() {
 /// ends that receive) and cancels the superseded solve at once, with a request id of its own. Only that solve's
 /// `result{cancelled}` confirms the cancel: the worker is then left running, nothing killed. Anything else read in the
 /// window is discarded, a late reply of the job included (§4.5: a completion racing a cancel never also yields
-/// `cancelled`), and the worker is killed and restarted exactly `CANCEL_KILL_MS` after the cancel. A cancel the link
-/// cannot send (the worker has exited) is answered by a restart at once. Nothing is emitted for the superseded decision.
+/// `cancelled`), and the worker is killed exactly `CANCEL_KILL_MS` after the cancel. A cancel the link cannot send (the
+/// worker has exited) is answered by a kill at once. Neither relaunches the worker (final fix round 2, ruling F2-Q1: a cleanup only kills; the next solve relaunches the worker before its send). Nothing is emitted for
+/// the superseded decision.
 #[test]
 fn a_cancel_is_confirmed_only_by_result_cancelled_else_the_worker_is_killed_1_5s_after_it() {
     let superseded_at_101 = |tail: Vec<FakeReply>| [vec![ack(), FakeReply::Delay { ms: 100 }, FakeReply::InvalidateIdentity, FakeReply::Delay { ms: 1 }], tail].concat();
@@ -774,10 +777,10 @@ fn a_cancel_is_confirmed_only_by_result_cancelled_else_the_worker_is_killed_1_5s
     let cancel_ack = FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None };
     // (case, script after the mutation, whether a cancel was sent, kills, restarts, the clock at return)
     let cases = [
-        ("no reply", vec![FakeReply::Hang], true, 1u32, 1u32, 1_601u64),
+        ("no reply", vec![FakeReply::Hang], true, 1u32, 0u32, 1_601u64),
         ("result{cancelled} at 301 ms", vec![cancel_ack, FakeReply::Delay { ms: 200 }, cancelled, FakeReply::Hang], true, 0, 0, 301),
-        ("the job's late ok", vec![ok_for(Street::River, "river_std_v1", 0.3), FakeReply::Hang], true, 1, 1, 1_601),
-        ("the worker has exited", vec![FakeReply::Exit { code: 3 }], false, 0, 1, 101),
+        ("the job's late ok", vec![ok_for(Street::River, "river_std_v1", 0.3), FakeReply::Hang], true, 1, 0, 1_601),
+        ("the worker has exited", vec![FakeReply::Exit { code: 3 }], false, 1, 0, 101),
     ];
     for (case, tail, cancel_sent, kills, restarts, now) in cases {
         let mut r = rig(Street::River, superseded_at_101(tail));
@@ -1067,8 +1070,8 @@ impl WorkerLink for StallsOnFailure {
 /// P2T23-I1 for every kind of failure and for identity. A confirmed exit or a faulty line written at 1 ms but observed
 /// at the watchdog's fire ends the attempt `DeadlinePassed` and restarts nothing; observed 1 ms before the fire it is
 /// classified as before (a restart, and no retry fits). A failure that arrives with a mutation is the superseded
-/// decision's: no worker failure of the live decision is reported, and the worker is restarted at once, never sent a
-/// cancel (ruling 23-N1; `a_link_failure_under_supersession_restarts_the_worker_at_once`).
+/// decision's: no worker failure of the live decision is reported, and the worker is killed at once, never sent a
+/// cancel and not relaunched (ruling 23-N1, F2-Q1; `a_link_failure_under_supersession_kills_the_worker_at_once`).
 #[test]
 fn a_link_failure_is_judged_by_identity_and_the_fire_before_it_is_classified() {
     for (failure, fragment) in [(FakeReply::Exit { code: 3 }, "WorkerExit{code: 3}"), (FakeReply::Malformed("{\"type\":".into()), "protocol error")] {
@@ -1095,19 +1098,20 @@ fn a_link_failure_is_judged_by_identity_and_the_fire_before_it_is_classified() {
     assert!(message.contains("superseded") && !retryable, "{message}");
     let sent = solves(&r.state).len();
     let s = r.state.lock().unwrap();
-    assert_eq!((sent, s.cancels.len(), s.kills, s.restarts, r.clock.now_ms()), (1, 0, 0, 1, 1));
+    assert_eq!((sent, s.cancels.len(), s.kills, s.restarts, r.clock.now_ms()), (1, 0, 1, 0, 1));
 }
 
 /// Ruling 23-N1 (spec 12: a protocol error or a worker exit is answered by kill, reap, respawn): a link failure observed
-/// in the same receive as a supersession restarts the worker at once, as `cancel_or_kill` does for a link failure in its
-/// window. The outcome stays the superseded decision's, and no cancel is sent: (a) a faulty line, even when the worker
-/// would then confirm a cancel, is restarted at the failure's observation time, 1 ms; (b) an unconfirmed end of stdout
-/// is restarted when the receive slice that returns it ends, 100 ms (final review I1: a receive lasts at most one slice,
-/// so the supersession is noticed then, not at the 2 500 ms hang bound), with no 1.5 s cancel window after it. Nothing is
-/// emitted for the superseded decision. The live-worker path (cancel, then kill without a confirmation) is
+/// in the same receive as a supersession kills the worker at once, as `cancel_or_kill` does for a link failure in its
+/// window; the respawn is the next solve's (final fix round 2, ruling F2-Q1: no relaunch on `engine-main` ahead of the
+/// next request). The outcome stays the superseded decision's, and no cancel is sent: (a) a faulty line, even when the
+/// worker would then confirm a cancel, is killed at the failure's observation time, 1 ms; (b) an unconfirmed end of
+/// stdout is killed when the receive slice that returns it ends, 100 ms (final review I1: a receive lasts at most one
+/// slice, so the supersession is noticed then, not at the 2 500 ms hang bound), with no 1.5 s cancel window after it.
+/// Nothing is emitted for the superseded decision. The live-worker path (cancel, then kill without a confirmation) is
 /// `superseded_request_cancels_then_kills_after_1_5s` and `a_cancel_is_confirmed_only_by_result_cancelled...`.
 #[test]
-fn a_link_failure_under_supersession_restarts_the_worker_at_once() {
+fn a_link_failure_under_supersession_kills_the_worker_at_once() {
     let cancel_ack = FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None };
     let cancelled = FakeReply::Result { id: IdRef::Last, status: ResultStatus::Cancelled, solution: None, error: None, elapsed_ms: 200 };
     let cases = [
@@ -1126,7 +1130,7 @@ fn a_link_failure_under_supersession_restarts_the_worker_at_once() {
         let sent = solves(&r.state).len();
         let s = r.state.lock().unwrap();
         got.push((case, sent, s.cancels.len(), s.kills, s.restarts, out.restarts, r.clock.now_ms()));
-        expected.push((case, 1, 0, 0, 1, 1, observed_ms));
+        expected.push((case, 1, 0, 1, 0, 0, observed_ms));
     }
     assert_eq!(got, expected);
 }
@@ -1153,7 +1157,8 @@ fn is_cancelled(m: &WorkerMessage) -> bool { matches!(m, WorkerMessage::Result {
 /// P2T23-I2: the cancel's 1.5 s bound is judged at the engine-clock time the client observes the confirmation, not by
 /// the bound its receive was given (a suspend, a stalled thread). The job's `result{cancelled}`, written at 301 ms for
 /// a cancel sent at 101 ms, confirms the cancel when observed at 1 600 ms (nothing killed); observed at 1 601 ms, the
-/// bound, it is too late and the worker is killed and restarted. Nothing is emitted for the superseded decision.
+/// bound, it is too late and the worker is killed (not relaunched: ruling F2-Q1). Nothing is emitted for the superseded
+/// decision.
 #[test]
 fn a_cancel_confirmation_observed_after_the_bound_is_answered_by_a_kill() {
     let cancelled = FakeReply::Result { id: IdRef::Last, status: ResultStatus::Cancelled, solution: None, error: None, elapsed_ms: 200 };
@@ -1165,7 +1170,7 @@ fn a_cancel_confirmation_observed_after_the_bound_is_answered_by_a_kill() {
         assert!(message.contains("superseded") && !retryable, "seen at {seen_at} ms: {message}");
         assert!(r.events.lock().unwrap().is_empty(), "seen at {seen_at} ms: nothing is emitted for a superseded decision");
         let cancels = r.state.lock().unwrap().cancels.len();
-        let expected = if confirmed { (0, (0, 0)) } else { (1, (1, 1)) };
+        let expected = if confirmed { (0, (0, 0)) } else { (0, (1, 0)) };
         assert_eq!((cancels, out.restarts, kills_and_restarts(&r.state), r.clock.now_ms()), (1, expected.0, expected.1, seen_at), "confirmation seen at {seen_at} ms");
     }
 }
