@@ -191,10 +191,11 @@ fn reached_bp(exploitability_chips: f32, pot: u32) -> u16 {
 /// comparison (`meets_target`): `Ok` iff the raw target is met, whatever the worker's status. `BestSoFar`, which
 /// assembly labels `DeadlineBestSoFar`, is reserved for a genuine deadline stop, a worker `best_so_far` (§7: the
 /// measured solution at the stop point), that misses it: only reasons actually incurred (§2). A worker `ok` that misses
-/// it breaks the worker's contract (`ok` means the target was met, §7): the worker stops at its f32-rounded threshold
-/// `(pot * target_bp / 10_000) as f32`, which can lie half an ulp above the raw target, and an `ok` there had no
-/// deadline stop. It is a non-retryable worker-contract `EngineError` naming the measurement, the raw target and the
-/// worker's threshold, never `Exact` and never `DeadlineBestSoFar`. (The worker's own comparison is follow-up P2.W1.)
+/// it breaks the worker's contract (`ok` means the target was met, §7). Since follow-up P2.W1 the worker stops on this
+/// same raw predicate (`solver-worker`'s `solve_loop::meets_target`), no longer at the f32-rounded threshold
+/// `(pot * target_bp / 10_000) as f32` it used before, which could lie half an ulp above the raw target; so no such `ok`
+/// is expected, and this check stays as a defence. It is a non-retryable worker-contract `EngineError` naming the
+/// measurement, the raw target and that former f32 threshold, never `Exact` and never `DeadlineBestSoFar`.
 fn terminal_for(status: ResultStatus, exploitability_chips: f32, pot: u32, target_bp: u16) -> Result<Terminal, UnsupportedReason> {
     match (status, meets_target(exploitability_chips, pot, target_bp)) {
         (ResultStatus::Ok | ResultStatus::BestSoFar, true) => Ok(Terminal::Ok),
