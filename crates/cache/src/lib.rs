@@ -78,6 +78,21 @@ pub(crate) mod seams {
         }
     }
 
+    static READER_CLOCKS: Mutex<Vec<(PathBuf, std::time::Instant)>> = Mutex::new(Vec::new());
+
+    /// Freezes the reader's clock under `dir` at `at` (fix round 2, review P4T7F1-N1): from now on
+    /// every reader gate under `dir` compares its request's deadline with `at` rather than the real
+    /// clock, so no gate refuses on time however slow the reader is. The stop check stays real, and
+    /// the waiter keeps the real clock, so its own deadline still passes.
+    pub(crate) fn freeze_reader_clock(dir: &Path, at: std::time::Instant) {
+        guard(&READER_CLOCKS).push((dir.to_path_buf(), at));
+    }
+
+    /// The reader's clock under `dir`: the instant frozen there, else the real `Instant::now()`.
+    pub(crate) fn reader_now(dir: &Path) -> std::time::Instant {
+        guard(&READER_CLOCKS).iter().rev().find(|(d, _)| d == dir).map_or_else(std::time::Instant::now, |(_, at)| *at)
+    }
+
     /// Every point reached under `dir` so far, in order.
     pub(crate) fn trace(dir: &Path) -> Vec<Point> {
         guard(&TRACE).iter().filter(|(d, _)| d == dir).map(|(_, p)| *p).collect()
@@ -523,9 +538,15 @@ fn serve_lookup(dir: &std::path::Path, stop: &std::sync::atomic::AtomicBool, key
         seams::fire(dir, seams::Point::Gate(stage));
         #[cfg(not(test))]
         let _ = stage; // the stage names the test seam only; every gate asks the same questions
+        // Test builds read the reader's clock through the seam, which a test may freeze
+        // (`seams::freeze_reader_clock`); every other build reads the real clock.
+        #[cfg(test)]
+        let now = seams::reader_now(dir);
+        #[cfg(not(test))]
+        let now = std::time::Instant::now();
         let refused = if stop.load(std::sync::atomic::Ordering::SeqCst) {
             Some(MissReason::ReaderUnavailable)
-        } else if std::time::Instant::now() >= deadline {
+        } else if now >= deadline {
             Some(MissReason::BudgetExhausted)
         } else {
             None
@@ -790,6 +811,12 @@ mod tests {
     /// Fix round 1 (review P4T7-I3): a prepared hit that reaches the waiter after its deadline is
     /// discarded -- `BudgetExhausted`, no hit, no touch. The waiter is held (a hook at `Receive`)
     /// until the reader has sent the hit, then past the deadline.
+    ///
+    /// Fix round 2 (review P4T7F1-N1): the property is the waiter's, so the test no longer depends
+    /// on how fast the reader is. The reader's clock is frozen before the lookup
+    /// (`seams::freeze_reader_clock`), so none of its gates can refuse on time and it always sends
+    /// the hit. The 10 s wait for `ReplyHit` is only a failure budget. The waiter is then held
+    /// `budget + 50 ms` on the real clock, so its deadline has certainly passed when it receives.
     #[test]
     fn a_prepared_hit_that_arrives_after_the_deadline_is_discarded_and_never_touched() {
         use crate::lookup::{Lookup, MissReason};
@@ -797,13 +824,15 @@ mod tests {
         let dir = test_dir::TempDir::new("late-reply");
         let (cache, e) = opened_with_fixture(&dir);
         let before = last_hit_on_disk(&dir, &e);
+        let budget = std::time::Duration::from_millis(250);
+        seams::freeze_reader_clock(dir.path(), std::time::Instant::now());
         let watched = dir.path().to_path_buf();
         seams::arm(dir.path(), Point::Receive, move || {
-            assert!(seams::wait_for(&watched, Point::ReplyHit, std::time::Duration::from_secs(10)), "the reader must send the prepared hit in time");
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(seams::wait_for(&watched, Point::ReplyHit, std::time::Duration::from_secs(10)), "the reader sends the prepared hit (a failure budget, not a speed requirement)");
+            std::thread::sleep(budget + std::time::Duration::from_millis(50));
         });
         let mut q = root_query(&e);
-        q.budget = std::time::Duration::from_millis(250);
+        q.budget = budget;
         assert_eq!(cache.lookup(&q), Lookup::Miss { reason: MissReason::BudgetExhausted }, "a late hit is discarded");
         writer_barrier(&cache);
         assert_eq!(last_hit_on_disk(&dir, &e), before, "a discarded hit is never touched");
