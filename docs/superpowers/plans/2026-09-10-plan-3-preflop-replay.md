@@ -1,5 +1,7 @@
 # Plan 3: Preflop charts and replay Implementation Plan
 
+Revision 4 (2026-09-28): execution errata; changelog PLAN-3-CHANGELOG-4.md
+
 Revision 3 (2026-09-17): verification edits R7 from docs/research/REVIEW-cross-plan-3.md; changelog PLAN-3-CHANGELOG-3.md
 
 Revision 2 (2026-09-17): seam re-check edits E03/E06 from docs/research/REVIEW-cross-plan-2.md; changelog PLAN-3-CHANGELOG-2.md
