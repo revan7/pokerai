@@ -182,25 +182,21 @@ fn walk_street(street: Street, history: &[(Seat, Action)], chosen: &Chosen, outp
     }
 }
 
-/// Spec section 8.4's cap disclosure at the postflop replay output boundary (ruling 15-I1): the
-/// current `BranchResidual{seat: hero, residual_mass_pct, cause: "cap"}` of the branch list
-/// ([`crate::residual_reason`]), recomputed from the weights the street leaves -- the frozen
-/// residual's share grows as later evidence shrinks the live weights -- so it replaces the
-/// disclosure an earlier boundary recorded, in place, rather than repeating it or keeping the
-/// share at the cap. No residual, no disclosure. The branches are not touched.
-fn disclose_cap(output: &mut ReplayOutput, hero: Seat) {
-    let current = residual_reason(&output.branches, hero);
-    let recorded = output
-        .reasons
-        .iter()
-        .position(|r| matches!(r, ApproxReason::BranchResidual { seat, cause, .. } if *seat == hero && cause == "cap"));
-    match (recorded, current) {
-        (Some(i), Some(r)) => output.reasons[i] = r,
-        (None, Some(r)) => output.reasons.push(r),
-        (Some(i), None) => {
-            output.reasons.remove(i);
-        }
-        (None, None) => {}
+/// Spec section 8.4's cap disclosure at a replay output boundary (rulings 15-I1, 15-N1, 15-Q5):
+/// exactly one `BranchResidual{seat: hero, residual_mass_pct, cause: "cap"}`, the current share of
+/// the branch list ([`crate::residual_reason`]) -- the frozen residual's share grows as later
+/// evidence shrinks the live weights, so a share recorded earlier is never kept. Every hero cap
+/// disclosure already on the output (an earlier boundary's, or one a snapshot inherited with
+/// another share) collapses into this one, at the first one's position; with no residual, none
+/// remains. A `BranchResidual` with another cause or seat is untouched, and so are the branches.
+/// The postflop walk calls it at its exit and `replay` at its own output boundary.
+pub(crate) fn disclose_cap(output: &mut ReplayOutput, hero: Seat) {
+    let is_cap = |r: &ApproxReason| matches!(r, ApproxReason::BranchResidual { seat, cause, .. } if *seat == hero && cause == "cap");
+    let first = output.reasons.iter().position(is_cap);
+    // Nothing before `first` is removed, so the index stays valid.
+    output.reasons.retain(|r| !is_cap(r));
+    if let Some(r) = residual_reason(&output.branches, hero) {
+        output.reasons.insert(first.unwrap_or(output.reasons.len()), r);
     }
 }
 

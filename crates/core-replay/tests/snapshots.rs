@@ -1667,15 +1667,16 @@ fn the_cap_inside_the_walk_keeps_each_survivor_on_its_own_path() {
     let utg = Seat(2);
     let splits = [(Action::Fold, 0.5), (Action::Call, 0.3), (Action::Raise { to: 30 }, 0.2)];
     // `seeded`: reasons already on the output when the walk starts (an earlier boundary's).
-    let walked_from = |line: &[Action], seeded: &[ApproxReason]| {
+    let walked_with = |snaps: &[StreetSnapshot], line: &[Action], seeded: &[ApproxReason]| {
         let mut out = replay_with(&walk_flop(), &[]);
         out.branches = core_replay::split_action(&out.branches, utg, &splits.iter().map(|&(a, f)| (a, f, vec![1.0; COMBOS])).collect::<Vec<_>>());
         out.reasons.extend_from_slice(seeded);
         let state = act(&walk_flop(), line);
         let store = PreflopStore::from_sources(vec![]);
-        walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &snapshots }, Street::Flop, &mut out);
+        walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: snaps }, Street::Flop, &mut out);
         out
     };
+    let walked_from = |line: &[Action], seeded: &[ApproxReason]| walked_with(&snapshots, line, seeded);
     let walked = |line: &[Action]| walked_from(line, &[]);
     let before_call = walked(&[Action::Check, Action::Bet { to: 73 }]);
     let after_call = walked(&check_bet73_call());
@@ -1739,6 +1740,51 @@ fn the_cap_inside_the_walk_keeps_each_survivor_on_its_own_path() {
     assert_eq!(caps[1], (BB, 5.0, "missing node k".to_string()), "another cause is not the cap's");
     let cleared = walked_from(&[Action::Check], &[stale]);
     assert!(!cleared.reasons.iter().any(|r| matches!(r, ApproxReason::BranchResidual { cause, .. } if cause == "cap")), "{:?}", cleared.reasons);
+
+    // Ruling 15-N1 (the re-review's probe P2): a snapshot may inherit a cap disclosure with another
+    // share (a cache-origin snapshot carries its stored entry's reasons). Exactly one hero cap
+    // reason survives, with the current share, at the first cap disclosure's position.
+    let mut inheriting = snapshots.to_vec();
+    inheriting[0].reasons.push(ApproxReason::BranchResidual { seat: BB, residual_mass_pct: 50.0, cause: "cap".into() });
+    let earlier = ApproxReason::BranchResidual { seat: BB, residual_mass_pct: 10.0, cause: "cap".into() };
+    for seeded in [vec![], vec![earlier]] {
+        let out = walked_with(&inheriting, &check_bet73_call(), &seeded);
+        let caps: Vec<(usize, &ApproxReason)> = out.reasons.iter().enumerate().filter(|(_, r)| matches!(r, ApproxReason::BranchResidual { .. })).collect();
+        assert_eq!(caps.len(), 1, "seeded {}: {:?}", seeded.len(), out.reasons);
+        match caps[0] {
+            (i, ApproxReason::BranchResidual { seat, residual_mass_pct, cause }) => {
+                assert_eq!((*seat, cause.as_str()), (BB, "cap"));
+                assert!((f64::from(*residual_mass_pct) - after).abs() < 1e-4, "the current share, not 50 or 10: {residual_mass_pct}");
+                if !seeded.is_empty() {
+                    assert_eq!(i, 1, "in place of the earlier boundary's disclosure (after the preflop reason)");
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// Ruling 15-N2: the disclosure also runs on the walk's no-snapshot exit. A residual that already
+/// exists when a street has no compatible snapshot (here five branches entering the flop, weights
+/// 0.3 / 0.25 / 0.2 / 0.15 / 0.1, capped into four plus a 0.1 residual) is disclosed once with its
+/// share, `100 * 0.1 / 1.0 = 10%`, and every branch is left bit for bit.
+#[test]
+fn the_cap_residual_is_disclosed_on_the_no_snapshot_exit_too() {
+    let mut out = replay_with(&walk_flop(), &[]);
+    let weights = [(Action::Fold, 0.3), (Action::Call, 0.25), (Action::Raise { to: 30 }, 0.2), (Action::Raise { to: 40 }, 0.15), (Action::Raise { to: 50 }, 0.1)];
+    out.branches = core_replay::split_action(&out.branches, Seat(2), &weights.iter().map(|&(a, f)| (a, f, vec![1.0; COMBOS])).collect::<Vec<_>>());
+    core_replay::cap_branches(&mut out.branches);
+    assert_eq!(out.branches.iter().filter(|b| b.residual).count(), 1);
+    let before: Vec<Bits> = out.branches.iter().map(bits).collect();
+    let state = walked_turn(&check_bet73_call());
+    let store = PreflopStore::from_sources(vec![]);
+    walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &[] }, Street::Flop, &mut out);
+    assert_eq!(out.branches.iter().map(bits).collect::<Vec<_>>(), before, "no snapshot: nothing is conditioned");
+    assert_eq!(flop_unconditioned(&out), vec![(SB, "no compatible snapshot".to_string()), (BB, "no compatible snapshot".to_string())]);
+    let caps = cap_reasons(&out);
+    assert_eq!(caps.len(), 1, "{:?}", out.reasons);
+    assert_eq!((caps[0].0, caps[0].2.as_str()), (BB, "cap"));
+    assert!((f64::from(caps[0].1) - 10.0).abs() < 1e-5, "{}", caps[0].1);
 }
 
 /// Every `BranchResidual` reason of `out`, as `(seat, residual_mass_pct, cause)`.

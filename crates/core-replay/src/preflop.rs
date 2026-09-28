@@ -68,7 +68,7 @@ use crate::branches::{
     cap_branches, initial, marginal, missing_reason, range_output, rescale, split_batch, stop_branch, zero_reason, BranchChoice,
     HistoryBranch,
 };
-use crate::postflop::walk_postflop;
+use crate::postflop::{disclose_cap, walk_postflop};
 use crate::snapshot::StreetSnapshot;
 use core_preflop::{
     interpolate, menu_step_index, ExpandedNode, Interpolation, PreflopAnswer, PreflopInvocation, PreflopNode, PreflopNodeKey,
@@ -121,7 +121,10 @@ pub struct ReplayOutput {
 /// none. The current street's own postflop actions are never replayed (Plan 2's street-root solve
 /// inserts them exactly), and no prior street is ever solved here. A preflop stop is scoped to the
 /// preflop street (spec section 9.3), so it clears once the hand has entered a postflop street; the
-/// residual never changes.
+/// residual never changes. At the output boundary a cap residual, whichever street's cap created
+/// it, is disclosed exactly once with its current share (spec section 8.4:
+/// `BranchResidual{seat: hero, residual_mass_pct, cause: "cap"}`, ruling 15-Q5), replacing any
+/// disclosure a postflop walk already recorded.
 ///
 /// Precondition on `input.snapshots` (P3.T14): [`ReplayInput`] has no model revision, so the slice
 /// must already be filtered to one hand, config revision and model revision -- the engine passes
@@ -148,6 +151,7 @@ pub fn replay(input: ReplayInput) -> ReplayOutput {
     }
     block_and_rescale(&mut output, root_board(input.state, current));
     publish(&mut output, input.state);
+    disclose_cap(&mut output, input.state.hero);
     output
 }
 
