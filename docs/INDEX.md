@@ -48,6 +48,7 @@ Status legend: **current** (live, authoritative as written) · **superseded by `
 | [`docs/log/2026-09-18.md`](./log/2026-09-18.md) | log | current | 2026-09-18 | Phase A item A4, the merge of the four worktrees paused on 2026-09-17 (P2.T8 fix, P4.T6, P5.T7, P5.T8), the P2.T8 closure and the Codex verdicts on P4.T6/P5.T7/P5.T8 before the second pause. |
 | [`docs/log/2026-09-26.md`](./log/2026-09-26.md) | log | current | 2026-09-26 | Resume day: remote `origin` added and pushed; plan 2 (T9-T12, T25), plan 3 (T5-T10, chart transcription and its blind verifications), plan 4 (T6, T13, T14, T17) and plan 5 (T9-T11) merges, reviews, fix rounds and rulings; third pause at the end of the day. |
 | [`docs/log/2026-09-27.md`](./log/2026-09-27.md) | log | current | 2026-09-27 | Execution continues: P2.T12/T13, P3.T11/T12, P4.T14/T17/T18 merges and verdicts; P2.T14, P4.T15 and the P3.T12/P4.T18 fix rounds dispatched. |
+| [`docs/log/2026-09-28.md`](./log/2026-09-28.md) | log | current | 2026-09-28 | Resume from the 2026-09-27 pause: P2.T28 fix round 1 merge, gates and re-review; then follow-up P2.W3 and P2.T29. |
 
 ## docs/data/
 
