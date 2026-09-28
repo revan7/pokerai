@@ -1123,3 +1123,59 @@ fn a_cancel_confirmation_observed_after_the_bound_is_answered_by_a_kill() {
         assert_eq!((cancels, out.restarts, kills_and_restarts(&r.state), r.clock.now_ms()), (1, expected.0, expected.1, seen_at), "confirmation seen at {seen_at} ms");
     }
 }
+
+// --- Task 28 fix round 1 (review P2T28R, ruling 28-I3): `SolveOutcome::outstanding_job` is the liveness provenance
+// `serve_request` conditions its post-`Final` cleanup on, never the clock. ---
+
+/// Ruling 28-I3: `outstanding_job` is true exactly when the solve ended with a sent job that may still be running on the
+/// worker, or with a busy link that failed, and nothing of the client cleaned it up: at the watchdog's fire (the
+/// client cleans nothing up there, ruling 23-I1). It is false when nothing was sent (expiry before the send), when the
+/// job's terminal arrived (validated past the fire, or observed at the fire), and for every outcome whose worker the
+/// client already answered (a success, the worker's own `no_iteration`, a superseded job cancelled or killed).
+#[test]
+fn the_outstanding_job_is_reported_only_when_a_sent_job_may_still_run() {
+    let tree = river_tree();
+    let result = || result_for(&tree, ResultStatus::Ok, &[], 0.3);
+    let progress = FakeReply::Progress { id: IdRef::Last, stage: Stage::Solving, iterations: 7, exploitability_chips: Some(0.9), elapsed_ms: 1 };
+    let mut cases: Vec<(&str, Rig)> = Vec::new();
+    // expiry before the send: the pre-send reading observes the fire (the `a_request_expired_while_prepared_is_never_sent` rig)
+    let mut r = rig(Street::River, vec![]);
+    let identity = r.core.identity.clone();
+    let armed = Arc::new(AtomicBool::new(false));
+    let clock: Arc<dyn Clock> = Arc::new(ArmedClock { fake: r.clock.clone(), armed: armed.clone(), fire_ms: r.plan.deadlines.watchdog_fire_ms(), readings_since_armed: AtomicU64::new(0) });
+    let (worker, state) = FakeWorker::scripted(r.clock.clone(), identity.clone(), vec![ack(), result()]);
+    r.core = EngineCore::new(Box::new(ArmsOnReady { inner: worker, armed }), clock, identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log")));
+    r.state = state;
+    cases.push(("expiry before the send", r));
+    // the terminal seen 1 ms before the fire and validated across it (`SHORT`: fire 2 200 ms)
+    let mut r = stalled_rig(vec![ack(), result()], is_result, Some(2_199), 1);
+    r.plan.deadlines = SHORT;
+    cases.push(("terminal validated across the fire", r));
+    // the job's own terminal observed at the fire: not accepted, but the job has ended
+    let mut r = stalled_rig(vec![ack(), result()], is_result, Some(2_200), 0);
+    r.plan.deadlines = SHORT;
+    cases.push(("terminal observed at the fire", r));
+    // a progress observed at the fire: the job is still running
+    let mut r = stalled_rig(vec![ack(), progress, FakeReply::Hang], is_progress, Some(2_200), 0);
+    r.plan.deadlines = SHORT;
+    cases.push(("progress observed at the fire", r));
+    // the `_min` retry still hanging at the fire (after the first attempt's hang and its restart)
+    cases.push(("retry hanging at the fire", rig(Street::River, vec![ack(), FakeReply::Hang])));
+    // a confirmed exit observed at the fire: a busy link failed, and nothing restarted it
+    let mut r = rig(Street::River, vec![]);
+    let identity = r.core.identity.clone();
+    let (worker, state) = FakeWorker::scripted(r.clock.clone(), identity.clone(), vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::Exit { code: 3 }]);
+    r.core = EngineCore::new(Box::new(StallsOnFailure { inner: worker, clock: r.clock.clone(), resume_at_ms: 14_900 }), r.clock.clone(), identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_solve_client_log")));
+    r.state = state;
+    cases.push(("exit observed at the fire", r));
+    // the answered outcomes
+    cases.push(("success", rig(Street::River, vec![ack(), result()])));
+    cases.push(("no_iteration twice", rig(Street::River, vec![ack(), err("no_iteration", false, None), ack(), err("no_iteration", false, None)])));
+    cases.push(("superseded, cancel unconfirmed", rig(Street::River, vec![ack(), FakeReply::Delay { ms: 100 }, FakeReply::InvalidateIdentity, FakeReply::Hang])));
+    let expected = [false, false, false, true, true, true, false, false, false];
+    for ((name, mut r), outstanding) in cases.into_iter().zip(expected) {
+        let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
+        assert_eq!(out.outstanding_job, outstanding, "{name}: {:?}", out.terminal);
+        if outstanding { assert_eq!(out.terminal, deadline_exceeded("building"), "{name}"); }
+    }
+}

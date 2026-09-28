@@ -44,7 +44,7 @@
 //! non-retryable `EngineError` naming both causes. Identity and the watchdog's cutoff are judged on every receive
 //! result, a link failure included, before it is classified or anything is recovered. At the watchdog's fire the client
 //! stops and cleans nothing up: the watchdog delivers the `Final`, and the kill and restart of a still-busy worker after
-//! it are `serve_request`'s.
+//! it are `serve_request`'s, which it conditions on `SolveOutcome::outstanding_job` (ruling 28-I3).
 
 use crate::bench_support::spot_identity;
 use crate::core::EngineCore;
@@ -122,6 +122,12 @@ pub struct SolveOutcome {
     pub restarts: u8,
     /// Display only: the raw exploitability in basis points of the solved pot, rounded (§4.4).
     pub reached_bp: Option<u16>,
+    /// Ruling 28-I3: the solve ended at the watchdog's fire with a sent job that may still be running on the worker (its
+    /// terminal not received), or with a failed link the client did not restart: the worker needs the cleanup after the
+    /// `Final` (spec 7; spec 12 "worker restarted if a job was running"). False when nothing was sent, when the job's
+    /// terminal arrived (accepted, refused, or seen at the fire), and whenever the client already answered the worker
+    /// (a restart, a confirmed cancel, a kill).
+    pub outstanding_job: bool,
 }
 
 /// Spec 4.5 `solve.spot`: the lowercase sha256 hex of the structural identity of the game `req` solves, the string a
@@ -234,7 +240,8 @@ fn ended_at(core: &EngineCore, plan: &SolvePlan, now_ms: u64, watch: Watch) -> O
         return Some(AttemptEnd::Superseded { running: matches!(watch, Watch::Waiting { .. }), link_failed: matches!(watch, Watch::Failed) });
     }
     if now_ms >= plan.deadlines.watchdog_fire_ms() {
-        return Some(AttemptEnd::DeadlinePassed);
+        // A job is left running while the client waits for its terminal, and a failed link is left as it is (28-I3).
+        return Some(AttemptEnd::DeadlinePassed { outstanding: matches!(watch, Watch::Waiting { .. } | Watch::Failed) });
     }
     match watch {
         Watch::Waiting { hang_bound_ms, .. } if now_ms >= hang_bound_ms => Some(AttemptEnd::Hang),
@@ -292,8 +299,9 @@ pub(crate) enum AttemptEnd {
     /// 23-N1). Before the send, or once the terminal arrived, there is nothing to cancel or restart. Never both.
     Superseded { running: bool, link_failed: bool },
     /// The watchdog's fire time was reached (a reply observed at or after it included, ruling 22-I1; before the send:
-    /// nothing was sent); the watchdog delivers the request's `Final` (§7).
-    DeadlinePassed,
+    /// nothing was sent); the watchdog delivers the request's `Final` (§7). `outstanding`: the sent job may still be
+    /// running (its terminal not received) or its link failed, and nothing cleaned it up (ruling 28-I3).
+    DeadlinePassed { outstanding: bool },
 }
 
 /// The `solve` for one attempt: the tree `b` at the root's chips, both ranges, the rake, the relative `deadline_ms` and
@@ -428,7 +436,14 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
                 return (end, None);
             }
         };
-        if let Some(end) = ended_at(core, plan, at_ms, Watch::Waiting { hang_bound_ms: expected_by, heartbeat_due_ms }) { return (end, None); }
+        if let Some(end) = ended_at(core, plan, at_ms, Watch::Waiting { hang_bound_ms: expected_by, heartbeat_due_ms }) {
+            // This solve's own terminal seen at the fire is not accepted, but its job has ended (ruling 28-I3).
+            let end = match end {
+                AttemptEnd::DeadlinePassed { .. } if matches!(&msg, WorkerMessage::Result { id, .. } if *id == req.id) => AttemptEnd::DeadlinePassed { outstanding: false },
+                end => end,
+            };
+            return (end, None);
+        }
         match msg {
             WorkerMessage::Ack { id, status, reason, .. } if id == req.id => match status {
                 AckStatus::Accepted => {}
@@ -478,12 +493,14 @@ pub(crate) fn succeeded(core: &EngineCore, t_start: u64, b: &TreeBuild, template
     assert!(matches!(terminal, Terminal::Ok | Terminal::BestSoFar), "succeeded: a {terminal:?} terminal carries no solution");
     let reached_bp = Some(reached_bp(sol.exploitability_chips, b.pot));
     SolveOutcome { terminal, decision_path: b.decision_path.clone(), tree: b.tree.clone(), solution: Some(sol), ordinal_paths: paths,
-        elapsed_ms: ms_between(t_start, core.clock.now_ms()), template_used: template.to_string(), street_violation, first_terminal_ms, restarts, reached_bp }
+        elapsed_ms: ms_between(t_start, core.clock.now_ms()), template_used: template.to_string(), street_violation, first_terminal_ms, restarts, reached_bp,
+        outstanding_job: false }
 }
 
 pub(crate) fn failed(core: &EngineCore, t_start: u64, reason: UnsupportedReason, input: &SolveInput, template: &str, restarts: u8, street_violation: bool, first_terminal_ms: Option<u64>) -> SolveOutcome {
     SolveOutcome { terminal: Terminal::Failed(reason), solution: None, ordinal_paths: vec![], decision_path: vec![], tree: input.tree.clone(),
-        elapsed_ms: ms_between(t_start, core.clock.now_ms()), template_used: template.to_string(), street_violation, first_terminal_ms, restarts, reached_bp: None }
+        elapsed_ms: ms_between(t_start, core.clock.now_ms()), template_used: template.to_string(), street_violation, first_terminal_ms, restarts, reached_bp: None,
+        outstanding_job: false }
 }
 
 /// Maps a non-success attempt end to its §12 reason, whether a `_min` retry is allowed and whether the worker must be
@@ -508,7 +525,7 @@ pub(crate) fn classify(end: AttemptEnd, stage: &str) -> (UnsupportedReason, bool
         AttemptEnd::Heartbeat => (engine_error(format!("no progress for {HEARTBEAT_MS} ms while solving (heartbeat)"), true), true, true),
         AttemptEnd::Rejected(r) => (engine_error(format!("solve rejected: {r}"), true), false, false),
         AttemptEnd::Superseded { .. } => (superseded(), false, false),
-        AttemptEnd::DeadlinePassed => (UnsupportedReason::DeadlineExceeded { stage: stage.into() }, false, false),
+        AttemptEnd::DeadlinePassed { .. } => (UnsupportedReason::DeadlineExceeded { stage: stage.into() }, false, false),
     }
 }
 
@@ -603,9 +620,11 @@ pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, si
                 return fail(core, superseded(), &template, restarts, first_terminal_ms);
             }
             // The watchdog delivers the `Final` (§7); the cleanup after it is `serve_request`'s, not the client's.
-            AttemptEnd::DeadlinePassed => {
+            AttemptEnd::DeadlinePassed { outstanding } => {
                 let stage = core.stage();
-                return fail(core, UnsupportedReason::DeadlineExceeded { stage }, &template, restarts, first_terminal_ms);
+                let mut out = fail(core, UnsupportedReason::DeadlineExceeded { stage }, &template, restarts, first_terminal_ms);
+                out.outstanding_job = outstanding;
+                return out;
             }
             _ => {}
         }
