@@ -14,9 +14,10 @@
 //! assignment fails the launch), and wait up to `STARTUP_TIMEOUT` for the first line, which must be a `ready` that
 //! `validate_ready` accepts. A launch that fails otherwise (the binary does not start, exits, stays silent, or writes
 //! something else first) is killed and retried once, then `Spawn` (§4.5). A `ready` that fails validation is refused
-//! at once, without the retry: the same binary reports the same values (§12, "until rebuilt"). So every `spawn` and
-//! every `restart` launches at most twice, each launch bounded by the startup timeout, and a failure is returned as
-//! `Spawn` with every attempt's reason; `restarts()` counts the restarts.
+//! at once, without the retry: the same binary reports the same values (§12, "until rebuilt"), and the refusal is
+//! returned typed, `ReadyRefused { exe, refusal }`, naming the check that failed and the value reported (follow-up
+//! P2.W2). So every `spawn` and every `restart` launches at most twice, each launch bounded by the startup timeout, and
+//! any other failure is returned as `Spawn` with every attempt's reason; `restarts()` counts the restarts.
 //!
 //! End: `recv` reports the end of stdout only after every line before it. One deadline, the caller's `timeout` from
 //! the call's start, covers the whole call, the exit confirmation included: the exit is confirmed only within what is
@@ -26,7 +27,8 @@
 //! stdout and live on; the caller that cannot wait kills it, §7/§12). A line cut off by the end of stdout (a process
 //! that died mid-write) is dropped: the death itself is what gets reported. A second `ready` is a protocol error
 //! (`ready` is written once, §4.5). `kill` is idempotent: it ends the stdin writer, terminates and reaps the child
-//! (bounded), closes the job and waits (bounded) for the stderr drain, so the ring is complete afterwards. Dropping a
+//! (bounded), closes the job, waits (bounded) for the three pipe threads to end and joins them (ruling 29-I2), so the
+//! stderr ring is complete afterwards and no thread of the link outlives it. Dropping a
 //! `ProcessWorker` kills its worker.
 //!
 //! Win32 here (kernel32): `WaitForSingleObject` on the child's process handle (the budgeted exit confirmation, the
@@ -35,7 +37,7 @@
 //! a console window under the GUI app. The job object's calls are all in `job_object`.
 use super::job_object::{self, JobHandle};
 use super::link::{WorkerLink, WorkerLinkError};
-use super::ready::validate_ready;
+use super::ready::{validate_ready, ReadyRefusal};
 use proto::worker::{EngineMessage, Ready, WorkerMessage, REQUEST_LINE_MAX};
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -43,6 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// §4.5's result-line limit, owned by `proto::worker`; re-exported, never redefined. It counts the line's bytes
@@ -56,8 +59,9 @@ pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub const START_ATTEMPTS: u32 = 2;
 /// Liveness bound on reaping a terminated child; termination is immediate, the bound only keeps `kill` from blocking.
 const REAP: Duration = Duration::from_secs(10);
-/// Liveness bound on the stderr drain after the child is gone (the pipe is at EOF by then).
-const STDERR_DRAIN: Duration = Duration::from_secs(2);
+/// Liveness bound on the end of the three pipe threads after the child is gone (its pipes are at EOF and the request
+/// queue is closed by then, so they end at once; the bound only keeps `kill` from blocking on a pipe held open elsewhere).
+const THREADS_END: Duration = Duration::from_secs(2);
 /// How much of an undecodable line a `Protocol` error quotes.
 const EXCERPT: usize = 200;
 
@@ -68,8 +72,11 @@ struct Live {
     child: Child,
     stdin: Sender<Vec<u8>>,
     lines: Receiver<Incoming>,
-    /// Disconnects when the stderr drain has ended (its sender is dropped with the thread).
-    stderr_done: Receiver<()>,
+    /// Disconnects when all three pipe threads have ended (each drops its sender as it ends).
+    threads_done: Receiver<()>,
+    /// The three pipe threads, joined by `kill` once they have ended (ruling 29-I2: nothing the engine starts is
+    /// detached).
+    threads: Vec<JoinHandle<()>>,
     /// Held for its `Drop`: closing it kills whatever is still in the job.
     _job: JobHandle,
     /// The confirmed exit code, once `recv` has read every line before the end of stdout and confirmed the exit
@@ -88,7 +95,7 @@ pub struct ProcessWorker {
 }
 
 /// Why one launch failed: `Refused` (a `ready` that fails validation) is final, `Failed` is retried once.
-enum Launch { Refused(String), Failed(WorkerLinkError) }
+enum Launch { Refused(ReadyRefusal), Failed(WorkerLinkError) }
 
 impl ProcessWorker {
     /// Spawns with `--threads N`, assigns the job object, validates `ready` within 5 s; one retry, then `Spawn`.
@@ -118,9 +125,9 @@ impl ProcessWorker {
         for attempt in 1..=START_ATTEMPTS {
             match self.launch() {
                 Ok(()) => return Ok(()),
-                Err(Launch::Refused(reason)) => {
+                Err(Launch::Refused(refusal)) => {
                     self.kill();
-                    return Err(WorkerLinkError::Spawn(format!("{}: ready refused: {reason}", self.exe.display())));
+                    return Err(WorkerLinkError::ReadyRefused { exe: self.exe.display().to_string(), refusal });
                 }
                 Err(Launch::Failed(e)) => { self.kill(); failures.push(format!("attempt {attempt}: {e}")); }
             }
@@ -143,11 +150,11 @@ impl ProcessWorker {
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
         let pipes = start_threads(stdin, stdout, stderr, self.stderr.clone());
-        let (stdin, lines, stderr_done) = match pipes {
+        let (stdin, lines, threads_done, threads) = match pipes {
             Ok(p) => p,
             Err(e) => { terminate(&mut child); return Err(failed(format!("worker threads: {e}"))); }
         };
-        self.live = Some(Live { child, stdin, lines, stderr_done, _job: job, exit: None });
+        self.live = Some(Live { child, stdin, lines, threads_done, threads, _job: job, exit: None });
         match self.recv_any(self.startup) {
             Ok(Some(WorkerMessage::Ready(r))) => {
                 validate_ready(&r, self.threads).map_err(Launch::Refused)?;
@@ -210,12 +217,18 @@ impl WorkerLink for ProcessWorker {
     }
     fn kill(&mut self) {
         self.ready = None;
-        let Some(Live { mut child, stdin, lines, stderr_done, _job: job, .. }) = self.live.take() else { return };
+        let Some(Live { mut child, stdin, lines, threads_done, threads, _job: job, .. }) = self.live.take() else { return };
         drop(stdin);           // the writer thread ends at its next receive (or at its failed write, below)
         terminate(&mut child); // TerminateProcess and a bounded reap
         drop(job);             // the last handle to the job: anything still in it is killed
         drop(lines);           // the reader thread ends at the pipe's EOF, or at its next send
-        let _ = stderr_done.recv_timeout(STDERR_DRAIN);
+        // The stderr drain has ended too once all three have (the ring is complete then), and they are joined (ruling
+        // 29-I2). Only a pipe held open outside the job could outlast the bound, and its thread is then left to end.
+        if let Err(RecvTimeoutError::Disconnected) = threads_done.recv_timeout(THREADS_END) {
+            for h in threads {
+                let _ = h.join();
+            }
+        }
     }
     fn ready(&self) -> Option<&Ready> { self.ready.as_ref() }
     fn peak_working_set_bytes(&self) -> u64 { self.live.as_ref().map_or(0, |l| peak_ws(&l.child)) }
@@ -236,16 +249,22 @@ pub(crate) fn encode_request(msg: &EngineMessage) -> Result<Vec<u8>, WorkerLinkE
     Ok(line)
 }
 
-type Pipes = (Sender<Vec<u8>>, Receiver<Incoming>, Receiver<()>);
+/// The request queue, the decoded lines, the receiver that disconnects once all three threads have ended, and their
+/// handles.
+type Pipes = (Sender<Vec<u8>>, Receiver<Incoming>, Receiver<()>, Vec<JoinHandle<()>>);
 
 fn start_threads(stdin: impl Write + Send + 'static, stdout: impl Read + Send + 'static, stderr: impl Read + Send + 'static, ring: Arc<Mutex<VecDeque<u8>>>) -> io::Result<Pipes> {
     let (req_tx, req_rx) = channel::<Vec<u8>>();
     let (line_tx, line_rx) = channel::<Incoming>();
     let (done_tx, done_rx) = channel::<()>();
-    std::thread::Builder::new().name("worker-stdin".into()).spawn(move || pump_stdin(stdin, req_rx))?;
-    std::thread::Builder::new().name("worker-stdout".into()).spawn(move || pump_stdout(stdout, MAX_RESULT_LINE, line_tx))?;
-    std::thread::Builder::new().name("worker-stderr".into()).spawn(move || drain_stderr(stderr, &ring, done_tx))?;
-    Ok((req_tx, line_rx, done_rx))
+    // Each thread holds a `done` sender, dropped as it ends.
+    let (stdin_done, stdout_done) = (done_tx.clone(), done_tx.clone());
+    let threads = vec![
+        std::thread::Builder::new().name("worker-stdin".into()).spawn(move || { let _done = stdin_done; pump_stdin(stdin, req_rx) })?,
+        std::thread::Builder::new().name("worker-stdout".into()).spawn(move || { let _done = stdout_done; pump_stdout(stdout, MAX_RESULT_LINE, line_tx) })?,
+        std::thread::Builder::new().name("worker-stderr".into()).spawn(move || drain_stderr(stderr, &ring, done_tx))?,
+    ];
+    Ok((req_tx, line_rx, done_rx, threads))
 }
 
 fn pump_stdin(mut stdin: impl Write, requests: Receiver<Vec<u8>>) {
@@ -490,6 +509,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod stand_in_tests {
     use super::*;
+    use crate::worker::ready::ReadyRefusal;
     use proto::worker::{ADAPTER_VERSION, PROTO_VERSION, SOLVER_COMMIT};
 
     struct StandIn { dir: PathBuf, script: PathBuf }
@@ -523,22 +543,32 @@ mod stand_in_tests {
         }
     }
 
-    /// The engine never trusts a `ready` that fails any §4.5 rule, and does not retry it: one launch, refused.
+    /// The engine never trusts a `ready` that fails any §4.5 rule, and does not retry it: one launch, refused with the
+    /// typed refusal (follow-up P2.W2) naming the binary, the check that failed and the value the worker reported.
     #[test]
     fn a_ready_failing_any_rule_is_refused_without_a_retry() {
-        let cases: [(&str, fn(&mut Ready), &str); 5] = [
-            ("proto", |r| r.proto_version = PROTO_VERSION + 1, "proto_version"),
-            ("commit", |r| r.solver_commit = "deadbeef".into(), "solver commit"),
-            ("adapter", |r| r.adapter_version = ADAPTER_VERSION + 1, "adapter_version"),
-            ("threads", |r| r.threads = 8, "threads 8 != requested 4"),
-            ("avx2", |r| r.build_features = vec!["fma".into()], "worker built without AVX2"),
+        let cases: [(&str, fn(&mut Ready), ReadyRefusal, &str); 5] = [
+            ("proto", |r| r.proto_version = PROTO_VERSION + 1, ReadyRefusal::ProtoVersion { reported: PROTO_VERSION + 1 }, "proto_version"),
+            ("commit", |r| r.solver_commit = "deadbeef".into(), ReadyRefusal::SolverCommit { reported: "deadbeef".into() }, "solver commit \"deadbeef\""),
+            ("adapter", |r| r.adapter_version = ADAPTER_VERSION + 1, ReadyRefusal::AdapterVersion { reported: ADAPTER_VERSION + 1 }, "adapter_version"),
+            ("threads", |r| r.threads = 8, ReadyRefusal::Threads { reported: 8, requested: 4 }, "threads 8 != requested 4"),
+            ("avx2", |r| r.build_features = vec!["fma".into()], ReadyRefusal::NoAvx2 { build_features: vec!["fma".into()] }, "worker built without AVX2 (build_features [\"fma\"])"),
         ];
-        for (tag, edit, expected) in cases {
+        for (tag, edit, expected, text) in cases {
             let mut r = valid();
             edit(&mut r);
             let s = StandIn::new(&format!("refused-{tag}"), &[echo_ready(r), WAIT.into()]);
-            let msg = spawn_err(&s, STARTUP_TIMEOUT);
-            assert!(msg.contains("ready refused") && msg.contains(expected), "{tag}: {msg}");
+            let err = match ProcessWorker::spawn_with(&s.script, 4, STARTUP_TIMEOUT) {
+                Err(e) => e,
+                Ok(_) => panic!("{tag}: the stand-in was accepted"),
+            };
+            let msg = err.to_string();
+            assert_eq!(msg, format!("{}: ready refused: {}", s.script.display(), expected), "{tag}");
+            match err {
+                WorkerLinkError::ReadyRefused { exe, refusal } => assert_eq!((exe, refusal), (s.script.display().to_string(), expected), "{tag}"),
+                other => panic!("{tag}: expected the typed ready refusal, got {other:?}"),
+            }
+            assert!(msg.contains(text), "{tag}: {msg}");
             assert_eq!(s.launches(), 1, "{tag}: a refused ready is not retried");
         }
     }
@@ -654,8 +684,8 @@ mod stand_in_tests {
     fn link_around(s: &StandIn, mut child: Child, stdin: impl Write + Send + 'static, stdout: impl Read + Send + 'static) -> ProcessWorker {
         let job = job_object::assign(&child).unwrap();
         let ring = Arc::new(Mutex::new(VecDeque::new()));
-        let (stdin, lines, stderr_done) = start_threads(stdin, stdout, child.stderr.take().unwrap(), ring.clone()).unwrap();
-        let live = Live { child, stdin, lines, stderr_done, _job: job, exit: None };
+        let (stdin, lines, threads_done, threads) = start_threads(stdin, stdout, child.stderr.take().unwrap(), ring.clone()).unwrap();
+        let live = Live { child, stdin, lines, threads_done, threads, _job: job, exit: None };
         ProcessWorker { exe: s.script.clone(), threads: 4, startup: STARTUP_TIMEOUT, live: Some(live), ready: Some(valid()), stderr: ring, restarts: 0 }
     }
 

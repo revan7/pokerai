@@ -12,6 +12,7 @@
 //! gate. The bound is a test-liveness allowance, never a correctness condition: the watchdog's time is the fake
 //! clock's, and every acknowledgement arrives within microseconds of the test driving it.
 
+use engine::clock::Clock;
 use engine::deadline::Deadlines;
 use engine::identity::IdentityState;
 use engine::testing::{FakeClock, Recorder, RecordingSink, ACK_LIVENESS};
@@ -557,4 +558,34 @@ fn a_sink_that_reads_the_identity_and_supersedes_from_the_fires_callback_complet
 fn an_acknowledgement_that_never_comes_fails_the_test_instead_of_hanging() {
     let (_never, rx) = mpsc::channel::<()>();
     acknowledged_within("an acknowledgement that never comes", Duration::ZERO, move || { let _ = rx.recv(); });
+}
+
+/// Ruling 29-I2: the watchdog owns its generation threads. `stop` wakes every one of them, the retired and the live,
+/// wherever it waits on the clock, and returns only once each has ended: none emits, records a fired `Final` or reaches
+/// its street deadline, and the clock does not move. A second `stop` does nothing, and arming after a stop is a bug.
+#[test]
+fn stop_wakes_and_joins_every_generation_thread() {
+    let clock = FakeClock::new();
+    let wd = watchdog(&clock);
+    let (sink, recorder) = recording(&clock);
+    let (retired, retired_delivered, retired_street) = armed(sink.clone(), "building");
+    wd.arm(retired);
+    let (live, live_delivered, live_street) = armed_at(sink.clone(), "solving", identity(), session(), 5);
+    wd.arm(live);
+    clock.wait_for_waiter(2_000);
+    clock.wait_for_waiter(2_005);
+    assert_eq!(wd.ended_thread_count(), 0, "both generation threads wait on the clock");
+    let stopper = wd.clone();
+    acknowledged_within("Watchdog::stop", ACK_LIVENESS, move || stopper.stop());
+    assert_eq!(wd.ended_thread_count(), 2, "stop returned only after both generation threads ended");
+    assert!(clock.waiting().is_empty() && clock.now_ms() == 0, "woken, not timed out: the clock never moved");
+    assert!(recorder.recorded().is_empty() && !retired_delivered.load(Ordering::SeqCst) && !live_delivered.load(Ordering::SeqCst));
+    assert!(!retired_street.violated() && !live_street.violated(), "neither reached its street deadline");
+    let stopper = wd.clone();
+    acknowledged_within("a second Watchdog::stop", ACK_LIVENESS, move || stopper.stop());
+    assert_eq!(wd.ended_thread_count(), 2);
+    let (late, _, _) = armed(sink, "building");
+    let armed_after_stop = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wd.arm(late)));
+    assert!(armed_after_stop.is_err(), "arming a stopped watchdog is a bug");
+    assert_eq!(wd.ended_thread_count(), 2, "no thread was started for it");
 }

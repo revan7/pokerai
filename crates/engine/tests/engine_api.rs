@@ -30,14 +30,14 @@ fn set_config_validates_and_queues() {
     assert!(e.set_config(cfg.clone()).is_err());
     cfg.solver.flop_budget_s = 30;
     let rev2 = e.set_config(cfg.clone()).unwrap();
-    assert!(rev2 > rev1);
+    assert_eq!(rev2, rev1 + 1, "neither rejected config consumed a revision");
     // §4.2: a config set during a hand is queued for the NEXT hand; the active hand keeps its frozen HandConfig
     let s = e.begin_hand(begin()).unwrap();
     assert_eq!(s.config.config_revision, rev2);
     cfg.solver.flop_budget_s = 12;
     cfg.bb_chips = 20;
     let rev3 = e.set_config(cfg.clone()).unwrap();
-    assert!(rev3 > rev2);
+    assert_eq!(rev3, rev2 + 1, "the next accepted config takes the next revision");
     assert_eq!(e.state().unwrap().config.bb_chips, 10, "the active hand's config is frozen");
     let next = e.begin_hand(begin()).unwrap();
     assert_eq!((next.config.bb_chips, next.config.config_revision), (20, rev3));
@@ -134,6 +134,155 @@ fn every_invalidation_cancels_the_equity_of_the_request_it_supersedes() {
     e.shutdown();
 }
 
+/// A sink whose first event holds `engine-main` inside the callback: it acknowledges the entry, then waits for the
+/// test's release (bounded by the liveness allowance, and released at once if the test's end drops the sender, so a
+/// failed assertion never leaves `engine-main` held behind a `shutdown`).
+struct HeldSink { entered: std::sync::mpsc::Sender<()>, release: std::sync::mpsc::Receiver<()>, held: bool }
+impl HeldSink {
+    fn new() -> (HeldSink, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (HeldSink { entered: entered_tx, release: release_rx, held: false }, entered_rx, release_tx)
+    }
+}
+impl engine::EventSink for HeldSink {
+    fn emit(&mut self, _ev: proto::RecommendationEvent) {
+        if self.held { return; }
+        self.held = true;
+        let _ = self.entered.send(());
+        let _ = self.release.recv_timeout(engine::testing::ACK_LIVENESS);
+    }
+}
+
+/// 29-I1: `recommend` supersedes the decision before it, and cancels the equity of the request served last in that
+/// same identity-lock hold (ruling 28-I4), not later when `engine-main` starts the new request. The first request is
+/// held inside its sink callback on `engine-main`; a second recommendation is accepted meanwhile, and the first
+/// request's token is already set when that `recommend` returns, before the callback is released. Released and joined
+/// before anything is asserted.
+#[test]
+fn recommend_cancels_the_superseded_requests_equity_at_once() {
+    let (cfg, _) = cfg_1_2();
+    let (mut e, tokens) = engine_with_tokens();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let (held, entered, release) = HeldSink::new();
+    let first = e.recommend(Box::new(held)).unwrap();
+    let reached = entered.recv_timeout(engine::testing::ACK_LIVENESS).is_ok();
+    let token = tokens.lock().unwrap().clone();
+    let before = token.as_ref().map(|t| t.load(Ordering::SeqCst));
+    let (sink, recorder) = RecordingSink::notifying(FakeClock::new(), None);
+    let second = e.recommend(Box::new(sink)).unwrap();
+    let after = token.as_ref().map(|t| t.load(Ordering::SeqCst));
+    let _ = release.send(());
+    recorder.wait_for(1);
+    e.shutdown();
+    assert!(reached, "the first request reached its sink callback");
+    assert_eq!(before, Some(false), "the first request's equity runs while it is the active decision");
+    assert_eq!(after, Some(true), "the second recommendation cancelled the first request's equity before returning");
+    assert!(second.decision_id > first.decision_id);
+}
+
+/// `begin()`'s hand with hero holding AhAd, to hero's preflop decision: the big blind facing the button's raise.
+fn hero_preflop_via(e: &mut Engine) {
+    e.set_hero_cards([Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()]).unwrap();
+    for a in [Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold] { e.apply_action(a).unwrap(); }
+}
+/// `begin()`'s hand with hero holding AhAd, checked down to the river through the engine: hero (the big blind) to act
+/// against the button.
+fn river_via(e: &mut Engine) -> proto::HandState {
+    hero_preflop_via(e);
+    river_after_hero_preflop(e)
+}
+/// From hero's preflop decision (`hero_preflop_via`): hero calls, then both check down to the river.
+fn river_after_hero_preflop(e: &mut Engine) -> proto::HandState {
+    let cards = |s: &str| s.split(' ').map(|c| Card::parse(c).unwrap()).collect::<Vec<_>>();
+    e.apply_action(Action::Call).unwrap();
+    e.set_board(&cards("Kh 7d 2c")).unwrap();
+    e.apply_action(Action::Check).unwrap(); e.apply_action(Action::Check).unwrap();
+    e.set_board(&cards("Kh 7d 2c 4d")).unwrap();
+    e.apply_action(Action::Check).unwrap(); e.apply_action(Action::Check).unwrap();
+    e.set_board(&cards("Kh 7d 2c 4d 9s")).unwrap()
+}
+/// The same river, built outside any engine, for the scripted worker's solution.
+fn river_state() -> proto::HandState {
+    use engine::testing::{board, hand, play};
+    let aa = Some([Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()]);
+    let s = play(&hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), Seat(0), Seat(2), aa),
+        &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold, Action::Call]);
+    board(&play(&board(&play(&board(&s, "Kh 7d 2c"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d"), &[Action::Check, Action::Check]), "Kh 7d 2c 4d 9s")
+}
+fn full(board: &[Card]) -> proto::Range1326 {
+    let mut r = proto::Range1326([1.0; 1326]);
+    for (i, w) in r.0.iter_mut().enumerate() { let [a, b] = proto::combo_cards(i as u16); if board.contains(&a) || board.contains(&b) { *w = 0.0; } }
+    r
+}
+/// A recording sink that reports when it is dropped: the last holder of a request's sink is the last thread of that
+/// request (`engine-main`'s request, its watchdog generation, its `fast-path` equity thread).
+struct DropFlagged(RecordingSink, Arc<AtomicBool>);
+impl engine::EventSink for DropFlagged { fn emit(&mut self, ev: proto::RecommendationEvent) { self.0.emit(ev); } }
+impl Drop for DropFlagged { fn drop(&mut self) { self.1.store(true, Ordering::SeqCst); } }
+
+/// 29-I2: `Engine` owns every thread it causes. A river request is answered (its `Final` delivered) and leaves behind
+/// its retired watchdog generation, waiting on the frozen fake clock for its street deadline, and its `fast-path` equity
+/// runner, blocked until its cancellation (a routine that waits on the engine clock, woken by the teardown). When
+/// `shutdown` returns: the runner has returned, the watchdog thread has ended, every thread holding the request's sink
+/// has dropped it, and the worker was told to shut down and killed, once. A second `shutdown` does nothing.
+#[test]
+fn shutdown_joins_every_thread_the_engine_started_then_kills_the_worker() {
+    use engine::clock::Clock;
+    use engine::equity::pending_summary;
+    use engine::serve::{EquityRoutine, ServeSeams};
+    use engine::testing::{uniform_solution, IdRef};
+    use proto::worker::{AckStatus, EngineMessage, ResultStatus};
+    let state = river_state();
+    let root = core_model::street_root(&state).unwrap();
+    let build = engine::tree::build_tree_full(&root, &engine::tree::TemplateSelection::from_history("river_std_v1", &root.history)).unwrap();
+    let solution = uniform_solution(&build.tree, &build.history, 0.2);
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let script = vec![FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None },
+        FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(solution), error: None, elapsed_ms: 3 }];
+    let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
+    let core = EngineCore::new(worker, clock.clone(), identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_engine_api_log")));
+    let watchdog_ended = core.watchdog.ended_threads();
+    let tasks = core.tasks.clone();
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let finished = Arc::new(AtomicBool::new(false));
+    let runner_finished = finished.clone();
+    let started_tx = Mutex::new(started_tx);
+    let runner: EquityRoutine = Arc::new(move |clock: &dyn Clock, _: Option<[Card; 2]>, _: &proto::Range1326, _: &[(Seat, proto::Range1326)], _: &[Card],
+        _: std::time::Duration, cancel: &AtomicBool| {
+        let _ = started_tx.lock().unwrap().send(());
+        clock.wait_until_or_stopped(u64::MAX, cancel);
+        runner_finished.store(true, Ordering::SeqCst);
+        pending_summary(&[])
+    });
+    let mut e = Engine::with_core_and_seams(core, ServeSeams { equity: Some(runner), ..ServeSeams::default() });
+    let (cfg, _) = cfg_1_2();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let s = river_via(&mut e);
+    e.set_explicit_ranges(full(&s.board), full(&s.board));
+    let (sink, recorder) = RecordingSink::notifying(clock.clone(), None);
+    let dropped = Arc::new(AtomicBool::new(false));
+    e.recommend(Box::new(DropFlagged(sink, dropped.clone()))).unwrap();
+    let delivered = recorder.wait_for(2);
+    let runner_started = started.recv_timeout(engine::testing::ACK_LIVENESS).is_ok();
+    let before = (finished.load(Ordering::SeqCst), watchdog_ended.count(), tasks.unjoined(), dropped.load(Ordering::SeqCst), fake.lock().unwrap().kills);
+    e.shutdown();
+    let after = (finished.load(Ordering::SeqCst), watchdog_ended.count(), tasks.unjoined(), dropped.load(Ordering::SeqCst), fake.lock().unwrap().kills);
+    let (sent, last_sent) = { let f = fake.lock().unwrap(); (f.sent.len(), f.sent.last().cloned()) };
+    e.shutdown();
+    let again = { let f = fake.lock().unwrap(); (f.kills, f.sent.len()) };
+    assert!(matches!(delivered[1].event, proto::RecommendationEvent::Final(_)), "the request was answered: {delivered:?}");
+    assert!(runner_started, "the request's equity runner started");
+    assert_eq!(before, (false, 0, 1, false, 0), "before shutdown: the runner waits on its thread, the retired watchdog waits, the sink is held, the worker lives");
+    assert_eq!(after, (true, 1, 0, true, 1),
+        "when shutdown returns: the runner returned and its thread was joined, the watchdog thread ended, the sink was dropped, the worker was killed");
+    assert!(matches!(last_sent, Some(EngineMessage::Shutdown { .. })), "the worker was told to shut down: {last_sent:?}");
+    assert_eq!(again, (1, sent), "a second shutdown does nothing");
+}
+
 /// §12: a rejected entry leaves the state unchanged. A `begin_hand` that `core_model` refuses leaves the hand in
 /// progress as it was (its history, its undo stack) and consumes no hand id.
 #[test]
@@ -199,6 +348,58 @@ fn new_validates_the_config_first_and_reports_a_missing_worker() {
     }
 }
 
+/// The startup report of a degraded engine (spec 12, ruling 29-I4): no worker ready, the typed refusal, and one banner.
+fn degraded_report(refusal: &engine::worker::ready::ReadyRefusal) -> engine::StartupReport {
+    engine::StartupReport { worker_ready: false, worker_refusal: Some(refusal.clone()), cache_state: "absent".into(),
+        banners: vec![format!("the solver worker was refused at startup (worker/proto version mismatch: {refusal}); every recommendation answers \
+            this error until the worker is rebuilt")], ..Default::default() }
+}
+/// Requests a recommendation and returns the message of its answer, which must be a single non-retryable
+/// `Unsupported{EngineError}` `Final`.
+fn answered_with(e: &mut Engine) -> String {
+    let (sink, recorder) = RecordingSink::notifying(FakeClock::new(), None);
+    e.recommend(Box::new(sink)).unwrap();
+    let events = recorder.wait_for(1);
+    match &events[0].event {
+        proto::RecommendationEvent::Final(r) => match &r.coverage {
+            proto::Coverage::Unsupported { reason: proto::UnsupportedReason::EngineError { message, retryable: false }, .. } => message.clone(),
+            other => panic!("expected a non-retryable EngineError, got {other:?}"),
+        },
+        other => panic!("expected a Final, got {other:?}"),
+    }
+}
+
+/// Ruling 29-I4 without a process: a core whose link is the refusal (`RefusedWorker`, what `Engine::new` builds when
+/// the worker's `ready` is refused) is a degraded engine. Its report says so; every decision is answered with the
+/// version mismatch before any solve and without a launch (the link has none to make); a request at a point that is no
+/// decision still answers `NoDecision` (§5 step 4, which precedes everything).
+#[test]
+fn a_degraded_engine_answers_every_decision_with_the_version_mismatch() {
+    use engine::worker::ready::ReadyRefusal;
+    use engine::worker::RefusedWorker;
+    let refusal = ReadyRefusal::SolverCommit { reported: "deadbeef".into() };
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let core = EngineCore::new(Box::new(RefusedWorker::new("solver-worker.exe".into(), refusal.clone())), FakeClock::new(), identity,
+        DecisionLog::open(&std::env::temp_dir().join("pokerai_engine_api_log")));
+    let mut e = Engine::with_core(core);
+    assert_eq!(e.startup_report(), degraded_report(&refusal));
+    let (cfg, _) = cfg_1_2();
+    e.set_config(cfg).unwrap();
+    e.begin_hand(begin()).unwrap();
+    let mismatch = format!("worker/proto version mismatch: solver commit \"deadbeef\" != pinned {}", proto::worker::SOLVER_COMMIT);
+    hero_preflop_via(&mut e);
+    assert_eq!(answered_with(&mut e), mismatch, "preflop");
+    let river = river_after_hero_preflop(&mut e);
+    e.set_explicit_ranges(full(&river.board), full(&river.board));
+    assert_eq!(answered_with(&mut e), mismatch, "river");
+    e.apply_action(Action::Check).unwrap();
+    e.apply_action(Action::Check).unwrap();
+    let (sink, recorder) = RecordingSink::notifying(FakeClock::new(), None);
+    e.recommend(Box::new(sink)).unwrap();
+    assert!(matches!(recorder.wait_for(1)[0].event, proto::RecommendationEvent::NoDecision { .. }), "the hand is complete: no decision");
+    e.shutdown();
+}
+
 /// `Engine::new` against stand-in workers: batch files that write a `ready` line and then wait on stdin (`set /p`), as
 /// the process link's own stand-in tests do (`worker::process`). The real link validates the `ready` (spec 3.7, 4.5).
 #[cfg(windows)]
@@ -208,6 +409,8 @@ mod stand_in {
     use proto::worker::{Ready, WorkerMessage};
     use std::path::PathBuf;
 
+    /// Each launch appends a line to `launches.txt` next to the script before anything else, as the process link's own
+    /// stand-ins do, so a test counts launches.
     struct StandIn { dir: PathBuf }
     impl StandIn {
         fn new(tag: &str, ready: &Ready) -> StandIn {
@@ -215,12 +418,13 @@ mod stand_in {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let line = serde_json::to_string(&WorkerMessage::Ready(ready.clone())).unwrap();
-            std::fs::write(dir.join("worker.cmd"), format!("@echo off\r\necho {line}\r\nset /p _=\r\n")).unwrap();
+            std::fs::write(dir.join("worker.cmd"), format!("@echo off\r\necho x>>\"%~dp0launches.txt\"\r\necho {line}\r\nset /p _=\r\n")).unwrap();
             StandIn { dir }
         }
         fn paths(&self) -> Paths {
             Paths { log_dir: self.dir.join("log"), worker_exe: self.dir.join("worker.cmd"), preflop: self.dir.join("preflop"), cache: self.dir.join("cache") }
         }
+        fn launches(&self) -> usize { std::fs::read_to_string(self.dir.join("launches.txt")).map(|s| s.lines().count()).unwrap_or(0) }
     }
     impl Drop for StandIn { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); } }
 
@@ -237,25 +441,42 @@ mod stand_in {
         let s = StandIn::new("valid", &ready);
         let mut e = start(&s);
         assert_eq!(e.startup_report(), StartupReport { worker_ready: true, worker_threads: 16, build_features: ready.build_features.clone(),
-            cpu_features: ready.cpu_features.clone(), capabilities: ready.capabilities.clone(), cpu_lacks_avx2: false, quarantined_bundles: vec![],
-            cache_state: "absent".into(), banners: vec![] });
+            cpu_features: ready.cpu_features.clone(), capabilities: ready.capabilities.clone(), cpu_lacks_avx2: false, worker_refusal: None,
+            quarantined_bundles: vec![], cache_state: "absent".into(), banners: vec![] });
         assert_eq!(e.state(), None);
         assert_eq!(e.begin_hand(begin()).unwrap().config.config_revision, 1);
         e.shutdown();
         e.shutdown();
+        assert_eq!(s.launches(), 1);
     }
 
-    /// §3.7: a worker built without AVX2 is refused (`EngineError("worker built without AVX2")`).
+    /// Spec 12 line 658 (ruling 29-I4): a worker whose `ready` is refused (§4.5; built without AVX2, §3.7, or of another
+    /// protocol version) leaves a DEGRADED engine, not a failed construction: `Engine::new` succeeds, the startup report
+    /// says the worker is not ready and why (the typed refusal), and every decision, preflop and river alike, is
+    /// answered with the non-retryable `EngineError("worker/proto version mismatch ...")`, the refused build never being
+    /// launched again.
     #[test]
-    fn new_refuses_a_worker_built_without_avx2() {
-        let mut ready = FakeWorker::default_ready();
-        ready.build_features = vec!["sse2".into()];
-        let s = StandIn::new("no-avx2-build", &ready);
-        let (cfg, _) = cfg_1_2();
-        match Engine::new(cfg, s.paths()) {
-            Err(EngineError::Message(m)) => assert!(m.contains("worker built without AVX2"), "{m}"),
-            Err(other) => panic!("{other:?}"),
-            Ok(_) => panic!("a worker built without AVX2 was accepted"),
+    fn a_refused_worker_leaves_a_degraded_engine() {
+        use engine::worker::ready::ReadyRefusal;
+        use proto::worker::PROTO_VERSION;
+        let mut no_avx2 = FakeWorker::default_ready();
+        no_avx2.build_features = vec!["sse2".into()];
+        let mut old_proto = FakeWorker::default_ready();
+        old_proto.proto_version = PROTO_VERSION - 1;
+        for (tag, ready, refusal) in [("no-avx2-build", no_avx2, ReadyRefusal::NoAvx2 { build_features: vec!["sse2".into()] }),
+            ("old-proto", old_proto, ReadyRefusal::ProtoVersion { reported: PROTO_VERSION - 1 })] {
+            let s = StandIn::new(tag, &ready);
+            let mut e = start(&s);
+            assert_eq!(e.startup_report(), degraded_report(&refusal), "{tag}");
+            let mismatch = format!("worker/proto version mismatch: {refusal}");
+            e.begin_hand(begin()).unwrap();
+            hero_preflop_via(&mut e);
+            assert_eq!(answered_with(&mut e), mismatch, "{tag}: preflop");
+            let river = river_after_hero_preflop(&mut e);
+            e.set_explicit_ranges(full(&river.board), full(&river.board));
+            assert_eq!(answered_with(&mut e), mismatch, "{tag}: river");
+            e.shutdown();
+            assert_eq!(s.launches(), 1, "{tag}: the refused build was launched once, at startup, and never again");
         }
     }
 

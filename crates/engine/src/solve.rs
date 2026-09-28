@@ -162,9 +162,9 @@ fn engine_error(m: impl Into<String>, retryable: bool) -> UnsupportedReason { Un
 fn superseded() -> UnsupportedReason { engine_error("superseded by a newer request", false) }
 
 /// The reason of a solve whose worker could not be restarted after the attempt failed with `reason` (§12): both causes,
-/// named. Not retryable (P2T23-I3): the link has already made its bounded launches, and its failure can be permanent (a
-/// `ready` it refused, which a rebuilt binary alone cures) in a way the engine cannot tell from a transient one (a typed
-/// refusal is follow-up P2.W2). No live worker is left; the next request relaunches it once.
+/// named. Not retryable (P2T23-I3), whatever the link's failure: a `ready` it refused (`WorkerLinkError::ReadyRefused`,
+/// typed since follow-up P2.W2, which a rebuilt binary alone cures) or a launch that failed (`Spawn`, possibly transient;
+/// telling them apart for retries is not done here). No live worker is left; the next request relaunches it once.
 fn restart_failed(reason: UnsupportedReason, e: &WorkerLinkError) -> UnsupportedReason {
     let failure = match reason { UnsupportedReason::EngineError { message, .. } => message, other => format!("{other:?}") };
     engine_error(format!("{failure}; restarting the worker failed: {e}"), false)
@@ -208,17 +208,16 @@ fn reached_bp(exploitability_chips: f32, pot: u32) -> u16 {
 /// same raw predicate (`solver-worker`'s `solve_loop::meets_target`), no longer at the f32-rounded threshold
 /// `(pot * target_bp / 10_000) as f32` it used before, which could lie half an ulp above the raw target; so no such `ok`
 /// is expected, and this check stays as a defence. It is a non-retryable worker-contract `EngineError` naming the
-/// measurement, the raw target and that former f32 threshold, never `Exact` and never `DeadlineBestSoFar`.
+/// measurement and the raw target the worker's own stop applies, never `Exact` and never `DeadlineBestSoFar`.
 fn terminal_for(status: ResultStatus, exploitability_chips: f32, pot: u32, target_bp: u16) -> Result<Terminal, UnsupportedReason> {
     match (status, meets_target(exploitability_chips, pot, target_bp)) {
         (ResultStatus::Ok | ResultStatus::BestSoFar, true) => Ok(Terminal::Ok),
         (ResultStatus::BestSoFar, false) => Ok(Terminal::BestSoFar),
         (ResultStatus::Ok, false) => {
+            // Defensive: the worker evaluates this same raw predicate before it answers `ok` (follow-up P2.W1).
             let raw_target = f64::from(target_bp) * f64::from(pot) / 10_000.0;
-            // The worker's threshold, computed exactly as the worker computes it (`solver-worker` job, `target_chips`).
-            let worker_threshold = (f64::from(pot) * f64::from(target_bp) / 10_000.0) as f32;
-            Err(engine_error(format!("worker contract: `ok` at {} chips misses the raw target {raw_target} chips ({target_bp} bp of the {pot}-chip pot); \
-                the worker's f32-rounded threshold is {} chips", f64::from(exploitability_chips), f64::from(worker_threshold)), false))
+            Err(engine_error(format!("worker contract: `ok` at {} chips misses the raw target {raw_target} chips ({target_bp} bp of the {pot}-chip pot), \
+                which the worker's own stop applies", f64::from(exploitability_chips)), false))
         }
         (s @ (ResultStatus::Cancelled | ResultStatus::Error), _) => unreachable!("terminal_for: a {} result carries no solution (`result_shape`)", status_name(s)),
     }
@@ -411,8 +410,8 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
             WorkerLinkError::Protocol(m) => AttemptEnd::Unsent(m),
             WorkerLinkError::LineTooLong(n) => AttemptEnd::Unsent(format!("a {n}-byte request line is over the limit")),
             WorkerLinkError::Exit { code } => AttemptEnd::Exit(code),
-            // `send` never launches a worker: no live worker is its `Eof`.
-            WorkerLinkError::Eof | WorkerLinkError::Spawn(_) => AttemptEnd::Ended,
+            // `send` never launches a worker: no live worker is its `Eof` (a degraded engine's link answers its refusal).
+            WorkerLinkError::Eof | WorkerLinkError::Spawn(_) | WorkerLinkError::ReadyRefused { .. } => AttemptEnd::Ended,
         };
         return (end, None);
     }
@@ -444,7 +443,7 @@ pub(crate) fn run_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &Shared
                 if let Some(end) = ended_at(core, plan, at_ms, Watch::Failed) { return (end, None); }
                 let end = match e {
                     WorkerLinkError::Exit { code } => AttemptEnd::Exit(code),
-                    WorkerLinkError::Eof | WorkerLinkError::Spawn(_) => AttemptEnd::Ended,
+                    WorkerLinkError::Eof | WorkerLinkError::Spawn(_) | WorkerLinkError::ReadyRefused { .. } => AttemptEnd::Ended,
                     e @ (WorkerLinkError::Protocol(_) | WorkerLinkError::LineTooLong(_)) => AttemptEnd::Protocol(e.to_string()),
                 };
                 return (end, None);
@@ -695,16 +694,17 @@ mod tests {
     }
 
     /// Ruling 22-I3: `Ok` iff the raw target is met, whatever the status; `BestSoFar` only for a `best_so_far` short of
-    /// it; an `ok` short of it (0.3f32 of 100 chips at 30 bp: the worker's own threshold admits it) is a non-retryable
-    /// worker-contract error naming the raw target and the worker's f32-rounded threshold.
+    /// it; an `ok` short of it (0.3f32 of 100 chips at 30 bp: the f32-rounded threshold the worker used before P2.W1
+    /// admitted it; the worker now stops on the raw predicate, so the engine's check is a defence) is a non-retryable
+    /// worker-contract error naming the measurement and the raw target the worker itself applies.
     #[test]
     fn the_terminal_follows_the_raw_target_and_the_worker_contract() {
         assert_eq!(terminal_for(ResultStatus::Ok, 0.5, 100, 50), Ok(Terminal::Ok));
         assert_eq!(terminal_for(ResultStatus::BestSoFar, 0.5, 100, 50), Ok(Terminal::Ok));
         assert_eq!(terminal_for(ResultStatus::BestSoFar, 0.3, 100, 30), Ok(Terminal::BestSoFar));
         let Err(UnsupportedReason::EngineError { message, retryable: false }) = terminal_for(ResultStatus::Ok, 0.3, 100, 30) else { panic!("an ok short of the raw target") };
-        assert_eq!(message, "worker contract: `ok` at 0.30000001192092896 chips misses the raw target 0.3 chips (30 bp of the 100-chip pot); \
-            the worker's f32-rounded threshold is 0.30000001192092896 chips");
+        assert_eq!(message, "worker contract: `ok` at 0.30000001192092896 chips misses the raw target 0.3 chips (30 bp of the 100-chip pot), \
+            which the worker's own stop applies");
     }
 
     /// The street verdict: on time at the deadline, late 1 ms after; without a terminal, violated once reached.

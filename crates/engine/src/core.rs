@@ -1,7 +1,11 @@
 //! The state `engine-main` owns (spec 3.4): the worker link, the clock every deadline is measured on, the decision
 //! identity, the watchdog, the decision log, the request-id counter, the memory limit and the furthest stage the live
 //! request has reached, and (Task 27) the snapshot store, the game config and the range source, and (Task 28) the
-//! equity cancellation token of the request served last.
+//! equity cancellation token of the request served last, and (ruling 29-I2) the threads its requests start.
+//!
+//! Ownership (rulings 29-I2, 29-I3). `Engine` hands the core to `engine-main`, which owns it alone (no lock around it)
+//! and tears it down on its way out (`shutdown`): every thread the core started is stopped and joined, then the worker
+//! is told to shut down and killed.
 
 use crate::clock::Clock;
 use crate::identity::IdentityState;
@@ -10,9 +14,11 @@ use crate::ranges::{ExplicitRanges, RangeSource};
 use crate::snapshots::SnapshotStore;
 use crate::watchdog::Watchdog;
 use crate::worker::link::WorkerLink;
+use proto::worker::EngineMessage;
 use proto::{DecisionIdentity, GameConfig, Rake, SolverPrefs};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 
 /// §10.3: the engine's default `memory_limit_bytes` on every `solve` (10 GiB).
 pub const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 10 << 30;
@@ -25,6 +31,47 @@ fn stage_rank(s: &str) -> u8 {
         "solving" => 2,
         "extracting" => 3,
         _ => 0,
+    }
+}
+
+/// A lock that survives a panic elsewhere: the teardown runs while `engine-main` unwinds too, and must neither panic
+/// again nor stop short of killing the worker. Every value behind these locks stays consistent at every point a panic
+/// could interrupt it (an `Option` set or taken, a list of handles).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The threads a request starts beside `engine-main` (the `fast-path` equity runner, §3.4), owned by the core (ruling
+/// 29-I2): each is registered as it starts, those already ended are joined at the next start, and `join_all` joins the
+/// rest. Nothing it runs is detached.
+#[derive(Default)]
+pub struct Tasks {
+    handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Tasks {
+    /// Starts `f` on a thread named `name` and keeps its handle.
+    pub fn spawn(&self, name: &str, f: impl FnOnce() + Send + 'static) {
+        let mut handles = lock(&self.handles);
+        let (ended, running): (Vec<_>, Vec<_>) = handles.drain(..).partition(|h| h.is_finished());
+        for h in ended {
+            let _ = h.join();
+        }
+        *handles = running;
+        handles.push(std::thread::Builder::new().name(name.into()).spawn(f).unwrap_or_else(|e| panic!("spawn the {name} thread: {e}")));
+    }
+
+    /// Joins every thread started so far; returns once each has ended. A thread that panicked has reported it already.
+    pub fn join_all(&self) {
+        let handles = std::mem::take(&mut *lock(&self.handles));
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+
+    /// How many started threads have not been joined yet.
+    pub fn unjoined(&self) -> usize {
+        lock(&self.handles).len()
     }
 }
 
@@ -53,6 +100,11 @@ pub struct EngineCore {
     /// The equity cancellation token of the request served last (ruling 28-I4): `serve_request` sets it when the next
     /// request starts (a newer request supersedes it), and `Engine` can clone this handle to set it on a mutation.
     pub equity_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    /// The `fast-path` threads the core's requests started (ruling 29-I2), joined by `shutdown`. Shared so that a test can
+    /// see, once the engine is shut down, that none is left unjoined.
+    pub tasks: Arc<Tasks>,
+    /// `shutdown` has run.
+    shut_down: bool,
 }
 
 impl EngineCore {
@@ -71,7 +123,32 @@ impl EngineCore {
             config: Arc::new(Mutex::new(GameConfig { config_revision: 0, chip_label: "$1".into(), sb_chips: 5, bb_chips: 10, straddle: None, rake: Rake::TimeCharge, seats: vec![], solver: SolverPrefs { threads: 16, target_bp: 50, flop_budget_s: 10 } })),
             range_source: Arc::new(Mutex::new(Box::new(ExplicitRanges { oop: None, ip: None }))),
             equity_cancel: Arc::new(Mutex::new(None)),
+            tasks: Arc::default(),
+            shut_down: false,
         }
+    }
+
+    /// The teardown (ruling 29-I2), run once, by `engine-main` on its way out (`Engine::shutdown`, or a panic): the
+    /// equity of the request served last is cancelled (earlier ones were cancelled by the requests after them) and every
+    /// thread waiting on the engine clock is woken to see it; the watchdog is stopped, which wakes and joins its
+    /// generation threads; the `fast-path` threads are joined; then the worker is told to shut down and killed (the link
+    /// reaps the process). It returns only once all of that is done. A second call does nothing. Nothing here waits on
+    /// an engine lock held elsewhere: `Engine` holds none while it joins `engine-main`, and the threads joined take
+    /// the identity and sink locks only briefly.
+    pub fn shutdown(&mut self) {
+        if self.shut_down {
+            return;
+        }
+        self.shut_down = true;
+        if let Some(token) = lock(&self.equity_cancel).as_ref() {
+            token.store(true, Ordering::SeqCst);
+        }
+        self.clock.wake_waiters();
+        self.watchdog.stop();
+        self.tasks.join_all();
+        let id = self.next_id();
+        let _ = self.worker.send(&EngineMessage::Shutdown { id });
+        self.worker.kill();
     }
 
     /// The next request id, `"1"`, `"2"`, ... The counter is checked in its own width: an id is never reused, even in a

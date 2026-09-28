@@ -16,8 +16,14 @@
 //!
 //! Generations. Only the most recent generation is live: `arm` retires the one before it, and `disarm` retires the
 //! live one. A retired generation does nothing at its times, not even its street-deadline record, and its thread ends
-//! at its next wake-up. The `Clock` has no way to interrupt a wait, so a retired thread still sleeps until its next
-//! deadline (at most the flop's `5 s + flop_budget_s`) before it ends.
+//! at its next wake-up: a retired thread still waits until its next deadline (at most the flop's `5 s +
+//! flop_budget_s`) before it ends, unless the watchdog is stopped first.
+//!
+//! Threads (ruling 29-I2: the engine owns every thread it causes). The watchdog keeps the handle of every generation
+//! thread it starts; `arm` joins those already ended, and `stop` wakes every one still waiting on the clock (the
+//! `Clock`'s interruptible wait, `wait_until_or_stopped`), joins them all and returns only once each has ended. A
+//! stopped generation emits nothing and records nothing, a fire already in progress completes its emission first, and a
+//! stopped watchdog is never armed again (asserted). `stop` is the engine's teardown (`EngineCore::shutdown`).
 //!
 //! One `Final` per request. `delivered` is shared with the engine's own delivery path: whichever side swaps it from
 //! false to true first delivers, and the other stays silent. A request whose `Final` was already delivered is never
@@ -39,7 +45,8 @@
 //! sink (ruling 28-I1: no engine lock is held during a sink callback), so the callback may read the identity or
 //! supersede the decision it receives.
 //!
-//! Locking. Waiting holds no lock. The generation lock is taken to check liveness and, at the fire, held from the
+//! Locking. Waiting holds no lock. The thread registry's lock is taken by `arm` before the generation lock and by `stop`
+//! alone, never by a generation thread. The generation lock is taken to check liveness and, at the fire, held from the
 //! liveness check through the emission, so `arm` and `disarm` are linearized with a fire: once either returns, no
 //! earlier generation emits anything. Lock order: generation, then the identity lock (taken alone under the generation
 //! lock for the check and the claim, and released before any other lock is taken), then `retained`, then `fallback`,
@@ -65,6 +72,7 @@ use crate::EventSink;
 use proto::{Coverage, DecisionIdentity, Phase, Recommendation, RecommendationEvent, UnsupportedReason};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 
 /// The sink of one request's events, shared by `engine-main`, the `fast-path` thread and the watchdog.
 pub type SharedSink = Arc<Mutex<Box<dyn EventSink>>>;
@@ -182,6 +190,10 @@ struct Generations {
 pub struct Watchdog {
     clock: Arc<dyn Clock>,
     generations: Arc<Mutex<Generations>>,
+    /// Set by `stop`: every generation thread's clock wait ends, and nothing is armed again.
+    stop: Arc<AtomicBool>,
+    /// The generation threads started and not joined yet (see "Threads" above).
+    threads: Mutex<Vec<JoinHandle<()>>>,
     #[cfg(any(test, feature = "testing"))]
     ends: Arc<seam::Ends>,
 }
@@ -199,13 +211,19 @@ impl Watchdog {
         Self {
             clock,
             generations: Arc::new(Mutex::new(Generations { live: 0, fired: None })),
+            stop: Arc::new(AtomicBool::new(false)),
+            threads: Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "testing"))]
             ends: Arc::new(seam::Ends::default()),
         }
     }
 
-    /// Starts a new generation for `a`, retiring the previous one, on a thread of its own.
+    /// Starts a new generation for `a`, retiring the previous one, on a thread of its own, whose handle the watchdog
+    /// keeps (see "Threads" above). The thread lock is held from the stop check through the handle's registration, so a
+    /// `stop` either finds this thread's handle or makes this `arm` a bug. Lock order: threads, then generation.
     pub fn arm(&self, a: Armed) {
+        let mut threads = lock(&self.threads);
+        assert!(!self.stop.load(Ordering::SeqCst), "watchdog armed for decision {:?} after it was stopped", a.identity);
         assert!(
             !a.delivered.load(Ordering::SeqCst),
             "watchdog armed for decision {:?} after its Final was delivered",
@@ -242,18 +260,41 @@ impl Watchdog {
             g.live = g.live.checked_add(1).expect("watchdog generation counter overflowed u64");
             g.live
         };
-        let (clock, generations) = (self.clock.clone(), self.generations.clone());
+        let (clock, generations, stop) = (self.clock.clone(), self.generations.clone(), self.stop.clone());
         #[cfg(any(test, feature = "testing"))]
         let ends = self.ends.clone();
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("watchdog".into())
             .spawn(move || {
                 // Counts this thread's end once `watch` has returned (or unwound): after its last action.
                 #[cfg(any(test, feature = "testing"))]
                 let _end = seam::End(&ends);
-                watch(clock.as_ref(), &generations, generation, a)
+                watch(clock.as_ref(), &generations, generation, &stop, a)
             })
             .expect("spawn the watchdog thread");
+        // The threads already ended are joined here, so the handles kept stay those of threads that may still run.
+        let (ended, running): (Vec<_>, Vec<_>) = threads.drain(..).partition(|h| h.is_finished());
+        for h in ended {
+            let _ = h.join();
+        }
+        *threads = running;
+        threads.push(handle);
+    }
+
+    /// Stops the watchdog (ruling 29-I2): wakes every generation thread still waiting on the clock, joins every one,
+    /// and returns once each has ended. A fire in progress completes its emission first; no stopped generation emits or
+    /// records anything afterwards. Idempotent. Never call it while holding the sink, `retained`, `fallback`, `stage` or
+    /// `fired` lock of an armed request, nor the identity lock (a fire in progress takes them).
+    pub fn stop(&self) {
+        let handles = {
+            let mut threads = lock(&self.threads);
+            self.stop.store(true, Ordering::SeqCst);
+            std::mem::take(&mut *threads)
+        };
+        self.clock.wake_waiters();
+        for h in handles {
+            let _ = h.join();
+        }
     }
 
     /// Retires the live generation: it emits nothing and records nothing from now on. Once `disarm` returns, no fire
@@ -287,6 +328,12 @@ impl Watchdog {
     pub fn ended_threads(&self) -> EndedThreads {
         EndedThreads(self.ends.clone())
     }
+
+    /// How many of this watchdog's generation threads have ended so far, read without waiting: what a test asserts
+    /// once a call that must have ended them has returned (`stop`, ruling 29-I2).
+    pub fn ended_thread_count(&self) -> u64 {
+        self.ends.count()
+    }
 }
 
 /// A watchdog's count of ended generation threads (`Watchdog::ended_threads`).
@@ -301,6 +348,11 @@ impl EndedThreads {
     /// allowance, never a condition on the engine's time).
     pub fn wait_for(&self, n: u64) {
         self.0.wait_for_within(n, crate::testing::ACK_LIVENESS);
+    }
+
+    /// How many have ended so far, read without waiting (see `Watchdog::ended_thread_count`).
+    pub fn count(&self) -> u64 {
+        self.0.count()
     }
 }
 
@@ -317,6 +369,10 @@ mod seam {
     }
 
     impl Ends {
+        pub(super) fn count(&self) -> u64 {
+            *super::lock(&self.count)
+        }
+
         pub(super) fn wait_for(&self, n: u64) {
             let mut count = super::lock(&self.count);
             while *count < n {
@@ -359,9 +415,11 @@ fn claim_if_active(a: &Armed) -> bool {
     ids.is_active(&a.identity) && !a.delivered.swap(true, Ordering::SeqCst)
 }
 
-/// The body of one generation's thread.
-fn watch(clock: &dyn Clock, generations: &Mutex<Generations>, generation: u64, a: Armed) {
-    clock.wait_until(a.street_deadline.deadline_ms());
+/// The body of one generation's thread. A stop ends either wait, and the thread with it.
+fn watch(clock: &dyn Clock, generations: &Mutex<Generations>, generation: u64, stop: &AtomicBool, a: Armed) {
+    if clock.wait_until_or_stopped(a.street_deadline.deadline_ms(), stop) {
+        return;
+    }
     {
         let g = lock(generations);
         if g.live != generation {
@@ -371,7 +429,9 @@ fn watch(clock: &dyn Clock, generations: &Mutex<Generations>, generation: u64, a
         // (`StreetDeadline::violated`), not from when this thread resumed.
         a.street_deadline.reach();
     }
-    clock.wait_until(a.fire_ms);
+    if clock.wait_until_or_stopped(a.fire_ms, stop) {
+        return;
+    }
     // Held through the emission: see "Locking" above.
     let mut g = lock(generations);
     if g.live != generation || !claim_if_active(&a) {

@@ -2,7 +2,9 @@
 //! and flop paths attach at the `Classification::Preflop` arm and at the flop guard below (plans 3 and 4).
 //!
 //! One request. `serve_request` classifies the decision (§6) and answers at once every row the classifier settles
-//! alone. For a heads-up river or turn decision it arms the watchdog (§7), reads the public root ranges from the range
+//! alone; a degraded engine (a worker whose `ready` was refused at startup, spec 12, ruling 29-I4) answers every
+//! decision that way too, with the version mismatch. For a heads-up river or turn decision it arms the watchdog (§7),
+//! reads the public root ranges from the range
 //! source (§9: the only provider, which owns their validation, rulings 27-D3/D4), emits `Fast` (§5 step 5), starts the
 //! `fast-path` equity thread (§3.4), solves through the solve client (`solve::run_solve`, Tasks 22-23), assembles the
 //! `Final` (§4.4, §5 step 7), registers a validated solution as a snapshot (§9.2) and logs the decision (§5 step 10).
@@ -48,9 +50,11 @@
 //!
 //! Equity (§3.4, §7, ruling 28-I4). Each request's `fast-path` equity runs with its own cancellation token, polled by
 //! the equity routine between its units of work. It is set on supersession: by the next request as it starts
-//! (`EngineCore::equity_cancel` holds the last request's token), when this request finds its decision no longer active,
+//! (`EngineCore::equity_cancel` holds the last request's token), by `Engine` when a public call supersedes the decision
+//! (in the same identity-lock hold, rulings 29-I1 and 28-I4), when this request finds its decision no longer active,
 //! and by the fast path itself when the decision is already stale as it starts; never by the request's own `Final`,
-//! since a late `Equity` of the active decision still enriches it.
+//! since a late `Equity` of the active decision still enriches it. The `fast-path` thread is the core's
+//! (`EngineCore::tasks`), joined at the engine's teardown (ruling 29-I2).
 //!
 //! Locks. The identity lock is taken before the snapshot store and released after it, never the other way round, and
 //! neither is held during a sink callback. The snapshot store, the config, the range source and the fallback slot are
@@ -233,6 +237,14 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
     let mut ctx = AssemblyCtx { identity: req.identity.clone(), legal: d.legal.clone(), hero_combo, bb_chips: req.state.config.bb_chips, equity: pending_summary(&[]) };
     let mut assumptions = assemble::empty_assumptions("");
     assumptions.target_bp = config.solver.target_bp;
+    // Spec 12 (ruling 29-I4): a worker whose `ready` was refused at startup (a degraded engine, `WorkerLink::refused`)
+    // answers every decision with the non-retryable version mismatch, before anything else runs and without launching
+    // the refused build. A request at a point that is no decision still answers `NoDecision` (§5 step 4).
+    let refused = core.worker.refused().map(|refusal| format!("worker/proto version mismatch: {refusal}"));
+    if let (Some(message), false) = (refused, matches!(class, Classification::NoDecision { .. })) {
+        settle(core, &req, hooks, &deadlines, &equity_cancel, d.street, assemble::unsupported(&ctx, engine_error(&message), vec![], assumptions));
+        return;
+    }
     let (root, inherited, facing_allin_flag, opponent) = match class {
         Classification::NoDecision { reason } => {
             emit(core, &req, None, RecommendationEvent::NoDecision { identity: req.identity.clone(), reason });
@@ -400,18 +412,16 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
 fn spawn_equity(core: &EngineCore, req: &LiveRequest, hero_public: Range1326, opponent: (Seat, Range1326), board: Vec<Card>, routine: EquityRoutine,
     cancel: Arc<AtomicBool>) {
     let (ids, identity, sink, clock, hero) = (core.identity.clone(), req.identity.clone(), req.sink.clone(), core.clock.clone(), req.state.hero_cards);
-    std::thread::Builder::new()
-        .name("fast-path".into())
-        .spawn(move || {
-            let stale = !ids.lock().unwrap().is_active(&identity);
-            if stale {
-                cancel.store(true, Ordering::SeqCst);
-                return;
-            }
-            let equity = routine(clock.as_ref(), hero, &hero_public, &[opponent], &board, Duration::from_millis(EQUITY_BUDGET_MS), &cancel);
-            deliver(&ids, &identity, &sink, None, RecommendationEvent::Equity { identity: identity.clone(), equity });
-        })
-        .expect("spawn the fast-path thread");
+    // Owned by the core (ruling 29-I2): joined at the engine's teardown, never detached.
+    core.tasks.spawn("fast-path", move || {
+        let stale = !ids.lock().unwrap().is_active(&identity);
+        if stale {
+            cancel.store(true, Ordering::SeqCst);
+            return;
+        }
+        let equity = routine(clock.as_ref(), hero, &hero_public, &[opponent], &board, Duration::from_millis(EQUITY_BUDGET_MS), &cancel);
+        deliver(&ids, &identity, &sink, None, RecommendationEvent::Equity { identity: identity.clone(), equity });
+    });
 }
 
 /// §6's analytic fallback facing an all-in, for hero's actual combo against the opponent's public range. `C` is what
