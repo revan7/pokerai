@@ -12,6 +12,7 @@ pub mod engine;
 pub mod equity;
 pub mod identity;
 pub mod log;
+pub mod preflop;
 pub mod ranges;
 pub mod serve;
 pub mod snapshots;

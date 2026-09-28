@@ -13,7 +13,7 @@ pub use branches::*; // SeatMass, HistoryBranch, initial, marginal, posterior, c
                      // stop_branch, missing_reason, zero_reason
 pub use postflop::*; // walk_postflop, snapshot_root, uncovered (P3.T15)
 pub use preflop::*; // ReplayInput, ReplayOutput, replay, walk_preflop, apply_preflop_action, query_translated,
-                    // board_mask, block_and_rescale, publish
+                    // board_mask, block_and_rescale, publish, replay_decision, DecisionLookup (P3.T17)
 pub use snapshot::*; // SnapshotKey, SnapshotProvenance, StreetSnapshot, CompatKey, compatible, covered_prefix,
                      // select_snapshot, snapshot_node_at, street_number, street_history, root_board,
                      // SnapshotStore (P3.T14, P3.T15)

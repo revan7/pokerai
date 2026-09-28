@@ -889,6 +889,7 @@ dependencies = [
  "core-eval",
  "core-iso",
  "core-model",
+ "core-preflop",
  "core-ranges",
  "core-replay",
  "engine",

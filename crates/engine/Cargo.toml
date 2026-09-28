@@ -12,6 +12,7 @@ core-model = { path = "../core-model" }
 core-ranges = { path = "../core-ranges" }
 core-iso = { path = "../core-iso" }
 core-eval = { path = "../core-eval" }
+core-preflop = { path = "../core-preflop" }
 core-replay = { path = "../core-replay" }
 serde.workspace = true
 serde_json.workspace = true
