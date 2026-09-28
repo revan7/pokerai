@@ -623,6 +623,63 @@ fn replay_branch_cap_residual() {
     cap_branches(&mut b);
     close(b.iter().find(|b| b.residual).unwrap().q, 0.0521);
     assert_eq!(b.iter().filter(|b| b.residual).count(), 1);
+    replay_branch_cap_residual_row_figures();
+}
+
+/// The rest of section 13.1's `replay_branch_cap_residual` figures (plan 3 Task 19's test-name
+/// audit; the brief's body above asserts only the residual weights and totals): the eight weights
+/// before the first cap, the four the cap keeps, the disclosed shares 35.2% and 52.1%, and the
+/// fourth split's children with the three earliest-created `0.0027` branches kept.
+fn replay_branch_cap_residual_row_figures() {
+    let hero = Seat(1);
+    let actor = Seat(0);
+    let choices = vec![(Action::Raise { to: 50 }, 0.6, vec![0.5; 1326]), (Action::Raise { to: 100 }, 0.4, vec![0.5; 1326])];
+    let descending = |bs: &[HistoryBranch], residual: bool| {
+        let mut qs: Vec<f64> = bs.iter().filter(|b| b.residual == residual).map(|b| b.q).collect();
+        qs.sort_by(|x, y| y.total_cmp(x));
+        qs
+    };
+    let assert_all = |got: Vec<f64>, want: &[f64]| {
+        assert_eq!(got.len(), want.len(), "{got:?} against {want:?}");
+        for (g, w) in got.iter().zip(want) {
+            close(*g, *w);
+        }
+    };
+    let share = |bs: &[HistoryBranch]| match residual_reason(bs, hero) {
+        Some(ApproxReason::BranchResidual { seat, residual_mass_pct, cause }) => {
+            assert_eq!((seat, cause.as_str()), (hero, "cap"));
+            f64::from(residual_mass_pct)
+        }
+        other => panic!("expected the cap's BranchResidual, got {other:?}"),
+    };
+    let mut b = two_combos();
+    for _ in 0..2 {
+        b = split_action(&b, actor, &choices);
+        cap_branches(&mut b);
+    }
+    b = split_action(&b, actor, &choices);
+    assert_all(descending(&b, false), &[0.027, 0.018, 0.018, 0.018, 0.012, 0.012, 0.012, 0.008]);
+    close(b.iter().map(|b| b.q).sum(), 0.125);
+    cap_branches(&mut b);
+    assert_all(descending(&b, false), &[0.027, 0.018, 0.018, 0.018]);
+    close(b.iter().filter(|b| !b.residual).map(|b| b.q).sum(), 0.081);
+    assert_all(descending(&b, true), &[0.044]);
+    assert!((share(&b) - 35.2).abs() < 0.05);
+    b = b.iter().filter_map(|b| condition(b, actor, &vec![0.5; 1326], 1.)).collect();
+    assert_all(descending(&b, false), &[0.0135, 0.009, 0.009, 0.009]);
+    assert!((share(&b) - 52.1).abs() < 0.05, "never renormalized away");
+    b = split_action(&b, actor, &choices);
+    assert_all(descending(&b, false), &[0.00405, 0.0027, 0.0027, 0.0027, 0.0027, 0.0018, 0.0018, 0.0018]);
+    let mut tied: Vec<u8> = b.iter().filter(|b| !b.residual && (b.q - 0.0027).abs() < 1e-12).map(|b| b.id).collect();
+    tied.sort_unstable();
+    assert_eq!(tied.len(), 4);
+    cap_branches(&mut b);
+    assert_all(descending(&b, false), &[0.00405, 0.0027, 0.0027, 0.0027]);
+    let mut kept: Vec<u8> = b.iter().filter(|b| !b.residual && (b.q - 0.0027).abs() < 1e-12).map(|b| b.id).collect();
+    kept.sort_unstable();
+    assert_eq!(kept, tied[..3], "ties keep the three earliest-created 0.0027 branches");
+    assert_all(descending(&b, true), &[0.0521]);
+    assert_eq!(b.iter().filter(|b| b.residual).count(), 1, "the same residual is extended, never a second one");
 }
 
 /// `residual_reason` recomputes the share from current weights every call, never caches the
