@@ -19,7 +19,7 @@ use crate::watchdog::Watchdog;
 use crate::worker::link::WorkerLink;
 use core_preflop::PreflopStore;
 use proto::worker::EngineMessage;
-use proto::{DecisionIdentity, GameConfig, Rake, SolverPrefs};
+use proto::{DecisionIdentity, GameConfig, Rake, SolverPrefs, UnsupportedReason};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -126,13 +126,17 @@ pub struct EngineCore {
     pub preflop: Arc<PreflopStore>,
     /// The flop/turn street-solution cache (plan 4 Task 7, spec 10.4): `Cache::disabled()` as built, so every Plan 2
     /// rig keeps a core that never touches the disk; `Engine::new` opens it at `Paths::cache` (`with_cache` installs a
-    /// test's). A lookup runs on the request's own `fast-path` work, never on `watchdog` or `engine-main`. The pre-solver
-    /// handle is not here: it lives on `Engine` (Task 16), so a status or pause command never waits for this core.
+    /// test's). `serve_request` asks it on `engine-main`, inside the request's own budget: the shared 500 ms cache budget
+    /// of spec 7 bounds every lookup of a decision together (plan 4 Task 10, ruling 10-pre1); the watchdog never asks
+    /// it. A live flop or turn solution is stored through its non-blocking `store`. The pre-solver handle is not here:
+    /// it lives on `Engine` (Task 16), so a status or pause command never waits for this core.
     pub cache: cache::Cache,
     /// The live flop template policy (plan 4 Task 9, spec 10.1): whether V3 admitted `flop_min_v1` for single-raised
     /// pots. `FlopPolicy::from_v3(None, None)` as built, the conservative policy (`flop_fast_v1` for every flop), until
     /// provenance-matching V3 evidence is loaded (`flop::load_v3_policy`) before the core is handed to `engine-main`.
     pub flop_policy: crate::flop::FlopPolicy,
+    /// `log_cache_reject` has reported a refused cache entry on stderr this session (it does so once).
+    cache_reject_reported: bool,
     /// `shutdown` has run.
     shut_down: bool,
 }
@@ -158,6 +162,7 @@ impl EngineCore {
             preflop: Arc::new(PreflopStore::from_sources(vec![])),
             cache: cache::Cache::disabled(),
             flop_policy: crate::flop::FlopPolicy::from_v3(None, None),
+            cache_reject_reported: false,
             shut_down: false,
         }
     }
@@ -240,6 +245,23 @@ impl EngineCore {
 
     pub fn set_config(&self, cfg: GameConfig) {
         *lock(&self.config) = cfg;
+    }
+
+    /// Plan 4 Task 10 (spec 10.4, 12): a live solution the cache refused to store (`cache_bridge::entry_from_solution`'s
+    /// `reason`) for decision `identity`. Recorded in the diagnostics log (`cache_reject`) every time, and reported on
+    /// stderr once per session; the refused entry is stored nowhere, and the decision's delivery is never affected.
+    pub fn log_cache_reject(&mut self, identity: &DecisionIdentity, reason: &UnsupportedReason) {
+        let detail = match reason {
+            UnsupportedReason::EngineError { message, .. } => message.clone(),
+            other => format!("{other:?}"),
+        };
+        if !self.cache_reject_reported {
+            self.cache_reject_reported = true;
+            eprintln!("cache entry refused for decision {identity:?}: {detail} (not reported again this session; see diagnostics.jsonl)");
+        }
+        let rec = crate::log::DiagnosticRecord { at_ms: self.clock.now_ms(), event: "cache_reject".into(), identity: Some(identity.clone()), detail, stderr_tail: String::new(),
+            engine_tree: None };
+        self.log.diagnostic(&rec);
     }
 }
 

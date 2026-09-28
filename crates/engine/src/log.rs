@@ -10,8 +10,13 @@
 //! `tree_mismatch` is logged with both trees). Beside the decisions, the same directory keeps
 //! `diagnostics.jsonl` (rotated the same way): one `DiagnosticRecord` for every kill and restart
 //! of the worker the engine makes, with its cause and the worker's bounded stderr tail, for every
-//! `tree_mismatch`, with the engine's tree, and for a panic `engine-main` contained. Nothing of
-//! these paths goes to the process's stderr, which a windowed app does not show.
+//! `tree_mismatch`, with the engine's tree, for a panic `engine-main` contained, and (plan 4 Task
+//! 10) for every live solution the cache refused to store (`cache_reject`). Nothing of these paths
+//! goes to the process's stderr, which a windowed app does not show, except the first refused cache
+//! entry of a session, which `EngineCore::log_cache_reject` also reports there once.
+//!
+//! `DecisionRecord::cache` is the delivered `Final`'s `assumptions.cache` (`miss`, `exact`,
+//! `approximate` or `provisional`, spec 4.4), plan 4 Task 10's cache result of the decision.
 //!
 //! Most fields on `DecisionRecord`/`InputRecord` are plain integer/bool/`String`s with no numeric
 //! domain of their own, or a nested `proto` type (`DecisionIdentity`, `Street`, `Coverage`,
@@ -244,7 +249,7 @@ impl<'de> Deserialize<'de> for DecisionRecord {
 pub struct DiagnosticRecord {
     /// Engine-clock milliseconds when it happened.
     pub at_ms: u64,
-    /// `kill`, `restart`, `tree_mismatch` or `panic`.
+    /// `kill`, `restart`, `tree_mismatch`, `panic` or `cache_reject`.
     pub event: String,
     /// The decision concerned, when one is.
     pub identity: Option<DecisionIdentity>,

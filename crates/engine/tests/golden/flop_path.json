@@ -1,0 +1,2467 @@
+{
+  "chart_hit": {
+    "log": [
+      {
+        "cache": "approximate",
+        "coverage": {
+          "kind": "Approximate",
+          "reasons": [
+            {
+              "kind": "ChartRounded"
+            }
+          ]
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "approximate",
+            "coverage": {
+              "kind": "Approximate",
+              "reasons": [
+                {
+                  "kind": "ChartRounded"
+                }
+              ]
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [50]",
+              "cache source storage mode: f32",
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "cache_approximate",
+        1
+      ]
+    ],
+    "solves": [],
+    "stored": [
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 10,
+        "pot": 100,
+        "reasons": [
+          {
+            "kind": "ChartRounded"
+          }
+        ],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      }
+    ]
+  },
+  "cold_srp_best_so_far": {
+    "log": [
+      {
+        "cache": "miss",
+        "coverage": {
+          "kind": "Approximate",
+          "reasons": [
+            {
+              "kind": "DeadlineBestSoFar",
+              "reached_bp": 190,
+              "target_bp": 50
+            }
+          ]
+        },
+        "final_violation": false,
+        "reached_bp": 190,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "miss",
+            "coverage": {
+              "kind": "Approximate",
+              "reasons": [
+                {
+                  "kind": "DeadlineBestSoFar",
+                  "reached_bp": 190,
+                  "target_bp": 50
+                }
+              ]
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 190,
+            "source": "solver-worker@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 190 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "live",
+        1
+      ]
+    ],
+    "solves": [
+      "flop_fast_v1"
+    ],
+    "stored": [
+      {
+        "exploitability_over_P": 0.01899999976158142,
+        "export": "street",
+        "nodes": 10,
+        "pot": 100,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      }
+    ]
+  },
+  "cold_srp_raw_target_ok": {
+    "log": [
+      {
+        "cache": "miss",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "miss",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "solver-worker@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "live",
+        1
+      ]
+    ],
+    "solves": [
+      "flop_fast_v1"
+    ],
+    "stored": [
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 10,
+        "pot": 100,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      }
+    ]
+  },
+  "disk_blocked": {
+    "log": [
+      {
+        "cache": "miss",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "miss",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "solver-worker@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "live",
+        1
+      ]
+    ],
+    "solves": [
+      "flop_fast_v1"
+    ],
+    "stored": []
+  },
+  "exact_synthetic_hit": {
+    "log": [
+      {
+        "cache": "exact",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "exact",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [50]",
+              "cache source storage mode: f32",
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "cache_exact",
+        1
+      ]
+    ],
+    "solves": [],
+    "stored": [
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 10,
+        "pot": 100,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      }
+    ]
+  },
+  "menu_only": {
+    "log": [
+      {
+        "cache": "approximate",
+        "coverage": {
+          "kind": "Approximate",
+          "reasons": [
+            {
+              "kind": "MenuRounded",
+              "max_delta_pct": 1.0
+            }
+          ]
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.20000000298023224,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 0.699999988079071,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "approximate",
+            "coverage": {
+              "kind": "Approximate",
+              "reasons": [
+                {
+                  "kind": "MenuRounded",
+                  "max_delta_pct": 1.0
+                }
+              ]
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [50]",
+              "cache source storage mode: f32",
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "cache_approximate",
+        1
+      ]
+    ],
+    "solves": [],
+    "stored": [
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 10,
+        "pot": 200,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      }
+    ]
+  },
+  "missed_path": {
+    "log": [
+      {
+        "cache": "miss",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 10.399999618530273,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 11.399999618530273,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "miss",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "solver-worker@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "live",
+        1
+      ]
+    ],
+    "solves": [
+      "flop_fast_v1"
+    ],
+    "stored": [
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "truncated",
+        "nodes": 1,
+        "pot": 100,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      }
+    ]
+  },
+  "presolver_miss_live_template_hit": {
+    "log": [
+      {
+        "cache": "exact",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_min_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 75
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "exact",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [75]",
+              "cache source storage mode: f32",
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 75
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_min_v1",
+            "translations": [],
+            "tree_signature": "f20551b7839aca03398db01c14f38134036adc4869c8db64d14fcb4f5993dc7d"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "cache_exact",
+        1
+      ]
+    ],
+    "solves": [],
+    "stored": [
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 6,
+        "pot": 100,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_min_v1"
+      }
+    ]
+  },
+  "presolver_provisional_live_template_exact": {
+    "log": [
+      {
+        "cache": "exact",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_min_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 75
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "exact",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [75]",
+              "cache source storage mode: f32",
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 75
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_min_v1",
+            "translations": [],
+            "tree_signature": "f20551b7839aca03398db01c14f38134036adc4869c8db64d14fcb4f5993dc7d"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "cache_exact",
+        1
+      ]
+    ],
+    "solves": [],
+    "stored": [
+      {
+        "exploitability_over_P": 0.01899999976158142,
+        "export": "street",
+        "nodes": 10,
+        "pot": 100,
+        "reasons": [
+          {
+            "kind": "ChartRounded"
+          }
+        ],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      },
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 6,
+        "pot": 100,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_min_v1"
+      }
+    ]
+  },
+  "provisional_then_no_iteration": {
+    "log": [
+      {
+        "cache": "provisional",
+        "coverage": {
+          "kind": "Approximate",
+          "reasons": [
+            {
+              "kind": "ChartRounded"
+            }
+          ]
+        },
+        "final_violation": false,
+        "reached_bp": 190,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Provisional",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "provisional",
+            "coverage": {
+              "kind": "Approximate",
+              "reasons": [
+                {
+                  "kind": "ChartRounded"
+                }
+              ]
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [50]",
+              "cache source storage mode: f32",
+              "headline: highest EV"
+            ],
+            "phase": "provisional",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 190,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 190 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          },
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "provisional",
+            "coverage": {
+              "kind": "Approximate",
+              "reasons": [
+                {
+                  "kind": "ChartRounded"
+                }
+              ]
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [50]",
+              "cache source storage mode: f32",
+              "headline: highest EV",
+              "live refinement failed (deadline exceeded at stage solving); the retained cache payload 0.019000 is delivered"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 190,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 190 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "cache_provisional",
+        1
+      ]
+    ],
+    "solves": [
+      "flop_fast_v1",
+      "flop_min_v1"
+    ],
+    "stored": [
+      {
+        "exploitability_over_P": 0.01899999976158142,
+        "export": "street",
+        "nodes": 10,
+        "pot": 100,
+        "reasons": [
+          {
+            "kind": "ChartRounded"
+          }
+        ],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      }
+    ]
+  },
+  "provisional_then_ok": {
+    "log": [
+      {
+        "cache": "provisional",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Provisional",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "provisional",
+            "coverage": {
+              "kind": "Approximate",
+              "reasons": [
+                {
+                  "kind": "ChartRounded"
+                }
+              ]
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [50]",
+              "cache source storage mode: f32",
+              "headline: highest EV"
+            ],
+            "phase": "provisional",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 190,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 190 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          },
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "provisional",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "solver-worker@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "live",
+        1
+      ]
+    ],
+    "solves": [
+      "flop_fast_v1"
+    ],
+    "stored": [
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 10,
+        "pot": 100,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      }
+    ]
+  },
+  "provisional_then_worse_best_so_far": {
+    "log": [
+      {
+        "cache": "provisional",
+        "coverage": {
+          "kind": "Approximate",
+          "reasons": [
+            {
+              "kind": "ChartRounded"
+            },
+            {
+              "kind": "DeadlineBestSoFar",
+              "reached_bp": 300,
+              "target_bp": 50
+            }
+          ]
+        },
+        "final_violation": false,
+        "reached_bp": 190,
+        "street": "flop",
+        "street_violation": true,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Provisional",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "provisional",
+            "coverage": {
+              "kind": "Approximate",
+              "reasons": [
+                {
+                  "kind": "ChartRounded"
+                }
+              ]
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [50]",
+              "cache source storage mode: f32",
+              "headline: highest EV"
+            ],
+            "phase": "provisional",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 190,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 190 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          },
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "provisional",
+            "coverage": {
+              "kind": "Approximate",
+              "reasons": [
+                {
+                  "kind": "ChartRounded"
+                },
+                {
+                  "kind": "DeadlineBestSoFar",
+                  "reached_bp": 300,
+                  "target_bp": 50
+                }
+              ]
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [50]",
+              "cache source storage mode: f32",
+              "headline: highest EV",
+              "live refinement reached raw 0.030000; the retained cache payload 0.019000 is better"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 190,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 190 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "cache_provisional",
+        1
+      ]
+    ],
+    "solves": [
+      "flop_fast_v1"
+    ],
+    "stored": [
+      {
+        "exploitability_over_P": 0.01899999976158142,
+        "export": "street",
+        "nodes": 10,
+        "pot": 100,
+        "reasons": [
+          {
+            "kind": "ChartRounded"
+          }
+        ],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      }
+    ]
+  },
+  "retry_min_is_stored_on_its_own_tree": {
+    "log": [
+      {
+        "cache": "miss",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_min_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 75
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "miss",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 75
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "solver-worker@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_min_v1",
+            "translations": [],
+            "tree_signature": "f20551b7839aca03398db01c14f38134036adc4869c8db64d14fcb4f5993dc7d"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "live",
+        1
+      ]
+    ],
+    "solves": [
+      "flop_fast_v1",
+      "flop_min_v1"
+    ],
+    "stored": [
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 6,
+        "pot": 100,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_min_v1"
+      }
+    ]
+  },
+  "river_no_store": {
+    "log": [
+      {
+        "cache": "miss",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "river",
+        "street_violation": false,
+        "template_id": "river_std_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 33
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.2916666567325592,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 75
+                },
+                "ev_bb": 2.4000000953674316,
+                "frequency": 0.2916666567325592,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "allin",
+                  "to": 955
+                },
+                "ev_bb": 3.4000000953674316,
+                "frequency": 0.2916666567325592,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "miss",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5071693062782288
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 33
+                },
+                0.16427689790725708
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 75
+                },
+                0.16427689790725708
+              ],
+              [
+                {
+                  "kind": "allin",
+                  "to": 955
+                },
+                0.16427689790725708
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "solver-worker@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "river_std_v1",
+            "translations": [],
+            "tree_signature": "9760c144e1f47abb7c345e0bceab352a60fe733e171a14b3084dbe94eaca7ef2"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "river",
+        "live",
+        1
+      ]
+    ],
+    "solves": [
+      "river_std_v1"
+    ],
+    "stored": []
+  },
+  "spr_and_menu": {
+    "log": [
+      {
+        "cache": "approximate",
+        "coverage": {
+          "kind": "Approximate",
+          "reasons": [
+            {
+              "actual": 9.550000190734863,
+              "kind": "SprBucketed",
+              "used": 9.5
+            },
+            {
+              "kind": "MenuRounded",
+              "max_delta_pct": 5.0
+            }
+          ]
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.20000000298023224,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 50
+                },
+                "ev_bb": 0.699999988079071,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "approximate",
+            "coverage": {
+              "kind": "Approximate",
+              "reasons": [
+                {
+                  "actual": 9.550000190734863,
+                  "kind": "SprBucketed",
+                  "used": 9.5
+                },
+                {
+                  "kind": "MenuRounded",
+                  "max_delta_pct": 5.0
+                }
+              ]
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [50]",
+              "cache source storage mode: f32",
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 50
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "cache_approximate",
+        1
+      ]
+    ],
+    "solves": [],
+    "stored": [
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 10,
+        "pot": 200,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      }
+    ]
+  },
+  "srp_live_flop_min": {
+    "log": [
+      {
+        "cache": "miss",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_min_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 75
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "miss",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 75
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "solver-worker@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_min_v1",
+            "translations": [],
+            "tree_signature": "f20551b7839aca03398db01c14f38134036adc4869c8db64d14fcb4f5993dc7d"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "live",
+        1
+      ]
+    ],
+    "solves": [
+      "flop_min_v1"
+    ],
+    "stored": [
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 6,
+        "pot": 100,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_min_v1"
+      }
+    ]
+  },
+  "stale_result": {
+    "log": [],
+    "served": [
+      {
+        "kinds": [
+          "Fast"
+        ],
+        "results": []
+      }
+    ],
+    "snapshots": [],
+    "solves": [
+      "flop_fast_v1"
+    ],
+    "stored": []
+  },
+  "three_bet_fast": {
+    "log": [
+      {
+        "cache": "miss",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 21,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_fast_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 95
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "miss",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 95
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 21,
+            "source": "solver-worker@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 22 bp",
+            "template_id": "flop_fast_v1",
+            "translations": [],
+            "tree_signature": "00af8a426c88571d76a6da185f285f5afe6b0bb2ef54a5e185c021d5b16f6a8f"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "live",
+        1
+      ]
+    ],
+    "solves": [
+      "flop_fast_v1"
+    ],
+    "stored": [
+      {
+        "exploitability_over_P": 0.0021052631892656023,
+        "export": "street",
+        "nodes": 10,
+        "pot": 190,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      }
+    ]
+  },
+  "turn_store_then_hit": {
+    "log": [
+      {
+        "cache": "miss",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "turn",
+        "street_violation": false,
+        "template_id": "turn_std_v1"
+      },
+      {
+        "cache": "exact",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "turn",
+        "street_violation": false,
+        "template_id": "turn_std_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 33
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.4375,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 75
+                },
+                "ev_bb": 2.4000000953674316,
+                "frequency": 0.4375,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "miss",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5090869069099426
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 33
+                },
+                0.24545656144618988
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 75
+                },
+                0.24545656144618988
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "solver-worker@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "turn_std_v1",
+            "translations": [],
+            "tree_signature": "927af6c30fc9e19976326794b45ff863b6e59828e7a5a2046b4524a0231dad31"
+          }
+        ]
+      },
+      {
+        "kinds": [
+          "Fast",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 33
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.4375,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 75
+                },
+                "ev_bb": 2.4000000953674316,
+                "frequency": 0.4375,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "exact",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 2,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [33, 75]",
+              "cache source storage mode: f32",
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5090869069099426
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 33
+                },
+                0.24545656144618988
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 75
+                },
+                0.24545656144618988
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "turn_std_v1",
+            "translations": [],
+            "tree_signature": "927af6c30fc9e19976326794b45ff863b6e59828e7a5a2046b4524a0231dad31"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "turn",
+        "live",
+        1
+      ],
+      [
+        "turn",
+        "cache_exact",
+        2
+      ]
+    ],
+    "solves": [
+      "turn_std_v1"
+    ],
+    "stored": [
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 18,
+        "pot": 100,
+        "reasons": [],
+        "street": "turn",
+        "target_bp": 50,
+        "template": "turn_std_v1"
+      }
+    ]
+  },
+  "two_provisionals_the_better_retained": {
+    "log": [
+      {
+        "cache": "provisional",
+        "coverage": {
+          "kind": "Exact"
+        },
+        "final_violation": false,
+        "reached_bp": 40,
+        "street": "flop",
+        "street_violation": false,
+        "template_id": "flop_min_v1"
+      }
+    ],
+    "served": [
+      {
+        "kinds": [
+          "Fast",
+          "Provisional",
+          "Final"
+        ],
+        "results": [
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 75
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "provisional",
+            "coverage": {
+              "kind": "Approximate",
+              "reasons": []
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "cache realized menu at the requested node: [75]",
+              "cache source storage mode: f32",
+              "headline: highest EV"
+            ],
+            "phase": "provisional",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 75
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 120,
+            "source": "cache@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 121 bp",
+            "template_id": "flop_min_v1",
+            "translations": [],
+            "tree_signature": "f20551b7839aca03398db01c14f38134036adc4869c8db64d14fcb4f5993dc7d"
+          },
+          {
+            "actions": [
+              {
+                "action": {
+                  "kind": "check"
+                },
+                "ev_bb": 0.4000000059604645,
+                "frequency": 0.125,
+                "headline": false,
+                "unavailable": null
+              },
+              {
+                "action": {
+                  "kind": "bet",
+                  "to": 75
+                },
+                "ev_bb": 1.399999976158142,
+                "frequency": 0.875,
+                "headline": true,
+                "unavailable": null
+              }
+            ],
+            "cache": "provisional",
+            "coverage": {
+              "kind": "Exact"
+            },
+            "decision_id": 1,
+            "hand_revision": 1,
+            "mappings": [],
+            "notes": [
+              "headline: highest EV"
+            ],
+            "phase": "final",
+            "range_mix": [
+              [
+                {
+                  "kind": "check"
+                },
+                0.5089285969734192
+              ],
+              [
+                {
+                  "kind": "bet",
+                  "to": 75
+                },
+                0.4910714328289032
+              ]
+            ],
+            "reached_bp": 40,
+            "source": "solver-worker@9d1509fe5077d019825f833eed04b16d342dfda1",
+            "source_accuracy": "exploitability <= 41 bp",
+            "template_id": "flop_min_v1",
+            "translations": [],
+            "tree_signature": "f20551b7839aca03398db01c14f38134036adc4869c8db64d14fcb4f5993dc7d"
+          }
+        ]
+      }
+    ],
+    "snapshots": [
+      [
+        "flop",
+        "live",
+        1
+      ]
+    ],
+    "solves": [
+      "flop_min_v1"
+    ],
+    "stored": [
+      {
+        "exploitability_over_P": 0.03,
+        "export": "street",
+        "nodes": 10,
+        "pot": 100,
+        "reasons": [
+          {
+            "kind": "ChartRounded"
+          }
+        ],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_fast_v1"
+      },
+      {
+        "exploitability_over_P": 0.004000000059604645,
+        "export": "street",
+        "nodes": 6,
+        "pot": 100,
+        "reasons": [],
+        "street": "flop",
+        "target_bp": 50,
+        "template": "flop_min_v1"
+      }
+    ]
+  }
+}

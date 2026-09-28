@@ -805,21 +805,14 @@ fn superseding_a_request_cancels_its_equity_and_its_own_final_does_not() {
 fn classifier_rows_and_refused_ranges_are_answered_without_the_worker() {
     let mut r = rig("early", vec![]);
     let start = hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), Seat(0), Seat(2), Some([card("Ah"), card("Ad")]));
-    let unsupported = |message: &str| Coverage::Unsupported { reason: UnsupportedReason::EngineError { message: message.into(), retryable: false }, partial: vec![] };
     // UTG to act: no decision
     let no_decision = serve(&mut r, &start);
     let e = events_of(&r, &no_decision);
     assert!(e.len() == 1 && matches!(&e[0].event, RecommendationEvent::NoDecision { reason, .. } if reason == "another seat is to act"), "{e:?}");
-    // BB facing a raise preflop (the hand the flop below continues)
-    let preflop = play(&start, &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold]);
     // three players see the flop: multiway, no numeric EV
     let three = board(&play(&start, &[Action::Fold, Action::Fold, Action::Call, Action::Call, Action::Fold, Action::Check]), "Kh 7d 2c");
     let id = serve(&mut r, &three);
     assert_eq!(finals(&r, &id).iter().map(|f| f.2.coverage.clone()).collect::<Vec<_>>(), [Coverage::Unsupported { reason: UnsupportedReason::MultiwayEv { pot_eligible: 3 }, partial: vec![] }]);
-    // a heads-up flop: the plan-4 hook
-    let flop = board(&play(&preflop, &[Action::Call]), "Kh 7d 2c");
-    let id = serve(&mut r, &flop);
-    assert_eq!(finals(&r, &id).iter().map(|f| f.2.coverage.clone()).collect::<Vec<_>>(), [unsupported("no flop path in this build (plan 4)")]);
     // a river whose root ranges the range source refuses
     *r.core.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: None, ip: None });
     let id = serve(&mut r, &river_state());
@@ -828,7 +821,6 @@ fn classifier_rows_and_refused_ranges_are_answered_without_the_worker() {
     assert!(r.state.lock().unwrap().sent.is_empty() && kills_and_restarts(&r) == (0, 0), "nothing reaches the worker");
     let logged: Vec<(Street, Coverage)> = records(&r).into_iter().map(|x| (x.street, x.coverage)).collect();
     assert_eq!(logged, [(Street::Flop, Coverage::Unsupported { reason: UnsupportedReason::MultiwayEv { pot_eligible: 3 }, partial: vec![] }),
-        (Street::Flop, unsupported("no flop path in this build (plan 4)")),
         (Street::River, Coverage::Unsupported { reason: UnsupportedReason::InvalidRanges, partial: vec![] })]);
 }
 
