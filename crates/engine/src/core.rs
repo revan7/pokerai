@@ -129,6 +129,10 @@ pub struct EngineCore {
     /// test's). A lookup runs on the request's own `fast-path` work, never on `watchdog` or `engine-main`. The pre-solver
     /// handle is not here: it lives on `Engine` (Task 16), so a status or pause command never waits for this core.
     pub cache: cache::Cache,
+    /// The live flop template policy (plan 4 Task 9, spec 10.1): whether V3 admitted `flop_min_v1` for single-raised
+    /// pots. `FlopPolicy::from_v3(None, None)` as built, the conservative policy (`flop_fast_v1` for every flop), until
+    /// provenance-matching V3 evidence is loaded (`flop::load_v3_policy`) before the core is handed to `engine-main`.
+    pub flop_policy: crate::flop::FlopPolicy,
     /// `shutdown` has run.
     shut_down: bool,
 }
@@ -153,6 +157,7 @@ impl EngineCore {
             pending_cancel: None,
             preflop: Arc::new(PreflopStore::from_sources(vec![])),
             cache: cache::Cache::disabled(),
+            flop_policy: crate::flop::FlopPolicy::from_v3(None, None),
             shut_down: false,
         }
     }
@@ -285,6 +290,16 @@ mod tests {
         assert_eq!(c.cache.availability_warning(), None);
         drop(c);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan 4 Task 9: every core starts with the conservative flop policy (`flop_min_v1` not admitted, V3 evidence not
+    /// loaded), so a single-raised-pot flop decision is solved live with `flop_fast_v1`.
+    #[test]
+    fn a_core_starts_with_the_conservative_flop_policy() {
+        let c = core();
+        assert_eq!(c.flop_policy, crate::flop::FlopPolicy::from_v3(None, None));
+        assert!(!c.flop_policy.min_admitted);
+        assert_eq!(c.flop_policy.live_template(2), "flop_fast_v1");
     }
 
     /// Ids are decimal strings from 1, never reused; the active identity is read through the shared state.

@@ -1,4 +1,5 @@
-//! Engine integration-test support: `CacheRig` (plan 4 Task 8), the spec section 13.1 T4 harness over the real cache.
+//! Engine integration-test support: `CacheRig` (plan 4 Task 8), the spec section 13.1 T4 harness over the real cache,
+//! and (plan 4 Task 9) `engine_with_fake_worker` / `game_config`, an `Engine` over plan 2's fake worker and clock.
 //!
 //! A rig materializes one template with the production tree builder (`engine::tree::build_tree_full`) at a flop street
 //! root (board Kh7d2c, OOP `Seat(2)`, IP `Seat(0)`, equal effective stacks, dead 0, `bb_chips: 2`, public board-only
@@ -312,4 +313,26 @@ impl Drop for CacheRig {
     fn drop(&mut self) {
         self.cache.shutdown();
     }
+}
+
+/// Plan 4 Task 9: an `Engine` started by `Engine::with_core` over plan 2's rigs, a `FakeWorker` that never replies
+/// (`FakeReply::Hang`) and a `FakeClock` at 0 ms, with the core's default session config and no hand in progress. Its
+/// decision log goes to a per-process, per-call temporary directory nothing else writes.
+#[allow(dead_code)] // `cache_key_structural_identity.rs` declares this module privately (`mod support;`) and never calls it
+pub fn engine_with_fake_worker() -> engine::Engine {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let clock = engine::testing::FakeClock::new();
+    let identity = std::sync::Arc::new(std::sync::Mutex::new(engine::identity::IdentityState::new()));
+    let (worker, _state) = engine::testing::FakeWorker::scripted(clock.clone(), identity.clone(), vec![engine::testing::FakeReply::Hang]);
+    let log_dir = std::env::temp_dir().join(format!("pokerai-engine-fake-worker-{}-{n}", std::process::id()));
+    let core = engine::core::EngineCore::new(worker, clock, identity, engine::log::DecisionLog::open(&log_dir));
+    engine::Engine::with_core(core)
+}
+
+/// Plan 4 Task 9: the session `GameConfig` of plan 2's `testing::cfg_1_2()` (blinds 5/10 chips, 5% pot rake capped at 5
+/// chips, no straddle, solver preferences 16 threads / 50 bp / `flop_budget_s` 10).
+#[allow(dead_code)] // `cache_key_structural_identity.rs` declares this module privately (`mod support;`) and never calls it
+pub fn game_config() -> proto::GameConfig {
+    engine::testing::cfg_1_2().0
 }

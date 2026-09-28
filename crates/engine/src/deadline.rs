@@ -14,6 +14,12 @@ pub const PIPE_MARGIN_MS: u64 = 50;
 /// §7: the watchdog emits `Final` this long before the final delivery deadline.
 pub const WATCHDOG_LEAD_MS: u64 = 100;
 
+/// §4.2 / §13.3: the per-session flop budget is 1..=30 seconds, default 10. The range is `Engine::set_config`'s own
+/// (`engine::FLOP_BUDGET_RANGE`, plan 2 Task 29), so this and the validation it performs cannot disagree.
+pub fn flop_budget_valid(flop_budget_s: u8) -> bool {
+    crate::engine::FLOP_BUDGET_RANGE.contains(&flop_budget_s)
+}
+
 /// §7 street budgets: river 2 s, turn 6 s, flop `flop_budget_s`.
 pub fn street_budget_ms(street: Street, flop_budget_s: u8) -> u64 {
     match street {

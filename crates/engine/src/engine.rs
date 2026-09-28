@@ -461,6 +461,11 @@ impl Engine {
 
     pub fn state(&self) -> Option<HandState> { self.state.clone() }
 
+    /// Settings UI reads the accepted next-hand configuration, not the frozen active one.
+    pub fn config(&self) -> GameConfig {
+        self.queued_config.clone().unwrap_or_else(|| self.config.clone())
+    }
+
     /// `&mut self` and idempotent: Tauri managed state cannot move out of the handle (spec §3.5); a second call does
     /// nothing. In order (ruling 29-I2): the hand is invalidated and the last request's equity cancelled (one identity
     /// hold), so a request still running stops at its next identity check rather than at its deadline; scheduling stops
