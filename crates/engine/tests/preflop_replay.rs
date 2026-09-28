@@ -738,7 +738,10 @@ fn a_cap_residual_alone_is_disclosed_once_as_the_cap() {
     close(f64::from(f.unresolved_mass), share, 1e-6, "hero's unresolved share is the residual's");
     close(frequencies(&f).iter().sum::<f64>() + f64::from(f.unresolved_mass), 1.0, 1e-6, "sum(frequency) + unresolved_mass = 1");
     assert!(f.assumptions.notes.iter().any(|n| n.ends_with("% of the posterior has no strategy")), "{:?}", f.assumptions.notes);
-    assert!(f.assumptions.notes.iter().any(|n| n.contains("cap residual")), "the deduplication is disclosed: {:?}", f.assumptions.notes);
+    // Ruling 19-I1 (P3.T19 fix round 1): the assembly itself now discloses the residual-only share as the cap (spec
+    // 8.4), which deduplicates by value with the replay's cap reason above; it never produces the "missing node" wording
+    // that the engine used to withdraw with a note, so there is nothing to withdraw and no such note.
+    assert!(rs.iter().all(|x| !matches!(x, ApproxReason::BranchResidual { cause, .. } if cause.starts_with("missing node "))), "no missing-node wording: {rs:?}");
     assert!(f.actions.iter().all(|a| !a.headline) && headline_note(&f).is_none());
 }
 

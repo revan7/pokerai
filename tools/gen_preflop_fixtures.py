@@ -790,11 +790,19 @@ def assemble_expected(case: dict) -> dict:
                 why = {"kind": "NoEvReference"}
             out["actions"].append({"action": a, "frequency": freq, "ev_bb": ev, "unavailable": why, "headline": False})
     if unresolved > 0:
-        missing = [k for k in positive if not has[k] and not branches[k]["residual"] and by_id.get(branches[k]["id"])]
-        known = [k for k in range(len(branches)) if not branches[k]["residual"] and by_id.get(branches[k]["id"])]
-        key = by_id[branches[heaviest(missing or known)]["id"]]["key"]
-        out["reasons"].append({"kind": "BranchResidual", "seat": case["hero"], "residual_mass_pct": 100 * unresolved,
-                               "cause": f"missing node {key}"})
+        # Spec section 8.4's causes, only those actually incurred (section 2; ruling 19-I1): the cap
+        # residual's own share is "cap"; the share of positive branches whose key has no node (stopped,
+        # or live without one) is "missing node <key>", the heaviest such branch's key.
+        capped = [k for k in positive if not has[k] and branches[k]["residual"]]
+        missing = [k for k in positive if not has[k] and not branches[k]["residual"]]
+        if capped:
+            out["reasons"].append({"kind": "BranchResidual", "seat": case["hero"],
+                                   "residual_mass_pct": 100 * math.fsum(pi[k] for k in capped), "cause": "cap"})
+        if missing:
+            keyed = [k for k in missing if by_id.get(branches[k]["id"], {}).get("key")]
+            key = by_id[branches[heaviest(keyed)]["id"]]["key"] if keyed else "no retained key"
+            out["reasons"].append({"kind": "BranchResidual", "seat": case["hero"],
+                                   "residual_mass_pct": 100 * math.fsum(pi[k] for k in missing), "cause": f"missing node {key}"})
         out["notes"].append(f"{100 * unresolved:.1f}% of the posterior has no strategy")
     # Section 4.4's headline, only ever with nothing unresolved.
     acts = out["actions"]
@@ -818,8 +826,8 @@ def assembly_cases() -> list:
     def raise_to(to: int) -> dict:
         return {"kind": "raise", "to": to}
 
-    def branch(id_: int, q: float, residual: bool = False, zero: list | None = None) -> dict:
-        return {"id": id_, "q": q, "residual": residual, "stopped": None, "zero_combos": zero or []}
+    def branch(id_: int, q: float, residual: bool = False, zero: list | None = None, stopped: str | None = None) -> dict:
+        return {"id": id_, "q": q, "residual": residual, "stopped": stopped, "zero_combos": zero or []}
 
     def at(branch_id: int, key: str, actions: list | None = None, probs: list | None = None, evs: list | None = None,
            source: str = "PokerDataJson", ev_reference: str = "decision_incremental_verified") -> dict:
@@ -849,6 +857,15 @@ def assembly_cases() -> list:
          [at(0, "golden:after raise A"), at(1, "golden:after raise B")]),
         ("hero_out_of_support", [branch(0, 1.0, zero=[hero_combo])],
          [at(0, "golden:out of support", menu, [.5, .3, .2], [0.0, 1.0, 3.0])]),
+        # A node actually missing (ruling 19-I1): branch B's lookup found no node for hero, so its
+        # share is "missing node <B's key>".
+        ("missing_node_partial", [branch(0, .6), branch(1, .4)],
+         [at(0, "golden:after raise A", **t7_b), at(1, "golden:after raise B")]),
+        # Both causes at once: the cap residual (0.5), a branch stopped on a missing node (0.1) and a
+        # live branch with hero's node (0.4): one reason per cause, shares 50% and 10%.
+        ("cap_beside_missing_node",
+         [branch(0, .5, residual=True), branch(1, .1, stopped="missing node golden:k-missing"), branch(2, .4)],
+         [at(1, "golden:k-missing"), at(2, "golden:k-live", **t7_b)]),
     ]
     out = []
     for name, branches, nodes in cases:

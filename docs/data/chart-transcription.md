@@ -3304,6 +3304,21 @@ assertion (ruling 15-D2 placed the postflop halves in `tests/snapshots.rs`).
 
 Plan 2's identity, deadline and analytic goldens are unchanged by this task.
 
+### Fix round 1 (2026-09-28): residual causes (ruling 19-I1)
+
+The task review (P3.T19-I1) found that `t7_residual_no_headline` froze `BranchResidual { cause:
+"missing node golden:after raise B" }` although both live nodes are present and only the cap
+residual lacks a strategy. Spec section 8.4's cause vocabulary is `"cap" | "missing node <key>" |
+"uncovered path <ordinal path>"` and section 2 emits only reasons actually incurred, so
+`core_preflop::mix_nodes` now discloses hero's unresolved share per cause -- the cap residual's
+share as `cause: "cap"`, the share of positive branches whose key has no node as `cause: "missing
+node <key>"` -- and the oracle does the same. `bet_translation_golden.json` was regenerated from
+the corrected oracle: that row now freezes `{seat: 0, residual_mass_pct: 5, cause: "cap"}`, and two
+rows were added (`missing_node_partial`, a node actually missing; `cap_beside_missing_node`, both
+causes at once), so the assembly section has nine rows. `replay_weights_golden.json` is
+byte-identical (SHA-256 `0E47B1D7087FD1C25B9F965F2F553E477522C207F04499247F658E7025E8687B` before
+and after).
+
 ## Independent blind re-read of the 100bb grids (2026-09-26)
 
 A second agent, different from the transcriber, re-read all 22 grids (pages 3-6 physical) from fresh pypdfium2 renders in reverse row order with the committed transcription closed, wrote its own values for every cell, and only then diffed them programmatically against `fixtures/charts/transcription/pokercoaching_100.json`: 3,718 cells read, 0 mismatches; the page-6 SB grid reduced to its first action also matches node 4 (169 cells, 0 mismatches); an independent pixel classification agrees on all 3,718 cells and no cell is mixed. Orientation (suited above the diagonal, offsuit below) and grid-to-node assignment were confirmed on the pages, and eight absent inventory rows were spot-checked as genuinely absent. The flagged node "SB facing the BB 3bet" (row 23) is kept as transcribed: its 10.5bb 3bet is page 2's in-position 3.5x rule (the BB acts in position against the SB preflop); node 20 (BB vs SB raise) uses the same size, so any later change must update both. This blind re-read satisfies the Step 5 hidden-first-pass requirement; the transcriber's own reverse re-read was not blind (disclosed above). Evidence: the plan-3 SDD workspace file `task-5-visual-verification.md`.

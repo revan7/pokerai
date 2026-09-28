@@ -454,9 +454,10 @@ fn bet_translation_golden() {
 
     // Branch-supported assembly and its headline: the T7 frequency headline, the chart and
     // unverified-source wordings, a complete-EV headline, no headline with unresolved mass, no node
-    // anywhere, and hero out of support with the range mix.
+    // anywhere, hero out of support with the range mix, and the residual share by cause (ruling
+    // 19-I1: the cap residual's share is "cap", a missing node's is "missing node <key>").
     let assembly = v["assembly"].as_array().expect("assembly rows");
-    assert_eq!(assembly.len(), 7);
+    assert_eq!(assembly.len(), 9);
     for case in assembly {
         check_assembly(case, tol(&v, "probability"));
     }
