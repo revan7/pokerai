@@ -119,6 +119,12 @@ pub struct ReplayOutput {
 /// The current street's own postflop actions are never replayed: Plan 2's street-root solve inserts
 /// them exactly. A preflop stop is scoped to the preflop street (spec section 9.3), so it clears
 /// once the hand has entered a postflop street; the residual never changes.
+///
+/// Precondition on `input.snapshots` (P3.T14): [`ReplayInput`] has no model revision, so the slice
+/// must already be filtered to one hand, config revision and model revision -- the engine passes
+/// [`SnapshotStore::for_identity`](crate::SnapshotStore::for_identity) of the active decision, and a
+/// baseline caller without the engine passes `model_revision = 0` snapshots only. Replay never
+/// derives the active model from an arbitrary snapshot; the engine remains the identity authority.
 pub fn replay(input: ReplayInput) -> ReplayOutput {
     let mut output = ReplayOutput {
         ranges: vec![None; 6],

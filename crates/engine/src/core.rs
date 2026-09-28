@@ -91,7 +91,8 @@ pub struct EngineCore {
     /// The furthest stage the live request has reached, shared with the watchdog (`watchdog::Armed::stage`), which
     /// reports it in `Unsupported{DeadlineExceeded{stage}}`.
     pub stage: Arc<Mutex<String>>,
-    /// Shared with `Engine` so a mutation can invalidate snapshots without waiting for a running request.
+    /// `core_replay::SnapshotStore` (re-exported by `crate::snapshots`, plan 3 Task 14). Shared with `Engine` so a
+    /// mutation can invalidate snapshots without waiting for a running request.
     pub snapshots: Arc<Mutex<SnapshotStore>>,
     /// Read once, as a snapshot, at the start of each request.
     pub config: Arc<Mutex<GameConfig>>,
