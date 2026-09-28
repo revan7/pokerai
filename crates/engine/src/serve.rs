@@ -16,10 +16,13 @@
 //! One request. `serve_request` classifies the decision (§6) and answers at once every row the classifier settles
 //! alone; a degraded engine (a worker whose `ready` was refused at startup, spec 12, ruling 29-I4) answers every
 //! decision that way too, with the version mismatch. For a heads-up river or turn decision it reads the public root
-//! ranges from the range source (§9: the only provider, which owns their validation, rulings 27-D3/D4), emits `Fast` (§5
-//! step 5), starts the `fast-path` equity thread (§3.4), solves through the solve client (`solve::run_solve`, Tasks
-//! 22-23), assembles the `Final` (§4.4, §5 step 7), registers a validated solution as a snapshot (§9.2) and logs the
-//! decision (§5 step 10).
+//! ranges from the range source (§9: the only provider, which owns their validation, rulings 27-D3/D4; in production the
+//! replay's, plan 3 Task 18), emits `Fast` (§5 step 5), starts the `fast-path` equity thread (§3.4), solves through the
+//! solve client (`solve::run_solve`, Tasks 22-23), assembles the `Final` (§4.4, §5 step 7), registers a validated
+//! solution as a snapshot (§9.2) and logs the decision (§5 step 10). A heads-up postflop decision that ends with no
+//! solution (the flop guard, a refused range, a failed solve, the watchdog's `Final`) records its miss instead, with the
+//! engine's cause, under the same identity rule (plan 3 Task 18, spec 9.3): a later replay names that cause for a street
+//! left without a snapshot.
 //!
 //! Identity (ruling 28-I1). Every event goes through `deliver` (`emit` for the crate): it is accepted under the
 //! identity lock, where a decision no longer active is refused and a `Final` claims the request's once-only delivery,
@@ -40,15 +43,16 @@
 //!
 //! One `Final` (§7, ruling 28-I2). The engine's `Final` and the watchdog's race for one claim (`Armed::delivered`); the
 //! fire records what it delivered and when (`Armed::fired`). The engine claims its candidate in `finish`: the snapshot
-//! of a solved candidate is registered under the identity lock as part of the accepted claim (§9.2), and the `Final`
-//! delivered is the one logged. When the watchdog won, during the solve or while the candidate was prepared, the
-//! candidate is discarded, registers nothing (and, won during the solve, no candidate or analytic fallback is even
-//! built), and the decision log records the watchdog's `Final` with its delivery time. Until the fire the watchdog's
-//! fallback is refreshed as the request learns more, so a watchdog `Final` keeps the range source's reasons and the
-//! assumptions known by then (ruling 28-I6; spec 6). Nothing but an `Equity` of the request follows its delivered
-//! `Final` (ruling 28-N1; spec 7, spec 4.4): the request's `Fast` carries its claim, and so does the solve client's
-//! `Progress` (`SolvePlan::final_claim`, re-review observation O5), and `deliver` drops either, under the sink lock,
-//! once the watchdog has delivered.
+//! of a solved candidate is registered under the identity lock as part of the accepted claim (§9.2, by the one
+//! registration rule, `replay_bridge::register_accepted`), and the `Final` delivered is the one logged. When the
+//! watchdog won, during the solve or while the candidate was prepared, the candidate is discarded, registers nothing
+//! (and, won during the solve, no candidate or analytic fallback is even built; a heads-up postflop decision records the
+//! watchdog's cause as its miss, superseded since or not), and the decision log records the watchdog's `Final` with its
+//! delivery time. Until the fire the watchdog's fallback is refreshed as the request learns more, so a watchdog `Final`
+//! keeps the range source's reasons and the assumptions known by then (ruling 28-I6; spec 6). Nothing but an `Equity`
+//! of the request follows its delivered `Final` (ruling 28-N1; spec 7, spec 4.4): the request's `Fast` carries its
+//! claim, and so does the solve client's `Progress` (`SolvePlan::final_claim`, re-review observation O5), and `deliver`
+//! drops either, under the sink lock, once the watchdog has delivered.
 //!
 //! Panics (final review I3, ruling F-I3). `engine-main` serves each request inside `catch_unwind`. A panic (an always-on
 //! assert of an internal invariant) is contained at that boundary by `contain_panic`: the request's `Final`, unless the
@@ -99,13 +103,15 @@ use crate::deadline::Deadlines;
 use crate::equity::{equity_summary_with_clock, pending_summary, EQUITY_BUDGET_MS};
 use crate::identity::IdentityState;
 use crate::log::{DecisionRecord, InputRecord};
-use crate::snapshots::{SnapshotKey, SnapshotProvenance, StreetSnapshot};
+use crate::replay_bridge::{miss_cause, miss_cause_of_final, miss_for, register_accepted, snapshot_from_solution};
+use crate::snapshots::StreetSnapshot;
 use crate::solve::{run_solve, SolvePlan, Terminal};
 use crate::tree::{build_tree_full, tree_signature, TemplateSelection, Templates};
 use crate::watchdog::{Armed, Fired, SharedSink, StreetDeadline, Watchdog};
 use crate::EngineError;
 use core_model::derive;
 use core_ranges::hash_scaled;
+use core_replay::SnapshotMiss;
 use proto::worker::SOLVER_COMMIT;
 use proto::{
     combo_index, ApproxReason, Assumptions, Card, Coverage, DecisionIdentity, Derived, EquitySummary, GameConfig, HandState, LegalAction, Phase, Range1326,
@@ -323,7 +329,7 @@ pub(crate) struct Hooks {
     /// claim is consulted.
     after_active_check: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Runs on `engine-main` inside the accepted claim of the engine's own `Final`, under the identity lock, immediately
-    /// before a solved candidate's snapshot is registered.
+    /// before a solved candidate's snapshot is registered (never before a miss is recorded).
     at_registration: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -421,9 +427,15 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     let claim = Claim { watch, equity_cancel: &equity_cancel };
     // Spec 12 (ruling 29-I4): a worker whose `ready` was refused at startup (a degraded engine, `WorkerLink::refused`)
     // answers every decision with the non-retryable version mismatch, before anything else runs and without launching
-    // the refused build.
+    // the refused build. A heads-up postflop decision records that engine error as its miss (plan 3 Task 18).
     if let Some(refusal) = core.worker.refused().map(|refusal| format!("worker/proto version mismatch: {refusal}")) {
-        settle(core, req, hooks, &claim, d.street, assemble::unsupported(&ctx, engine_error(&refusal), vec![], assumptions));
+        let reason = engine_error(&refusal);
+        let rec = assemble::unsupported(&ctx, reason.clone(), vec![], assumptions);
+        let candidate = match &class {
+            Classification::HuStreet { root, .. } => Candidate::missed(rec, miss_for(&req.identity, root, miss_cause(&reason))),
+            _ => Candidate::unsolved(rec),
+        };
+        finish(core, req, hooks, &claim, candidate, Logged::unsolved(d.street, None, vec![]));
         return;
     }
     let (root, inherited, facing_allin_flag, opponent) = match class {
@@ -444,9 +456,13 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
         }
         Classification::HuStreet { root, reasons, facing_allin, opponent } => (root, reasons, facing_allin, opponent),
     };
-    // PLAN 4 HOOK: the flop path (cache lookup, pre-solver templates, flop budget) replaces this guard.
+    // PLAN 4 HOOK: the flop path (cache lookup, pre-solver templates, flop budget) replaces this guard. Until then a flop
+    // decision records its engine error as the flop's miss (plan 3 Task 18, spec 9.3).
     if root.street == Street::Flop {
-        settle(core, req, hooks, &claim, root.street, assemble::unsupported(&ctx, engine_error("no flop path in this build (plan 4)"), inherited, assumptions));
+        let reason = engine_error("no flop path in this build (plan 4)");
+        let miss = miss_for(&req.identity, &root, miss_cause(&reason));
+        let candidate = Candidate::missed(assemble::unsupported(&ctx, reason, inherited, assumptions), miss);
+        finish(core, req, hooks, &claim, candidate, Logged::unsolved(root.street, None, vec![]));
         return;
     }
     assert!(matches!(root.street, Street::Turn | Street::River), "a heads-up street root on {:?}", root.street);
@@ -457,13 +473,16 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     let deadlines = watch.deadlines;
     let street_deadline = watch.street_deadline.clone();
 
-    // Fast phase (§5 step 5). The range source's lock is released at the end of this statement, before any emission.
+    // Fast phase (§5 step 5). The range source's lock is released at the end of this statement, before any emission. In
+    // production the source is the replay's (plan 3 Task 18: `replay_bridge::ReplayRanges`, installed by `Engine::new`),
+    // which owns the ranges' validation; nothing here validates them again (rulings 27-D3/D4).
     let ranges = lock(&core.range_source).ranges_at_root(&req.state, &root);
     let ranges = match ranges {
         Ok(r) => r,
         Err(reason) => {
             let logged = Logged::unsolved(root.street, Some(street_deadline.clone()), vec![]);
-            finish(core, req, hooks, &claim, Candidate::unsolved(assemble::unsupported(&ctx, reason, inherited, assumptions)), logged);
+            let miss = miss_for(&req.identity, &root, miss_cause(&reason));
+            finish(core, req, hooks, &claim, Candidate::missed(assemble::unsupported(&ctx, reason, inherited, assumptions), miss), logged);
             return;
         }
     };
@@ -487,7 +506,8 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
         Ok(b) => b,
         Err(reason) => {
             let logged = Logged::unsolved(root.street, Some(street_deadline.clone()), range_hashes);
-            finish(core, req, hooks, &claim, Candidate::unsolved(assemble::unsupported(&ctx, reason, inherited, assumptions)), logged);
+            let miss = miss_for(&req.identity, &root, miss_cause(&reason));
+            finish(core, req, hooks, &claim, Candidate::missed(assemble::unsupported(&ctx, reason, inherited, assumptions), miss), logged);
             return;
         }
     };
@@ -517,13 +537,18 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     if !active {
         // Superseded while it ran (§4.4): no candidate `Final` and no snapshot for a decision that is no longer active,
         // and its equity is cancelled (ruling 28-I4); a `Final` its watchdog delivered while it was still active is
-        // logged (ruling W3-I1), and nothing else is.
+        // logged (ruling W3-I1), and is the decision's outcome, its miss (plan 3 Task 18); nothing else is recorded.
         retire_stale(core, req, &claim, &logged);
+        if let Some(cause) = watchdog_cause(watch) {
+            record_delivered_miss(core, miss_for(&req.identity, &root, cause));
+        }
     } else if watch.delivered.load(Ordering::SeqCst) {
         // The watchdog won the delivery during the solve (ruling 28-I2): nothing of a candidate is built, no analytic
-        // fallback runs, and the `Final` it delivered is the one logged.
+        // fallback runs, and the `Final` it delivered is the one logged. The decision registers no solution: its miss is
+        // the watchdog's cause (plan 3 Task 18).
         core.watchdog.disarm(watch.generation);
         let fired = watchdog_final(&watch.fired);
+        record_delivered_miss(core, miss_for(&req.identity, &root, miss_cause_of_final(&fired.rec)));
         log_final(core, req, watch, Delivered { at_ms: fired.at_ms, rec: &fired.rec, by_watchdog: true, best_so_far: false }, &logged);
     } else {
         assumptions.elapsed_ms = elapsed_ms(req.t0_ms, returned_ms);
@@ -542,26 +567,28 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
                 let coverage = assemble::coverage_for_solve(sol.exploitability_chips, build.pot, config.solver.target_bp, best_so_far, inherited.clone());
                 let requested = sol.requested as usize;
                 let reach = assemble::hero_reach(&sol.nodes, &out.ordinal_paths, requested, hero_public, hero_actor);
-                // Registered only as part of this `Final`'s accepted delivery (§9.2, ruling 28-I2). Keyed by the public
-                // root ranges solved (hero's cards are in neither) and the solved tree's signature; the solved prefix is
-                // the street's observed history at the root; the covered paths are the ordinal paths the solve client
-                // resolved from the wire chip paths (§2). Built before `assumptions` moves into the `Final`. The key's
-                // config revision is the identity's, the hand's (ruling F-I4).
-                let snapshot = StreetSnapshot {
-                    key: SnapshotKey { hand_id: req.identity.hand_id, config_revision: req.identity.config_revision, model_revision: req.identity.model_revision,
-                        street: root.street, root_board: root.board.clone(), root_range_hashes: [hash_scaled(&ranges.oop), hash_scaled(&ranges.ip)],
-                        tree_signature: assumptions.tree_signature.clone() },
-                    provenance: SnapshotProvenance { identity_at_solve: req.identity.clone(), solved_prefix: root.history.clone(), origin: "live".into() },
-                    tree: out.tree.clone(), nodes: sol.nodes.clone(), covered_paths: out.ordinal_paths.clone(), exploitability_chips: sol.exploitability_chips,
-                    reasons: inherited.clone() };
+                // Registered only as part of this `Final`'s accepted delivery (§9.2, ruling 28-I2), by the one registration
+                // rule (plan 3 Task 18: `replay_bridge::register_accepted`). Built by `snapshot_from_solution` from the input
+                // actually solved: the public root ranges, which are the replay's own published ranges (so a later replay
+                // finds the snapshot by their hashes, Task 15 Q4; hero's cards are in neither), the street root and its
+                // history (the solved prefix, the projected root's for a projection), and the tree the answering attempt
+                // solved (the `_min` retry's when it answered), whose materialized nodes the solve client resolved every
+                // wire chip path against (`solve::validate`, §2's single rule) into `out.ordinal_paths`: the nodes the
+                // worker exported, never reconstructed. Its reasons are the ones this decision inherited. Built before
+                // `assumptions` moves into the `Final`. The key's config revision is the identity's, the hand's (ruling F-I4).
+                let solved = SolveInput { root: input.root.clone(), ranges: input.ranges.clone(), tree: out.tree.clone(), target_bp: input.target_bp };
+                let snapshot = snapshot_from_solution(&req.identity, &solved, sol, out.ordinal_paths.clone(), assumptions.tree_signature.clone(), "live",
+                    inherited.clone());
                 let rec = assemble::final_from_solution(&ctx, &sol.nodes[requested], &reach, coverage, assumptions);
-                Candidate { rec, snapshot: Some(snapshot), best_so_far }
+                Candidate { rec, record: Record::Snapshot(snapshot), best_so_far }
             }
             Terminal::Failed(reason) => {
                 // §5 step 7 / §6: facing an all-in with the worker failing, the analytic fallback answers.
                 let worker_failed = matches!(reason, UnsupportedReason::EngineError { .. } | UnsupportedReason::DeadlineExceeded { .. });
                 let analytic = if facing_allin_flag && worker_failed { analytic_allin(req, &d, hero_public, opp_public, &equity_cancel) } else { None };
-                Candidate::unsolved(match analytic {
+                // No solution to register: the worker's failure is the street's miss (plan 3 Task 18), analytic answer or not.
+                let miss = miss_for(&req.identity, &root, miss_cause(reason));
+                Candidate::missed(match analytic {
                     Some(a) => {
                         let mut rec = assemble::unsupported(&ctx, reason.clone(), vec![], assumptions);
                         rec.coverage = assemble::accumulate(Coverage::Approximate { reasons: vec![ApproxReason::UnconditionedCurrentStreet] }, inherited.clone());
@@ -571,7 +598,7 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
                         rec
                     }
                     None => assemble::unsupported(&ctx, reason.clone(), inherited.clone(), assumptions),
-                })
+                }, miss)
             }
         };
         finish(core, req, hooks, &claim, candidate, logged);
@@ -630,17 +657,62 @@ pub(crate) struct Claim<'a> {
     equity_cancel: &'a AtomicBool,
 }
 
-/// A `Final` the engine prepared, the snapshot its accepted delivery registers (§9.2) and whether it is a
+/// A `Final` the engine prepared, what its accepted delivery records in the snapshot store (§9.2) and whether it is a
 /// `best_so_far` (§12's violation rule).
 struct Candidate {
     rec: Recommendation,
-    snapshot: Option<StreetSnapshot>,
+    record: Record,
     best_so_far: bool,
 }
 
 impl Candidate {
-    /// A `Final` with no solution behind it.
-    fn unsolved(rec: Recommendation) -> Self { Self { rec, snapshot: None, best_so_far: false } }
+    /// A `Final` with no solution behind it, and no street root to record a miss at (a row the classifier settles).
+    fn unsolved(rec: Recommendation) -> Self { Self { rec, record: Record::Nothing, best_so_far: false } }
+
+    /// A heads-up postflop decision's `Final` with no solution behind it, and the miss its accepted delivery records.
+    fn missed(rec: Recommendation, miss: SnapshotMiss) -> Self { Self { rec, record: Record::Miss(miss), best_so_far: false } }
+}
+
+/// What a candidate's accepted delivery records in the snapshot store, under the identity lock, as part of the claim
+/// (§9.2; plan 3 Task 18).
+enum Record {
+    /// A validated solution: registered as a snapshot, by the one registration rule (`replay_bridge::register_accepted`).
+    Snapshot(StreetSnapshot),
+    /// A heads-up postflop decision answered with no solution: its miss, with the engine's cause (spec 9.3), which names
+    /// the street's `UnconditionedPriorStreet` for a later replay when the street has no snapshot (Task 15 Q2).
+    Miss(SnapshotMiss),
+    /// Nothing: a row the classifier settles alone, the preflop path.
+    Nothing,
+}
+
+impl Record {
+    /// The miss this record's decision leaves when the watchdog's `Final` is delivered in the engine's place, with the
+    /// cause `cause`: the decision registers no solution then. `None` for a row with no street root.
+    fn missed_with(self, cause: String) -> Option<SnapshotMiss> {
+        match self {
+            Record::Snapshot(s) => Some(SnapshotMiss { identity: s.provenance.identity_at_solve, street: s.key.street, root_board: s.key.root_board,
+                prefix: s.provenance.solved_prefix, cause }),
+            Record::Miss(m) => Some(SnapshotMiss { cause, ..m }),
+            Record::Nothing => None,
+        }
+    }
+}
+
+/// The cause of the `Final` `watch`'s watchdog delivered, if it delivered one (plan 3 Task 18). Read once the generation
+/// is retired (`Watchdog::disarm`), so a fire in progress has recorded what it delivered.
+fn watchdog_cause(watch: &Watched) -> Option<String> {
+    lock(&watch.fired).as_ref().map(|fired| miss_cause_of_final(&fired.rec))
+}
+
+/// Records `miss`, the miss of a decision whose `Final` its watchdog delivered in the engine's place (plan 3 Task 18).
+/// The fire delivers only to a decision still active, checked under the identity lock (`watchdog`'s "Identity at the
+/// fire"), so the miss is that decision's delivered outcome and is recorded even when a mutation has superseded the
+/// decision since, as its delivered `Final` is logged (ruling W3-I1): the UI may act on that `Final` before
+/// `engine-main` gets here. A replay validates every miss against its own state on read, and the next mutation's
+/// invalidation keeps or drops it like any other. The store's lock is taken alone.
+fn record_delivered_miss(core: &EngineCore, miss: SnapshotMiss) {
+    let owner = miss.identity.clone();
+    lock(&core.snapshots).record_miss(&owner, miss);
 }
 
 /// The street verdict of a request's log record (§7).
@@ -694,32 +766,52 @@ pub(crate) fn settle(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, cl
 /// The one `Final` path (§5 steps 7, 9, 10; ruling 28-I2). The candidate's delivery is claimed under the identity lock:
 /// a decision no longer active gets no `Final` of the engine's and its candidate registers nothing (its equity is
 /// cancelled), and the log records only a `Final` its watchdog delivered while it was still active (`retire_stale`,
-/// ruling W3-I1); a claim the watchdog already won discards the candidate, which registers nothing, and logs the
-/// watchdog's `Final` with its delivery time; a claim won registers the candidate's snapshot under the same lock, as
-/// part of that accepted delivery, hands the `Final` to the sink with no engine lock held, and logs it. The claim and
-/// the handover are recorded on the request (`Watched::claimed_by_engine`, `Watched::handed`) for a panic's containment
-/// (ruling F2-I3). The request's watchdog generation is retired in every case.
+/// ruling W3-I1; a heads-up postflop decision whose `Final` its watchdog delivered records the watchdog's cause as its
+/// miss, plan 3 Task 18); a claim the watchdog already won discards the candidate, which registers nothing (a heads-up
+/// postflop decision records the watchdog's cause as its miss instead), and logs the watchdog's `Final` with its
+/// delivery time; a claim won records the candidate's `Record` under the same lock, as part of that accepted delivery (a
+/// solved candidate's snapshot by the one registration rule, an unsolved heads-up postflop decision's miss), hands the
+/// `Final` to the sink with no engine lock held, and logs it. The claim and the handover are recorded on the request
+/// (`Watched::claimed_by_engine`, `Watched::handed`) for a panic's containment (ruling F2-I3). The request's watchdog
+/// generation is retired in every case.
 fn finish(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, claim: &Claim<'_>, candidate: Candidate, logged: Logged) {
     if let Some(before_claim) = &hooks.before_claim {
         before_claim();
     }
     let at_ms = core.clock.now_ms();
-    let Candidate { rec, snapshot, best_so_far } = candidate;
+    let Candidate { rec, record, best_so_far } = candidate;
     let snapshots = &core.snapshots;
+    // Taken by the accepted claim; still here when the watchdog won it.
+    let mut record = Some(record);
     let verdict = accept(&core.identity, &req.identity, Some(&claim.watch.delivered), |active| {
         claim.watch.claimed_by_engine.store(true, Ordering::SeqCst);
-        if let Some(snapshot) = snapshot {
-            if let Some(at_registration) = &hooks.at_registration {
-                at_registration();
+        match record.take() {
+            Some(Record::Snapshot(snapshot)) => {
+                if let Some(at_registration) = &hooks.at_registration {
+                    at_registration();
+                }
+                register_accepted(&mut lock(snapshots), active, snapshot);
             }
-            lock(snapshots).register(active, snapshot);
+            Some(Record::Miss(miss)) => {
+                lock(snapshots).record_miss(active, miss);
+            }
+            Some(Record::Nothing) | None => {}
         }
     });
     match verdict {
-        Delivery::Stale => retire_stale(core, req, claim, &logged),
+        Delivery::Stale => {
+            retire_stale(core, req, claim, &logged);
+            // A `Final` the watchdog delivered while the decision was still active (ruling W3-I1) is its outcome.
+            if let Some(miss) = watchdog_cause(claim.watch).and_then(|cause| record.take().and_then(|r| r.missed_with(cause))) {
+                record_delivered_miss(core, miss);
+            }
+        }
         Delivery::AlreadyDelivered => {
             core.watchdog.disarm(claim.watch.generation);
             let fired = watchdog_final(&claim.watch.fired);
+            if let Some(miss) = record.take().and_then(|r| r.missed_with(miss_cause_of_final(&fired.rec))) {
+                record_delivered_miss(core, miss);
+            }
             log_final(core, req, claim.watch, Delivered { at_ms: fired.at_ms, rec: &fired.rec, by_watchdog: true, best_so_far: false }, &logged);
         }
         Delivery::Accepted => {
@@ -861,6 +953,7 @@ mod tests {
     use super::*;
     use crate::log::DecisionLog;
     use crate::ranges::ExplicitRanges;
+    use crate::snapshots::{SnapshotKey, SnapshotProvenance};
     use crate::testing::{board, hand, play, uniform_solution, FakeClock, FakeReply, FakeWorker, IdRef, RecordingSink};
     use proto::worker::{AckStatus, ResultStatus};
     use proto::{resolve_chip_path, Action, OrdinalPath};

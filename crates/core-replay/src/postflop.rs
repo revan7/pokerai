@@ -19,7 +19,11 @@
 //! root not reproducible` when compatible snapshots exist but none of their roots replays;
 //! otherwise it follows how the street opened (ruling 15-I2): `multiway prior street` with three
 //! or more pot-eligible seats -- even if a later hero decision admitted a projected heads-up root,
-//! which is a financial root, not a snapshot -- and `no compatible snapshot` heads-up.
+//! which is a financial root, not a snapshot -- and, heads-up, the engine's concrete cause when
+//! `ReplayInput::missing` names one for the street (P3.T18: an engine error, a deadline, no
+//! request made; spec section 9.3), else `no compatible snapshot`. A street walked through a
+//! selected snapshot reports that snapshot's provenance, its `origin` included, in
+//! `ReplayOutput::snapshots_used` (P3.T18, spec section 9.3).
 //!
 //! # One observed action is one transaction
 //!
@@ -86,8 +90,8 @@ use proto::{
 };
 
 /// No compatible snapshot for a street that opened heads-up (spec section 9.3): none registered,
-/// or none for these incoming ranges. ReplayInput carries no engine failure, deadline or
-/// no-request provenance, so this is the cause replay can state ([`fallback_cause`]).
+/// or none for these incoming ranges, and the engine named no concrete cause for the street
+/// (`ReplayInput::missing`: an engine failure, a deadline, no request; [`fallback_cause`]).
 const NO_SNAPSHOT: &str = "no compatible snapshot";
 /// Compatible snapshots exist, but the model reproduces none of their solved roots: concrete
 /// reconstruction provenance, preferred over the fallback cause.
@@ -155,10 +159,13 @@ pub fn walk_postflop(input: &ReplayInput, street: Street, output: &mut ReplayOut
     }
     let history = street_history(input.state, street);
     match choose(input, street, &history, output) {
-        Ok(chosen) => walk_street(street, &history, &chosen, output),
+        Ok(chosen) => {
+            output.snapshots_used.push((street, chosen.snapshot.provenance.clone()));
+            walk_street(street, &history, &chosen, output);
+        }
         Err(cause) => {
             for seat in acting_seats(&history) {
-                output.reasons.push(ApproxReason::UnconditionedPriorStreet { street, seat, cause: cause.into() });
+                output.reasons.push(ApproxReason::UnconditionedPriorStreet { street, seat, cause: cause.clone() });
             }
         }
     }
@@ -211,7 +218,7 @@ struct Chosen<'a> {
 }
 
 /// Selects the street's snapshot (see the module docs), or names why there is none.
-fn choose<'a>(input: &ReplayInput<'a>, street: Street, history: &[(Seat, Action)], output: &ReplayOutput) -> Result<Chosen<'a>, &'static str> {
+fn choose<'a>(input: &ReplayInput<'a>, street: Street, history: &[(Seat, Action)], output: &ReplayOutput) -> Result<Chosen<'a>, String> {
     let board = root_board(input.state, street);
     let model_revision = model_revision_of(input.snapshots);
     let roots = decision_roots(input.state, street);
@@ -222,7 +229,7 @@ fn choose<'a>(input: &ReplayInput<'a>, street: Street, history: &[(Seat, Action)
                 && s.key.street == street
                 && s.key.root_board == board
         });
-        return Err(if for_this_street { NOT_REPRODUCIBLE } else { fallback_cause(input.state, street) });
+        return Err(if for_this_street { NOT_REPRODUCIBLE.to_string() } else { fallback_cause(input, street) });
     };
     // Every hero decision root of one street names the same two seats: pot eligibility only
     // shrinks within a street, and each root has exactly two eligible seats.
@@ -235,7 +242,7 @@ fn choose<'a>(input: &ReplayInput<'a>, street: Street, history: &[(Seat, Action)
             r.ip
         );
     }
-    let Some(model_revision) = model_revision else { return Err(fallback_cause(input.state, street)) };
+    let Some(model_revision) = model_revision else { return Err(fallback_cause(input, street)) };
     let mask = board_mask(&board);
     let hash = |seat: Seat| core_ranges::hash_scaled(&public_range(&output.branches, seat, &mask));
     let key = CompatKey {
@@ -248,12 +255,12 @@ fn choose<'a>(input: &ReplayInput<'a>, street: Street, history: &[(Seat, Action)
     };
     let candidates: Vec<&StreetSnapshot> = input.snapshots.iter().filter(|s| compatible(&s.key, &key)).collect();
     if candidates.is_empty() {
-        return Err(fallback_cause(input.state, street));
+        return Err(fallback_cause(input, street));
     }
     // Coverage is measured on the heads-up line, the domain the snapshot's tree was built in.
     let heads_up: Vec<(Seat, Action)> = history.iter().copied().filter(|(s, _)| *s == oop || *s == ip).collect();
-    let selected =
-        select_among(candidates.into_iter().filter(|s| reproduce(&roots, s).is_some()), &key, &heads_up).ok_or(NOT_REPRODUCIBLE)?;
+    let selected = select_among(candidates.into_iter().filter(|s| reproduce(&roots, s).is_some()), &key, &heads_up)
+        .ok_or_else(|| NOT_REPRODUCIBLE.to_string())?;
     let root = reproduce(&roots, selected).expect("a selected snapshot reproduces its root");
     Ok(Chosen { snapshot: selected, root })
 }
@@ -282,15 +289,15 @@ fn model_revision_of(snapshots: &[StreetSnapshot]) -> Option<u32> {
 }
 
 /// The one cause for a street with no compatible heads-up snapshot and no more concrete
-/// provenance (ruling 15-I2): `multiway prior street` when the street OPENED with three or more
-/// pot-eligible seats -- whatever its later hero decisions admitted -- and `no compatible
-/// snapshot` when it opened heads-up.
-fn fallback_cause(state: &HandState, street: Street) -> &'static str {
-    if opened_multiway(state, street) {
-        MULTIWAY
-    } else {
-        NO_SNAPSHOT
+/// reconstruction provenance (ruling 15-I2): `multiway prior street` when the street OPENED with
+/// three or more pot-eligible seats -- whatever its later hero decisions admitted, and whatever the
+/// engine says; when it opened heads-up, the engine's concrete cause for the street
+/// (`ReplayInput::missing`, P3.T18; the first one it names), else `no compatible snapshot`.
+fn fallback_cause(input: &ReplayInput, street: Street) -> String {
+    if opened_multiway(input.state, street) {
+        return MULTIWAY.to_string();
     }
+    input.missing.iter().find(|(s, _)| *s == street).map_or_else(|| NO_SNAPSHOT.to_string(), |(_, cause)| cause.clone())
 }
 
 /// Whether `street` opened with three or more pot-eligible seats: the dealt seats that did not
@@ -715,6 +722,40 @@ mod tests {
         assert_eq!(s, 100.0 / 230.0);
         // A line that does not replay to the node's actor has no mapped parent.
         assert!(walk.mapped_parent(&[1], Seat(1)).is_none());
+    }
+
+    /// P3.T18 (Task 15 Q2, spec 9.3): a completed street that opened heads-up and has no compatible snapshot takes the
+    /// engine's concrete cause when the input names one (`ReplayInput::missing`), else `no compatible snapshot`; the
+    /// cause changes the disclosure only, never a mass. A street that opened multiway keeps `multiway prior street`,
+    /// whatever the engine says (ruling 15-I2). No snapshot selected, no provenance reported.
+    #[test]
+    fn the_engines_cause_names_a_street_without_a_snapshot() {
+        let cfg = proto::HandConfig { config_revision: 1, sb_chips: 5, bb_chips: 10, straddle: None, rake: proto::Rake::TimeCharge, chip_label: "$1".into() };
+        let begin = core_model::BeginHand { hand_id: 1, button: Seat(5), hero: Seat(0), dealt: (0..6).map(Seat).collect(), stacks_start: vec![1000; 6],
+            hero_cards: Some(core_model::parse_hand("AhAd").unwrap()) };
+        let start = core_model::begin_hand(&cfg, begin).unwrap();
+        let play = |s: HandState, actions: &[Action]| actions.iter().fold(s, |s, a| core_model::apply_action(&s, *a).unwrap());
+        let deal = |s: HandState, board: &str| core_model::set_board(&s, &core_model::parse_cards(board).unwrap()).unwrap();
+        let (f, c) = (Action::Fold, Action::Check);
+        let heads_up = deal(play(deal(play(start.clone(), &[f, f, f, f, Action::Raise { to: 30 }, Action::Call]), "Kh7d2c"), &[c, c]), "Kh7d2c4s");
+        let three_way = deal(play(deal(play(start, &[f, f, Action::Call, f, Action::Call, c]), "Kh7d2c"), &[c, c, c]), "Kh7d2c4s");
+        let store = core_preflop::PreflopStore::from_sources(vec![]);
+        let run = |state: &HandState, missing: &[(Street, String)]| crate::replay(ReplayInput { cfg: &state.config, state, store: &store, snapshots: &[], missing });
+        let flop_causes = |out: &ReplayOutput| {
+            out.reasons
+                .iter()
+                .filter_map(|r| match r { ApproxReason::UnconditionedPriorStreet { street: Street::Flop, seat, cause } => Some((*seat, cause.clone())), _ => None })
+                .collect::<Vec<_>>()
+        };
+        let named = vec![(Street::Flop, "engine error: no flop path".to_string())];
+        let generic = run(&heads_up, &[]);
+        let told = run(&heads_up, &named);
+        assert_eq!(flop_causes(&generic), [(Seat(0), NO_SNAPSHOT.to_string()), (Seat(1), NO_SNAPSHOT.to_string())]);
+        assert_eq!(flop_causes(&told), [(Seat(0), named[0].1.clone()), (Seat(1), named[0].1.clone())]);
+        assert_eq!(format!("{:?}", told.ranges), format!("{:?}", generic.ranges), "a cause changes no mass");
+        assert!(generic.snapshots_used.is_empty() && told.snapshots_used.is_empty());
+        let multiway = run(&three_way, &named);
+        assert_eq!(flop_causes(&multiway), [(Seat(0), MULTIWAY.to_string()), (Seat(1), MULTIWAY.to_string()), (Seat(4), MULTIWAY.to_string())]);
     }
 
     /// The walk path's two states: defined (no cause) or frozen (a cause, no ordinal).

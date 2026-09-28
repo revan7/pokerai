@@ -69,7 +69,7 @@ use crate::branches::{
     HistoryBranch,
 };
 use crate::postflop::{disclose_cap, walk_postflop};
-use crate::snapshot::StreetSnapshot;
+use crate::snapshot::{SnapshotProvenance, StreetSnapshot};
 use core_preflop::{
     interpolate, menu_step_index, ExpandedNode, Interpolation, PreflopAnswer, PreflopInvocation, PreflopNode, PreflopNodeKey,
     PreflopStep, PreflopStore,
@@ -80,12 +80,19 @@ use std::collections::BTreeMap;
 /// Everything one replay reads (spec section 9.1). `snapshots` are the street solutions
 /// registered for this hand, one identity's (see [`replay`]'s precondition); the postflop walk
 /// ([`walk_postflop`]) selects one per completed street.
+///
+/// `missing` (P3.T18, Task 15 Q2; beyond spec section 9.1's sketch, which has no field for it):
+/// the engine's concrete cause for each completed postflop street it knows to have no snapshot
+/// (spec section 9.3: an engine error, a deadline, no request made), `(street, cause)`. A street
+/// that opened heads-up and has no compatible snapshot is disclosed with that cause in place of
+/// the generic `no compatible snapshot`; a caller without the engine's provenance passes none.
 #[derive(Clone, Copy)]
 pub struct ReplayInput<'a> {
     pub cfg: &'a HandConfig,
     pub state: &'a HandState,
     pub store: &'a PreflopStore,
     pub snapshots: &'a [StreetSnapshot],
+    pub missing: &'a [(Street, String)],
 }
 
 /// One replay's result (spec section 9.1).
@@ -101,6 +108,10 @@ pub struct ReplayInput<'a> {
 /// - `reasons`: every approximation the replay made, in the order it made them.
 /// - `unsupported`: set when the ranges cannot be used at all (`InvalidRanges`, or a preflop lookup
 ///   the hand's format or history cannot have).
+/// - `snapshots_used` (P3.T18, Task 15 Q1; beyond spec section 9.1's sketch): for each completed
+///   street walked through a selected snapshot, in street order, that snapshot's provenance -- the
+///   identity it was validated under, its solved prefix and its `origin` (spec section 9.3: the
+///   origin is carried into the current result). A street walked without one has no entry.
 #[derive(Clone, Debug)]
 pub struct ReplayOutput {
     pub ranges: Vec<Option<Range1326>>,
@@ -109,6 +120,7 @@ pub struct ReplayOutput {
     pub log_reach: Vec<f64>,
     pub reasons: Vec<ApproxReason>,
     pub unsupported: Option<UnsupportedReason>,
+    pub snapshots_used: Vec<(Street, SnapshotProvenance)>,
 }
 
 /// Replays `input.state`'s public history into every dealt seat's public range (spec section 9):
@@ -124,7 +136,9 @@ pub struct ReplayOutput {
 /// residual never changes. At the output boundary a cap residual, whichever street's cap created
 /// it, is disclosed exactly once with its current share (spec section 8.4:
 /// `BranchResidual{seat: hero, residual_mass_pct, cause: "cap"}`, ruling 15-Q5), replacing any
-/// disclosure a postflop walk already recorded.
+/// disclosure a postflop walk already recorded. A completed street with no compatible snapshot is
+/// disclosed with the engine's cause from `input.missing` when it names one (P3.T18), and every
+/// snapshot a street was walked through reports its provenance in `snapshots_used`.
 ///
 /// Precondition on `input.snapshots` (P3.T14): [`ReplayInput`] has no model revision, so the slice
 /// must already be filtered to one hand, config revision and model revision -- the engine passes
@@ -165,6 +179,7 @@ fn replay_with(input: ReplayInput, lookups: bool) -> (ReplayOutput, Vec<Decision
         log_reach: vec![0.0; 6],
         reasons: vec![],
         unsupported: None,
+        snapshots_used: vec![],
     };
     let mut run = ReplayState::default();
     walk_preflop_with(&input, &mut output, &mut run);
@@ -810,6 +825,7 @@ mod tests {
             log_reach: vec![0.0; 6],
             reasons: vec![],
             unsupported: None,
+            snapshots_used: vec![],
         };
         clear_preflop_stops(&mut output);
         assert_eq!(output.branches[0].stopped, None);
@@ -828,7 +844,7 @@ mod tests {
         let begin = core_model::BeginHand { hand_id: 1, button: Seat(5), hero: Seat(2), dealt: (0..6).map(Seat).collect(), stacks_start: vec![1000; 6], hero_cards: None };
         let state = core_model::begin_hand(&cfg, begin).expect("a six-max table");
         let store = PreflopStore::from_sources(vec![]);
-        let input = ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &[] };
+        let input = ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &[], missing: &[] };
         let (output, lookups) = replay_decision(input);
         assert_eq!(format!("{output:?}"), format!("{:?}", replay(input)), "the replay output is replay's");
         assert_eq!(lookups.len(), 1);
@@ -839,7 +855,7 @@ mod tests {
             flop = core_model::apply_action(&flop, a).expect("a legal action");
         }
         let flop = core_model::set_board(&flop, &core_model::parse_cards("2c7dTh").expect("a flop")).expect("the flop");
-        let input = ReplayInput { cfg: &flop.config, state: &flop, store: &store, snapshots: &[] };
+        let input = ReplayInput { cfg: &flop.config, state: &flop, store: &store, snapshots: &[], missing: &[] };
         let (output, lookups) = replay_decision(input);
         assert!(lookups.is_empty(), "the preflop street is closed");
         assert_eq!(format!("{output:?}"), format!("{:?}", replay(input)));

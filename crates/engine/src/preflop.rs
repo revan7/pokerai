@@ -157,7 +157,8 @@ struct Replayed {
 
 impl Replayed {
     fn run(state: &HandState, store: &PreflopStore, snapshots: &[StreetSnapshot]) -> Self {
-        let (output, lookups) = replay_decision(ReplayInput { cfg: &state.config, state, store, snapshots });
+        // A preflop decision walks no postflop street, so the engine names no street's cause (plan 3 Task 18).
+        let (output, lookups) = replay_decision(ReplayInput { cfg: &state.config, state, store, snapshots, missing: &[] });
         let mut inherited = Vec::new();
         for r in output.reasons.iter().chain(lookups.iter().flat_map(|l| l.answer.reasons.iter())) {
             push_unique(&mut inherited, r.clone());

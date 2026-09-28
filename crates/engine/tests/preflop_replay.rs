@@ -444,7 +444,7 @@ fn close(a: f64, b: f64, tol: f64, what: &str) {
 
 /// The replay the engine runs for `state`, run independently here for the branch weights a test checks against.
 fn replayed(store: &PreflopStore, state: &HandState) -> core_replay::ReplayOutput {
-    core_replay::replay(core_replay::ReplayInput { cfg: &state.config, state, store, snapshots: &[] })
+    core_replay::replay(core_replay::ReplayInput { cfg: &state.config, state, store, snapshots: &[], missing: &[] })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1070,4 +1070,495 @@ fn a_missing_preflop_directory_is_a_banner_and_an_empty_store() {
     // 12, ruling 17-I2).
     assert_eq!(f.coverage, Coverage::Unsupported { reason: UnsupportedReason::MissingPreflopNode { key: "no bundle".into() }, partial: vec![] });
     assert!(f.assumptions.notes.contains(&"missing preflop node: no bundle".to_string()), "{:?}", f.assumptions.notes);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan 3 Task 18: the replayed public root ranges feed the turn and river solves, and every accepted solution registers
+// its snapshot through the one registration rule (spec 9, 9.2, 9.3, 10.2).
+//
+// The rig is Plan 2's public `Engine` on a scripted worker and a fake clock, with the committed chart bundles as its
+// loaded preflop store and the replay range source installed as `Engine::new` installs it. The hand: everyone folds to
+// hero in the small blind, who raises to 3 bb (the chart's own size), and the big blind calls (60 chips at the flop).
+// This build has no flop path (plan 4), so a flop snapshot enters the way plan 4's cache route will register one: a
+// validated cache-hit `Final` through `Engine::register_snapshot`.
+// ---------------------------------------------------------------------------------------------
+
+use core_replay::{ReplayInput, ReplayOutput, SnapshotProvenance, SnapshotStore, StreetSnapshot};
+use core_ranges::{hash_scaled, hero_conditioned, mass, range_to_string};
+use engine::replay_bridge::{opposing_equity_ranges, snapshot_from_solution, ReplayRanges};
+use engine::testing::{uniform_solution, FakeReply, IdRef};
+use engine::tree::{build_tree_full, tree_signature, TemplateSelection};
+use proto::worker::{AckStatus, ResultStatus, SolveRequest, StreetSolution, WorkerError};
+use proto::{OrdinalPath, SolveInput};
+
+/// Everyone folds to hero in the small blind (seat 0), who raises to 3 bb, and the big blind (seat 1) calls.
+const PREFLOP: [Action; 6] = [Action::Fold, Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Call];
+const FLOP: &str = "Kh7d2c";
+const TURN: &str = "Kh7d2c4s";
+const RIVER: &str = "Kh7d2c4s9c";
+
+/// The street tests' hand through `core_model` alone, as the engine plays it: hero in the small blind holding `cards` at
+/// the 5/10-chip, 100 bb table of `engine::testing::cfg_1_2`, `PREFLOP`, then each `(board, actions)` step in turn.
+fn line(cards: &str, steps: &[(&str, &[Action])]) -> HandState {
+    let (_, hc) = engine::testing::cfg_1_2();
+    let begin = core_model::BeginHand { hand_id: 1, button: BTN, hero: SB, dealt: (0..6).map(Seat).collect(), stacks_start: vec![1000; 6],
+        hero_cards: Some(core_model::parse_hand(cards).unwrap()) };
+    let mut s = act(&core_model::begin_hand(&hc, begin).expect("the model admits the table"), &PREFLOP);
+    for (board, actions) in steps {
+        s = act(&core_model::set_board(&s, &core_model::parse_cards(board).unwrap()).expect("the board"), actions);
+    }
+    s
+}
+
+/// `sol` with every combo's row leaning on one action (0.7 on action `combo % width`, the rest shared), so conditioning
+/// through it shows in the ranges; still a solution `validate_solution` accepts.
+fn lean(mut sol: StreetSolution) -> StreetSolution {
+    for node in &mut sol.nodes {
+        let width = node.actions.len();
+        for (c, row) in node.probs.iter_mut().enumerate() {
+            for (a, p) in row.iter_mut().enumerate() {
+                *p = if a == c % width { 0.7 } else { 0.3 / (width - 1) as f32 };
+            }
+        }
+    }
+    sol
+}
+
+/// The validated solution the fake worker answers for `state`'s street root on `template`, every node of the street
+/// exported and leaning (see `lean`).
+fn solved(state: &HandState, template: &str, expl: f32) -> StreetSolution {
+    let root = core_model::street_root(state).expect("a heads-up street root");
+    let b = build_tree_full(&root, &TemplateSelection::from_history(template, &root.history)).expect("the tree");
+    let sol = lean(uniform_solution(&b.tree, &b.history, expl));
+    proto::worker::validate_solution(&sol, &b.tree.materialized).expect("a solution the engine accepts");
+    sol
+}
+
+fn ack() -> FakeReply {
+    FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None }
+}
+
+fn answer(status: ResultStatus, sol: StreetSolution) -> FakeReply {
+    FakeReply::Result { id: IdRef::Last, status, solution: Some(sol), error: None, elapsed_ms: 3 }
+}
+
+/// `core_replay::replay` of `state` over `store` and `snapshots`, with the engine's causes `missing`.
+fn direct(store: &PreflopStore, state: &HandState, snapshots: &[StreetSnapshot], missing: &[(Street, String)]) -> ReplayOutput {
+    core_replay::replay(ReplayInput { cfg: &state.config, state, store, snapshots, missing })
+}
+
+fn seat_range(out: &ReplayOutput, seat: Seat) -> Range1326 {
+    out.ranges[usize::from(seat.0)].clone().expect("a dealt seat's published range")
+}
+
+/// A street snapshot of decision `id` at `state` (a hero decision), as plan 4's cache route will build one: solved on
+/// `template` from the public root ranges the replay over `snapshots` publishes there, every node exported and leaning,
+/// keyed and provenanced by `snapshot_from_solution` with `origin`.
+fn snapshot_at(state: &HandState, id: &DecisionIdentity, store: &PreflopStore, snapshots: &[StreetSnapshot], template: &str, origin: &str, expl: f32) -> StreetSnapshot {
+    let root = core_model::street_root(state).expect("a heads-up street root");
+    let out = direct(store, state, snapshots, &[]);
+    let ranges = [seat_range(&out, root.oop), seat_range(&out, root.ip)];
+    let b = build_tree_full(&root, &TemplateSelection::from_history(template, &root.history)).expect("the tree");
+    let sol = lean(uniform_solution(&b.tree, &b.history, expl));
+    let paths = proto::worker::validate_solution(&sol, &b.tree.materialized).expect("a valid solution");
+    let signature = tree_signature(&b.tree, b.pot);
+    let input = SolveInput { root, ranges, tree: b.tree, target_bp: 50 };
+    snapshot_from_solution(id, &input, &sol, paths, signature, origin, out.reasons)
+}
+
+/// Plan 2's public `Engine` on a scripted worker and a fake clock, with handles taken before the core is handed over.
+struct StreetRig {
+    e: engine::Engine,
+    clock: Arc<FakeClock>,
+    fake: Arc<Mutex<FakeState>>,
+    snapshots: Arc<Mutex<SnapshotStore>>,
+    preflop: Arc<PreflopStore>,
+    calls: Arc<Mutex<Vec<EquityCall>>>,
+    /// The engine's decision log directory (declared last: removed after the engine is dropped).
+    _log: TempDir,
+}
+
+/// The committed chart bundles as the loaded store, `EngineCore::install_replay_ranges` as `Engine::new` runs it, the
+/// stub equity routine, and `cfg_1_2` as the session config.
+fn street_rig(tag: &str, script: Vec<FakeReply>) -> StreetRig {
+    let clock = FakeClock::new();
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
+    let log = TempDir::new(&format!("street_{tag}"), false);
+    let mut core = EngineCore::new(worker, clock.clone(), identity, DecisionLog::open(&log));
+    core.preflop = Arc::new(PreflopStore::from_sources(charts()));
+    core.install_replay_ranges();
+    let (snapshots, preflop) = (core.snapshots.clone(), core.preflop.clone());
+    let calls: Arc<Mutex<Vec<EquityCall>>> = Arc::default();
+    let mut e = engine::Engine::with_core_and_seams(core, ServeSeams { equity: Some(stub_equity(calls.clone())), ..ServeSeams::default() });
+    e.set_config(engine::testing::cfg_1_2().0).unwrap();
+    StreetRig { e, clock, fake, snapshots, preflop, calls, _log: log }
+}
+
+impl StreetRig {
+    fn begin(&mut self, cards: &str) {
+        let begin = proto::BeginHand { button: BTN, hero: SB, dealt: (0..6).map(Seat).collect(), stacks: vec![1000; 6], hero_cards: Some(core_model::parse_hand(cards).unwrap()) };
+        self.e.begin_hand(begin).unwrap();
+    }
+
+    fn play(&mut self, actions: &[Action]) {
+        for a in actions {
+            self.e.apply_action(*a).unwrap_or_else(|e| panic!("{a:?}: {e}"));
+        }
+    }
+
+    fn deal(&mut self, board: &str) {
+        self.e.set_board(&core_model::parse_cards(board).unwrap()).unwrap();
+    }
+
+    fn state(&self) -> HandState {
+        self.e.state().expect("a hand in progress")
+    }
+
+    /// Recommends at the current decision and waits for its `Final` (and, when it has a `Fast`, its `Equity`).
+    fn ask(&mut self) -> (DecisionIdentity, Recommendation) {
+        let (sink, recorder) = RecordingSink::notifying(self.clock.clone(), None);
+        let id = self.e.recommend(Box::new(sink)).unwrap();
+        let mut n = 1;
+        loop {
+            let got = recorder.wait_for(n);
+            let seen = kinds(&got);
+            if seen.contains(&"Final") && (!seen.contains(&"Fast") || seen.contains(&"Equity")) {
+                let f = got.iter().find_map(|r| match &r.event { RecommendationEvent::Final(f) => Some(f.clone()), _ => None }).expect("the Final");
+                assert_eq!(f.identity, id);
+                return (id, f);
+            }
+            n = got.len() + 1;
+        }
+    }
+
+    /// Every `solve` the worker took, in order.
+    fn solves(&self) -> Vec<SolveRequest> {
+        self.fake.lock().unwrap().sent.iter().filter_map(|m| match m { EngineMessage::Solve(q) => Some(q.clone()), _ => None }).collect()
+    }
+
+    /// The one snapshot registered for decision `id`.
+    fn snapshot_of(&self, id: &DecisionIdentity) -> StreetSnapshot {
+        let store = self.snapshots.lock().unwrap();
+        let of: Vec<&StreetSnapshot> = store.for_hand(id.hand_id).into_iter().filter(|s| s.provenance.identity_at_solve == *id).collect();
+        assert_eq!(of.len(), 1, "one snapshot of decision {id:?}");
+        of[0].clone()
+    }
+
+    fn origins(&self, hand_id: u64) -> Vec<(Street, String)> {
+        self.snapshots.lock().unwrap().for_hand(hand_id).iter().map(|s| (s.key.street, s.provenance.origin.clone())).collect()
+    }
+}
+
+fn translated_on(rs: &[ApproxReason], street: Street, by: Seat) -> bool {
+    rs.iter().any(|r| matches!(r, ApproxReason::BetTranslation { street: s, seat, .. } if *s == street && *seat == by))
+}
+
+/// `(seat, cause)` of every `UnconditionedPriorStreet` of `street` among `rec`'s reasons, in order.
+fn unconditioned(rec: &Recommendation, street: Street) -> Vec<(Seat, String)> {
+    reasons(rec)
+        .into_iter()
+        .filter_map(|r| match r { ApproxReason::UnconditionedPriorStreet { street: s, seat, cause } if s == street => Some((seat, cause)), _ => None })
+        .collect()
+}
+
+/// Plan 3 Task 18 Step 1 (spec 9.2, 10.2; brief decisions 2, 5 and 6). One hand through the public `Engine`:
+///
+/// - the flop: hero's decision has no flop path in this build; its cache-hit `Final` (plan 4's route) registers through
+///   `Engine::register_snapshot`, which refuses the same identity once a mutation made it stale;
+/// - the turn root (a live `ok`): the worker's ranges are the replay's public ranges, whole, conditioned through the
+///   flop snapshot's nodes (the big blind's 44-chip bet, 73% of the pot and off the snapshot's 33%/75% menu, is
+///   translated: `BetTranslation{Flop}`); its money is the financial street root's; the replay output names the flop
+///   snapshot's provenance and origin; the `Final` inherits every replay reason; the snapshot is keyed by the ranges
+///   solved, provenanced `live` at the empty root history, with the worker's nodes and their resolved ordinal paths;
+///   `Equity` runs hero's public range against the big blind's, whose hero-conditioned copy is `opposing_equity_ranges`';
+/// - the same turn root with other hero cards: the solve request, the replay's branches and weights and the snapshot
+///   hashes are identical; only the equity's hero and hero's advice change;
+/// - facing the big blind's 108-chip turn bet (73%): the root ranges are unchanged (the current street is never
+///   replayed), Plan 2's tree inserts the 108 exactly, nothing is translated on the turn, and the worker's money is
+///   still the street root's, not the decision point's;
+/// - hero calls and the river comes (a live `best_so_far`): the replay conditions the turn from the registered nodes
+///   (the snapshot whose tree has the 108 inserted is selected), every reason inherited on the turn is still there,
+///   the flop translation included, and the `best_so_far` registers through the same rule.
+#[test]
+fn replay_feeds_street_root_solves() {
+    let (first, second) = ("KdJd", "KcTc");
+    let flop_line: &[Action] = &[Action::Check, Action::Bet { to: 44 }, Action::Call];
+    let turn_root = line(first, &[(FLOP, flop_line), (TURN, &[])]);
+    let turn_facing = act(&turn_root, &[Action::Check, Action::Bet { to: 108 }]);
+    let river_root = line(first, &[(FLOP, flop_line), (TURN, &[Action::Check, Action::Bet { to: 108 }, Action::Call]), (RIVER, &[])]);
+    let script = vec![
+        ack(), answer(ResultStatus::Ok, solved(&turn_root, "turn_std_v1", 0.2)),          // the turn root
+        ack(), answer(ResultStatus::Ok, solved(&turn_root, "turn_std_v1", 0.2)),          // the same root, other hero cards
+        ack(), answer(ResultStatus::Ok, solved(&turn_facing, "turn_std_v1", 0.1)),        // facing the 108 bet
+        ack(), answer(ResultStatus::BestSoFar, solved(&river_root, "river_std_v1", 5.0)), // the river root
+    ];
+    let mut t = street_rig("feeds", script);
+    let preflop = t.preflop.clone();
+    t.begin(first);
+    t.play(&PREFLOP);
+    t.deal(FLOP);
+
+    // The flop.
+    let flop = t.state();
+    let (d1, f1) = t.ask();
+    assert!(matches!(&f1.coverage, Coverage::Unsupported { reason: UnsupportedReason::EngineError { message, .. }, .. } if message.contains("no flop path")), "{:?}", f1.coverage);
+    let s_flop = snapshot_at(&flop, &d1, &preflop, &[], "flop_full_v1", "cache_exact", 0.3);
+    assert!(t.e.register_snapshot(&d1, s_flop.clone()), "the cache-hit Final of the active decision registers");
+    t.play(flop_line);
+    assert!(!t.e.register_snapshot(&d1, s_flop.clone()), "a stale identity never registers");
+    t.deal(TURN);
+
+    // The turn root.
+    let turn = t.state();
+    let root = core_model::street_root(&turn).unwrap();
+    assert_eq!((root.oop, root.ip, root.pot_root, root.stack_oop_root, root.stack_ip_root, root.history.clone()), (SB, BB, 148, 926, 926, vec![]));
+    let (d2, f2) = t.ask();
+    let req2 = t.solves()[0].clone();
+    let flop_only = [s_flop.clone()];
+    let replayed = direct(&preflop, &turn, &flop_only, &[]);
+    assert!(req2.oop_range == seat_range(&replayed, root.oop) && req2.ip_range == seat_range(&replayed, root.ip), "the solve's root ranges are the replay's, whole");
+    assert_eq!((req2.pot, req2.stack_oop, req2.stack_ip, &req2.board), (root.pot_root + root.dead_this_street, root.stack_oop_root, root.stack_ip_root, &root.board),
+        "the worker's money is the financial street root's");
+    let unconditioned_flop = direct(&preflop, &turn, &[], &[]);
+    assert!(seat_range(&unconditioned_flop, BB) != seat_range(&replayed, BB), "the flop snapshot's nodes condition the big blind");
+    assert!(translated_on(&replayed.reasons, Street::Flop, BB), "the off-menu flop bet is translated: {:?}", replayed.reasons);
+    assert_eq!(replayed.snapshots_used, vec![(Street::Flop, s_flop.provenance.clone())], "the selected snapshot's provenance and origin reach the replay output");
+    let r2 = reasons(&f2);
+    assert!(r2.len() >= 2 && replayed.reasons.iter().all(|r| r2.contains(r)), "the Final inherits every replay reason: {r2:?} vs {:?}", replayed.reasons);
+    assert_eq!(f2.assumptions.ranges_used, vec![(SB, range_to_string(&req2.oop_range), mass(&req2.oop_range)), (BB, range_to_string(&req2.ip_range), mass(&req2.ip_range))]);
+    let s2 = t.snapshot_of(&d2);
+    assert_eq!(s2.key.root_range_hashes, [hash_scaled(&req2.oop_range), hash_scaled(&req2.ip_range)], "keyed by the public ranges solved");
+    assert_eq!(s2.provenance, SnapshotProvenance { identity_at_solve: d2.clone(), solved_prefix: vec![], origin: "live".into() });
+    let sol2 = solved(&turn_root, "turn_std_v1", 0.2);
+    let resolved: Vec<OrdinalPath> = sol2.covered_paths.iter().map(|p| proto::resolve_chip_path(&req2.tree.materialized, p).unwrap()).collect();
+    assert!(s2.tree == req2.tree && s2.nodes == sol2.nodes && s2.covered_paths == resolved && s2.reasons == replayed.reasons, "the worker's nodes on the tree solved");
+    let hero_cards = turn.hero_cards.unwrap();
+    {
+        let calls = t.calls.lock().unwrap();
+        let call = calls.last().expect("the turn root's equity");
+        assert_eq!((call.hero, &call.hero_public, &call.opponents, &call.board), (Some(hero_cards), &req2.oop_range, &vec![(BB, req2.ip_range.clone())], &turn.board));
+    }
+    assert_eq!(opposing_equity_ranges(&replayed, &turn), vec![(BB, hero_conditioned(&req2.ip_range, hero_cards))]);
+
+    // The same turn root with other hero cards.
+    t.e.set_hero_cards(core_model::parse_hand(second).unwrap()).unwrap();
+    let turn_second = t.state();
+    let (d2b, f2b) = t.ask();
+    let req2b = t.solves()[1].clone();
+    assert!(SolveRequest { id: String::new(), ..req2b.clone() } == SolveRequest { id: String::new(), ..req2.clone() }, "hero's cards change nothing the solve sees");
+    let replayed_second = direct(&preflop, &turn_second, &flop_only, &[]);
+    assert_eq!(format!("{:?}", replayed_second.branches), format!("{:?}", replayed.branches), "the branches, their weights q and their masses");
+    assert_eq!(t.snapshot_of(&d2b).key.root_range_hashes, s2.key.root_range_hashes);
+    assert_eq!((&f2b.coverage, &f2b.assumptions), (&f2.coverage, &f2.assumptions));
+    assert!(f2b.actions != f2.actions, "hero's advice follows hero's combo");
+    {
+        let calls = t.calls.lock().unwrap();
+        let (a, b) = (&calls[calls.len() - 2], &calls[calls.len() - 1]);
+        assert_eq!((&a.hero_public, &a.opponents, &a.board), (&b.hero_public, &b.opponents, &b.board), "only the equity's hero changes");
+        assert!(a.hero != b.hero);
+    }
+
+    // Facing the big blind's 108-chip turn bet.
+    t.play(&[Action::Check, Action::Bet { to: 108 }]);
+    let facing = t.state();
+    let facing_root = core_model::street_root(&facing).unwrap();
+    assert_eq!(facing_root.history, vec![(SB, Action::Check), (BB, Action::Bet { to: 108 })]);
+    let (d3, f3) = t.ask();
+    let req3 = t.solves()[2].clone();
+    assert!(req3.oop_range == req2.oop_range && req3.ip_range == req2.ip_range, "the current street's actions never enter the root ranges");
+    assert!(req3.tree.inserted.iter().any(|(_, _, a)| *a == Action::Bet { to: 108 }), "Plan 2's tree inserts the observed size exactly: {:?}", req3.tree.inserted);
+    let at_decision = core_model::derive(&facing);
+    assert_eq!((req3.pot, req3.stack_oop, req3.stack_ip), (148, 926, 926), "the street root's money");
+    assert_eq!((at_decision.pot, at_decision.stacks_remaining[usize::from(BB.0)]), (256, 818), "not the decision point's");
+    assert!(!reasons(&f3).iter().any(|r| matches!(r, ApproxReason::BetTranslation { street: Street::Turn, .. })), "{:?}", f3.coverage);
+
+    // Hero calls; the river.
+    t.play(&[Action::Call]);
+    t.deal(RIVER);
+    let river = t.state();
+    let river_root_snap = core_model::street_root(&river).unwrap();
+    let (d4, f4) = t.ask();
+    let req4 = t.solves()[3].clone();
+    let before: Vec<StreetSnapshot> = t.snapshots.lock().unwrap().for_identity(&d4).into_iter().filter(|s| s.key.street != Street::River).collect();
+    let replayed4 = direct(&preflop, &river, &before, &[]);
+    assert!(req4.oop_range == seat_range(&replayed4, river_root_snap.oop) && req4.ip_range == seat_range(&replayed4, river_root_snap.ip), "the river's root ranges are the replay's");
+    let s3 = t.snapshot_of(&d3);
+    assert_eq!(replayed4.snapshots_used, vec![(Street::Flop, s_flop.provenance.clone()), (Street::Turn, s3.provenance.clone())]);
+    let turn_unconditioned = direct(&preflop, &river, &flop_only, &[]);
+    assert!(seat_range(&turn_unconditioned, SB) != seat_range(&replayed4, SB), "the turn is conditioned from the registered nodes");
+    assert!(turn_unconditioned.reasons.iter().any(|r| matches!(r, ApproxReason::UnconditionedPriorStreet { street: Street::Turn, .. })));
+    let r4 = reasons(&f4);
+    assert!(r2.iter().all(|r| r4.contains(r)) && translated_on(&r4, Street::Flop, BB), "every inherited reason is still there: {r4:?}");
+    assert!(r4.iter().any(|r| matches!(r, ApproxReason::DeadlineBestSoFar { .. })) && !r4.iter().any(|r| matches!(r, ApproxReason::BetTranslation { street: Street::Turn, .. })),
+        "{r4:?}");
+    let s4 = t.snapshot_of(&d4);
+    assert_eq!((s4.provenance.origin.as_str(), s4.key.street, s4.key.root_range_hashes), ("live", Street::River, [hash_scaled(&req4.oop_range), hash_scaled(&req4.ip_range)]));
+    let origin = |street: Street, o: &str| (street, o.to_string());
+    assert_eq!(t.origins(d4.hand_id), [origin(Street::Flop, "cache_exact"), origin(Street::Turn, "live"), origin(Street::Turn, "live"), origin(Street::Turn, "live"),
+        origin(Street::River, "live")], "a cache hit, three live ok Finals and a live best_so_far, all through one rule");
+    t.e.shutdown();
+}
+
+/// Spec 9.2 (brief Step 5): a `Provisional` registration is replaced by the `Final` of the same decision at the same
+/// street, never the other way round, and only the active decision registers, through `Engine::register_snapshot`.
+#[test]
+fn replay_feeds_street_root_solves_a_provisional_is_replaced_by_its_final_never_the_reverse() {
+    let mut t = street_rig("provisional", vec![]);
+    let preflop = t.preflop.clone();
+    t.begin("KdJd");
+    t.play(&PREFLOP);
+    t.deal(FLOP);
+    let flop = t.state();
+    let (d1, _) = t.ask();
+    let provisional = snapshot_at(&flop, &d1, &preflop, &[], "flop_full_v1", "cache_provisional", 0.5);
+    let fin = snapshot_at(&flop, &d1, &preflop, &[], "flop_full_v1", "cache_exact", 0.2);
+    assert!(t.e.register_snapshot(&d1, provisional.clone()));
+    assert_eq!(t.origins(d1.hand_id), [(Street::Flop, "cache_provisional".to_string())]);
+    assert!(t.e.register_snapshot(&d1, fin.clone()), "the Final replaces the Provisional of the same decision");
+    assert_eq!(t.origins(d1.hand_id), [(Street::Flop, "cache_exact".to_string())]);
+    assert!(!t.e.register_snapshot(&d1, provisional), "a late Provisional never replaces the Final");
+    let other = DecisionIdentity { decision_id: d1.decision_id + 1, ..d1.clone() };
+    assert!(!t.e.register_snapshot(&other, snapshot_at(&flop, &other, &preflop, &[], "flop_full_v1", "cache_exact", 0.1)), "not the active decision");
+    assert!(!t.e.register_snapshot(&d1, snapshot_at(&flop, &other, &preflop, &[], "flop_full_v1", "cache_exact", 0.1)), "solved for another identity");
+    t.play(&[Action::Check]);
+    assert!(!t.e.register_snapshot(&d1, fin.clone()), "stale after a mutation");
+    assert_eq!(t.snapshots.lock().unwrap().for_hand(d1.hand_id).into_iter().cloned().collect::<Vec<_>>(), vec![fin]);
+    t.e.shutdown();
+}
+
+/// Spec 9.3 (Task 15 Q2): a completed street with no snapshot is unconditioned with the engine's concrete cause. In the
+/// first hand hero asked on the flop (no flop path in this build: an engine error) and on the turn, where the worker hung
+/// to the watchdog's fire (a deadline); in the second hand hero asked nothing on the flop (no request) and the worker
+/// failed on the turn (an engine error). Every seat that acted on the street carries the cause, on every later street.
+#[test]
+fn replay_feeds_street_root_solves_with_the_engines_cause_for_a_street_without_a_snapshot() {
+    let river = line("KdJd", &[(FLOP, &[Action::Check, Action::Check]), (TURN, &[Action::Check, Action::Check]), (RIVER, &[])]);
+    let mismatch = FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None,
+        error: Some(WorkerError { code: "tree_mismatch".into(), message: "tree_mismatch".into(), retryable: false, estimate_bytes: None }), elapsed_ms: 1 };
+    let script = vec![
+        ack(), FakeReply::Hang, ack(), FakeReply::Hang,                        // hand 1, the turn: both attempts hang to the fire
+        ack(), answer(ResultStatus::Ok, solved(&river, "river_std_v1", 0.2)), // hand 1, the river
+        ack(), mismatch,                                                       // hand 2, the turn: the worker fails
+        ack(), answer(ResultStatus::Ok, solved(&river, "river_std_v1", 0.2)), // hand 2, the river
+    ];
+    let mut t = street_rig("causes", script);
+    let both = |cause: &str| vec![(SB, cause.to_string()), (BB, cause.to_string())];
+    let no_flop_path = "engine error: no flop path in this build (plan 4)";
+
+    // Hand 1.
+    t.begin("KdJd");
+    t.play(&PREFLOP);
+    t.deal(FLOP);
+    t.ask();
+    t.play(&[Action::Check, Action::Check]);
+    t.deal(TURN);
+    let (_, turn_final) = t.ask();
+    assert!(matches!(turn_final.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { .. }, .. }), "{:?}", turn_final.coverage);
+    assert_eq!(unconditioned(&turn_final, Street::Flop), both(no_flop_path));
+    t.play(&[Action::Check, Action::Check]);
+    t.deal(RIVER);
+    let (_, river_final) = t.ask();
+    assert_eq!(unconditioned(&river_final, Street::Flop), both(no_flop_path));
+    let turn_causes = unconditioned(&river_final, Street::Turn);
+    assert_eq!(turn_causes.iter().map(|c| c.0).collect::<Vec<_>>(), [SB, BB]);
+    assert!(turn_causes.iter().all(|(_, c)| c.starts_with("deadline exceeded")), "{turn_causes:?}");
+
+    // Hand 2.
+    t.begin("KdJd");
+    t.play(&PREFLOP);
+    t.deal(FLOP);
+    t.play(&[Action::Check, Action::Check]);
+    t.deal(TURN);
+    let (_, turn_final) = t.ask();
+    assert_eq!(unconditioned(&turn_final, Street::Flop), both("no request"));
+    t.play(&[Action::Check, Action::Check]);
+    t.deal(RIVER);
+    let (_, river_final) = t.ask();
+    assert_eq!(unconditioned(&river_final, Street::Flop), both("no request"));
+    assert_eq!(unconditioned(&river_final, Street::Turn), both("engine error: tree_mismatch: tree_mismatch"));
+    t.e.shutdown();
+}
+
+/// Brief decision 4 (plan-2 carry, final re-review 2): the replay range source distrusts a snapshot store whose
+/// invalidation a contained panic interrupted. Here the store was poisoned by a panic and still holds a flop snapshot
+/// solved at a hero decision this history never reached (facing a bet that was never made): the turn's replay leaves it
+/// out (a store invalidated in full would have dropped it), so the flop's cause is the engine's (no request), never
+/// `snapshot root not reproducible`, and the worker's ranges are the replay's without it.
+#[test]
+fn replay_feeds_street_root_solves_distrusting_a_store_an_interrupted_invalidation_left_behind() {
+    let turn_state = line("KdJd", &[(FLOP, &[Action::Check, Action::Check]), (TURN, &[])]);
+    let mut t = street_rig("distrust", vec![ack(), answer(ResultStatus::Ok, solved(&turn_state, "turn_std_v1", 0.2))]);
+    let preflop = t.preflop.clone();
+    t.begin("KdJd");
+    t.play(&PREFLOP);
+    t.deal(FLOP);
+    let flop = t.state();
+    t.play(&[Action::Check, Action::Check]);
+    t.deal(TURN);
+    let turn = t.state();
+    let facing = act(&flop, &[Action::Check, Action::Bet { to: 44 }]);
+    let ghost_id = DecisionIdentity { hand_id: flop.hand_id, hand_revision: flop.hand_revision, decision_id: 999, config_revision: flop.config.config_revision, model_revision: 0 };
+    let ghost = snapshot_at(&facing, &ghost_id, &preflop, &[], "flop_full_v1", "live", 0.1);
+    let poisoner = t.snapshots.clone();
+    let _ = std::thread::spawn(move || {
+        let _held = poisoner.lock().unwrap();
+        panic!("an invalidation interrupted by a panic (deliberate)");
+    })
+    .join();
+    assert!(t.snapshots.is_poisoned());
+    assert!(t.snapshots.lock().unwrap_or_else(|p| p.into_inner()).register(&ghost_id, ghost.clone()), "the entry an interrupted invalidation left behind");
+    let trusted = direct(&preflop, &turn, &[ghost], &[]);
+    assert!(trusted.reasons.iter().any(|r| matches!(r, ApproxReason::UnconditionedPriorStreet { cause, .. } if cause == "snapshot root not reproducible")),
+        "trusted, the entry would change the flop's cause: {:?}", trusted.reasons);
+    let (_, f) = t.ask();
+    assert_eq!(unconditioned(&f, Street::Flop), vec![(SB, "no request".to_string()), (BB, "no request".to_string())]);
+    let root = core_model::street_root(&turn).unwrap();
+    let without = direct(&preflop, &turn, &[], &[(Street::Flop, "no request".into())]);
+    let req = t.solves()[0].clone();
+    assert!(req.oop_range == seat_range(&without, root.oop) && req.ip_range == seat_range(&without, root.ip));
+    t.e.shutdown();
+}
+
+/// Plan 3 Task 18 Step 6 (spec 7's targets: in-memory preflop lookup <= 0.05 s, validation + coverage + replay <= 0.15 s;
+/// plan 3 D6: measured and reported, never asserted against the wall clock). On the committed 100 bb chart path, with a
+/// flop and a turn snapshot registered, the store lookup of hero's preflop node and the replay range source's answer
+/// at the river root are timed; `cargo test --release ... -- --nocapture` prints the durations.
+#[test]
+fn replay_feeds_street_root_solves_measured_on_a_chart_path() {
+    use engine::ranges::RangeSource;
+    let flop_line: &[Action] = &[Action::Check, Action::Bet { to: 44 }, Action::Call];
+    let flop = line("KdJd", &[(FLOP, &[])]);
+    let turn = line("KdJd", &[(FLOP, flop_line), (TURN, &[])]);
+    let river = line("KdJd", &[(FLOP, flop_line), (TURN, &[Action::Check, Action::Check]), (RIVER, &[])]);
+    let identity = Arc::new(Mutex::new(IdentityState::new()));
+    let active = {
+        let mut ids = identity.lock().unwrap();
+        ids.set_config();
+        ids.begin_hand();
+        ids.next_decision().unwrap()
+    };
+    let store = Arc::new(PreflopStore::from_sources(charts()));
+    let s_flop = snapshot_at(&flop, &active, &store, &[], "flop_full_v1", "cache_exact", 0.2);
+    let s_turn = snapshot_at(&turn, &active, &store, std::slice::from_ref(&s_flop), "turn_std_v1", "live", 0.2);
+    let snapshots = Arc::new(Mutex::new(SnapshotStore::new()));
+    assert!(snapshots.lock().unwrap().register(&active, s_flop) && snapshots.lock().unwrap().register(&active, s_turn));
+    let source = ReplayRanges { store: store.clone(), snapshots, identity };
+    let root = core_model::street_root(&river).unwrap();
+    let mut lookup = Vec::new();
+    let mut replay = Vec::new();
+    for _ in 0..5 {
+        let t0 = std::time::Instant::now();
+        let answer = store.query(&river.config, &river, 4);
+        lookup.push(t0.elapsed());
+        assert!(answer.node.is_some(), "hero's node on the chart path");
+        let t0 = std::time::Instant::now();
+        let ranges = source.ranges_at_root(&river, &root).expect("the river's root ranges");
+        replay.push(t0.elapsed());
+        assert!(translated_on(&ranges.reasons, Street::Flop, BB) && !ranges.reasons.iter().any(|r| matches!(r, ApproxReason::UnconditionedPriorStreet { street: Street::Turn, .. })));
+    }
+    lookup.sort();
+    replay.sort();
+    println!("P3.T18 measurement (chart path pokercoaching_100, river root, flop and turn snapshots): preflop lookup min {:?} median {:?}; replay range source min {:?} median {:?}",
+        lookup[0], lookup[2], replay[0], replay[2]);
 }

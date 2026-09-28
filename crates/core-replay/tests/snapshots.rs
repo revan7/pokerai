@@ -752,7 +752,7 @@ fn check_bet73_call() -> Vec<Action> {
 /// Replays `state` with no preflop source and the given registered snapshots.
 fn replay_with(state: &HandState, snapshots: &[StreetSnapshot]) -> ReplayOutput {
     let store = PreflopStore::from_sources(vec![]);
-    replay(ReplayInput { cfg: &state.config, state, store: &store, snapshots })
+    replay(ReplayInput { cfg: &state.config, state, store: &store, snapshots, missing: &[] })
 }
 
 /// The combos `board` leaves: the `available` set of every exported node solved on it.
@@ -1167,7 +1167,7 @@ fn walk_flop_line(line: &[Action], snapshots: &[StreetSnapshot]) -> ReplayOutput
     let mut out = replay_with(&walk_flop(), &[]);
     let state = act(&walk_flop(), line);
     let store = PreflopStore::from_sources(vec![]);
-    walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots }, Street::Flop, &mut out);
+    walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots, missing: &[] }, Street::Flop, &mut out);
     out
 }
 
@@ -1673,7 +1673,7 @@ fn the_cap_inside_the_walk_keeps_each_survivor_on_its_own_path() {
         out.reasons.extend_from_slice(seeded);
         let state = act(&walk_flop(), line);
         let store = PreflopStore::from_sources(vec![]);
-        walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: snaps }, Street::Flop, &mut out);
+        walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: snaps, missing: &[] }, Street::Flop, &mut out);
         out
     };
     let walked_from = |line: &[Action], seeded: &[ApproxReason]| walked_with(&snapshots, line, seeded);
@@ -1778,7 +1778,7 @@ fn the_cap_residual_is_disclosed_on_the_no_snapshot_exit_too() {
     let before: Vec<Bits> = out.branches.iter().map(bits).collect();
     let state = walked_turn(&check_bet73_call());
     let store = PreflopStore::from_sources(vec![]);
-    walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &[] }, Street::Flop, &mut out);
+    walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &[], missing: &[] }, Street::Flop, &mut out);
     assert_eq!(out.branches.iter().map(bits).collect::<Vec<_>>(), before, "no snapshot: nothing is conditioned");
     assert_eq!(flop_unconditioned(&out), vec![(SB, "no compatible snapshot".to_string()), (BB, "no compatible snapshot".to_string())]);
     let caps = cap_reasons(&out);
@@ -1844,7 +1844,7 @@ fn replay_cross_actor_branches_through_snapshot_nodes() {
         ]
     };
     // The two-combo start, published at the flop root to key the snapshot.
-    let mut incoming = ReplayOutput { ranges: vec![None; 6], branches: initial(&flop.dealt), folded_ranges: vec![], log_reach: vec![0.0; 6], reasons: vec![], unsupported: None };
+    let mut incoming = ReplayOutput { ranges: vec![None; 6], branches: initial(&flop.dealt), folded_ranges: vec![], log_reach: vec![0.0; 6], reasons: vec![], unsupported: None, snapshots_used: vec![] };
     for s in incoming.branches[0].seats.iter_mut().filter(|s| s.seat == SB || s.seat == BB) {
         s.mass.fill(0.0);
         s.mass[0] = 1.0;
@@ -1858,7 +1858,7 @@ fn replay_cross_actor_branches_through_snapshot_nodes() {
     let walk = |snapshot: &StreetSnapshot, n: usize| {
         let state = act(&flop, &line[..n]);
         let mut out = incoming.clone();
-        walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: std::slice::from_ref(snapshot) }, Street::Flop, &mut out);
+        walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: std::slice::from_ref(snapshot), missing: &[] }, Street::Flop, &mut out);
         out
     };
     let near = |a: f64, b: f64| assert!((a - b).abs() < 5e-4, "{a} is not within 5e-4 of {b}");
