@@ -179,7 +179,8 @@ pub struct Engine {
 impl Engine {
     /// Validates `cfg`, launches the worker at `paths.worker_exe` (its `ready` validated, §4.5: a worker built without
     /// AVX2 is refused, §3.7), loads the preflop store from `paths.preflop` (plan 3 Task 17; its banners and quarantined
-    /// bundles join the startup report), installs the replay range source over it (plan 3 Task 18) and starts
+    /// bundles join the startup report), installs the replay range source over it (plan 3 Task 18), opens the cache at
+    /// `paths.cache` (plan 4 Task 7; a root it cannot open is a banner and a disabled cache) and starts
     /// `engine-main`; `cfg` becomes the session's first config revision. A
     /// refused `ready` leaves a degraded engine (see the module doc); an invalid config or a failed launch is an error,
     /// and neither touches the preflop directory.
@@ -199,8 +200,13 @@ impl Engine {
         let loaded = crate::preflop::load_store(&paths.preflop);
         core.preflop = Arc::new(loaded.store);
         core.install_replay_ranges();
+        // Plan 4 Task 7: the cache handle, opened once at `Paths::cache`. A root that cannot be opened leaves the core's
+        // cache disabled (every lookup a miss, every store dropped) and is a startup banner, never a construction error.
+        core.cache = cache::Cache::open(paths.cache.clone(), cache::CACHE_QUOTA_BYTES);
+        let cache_warning = core.cache.availability_warning();
         let mut e = Engine::with_core(core);
         e.startup.banners.extend(loaded.banners);
+        e.startup.banners.extend(cache_warning);
         e.startup.quarantined_bundles = loaded.quarantined;
         e.set_config(cfg)?;
         Ok(e)
@@ -581,6 +587,33 @@ mod tests {
         assert!(matches!(refused, Err(EngineError::Message(ref m)) if m.contains("not running")), "{refused:?}");
         assert!(e.identity.lock().unwrap().active().is_none());
         e.shutdown();
+    }
+
+    /// Plan 4 Task 7 (spec 12): `Engine::new` opens the cache at `Paths::cache`, creating its root; a root it cannot
+    /// create is a startup banner and a disabled cache, never a construction error. The worker is a stand-in batch file
+    /// that writes a valid `ready` and waits on stdin, as `engine_api`'s stand-ins do.
+    #[cfg(windows)]
+    #[test]
+    fn new_opens_the_cache_and_an_unusable_cache_root_is_a_banner() {
+        use proto::worker::WorkerMessage;
+        let dir = std::env::temp_dir().join(format!("pokerai-engine-unit-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = serde_json::to_string(&WorkerMessage::Ready(FakeWorker::default_ready())).unwrap();
+        std::fs::write(dir.join("worker.cmd"), format!("@echo off\r\necho {line}\r\nset /p _=\r\n")).unwrap();
+        std::fs::write(dir.join("blocker"), b"a file where the cache root should be").unwrap();
+        let paths = |cache: PathBuf| Paths { log_dir: dir.join("log"), worker_exe: dir.join("worker.cmd"), preflop: dir.join("preflop"), cache };
+        let (cfg, _) = cfg_1_2();
+        let mut e = Engine::new(cfg.clone(), paths(dir.join("blocker").join("v3"))).expect("an unusable cache never fails construction");
+        let banners = e.startup_report().banners;
+        assert!(banners.iter().any(|b| b.contains("flop cache") && b.contains("could not be opened")), "{banners:?}");
+        e.shutdown();
+        let mut e = Engine::new(cfg, paths(dir.join("cache"))).expect("a stand-in worker and a usable cache");
+        let banners = e.startup_report().banners;
+        assert!(!banners.iter().any(|b| b.contains("flop cache")), "a usable cache adds no banner: {banners:?}");
+        assert!(dir.join("cache").is_dir(), "the cache root is created at startup");
+        e.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A flop snapshot of the engine's current hand, solved for decision `decision_id` at `prefix` (plan 3 Task 14).

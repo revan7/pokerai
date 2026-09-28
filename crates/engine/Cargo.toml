@@ -14,6 +14,7 @@ core-iso = { path = "../core-iso" }
 core-eval = { path = "../core-eval" }
 core-preflop = { path = "../core-preflop" }
 core-replay = { path = "../core-replay" }
+cache = { path = "../cache" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

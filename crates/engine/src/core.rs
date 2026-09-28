@@ -124,6 +124,11 @@ pub struct EngineCore {
     /// `Engine`, which hands it out (`Engine::preflop_store`). Read-only from then on: no recommendation reads the disk.
     /// An empty store until one is installed.
     pub preflop: Arc<PreflopStore>,
+    /// The flop/turn street-solution cache (plan 4 Task 7, spec 10.4): `Cache::disabled()` as built, so every Plan 2
+    /// rig keeps a core that never touches the disk; `Engine::new` opens it at `Paths::cache` (`with_cache` installs a
+    /// test's). A lookup runs on the request's own `fast-path` work, never on `watchdog` or `engine-main`. The pre-solver
+    /// handle is not here: it lives on `Engine` (Task 16), so a status or pause command never waits for this core.
+    pub cache: cache::Cache,
     /// `shutdown` has run.
     shut_down: bool,
 }
@@ -147,8 +152,16 @@ impl EngineCore {
             tasks: Arc::default(),
             pending_cancel: None,
             preflop: Arc::new(PreflopStore::from_sources(vec![])),
+            cache: cache::Cache::disabled(),
             shut_down: false,
         }
+    }
+
+    /// Installs `cache` (plan 4 Task 7). `new` keeps Plan 2's four-argument signature and a disabled cache, so every
+    /// existing rig (`solve_client.rs`, `identity_race.rs`, `final_delivery.rs`) keeps compiling unchanged.
+    pub fn with_cache(mut self, cache: cache::Cache) -> Self {
+        self.cache = cache;
+        self
     }
 
     /// Plan 3 Task 18: installs the replay range source (`replay_bridge::ReplayRanges`) into the shared `range_source`,
@@ -256,6 +269,22 @@ mod tests {
     #[should_panic(expected = "not a worker stage")]
     fn setting_a_stage_that_is_not_a_worker_stage_is_a_bug() {
         core().set_stage("fast");
+    }
+
+    /// Plan 4 Task 7: `new` keeps its four arguments and builds the core with a disabled cache (no
+    /// thread, no directory, every lookup a miss), so no Plan 2 rig changes; `with_cache` installs
+    /// the handle given.
+    #[test]
+    fn a_core_starts_with_a_disabled_cache_and_with_cache_installs_one() {
+        let c = core();
+        assert!(c.cache.root().as_os_str().is_empty(), "the disabled cache has no root");
+        let dir = std::env::temp_dir().join(format!("pokerai_core_cache_unit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let c = core().with_cache(cache::Cache::open(dir.clone(), cache::CACHE_QUOTA_BYTES));
+        assert_eq!(c.cache.root(), dir.as_path());
+        assert_eq!(c.cache.availability_warning(), None);
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Ids are decimal strings from 1, never reused; the active identity is read through the shared state.

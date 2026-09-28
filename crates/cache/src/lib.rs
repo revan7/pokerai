@@ -66,12 +66,22 @@ impl StoreReceipt {
 }
 
 /// The cache handle: a root directory plus the endpoints of the two bounded service threads that
-/// own all of its I/O (`cache-writer` here, the reader in task 7). Cheap to share; every method
-/// takes `&self`, and no mutex is held across any file operation.
+/// own all of its I/O (`cache-writer` and `cache-reader`). Cheap to share; every method takes
+/// `&self`, and no mutex is held across any file operation.
+///
+/// Thread ownership (plan 4 task 7): the handle owns the `cache-reader` thread and joins it on
+/// `Drop`, after closing its queue -- the reads still queued are bounded (at most the queue's four
+/// requests plus the one in hand, three cells each), so the join is too. The writer ends on its own
+/// once this handle, its only sender, is gone (task 6); `shutdown` stops both early.
 pub struct Cache {
     root: std::path::PathBuf,
     writer: Option<std::sync::mpsc::SyncSender<WriteCommand>>,
-    reader: Option<std::sync::mpsc::SyncSender<crate::lookup::ReadCommand>>, // Task 7
+    reader: Option<std::sync::mpsc::SyncSender<crate::lookup::ReadCommand>>,
+    reader_thread: Option<std::thread::JoinHandle<()>>,
+    /// The token of the next `ReadCommand::Cells`; starts at 1 and only ever increases.
+    next_token: std::sync::atomic::AtomicU64,
+    /// Why an `open` yielded a handle that cannot serve (`availability_warning`).
+    warning: Option<String>,
     skipped: std::sync::atomic::AtomicBool,
 }
 
@@ -80,22 +90,50 @@ impl Cache {
     /// dropped. Used wherever the cache is switched off or could not be opened (section 12: the
     /// recommendation path is unaffected either way).
     pub fn disabled() -> Cache {
-        Cache { root: std::path::PathBuf::new(), writer: None, reader: None, skipped: std::sync::atomic::AtomicBool::new(false) }
+        Cache {
+            root: std::path::PathBuf::new(),
+            writer: None,
+            reader: None,
+            reader_thread: None,
+            next_token: std::sync::atomic::AtomicU64::new(1),
+            warning: None,
+            skipped: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The disabled handle `open` falls back to, carrying the reason for the startup banner.
+    fn unavailable(warning: String) -> Cache {
+        let mut cache = Cache::disabled();
+        cache.warning = Some(warning);
+        cache
     }
 
     pub fn root(&self) -> &std::path::Path {
         &self.root
     }
 
+    /// Section 12: why this handle, returned by `open`, cannot serve lookups or store entries --
+    /// the root directory could not be created, or a service thread did not start -- as one line
+    /// for the startup banners (`engine::StartupReport::banners`). `None` for a working cache and
+    /// for a deliberately `disabled` one.
+    pub fn availability_warning(&self) -> Option<String> {
+        self.warning.clone()
+    }
+
     /// Opens the store at `root` and starts its writer thread, which rebuilds the accounting index
     /// from disk (`quota::scan_index`) and clears any temp files a previous run's crash left
-    /// behind (`quota::sweep_temporaries`) before it accepts its first command.
+    /// behind (`quota::sweep_temporaries`) before it accepts its first command, then its reader
+    /// thread (`start_reader`).
     ///
     /// A failure to create the directory yields a disabled cache: every lookup is `Miss`
-    /// and every store is dropped, and the recommendation path is unaffected (section 12).
+    /// and every store is dropped, and the recommendation path is unaffected (section 12). Its
+    /// `availability_warning` says why.
     pub fn open(root: std::path::PathBuf, quota_bytes: u64) -> Cache {
-        if std::fs::create_dir_all(&root).is_err() {
-            return Cache::disabled();
+        if let Err(error) = std::fs::create_dir_all(&root) {
+            return Cache::unavailable(format!(
+                "the flop cache at {} could not be opened ({error}); every cache lookup misses and nothing is stored this session",
+                root.display()
+            ));
         }
         let (tx, rx) = std::sync::mpsc::sync_channel::<WriteCommand>(8);
         let dir = root.clone();
@@ -142,9 +180,97 @@ impl Cache {
             })
             .is_err()
         {
-            return Cache::disabled();
+            return Cache::unavailable(format!(
+                "the flop cache at {} is unavailable (its writer thread did not start); every cache lookup misses and nothing is stored this session",
+                root.display()
+            ));
         }
-        Cache { root, writer: Some(tx), reader: None, skipped: std::sync::atomic::AtomicBool::new(false) }
+        let mut cache = Cache::disabled();
+        cache.root = root;
+        cache.writer = Some(tx);
+        cache.start_reader();
+        cache
+    }
+
+    /// Starts the one `cache-reader` thread that owns every cell read (installed by `open` once the
+    /// writer runs). Each `ReadCommand::Cells` reads its distinct cell keys through
+    /// `storage::read_cell` -- which deletes only a file that fails `decode`/`validate_entry` -- and
+    /// answers without blocking; a reply whose waiter has gone is dropped. Does nothing on a handle
+    /// without a writer (a disabled cache never reads) or one whose reader already runs: a reader is
+    /// never respawned. A thread that does not start leaves every lookup a miss, with a warning.
+    pub fn start_reader(&mut self) {
+        if self.writer.is_none() || self.reader.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<crate::lookup::ReadCommand>(4);
+        let dir = self.root().to_path_buf();
+        let spawned = std::thread::Builder::new().name("cache-reader".into()).spawn(move || {
+            while let Ok(command) = rx.recv() {
+                match command {
+                    crate::lookup::ReadCommand::Shutdown => break,
+                    crate::lookup::ReadCommand::Cells { token, keys, reply } => {
+                        let mut seen = std::collections::BTreeSet::new();
+                        let cells = keys
+                            .iter()
+                            .filter(|k| seen.insert(**k))
+                            .filter_map(|k| crate::storage::read_cell(&crate::storage::entry_path(&dir, *k)))
+                            .collect::<Vec<_>>();
+                        let _ = reply.try_send((token, cells));
+                    }
+                }
+            }
+        });
+        match spawned {
+            Ok(handle) => {
+                self.reader = Some(tx);
+                self.reader_thread = Some(handle);
+            }
+            Err(error) => {
+                self.warning = Some(format!(
+                    "the flop cache at {} cannot serve lookups (its reader thread did not start: {error}); every cache lookup misses this session",
+                    self.root.display()
+                ));
+            }
+        }
+    }
+
+    /// Spec 10.4 lookup, bounded: posts one read of the query's `b - 1, b, b + 1` cells to the
+    /// reader without blocking and waits at most `min(q.budget, 500 ms)` for its reply. A full
+    /// queue, a closed channel, a timeout or a reply carrying another request's token is an
+    /// immediate `Miss`; so is a disabled cache. The reply is then filtered and ranked
+    /// (`lookup::select`), rebuilt in the query's chips and suits (`lookup::reconstruct`), and
+    /// labelled from the entry's inherited reasons, the query's own reasons and its raw accuracy
+    /// (`label::label`). A served hit is touched so eviction sees it as fresh. An ordinary query
+    /// mismatch is a `Miss` and never deletes anything; only `read_cell` deletes, and only a file
+    /// that fails `decode`/`validate_entry`. The caller runs this on the request's own
+    /// `fast-path` work, never on `watchdog` or `engine-main`.
+    pub fn lookup(&self, q: &crate::lookup::CacheQuery) -> crate::lookup::Lookup {
+        use crate::label::Label;
+        use crate::lookup::{Lookup, ReadCommand};
+        let Some(reader) = self.reader.as_ref() else { return Lookup::Miss };
+        let token = self.next_token.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let b = q.key.spr_bucket;
+        let keys = [q.key.at_bucket(b.saturating_sub(1)).digest(), q.key.digest(), q.key.at_bucket(b.saturating_add(1)).digest()];
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        if reader.try_send(ReadCommand::Cells { token, keys, reply: tx }).is_err() {
+            return Lookup::Miss;
+        }
+        let budget = q.budget.min(std::time::Duration::from_millis(500));
+        let Ok((replied, cells)) = rx.recv_timeout(budget) else { return Lookup::Miss };
+        if replied != token {
+            return Lookup::Miss;
+        }
+        let Some((entry, comparison)) = crate::lookup::select(cells, q) else { return Lookup::Miss };
+        let Some(mut hit) = crate::lookup::reconstruct(&entry, q) else { return Lookup::Miss };
+        let label = crate::label::label(&entry, q.source.spr, &comparison, q.target_bp, &q.reasons);
+        hit.coverage = label.coverage();
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        self.touch(entry.key.digest(), crate::lookup::payload_digest(&entry), now_ms);
+        match label {
+            Label::Exact => Lookup::Exact { hit },
+            Label::Approximate { reasons } => Lookup::Approximate { hit, reasons },
+            Label::Provisional { reasons } => Lookup::Provisional { hit, reasons },
+        }
     }
 
     fn send(&self, command: WriteCommand) {
@@ -187,6 +313,18 @@ impl Cache {
         }
         if let Some(tx) = self.reader.as_ref() {
             let _ = tx.send(crate::lookup::ReadCommand::Shutdown);
+        }
+    }
+}
+
+impl Drop for Cache {
+    /// Closes the reader's queue (this handle holds its only sender) and joins `cache-reader`,
+    /// which finishes the bounded reads already queued and ends; a reply nobody awaits any more is
+    /// dropped. The writer is not joined here: it ends once its own queue closes with this handle.
+    fn drop(&mut self) {
+        self.reader = None;
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -268,5 +406,64 @@ mod tests {
         cache.reader = Some(tx);
         cache.shutdown();
         assert!(matches!(rx.try_recv(), Ok(crate::lookup::ReadCommand::Shutdown)), "shutdown must reach the reader as lookup::ReadCommand::Shutdown");
+    }
+
+    /// Section 12 (plan 4 task 7): an `open` that cannot create its root is the disabled handle
+    /// with a startup banner saying why; a working cache and a deliberately disabled one have none.
+    #[test]
+    fn availability_warning_names_an_unopenable_root_only() {
+        let dir = std::env::temp_dir().join(format!("pokerai-cache-warning-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"a file where the cache root should be").unwrap();
+        let failed = Cache::open(blocker.join("v3"), CACHE_QUOTA_BYTES);
+        let warning = failed.availability_warning().expect("an unopenable root is announced");
+        assert!(warning.contains("could not be opened") && warning.contains("not-a-directory"), "{warning}");
+        assert!(failed.reader.is_none() && failed.writer.is_none() && failed.root.as_os_str().is_empty());
+        let working = Cache::open(dir.join("cache"), CACHE_QUOTA_BYTES);
+        assert_eq!(working.availability_warning(), None);
+        assert!(working.reader.is_some() && working.reader_thread.is_some(), "open starts the reader");
+        assert_eq!(Cache::disabled().availability_warning(), None);
+        drop(working);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reader is started once, by `open`, and never by a disabled handle (which would read
+    /// cell paths relative to the working directory) or a second time (a reader is never respawned).
+    #[test]
+    fn start_reader_never_starts_a_second_reader_or_one_without_a_store() {
+        let mut disabled = Cache::disabled();
+        disabled.start_reader();
+        assert!(disabled.reader.is_none() && disabled.reader_thread.is_none());
+        let dir = std::env::temp_dir().join(format!("pokerai-cache-reader-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cache = Cache::open(dir.clone(), CACHE_QUOTA_BYTES);
+        let first = cache.reader_thread.as_ref().map(|h| h.thread().id());
+        cache.start_reader();
+        assert_eq!(cache.reader_thread.as_ref().map(|h| h.thread().id()), first, "the running reader is kept");
+        assert_eq!(cache.reader_thread.as_ref().and_then(|h| h.thread().name().map(str::to_owned)), Some("cache-reader".to_owned()));
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping the handle closes the reader's queue, and the reader ends (`Drop` joins it; here
+    /// the handle is taken first so the test can watch the thread end on its own).
+    #[test]
+    fn the_reader_ends_once_its_handle_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("pokerai-cache-reader-join-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cache = Cache::open(dir.clone(), CACHE_QUOTA_BYTES);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = cache.reader_thread.take().expect("open starts the reader");
+        // Hand the join to a watcher so the test observes the end of the thread itself.
+        let watcher = std::thread::spawn(move || {
+            let _ = reader.join();
+            let _ = tx.send(());
+        });
+        drop(cache);
+        rx.recv_timeout(std::time::Duration::from_secs(30)).expect("the reader ends once its handle is dropped");
+        watcher.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
