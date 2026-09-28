@@ -1,0 +1,9545 @@
+{
+  "argmax": {
+    "action_index": 1,
+    "dev_den": 10300,
+    "dev_num": 300,
+    "entry_action": {
+      "kind": "allin",
+      "to": 200
+    },
+    "path": [
+      0,
+      1,
+      1,
+      0,
+      1,
+      2,
+      1
+    ],
+    "query_action": {
+      "kind": "allin",
+      "to": 203
+    }
+  },
+  "entry": [
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 50
+        }
+      ],
+      "actor": "oop",
+      "path": [],
+      "street": "flop",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 50
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 50
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 50
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 50
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 50
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        100,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 125
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        100,
+        200,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 313
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        350,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 500
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        726,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 125
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        100,
+        200,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 313
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        350,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 500
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        726,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 125
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        100,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 100
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 250
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 313
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        200,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 175
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 175
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 375
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 375
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 500
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        350,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 125
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        100,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 100
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 100
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 250
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 250
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 313
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        200,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 175
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 375
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 500
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        350,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 125
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        100,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 100
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 100
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 100
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 250
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 250
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 250
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        200,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 350
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 200
+        },
+        {
+          "kind": "allin",
+          "to": 350
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 350
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        800,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        800,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 313
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        200,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 175
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 175
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 175
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 175
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 375
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 375
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 375
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        350,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 375
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        350,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 500
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        350,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 125
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        100,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 100
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 100
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 100
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 100
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 250
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 250
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        200,
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 250
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        200,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 350
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 200
+        },
+        {
+          "kind": "allin",
+          "to": 350
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 350
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        800,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        800,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 250
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        200,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 200
+        },
+        {
+          "kind": "allin",
+          "to": 350
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 200
+        },
+        {
+          "kind": "allin",
+          "to": 350
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 350
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        800,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        800,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        0,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 350
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        800,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        800,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 450
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        400,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        3
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        400,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 313
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        200,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 175
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 175
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 175
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 375
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 375
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        350,
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 375
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        350,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 200
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        700,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 500
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        350,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        2,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 187
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        726,
+        1100
+      ]
+    }
+  ],
+  "max_delta_pct": 2.912621259689331,
+  "query": [
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 52
+        }
+      ],
+      "actor": "oop",
+      "path": [],
+      "street": "flop",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 52
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 52
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 52
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 52
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 52
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        103,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 130
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        103,
+        207,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 325
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        363,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 515
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        753,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 130
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        103,
+        207,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 325
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        363,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 515
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        753,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 130
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        103,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 104
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 260
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 325
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        207,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 182
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 182
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 385
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 385
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        1,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 515
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        363,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        0,
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 130
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        103,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 104
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 104
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 260
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 260
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        1,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 325
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        207,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 182
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 385
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 515
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        363,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        0,
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 130
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        103,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 104
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 104
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 104
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 260
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 260
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 260
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        207,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 359
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 208
+        },
+        {
+          "kind": "allin",
+          "to": 359
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 359
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        831,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        831,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 325
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        207,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 182
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 182
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 182
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 182
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 385
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 385
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 385
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        363,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 385
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        363,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        1,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 515
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        363,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        0,
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 130
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        103,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 104
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 104
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 104
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 104
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 260
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 260
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        207,
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        0,
+        1,
+        3
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 260
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        207,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 359
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 208
+        },
+        {
+          "kind": "allin",
+          "to": 359
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 359
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        831,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        831,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1,
+        0,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        0,
+        1,
+        3
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 260
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        207,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 208
+        },
+        {
+          "kind": "allin",
+          "to": 359
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 208
+        },
+        {
+          "kind": "allin",
+          "to": 359
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 359
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        831,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        831,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        0,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 359
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        831,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        831,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 463
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        415,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        2,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        2,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        1,
+        1,
+        2,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        1,
+        1,
+        3
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        415,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "raise",
+          "to": 325
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        207,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 182
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 182
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "bet",
+          "to": 182
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 385
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 385
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        363,
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        0,
+        1,
+        2
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 385
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        363,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 203
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1,
+        1,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        1,
+        0,
+        1,
+        2
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        727,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        },
+        {
+          "kind": "allin",
+          "to": 515
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        363,
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        2,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        null,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "check"
+        },
+        {
+          "kind": "allin",
+          "to": 190
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        0
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        null
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0,
+        0,
+        1
+      ],
+      "street": "river",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        0,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "ip",
+      "path": [
+        1,
+        2,
+        2,
+        1,
+        1
+      ],
+      "street": "turn",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    },
+    {
+      "actions": [
+        {
+          "kind": "fold"
+        },
+        {
+          "kind": "call"
+        }
+      ],
+      "actor": "oop",
+      "path": [
+        1,
+        2,
+        2,
+        2
+      ],
+      "street": "flop",
+      "terminal_pots": [
+        753,
+        1133
+      ]
+    }
+  ]
+}

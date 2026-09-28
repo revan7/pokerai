@@ -100,10 +100,45 @@ impl Templates {
     }
 }
 
+/// The three §13.1 T4 templates. `add`/`force` are literal spec values, `merging` is 0 and
+/// donk menus follow the §4.6 rule (`None` on the root street, explicit empty after it).
+/// Registration goes through Plan 2 Task 2's `Templates::with_extra`, which REPLACES the whole
+/// extra set on every call (it does not merge per id): this helper is therefore the single
+/// `with_extra` caller of any test binary that uses it, called once behind a `std::sync::Once`
+/// (`CacheRig::new`), and no other test of such a binary registers extra templates.
+#[cfg(any(test, feature = "test-templates"))]
+pub fn install_cache_test_templates() {
+    use proto::MenuSize::{AllIn, Pot};
+    use proto::Street::{Flop, River, Turn};
+    let streets = [Flop, Turn, River];
+    let build = |id: &'static str, bet: Vec<MenuSize>, raise: Vec<MenuSize>, add: f32, force: f32| {
+        let mut menus = BTreeMap::new();
+        for s in streets {
+            menus.insert(s, PlayerMenus { oop: SideMenu { bet: bet.clone(), raise: raise.clone() }, ip: SideMenu { bet: bet.clone(), raise: raise.clone() }, donk: if s == Flop { None } else { Some(vec![]) } });
+        }
+        TemplateSpec { id, root_street: Flop, menus, add_allin_threshold: add, force_allin_threshold: force, merging_threshold: 0.0, wager_cap: 1 }
+    };
+    // 1. `a`-only bets, no ordinary raises: the §10.4 terminal rake-cap pair 500 / 504.
+    // 2. empty menus everywhere: isolates SPR 5.00 / 5.08 / 5.11 with identical realized menus.
+    // 3. single 0.33 bet, `a`-only raises: the specified `MenuRounded{2.0}` pair 100/500 vs 20/100.
+    Templates::with_extra(&[
+        build("check_jam_test_v1", vec![AllIn], vec![], 0.0, 0.0),
+        build("check_only_test_v1", vec![], vec![], 0.0, 0.0),
+        build("menu_round_test_v1", vec![Pot(0.33)], vec![AllIn], 1.5, 0.15),
+    ]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proto::{MenuSize, PlayerMenus, SideMenu, Street};
+
+    /// `with_extra` replaces the whole process-global extra set, so the two tests of this binary that
+    /// register extras (plan 2's registry test and plan 4 Task 8's) hold this lock for their whole body:
+    /// neither can clear or replace the other's registrations between its own call and its assertions.
+    static EXTRA_REGISTRY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn registry_lock() -> std::sync::MutexGuard<'static, ()> { EXTRA_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) }
+
     #[test]
     fn river_std_matches_spec_10_1() {
         let t = Templates::get("river_std_v1").unwrap();
@@ -124,6 +159,7 @@ mod tests {
 
     #[test]
     fn extra_templates_register_and_do_not_disturb_the_production_set() {
+        let _registry = registry_lock();
         // plan 4 Task 8 registers `check_jam_test_v1`, `menu_round_test_v1` and `check_only_test_v1` through this seam
         let extra = [TemplateSpec { id: "check_only_test_v1", root_street: Street::River,
             menus: std::collections::BTreeMap::from([(Street::River, PlayerMenus { oop: SideMenu { bet: vec![], raise: vec![] }, ip: SideMenu { bet: vec![], raise: vec![] }, donk: None })]),
@@ -135,6 +171,35 @@ mod tests {
         assert_eq!(Templates::base_ids().len(), 9, "the production registry is never enlarged by with_extra");
         Templates::with_extra(&[]);   // idempotent reset
         assert!(Templates::get("check_only_test_v1").is_none());
+    }
+
+    /// Plan 4 Task 8: the three spec 13.1 T4 test templates are registered through `with_extra` alone, with the
+    /// exact spec values, and never enlarge the production registry.
+    #[test]
+    fn install_cache_test_templates_registers_the_three_t4_templates() {
+        let _registry = registry_lock();
+        install_cache_test_templates();
+        assert_eq!(Templates::base_ids().len(), 9);
+        for id in ["check_jam_test_v1", "check_only_test_v1", "menu_round_test_v1"] {
+            assert!(Templates::get(id).is_some());
+            assert!(Templates::ids().contains(&id));
+            assert!(!Templates::base_ids().contains(&id), "{id} is a test template, never a production one");
+            assert_eq!(Templates::min_variant(id), None);
+        }
+        let menu = Templates::get("menu_round_test_v1").unwrap();
+        assert_eq!((menu.root_street, menu.add_allin_threshold, menu.force_allin_threshold, menu.merging_threshold, menu.wager_cap), (Street::Flop, 1.5, 0.15, 0.0, 1));
+        for street in [Street::Flop, Street::Turn, Street::River] {
+            let m = &menu.menus[&street];
+            assert_eq!((&m.oop.bet[..], &m.oop.raise[..]), (&[MenuSize::Pot(0.33)][..], &[MenuSize::AllIn][..]));
+            assert_eq!(m.ip, m.oop);
+            assert_eq!(m.donk, if street == Street::Flop { None } else { Some(vec![]) });
+        }
+        let jam = Templates::get("check_jam_test_v1").unwrap();
+        assert_eq!((jam.add_allin_threshold, jam.force_allin_threshold, jam.wager_cap), (0.0, 0.0, 1));
+        assert_eq!((&jam.menus[&Street::Turn].oop.bet[..], jam.menus[&Street::Turn].oop.raise.len()), (&[MenuSize::AllIn][..], 0));
+        let check = Templates::get("check_only_test_v1").unwrap();
+        assert!(check.menus.values().all(|m| m.oop.bet.is_empty() && m.oop.raise.is_empty() && m.ip.bet.is_empty() && m.ip.raise.is_empty()));
+        assert_eq!(check.menus.len(), 3);
     }
 
     /// Final review M10: the extra registrations are process-global, so an extra that overrode a production id would

@@ -195,17 +195,178 @@ fn cell_entry_count_out_of_range_rejected_by_encode() {
 /// patching of an already-encoded payload, which is why
 /// `cache_storage_rejects_and_deletes_byte_level_corrupt_payloads` below exercises the same two
 /// values again, through `read_cell` this time -- this test's job is only the in-memory check.
+///
+/// Plan 4 Task 8: every mutation runs on both fixtures -- Task 2's hand-built `support::entry()` and the real
+/// materialized fixture (`real_entry()`, the production `flop_fast_v1` tree Task 8 froze) -- and each fixture is
+/// itself valid first, so every rejection is the mutation's.
 #[test]
 fn cache_payload_validated() {
-    for row in [vec![0.2, 0.2], vec![-0.1, 1.1], vec![1.1, -0.1]] {
-        let mut e = support::entry();
-        let i = e.nodes[0].available.iter().position(|x| *x).unwrap();
-        e.nodes[0].probs[i] = row;
-        assert!(validate_entry(&e).is_err());
+    for (fixture, entry) in fixtures() {
+        assert!(validate_entry(&entry).is_ok(), "{fixture}: the unmutated fixture is valid");
+        for row in [vec![0.2, 0.2], vec![-0.1, 1.1], vec![1.1, -0.1]] {
+            let mut e = entry.clone();
+            let i = e.nodes[0].available.iter().position(|x| *x).unwrap();
+            e.nodes[0].probs[i] = row;
+            assert!(validate_entry(&e).is_err(), "{fixture}");
+        }
+        let mut e = entry.clone();
+        e.covered_paths.reverse();
+        assert!(validate_entry(&e).is_err(), "{fixture}");
     }
-    let mut e = support::entry();
-    e.covered_paths.reverse();
-    assert!(validate_entry(&e).is_err());
+}
+
+// --- plan 4 task 8: the real materialized fixture ----------------------------------------------------------------
+
+/// The committed production tree plan 4 Task 8 froze (`crates/engine/tests/golden/cache_scale.json`, `"entry"`: the
+/// engine materializer's complete `flop_fast_v1` list at P = 100, stacks 500), wrapped in a valid entry the way Task 8's
+/// `CacheRig` builds one: board Kh7d2c, public AA / KK ranges blocked by the board and canonicalized with it, every
+/// flop node exported with the uniform legal probabilities and `EV(a) = 10 * n + a` chips (fold exactly 0), 5% rake
+/// capped at 5 chips. The tree signature is the engine's to compute and `validate_entry` does not re-derive it, so the
+/// template id stands in for it here. A committed artifact: a missing golden fails (standing ruling (e)).
+fn real_entry() -> CacheEntry {
+    use cache::key::{spr_bucket, KeyFields, Model, RakeKey, Rational};
+    use proto::{Action, MenuSize, PlayerMenus, SideMenu, Street};
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/golden/cache_scale.json");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("the committed fixture {} is missing: {e}", path.display()));
+    let golden: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let materialized: Vec<proto::MaterializedNode> = serde_json::from_value(golden["entry"].clone()).unwrap();
+
+    let board = ["Kh", "7d", "2c"].map(|c| proto::Card::parse(c).unwrap()).to_vec();
+    let mut ranges = [core_ranges::parse_range("AA").unwrap(), core_ranges::parse_range("KK").unwrap()];
+    for r in &mut ranges {
+        core_ranges::block_public(r, &board);
+    }
+    let (_, perm) = core_iso::canonicalize(&board, &[&ranges[0], &ranges[1]]);
+    let mut canonical_board = board.iter().map(|c| core_iso::apply(&perm, *c)).collect::<Vec<_>>();
+    canonical_board.sort_by_key(|c| c.0);
+    let ranges = [core_iso::apply_range(&perm, &ranges[0]), core_iso::apply_range(&perm, &ranges[1])];
+
+    let side = SideMenu { bet: vec![MenuSize::Pot(0.5)], raise: vec![MenuSize::Pot(2.5)] };
+    let menus = [Street::Flop, Street::Turn, Street::River]
+        .into_iter()
+        .map(|s| (s, PlayerMenus { oop: side.clone(), ip: side.clone(), donk: if s == Street::Flop { None } else { Some(vec![]) } }))
+        .collect();
+    let tree = proto::EffectiveTree {
+        rules_version: 3,
+        template_id: "flop_fast_v1".into(),
+        root_street: Street::Flop,
+        menus,
+        add_allin_threshold: 1.0,
+        force_allin_threshold: 0.15,
+        merging_threshold: 0.0,
+        wager_cap: 3,
+        inserted: vec![],
+        materialized,
+    };
+    let nodes = tree
+        .materialized
+        .iter()
+        .filter(|m| m.street == Street::Flop)
+        .enumerate()
+        .map(|(n, m)| {
+            let range = &ranges[if m.actor == "oop" { 0 } else { 1 }];
+            let width = m.actions.len();
+            let available = range.0.iter().map(|w| *w > 0.0).collect::<Vec<_>>();
+            proto::worker::NodeStrategy {
+                path: cache::entry::chip_path(&tree.materialized, &m.path).unwrap(),
+                actor: m.actor.clone(),
+                actions: m.actions.clone(),
+                probs: available.iter().map(|a| if *a { vec![1.0 / width as f32; width] } else { vec![0.0; width] }).collect(),
+                ev_chips: available
+                    .iter()
+                    .map(|a| m.actions.iter().enumerate().map(|(i, x)| if !*a || *x == Action::Fold { 0.0 } else { (10 * n + i) as f32 }).collect())
+                    .collect(),
+                available,
+            }
+        })
+        .collect::<Vec<_>>();
+    let solution = proto::worker::StreetSolution {
+        covered_paths: nodes.iter().map(|n| n.path.clone()).collect(),
+        nodes,
+        requested: 0,
+        exploitability_chips: 0.4,
+        iterations: 1000,
+        memory_bytes: 1 << 20,
+        mode: "f32".into(),
+        locks_applied: 0,
+        export: "street".into(),
+    };
+    let nodes = cache::entry::normalize(&solution, &tree, 100).unwrap();
+    let fractions = tree
+        .materialized
+        .iter()
+        .map(|m| m.actions.iter().map(|a| cache::lookup::action_to(a).map(|to| Rational::new(to as u64, 100).unwrap())).collect())
+        .collect();
+    let spr = Rational::new(500, 100).unwrap();
+    CacheEntry {
+        key: KeyFields {
+            schema_version: 3,
+            solver_commit: proto::worker::SOLVER_COMMIT.into(),
+            adapter_version: proto::worker::ADAPTER_VERSION,
+            rules_version: 3,
+            canonical_board,
+            root_street: Street::Flop,
+            spr_bucket: spr_bucket(spr),
+            tree_signature: "flop_fast_v1".into(),
+            rake: RakeKey::new(0.05, Rational::new(5000, 100_000).unwrap(), 1).unwrap(),
+            range_hash_oop: core_ranges::hash_scaled(&ranges[0]),
+            range_hash_ip: core_ranges::hash_scaled(&ranges[1]),
+            model: Model::Baseline,
+        },
+        source: cache::entry::SourceInputs {
+            pot: 100,
+            stack_oop: 500,
+            stack_ip: 500,
+            spr,
+            bb_chips: 2,
+            quantum_over_p: Rational::new(1, 100).unwrap(),
+            cap_mchips: 5000,
+            ranges,
+        },
+        tree,
+        fractions,
+        covered_paths: nodes.iter().map(|n| n.path.clone()).collect(),
+        nodes,
+        exploitability_over_P: 0.004,
+        target_bp: 50,
+        iterations: 1000,
+        elapsed_ms: 100,
+        memory_bytes: 1 << 20,
+        mode: "f32".into(),
+        locks_applied: 0,
+        export: "street".into(),
+        reasons: vec![],
+        created: 1,
+        last_hit: 1,
+    }
+}
+
+/// The fixtures Task 5's corruption mutations run on: Task 2's hand-built skeleton and the real materialized tree.
+fn fixtures() -> Vec<(&'static str, CacheEntry)> {
+    vec![("support::entry", support::entry()), ("real flop_fast_v1 100/500", real_entry())]
+}
+
+/// The real fixture is what it claims to be: the complete three-street production tree (the golden's 182 nodes, flop
+/// root Check / Bet(50)), valid, and stored and read back unchanged through the real cell codec.
+#[test]
+fn the_real_materialized_fixture_is_valid_and_round_trips() {
+    let e = real_entry();
+    assert!(validate_entry(&e).is_ok());
+    assert_eq!(e.tree.materialized.len(), 182);
+    assert_eq!(e.tree.materialized[0].actions, vec![proto::Action::Check, proto::Action::Bet { to: 50 }]);
+    assert!([proto::Street::Turn, proto::Street::River].iter().all(|s| e.tree.materialized.iter().any(|m| m.street == *s)));
+    assert_eq!(e.nodes.len(), e.tree.materialized.iter().filter(|m| m.street == proto::Street::Flop).count());
+    let dir = TempDir::new("real-fixture");
+    let path = storage::entry_path(dir.path(), e.key.digest());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, storage::encode(&Cell { entries: vec![e.clone()] }).unwrap()).unwrap();
+    let back = storage::read_cell(&path).expect("a valid real cell reads back");
+    assert!(path.exists());
+    assert_eq!(quota_digest(&back.entries[0]), quota_digest(&e));
+}
+
+fn quota_digest(e: &CacheEntry) -> Vec<u8> {
+    cache::quota::entry_digest(e)
 }
 
 // --- review R1: lossless persistence -------------------------------------------------------------
@@ -529,12 +690,15 @@ fn cache_storage_rejects_and_deletes_struct_level_corrupt_payloads() {
         })),
     ];
 
-    for (name, mutate) in cases {
-        let mut e = support::entry();
-        mutate(&mut e);
-        assert!(validate_entry(&e).is_err(), "{name} must actually be invalid, or this case tests nothing");
-        let bytes = write_unchecked(&[e]);
-        assert_miss_and_deleted(&bytes, dir.path(), &format!("{name}.bin"));
+    // Plan 4 Task 8: on both fixtures, Task 2's skeleton and the real materialized tree.
+    for (k, (fixture, entry)) in fixtures().into_iter().enumerate() {
+        for (name, mutate) in &cases {
+            let mut e = entry.clone();
+            mutate(&mut e);
+            assert!(validate_entry(&e).is_err(), "{fixture}: {name} must actually be invalid, or this case tests nothing");
+            let bytes = write_unchecked(&[e]);
+            assert_miss_and_deleted(&bytes, dir.path(), &format!("{k}-{name}.bin"));
+        }
     }
 }
 
@@ -549,50 +713,53 @@ fn cache_storage_rejects_and_deletes_struct_level_corrupt_payloads() {
 fn cache_storage_rejects_and_deletes_byte_level_corrupt_payloads() {
     let dir = TempDir::new("byte-corrupt");
 
-    // Out-of-domain probabilities (-0.1, 1.1): patch one value of an otherwise-valid, row-summing
-    // pair so only the *patched* value itself is out of domain.
-    for (name, sentinel, corrupt) in [("prob_1_1", 0.411_337_f32, 1.1_f32), ("prob_neg_0_1", 0.522_337_f32, -0.1_f32)] {
-        let mut e = support::entry();
-        let i = e.nodes[0].available.iter().position(|x| *x).unwrap();
-        e.nodes[0].probs[i] = vec![sentinel, 1.0 - sentinel];
-        let bytes = storage::encode(&Cell { entries: vec![e] }).unwrap();
-        let mut payload = decompressed_payload_of(&bytes);
-        let needle = sentinel.to_le_bytes();
-        let occurrences = payload.windows(4).filter(|w| *w == needle).count();
-        assert_eq!(occurrences, 1, "sentinel {sentinel} must appear exactly once in the decoded payload");
-        let pos = payload.windows(4).position(|w| w == needle).unwrap();
-        payload[pos..pos + 4].copy_from_slice(&corrupt.to_le_bytes());
-        assert_miss_and_deleted(&reframe(&payload), dir.path(), &format!("{name}.bin"));
-    }
+    // Plan 4 Task 8: on both fixtures, Task 2's skeleton and the real materialized tree.
+    for (k, (fixture, entry)) in fixtures().into_iter().enumerate() {
+        // Out-of-domain probabilities (-0.1, 1.1): patch one value of an otherwise-valid, row-summing
+        // pair so only the *patched* value itself is out of domain.
+        for (name, sentinel, corrupt) in [("prob_1_1", 0.411_337_f32, 1.1_f32), ("prob_neg_0_1", 0.522_337_f32, -0.1_f32)] {
+            let mut e = entry.clone();
+            let i = e.nodes[0].available.iter().position(|x| *x).unwrap();
+            e.nodes[0].probs[i] = vec![sentinel, 1.0 - sentinel];
+            let bytes = storage::encode(&Cell { entries: vec![e] }).unwrap();
+            let mut payload = decompressed_payload_of(&bytes);
+            let needle = sentinel.to_le_bytes();
+            let occurrences = payload.windows(4).filter(|w| *w == needle).count();
+            assert_eq!(occurrences, 1, "{fixture}: sentinel {sentinel} must appear exactly once in the decoded payload");
+            let pos = payload.windows(4).position(|w| w == needle).unwrap();
+            payload[pos..pos + 4].copy_from_slice(&corrupt.to_le_bytes());
+            assert_miss_and_deleted(&reframe(&payload), dir.path(), &format!("{k}-{name}.bin"));
+        }
 
-    // Nonfinite EV: patch a populated combo's non-fold EV to NaN.
-    {
-        let sentinel = 24_681.359_f32;
-        let mut e = support::entry();
-        let i = e.nodes[0].available.iter().position(|x| *x).unwrap();
-        e.nodes[0].ev_over_P[i][1] = sentinel;
-        let bytes = storage::encode(&Cell { entries: vec![e] }).unwrap();
-        let mut payload = decompressed_payload_of(&bytes);
-        let needle = sentinel.to_le_bytes();
-        let occurrences = payload.windows(4).filter(|w| *w == needle).count();
-        assert_eq!(occurrences, 1, "sentinel must appear exactly once in the decoded payload");
-        let pos = payload.windows(4).position(|w| w == needle).unwrap();
-        payload[pos..pos + 4].copy_from_slice(&f32::NAN.to_le_bytes());
-        assert_miss_and_deleted(&reframe(&payload), dir.path(), "nonfinite_ev.bin");
-    }
+        // Nonfinite EV: patch a populated combo's non-fold EV to NaN.
+        {
+            let sentinel = 24_681.359_f32;
+            let mut e = entry.clone();
+            let i = e.nodes[0].available.iter().position(|x| *x).unwrap();
+            e.nodes[0].ev_over_P[i][1] = sentinel;
+            let bytes = storage::encode(&Cell { entries: vec![e] }).unwrap();
+            let mut payload = decompressed_payload_of(&bytes);
+            let needle = sentinel.to_le_bytes();
+            let occurrences = payload.windows(4).filter(|w| *w == needle).count();
+            assert_eq!(occurrences, 1, "{fixture}: sentinel must appear exactly once in the decoded payload");
+            let pos = payload.windows(4).position(|w| w == needle).unwrap();
+            payload[pos..pos + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+            assert_miss_and_deleted(&reframe(&payload), dir.path(), &format!("{k}-nonfinite_ev.bin"));
+        }
 
-    // Nonfinite exploitability_over_P (f64, top-level CacheEntry field).
-    {
-        let sentinel = 0.041_233_7_f64;
-        let mut e = support::entry();
-        e.exploitability_over_P = sentinel;
-        let bytes = storage::encode(&Cell { entries: vec![e] }).unwrap();
-        let mut payload = decompressed_payload_of(&bytes);
-        let needle = sentinel.to_le_bytes();
-        let occurrences = payload.windows(8).filter(|w| *w == needle).count();
-        assert_eq!(occurrences, 1, "sentinel must appear exactly once in the decoded payload");
-        let pos = payload.windows(8).position(|w| w == needle).unwrap();
-        payload[pos..pos + 8].copy_from_slice(&f64::NAN.to_le_bytes());
-        assert_miss_and_deleted(&reframe(&payload), dir.path(), "nonfinite_exploitability.bin");
+        // Nonfinite exploitability_over_P (f64, top-level CacheEntry field).
+        {
+            let sentinel = 0.041_233_7_f64;
+            let mut e = entry.clone();
+            e.exploitability_over_P = sentinel;
+            let bytes = storage::encode(&Cell { entries: vec![e] }).unwrap();
+            let mut payload = decompressed_payload_of(&bytes);
+            let needle = sentinel.to_le_bytes();
+            let occurrences = payload.windows(8).filter(|w| *w == needle).count();
+            assert_eq!(occurrences, 1, "{fixture}: sentinel must appear exactly once in the decoded payload");
+            let pos = payload.windows(8).position(|w| w == needle).unwrap();
+            payload[pos..pos + 8].copy_from_slice(&f64::NAN.to_le_bytes());
+            assert_miss_and_deleted(&reframe(&payload), dir.path(), &format!("{k}-nonfinite_exploitability.bin"));
+        }
     }
 }
