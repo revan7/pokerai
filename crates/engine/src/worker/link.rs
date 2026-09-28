@@ -1,3 +1,4 @@
+use super::ready::ReadyRefusal;
 use proto::worker::{EngineMessage, Ready, WorkerMessage};
 use std::time::Duration;
 
@@ -14,8 +15,12 @@ pub enum WorkerLinkError {
     /// A line longer than the limit, counted with its terminator (spec 4.5: result line <= 16 MiB, request line
     /// <= 1 MiB); the number is the line's full length.
     #[error("line too long: {0} bytes")] LineTooLong(usize),
-    /// The worker could not be started and validated (bounded: at most two launches, spec 4.5).
+    /// The worker could not be started and validated (bounded: at most two launches, spec 4.5): the binary did not
+    /// start, exited, stayed silent or wrote something other than `ready` first. Possibly transient.
     #[error("spawn: {0}")] Spawn(String),
+    /// The worker at `exe` started and wrote a `ready` that fails validation (spec 4.5): permanent for that binary, which
+    /// reports the same values at every launch, so it is not relaunched (spec 12, "until rebuilt"; follow-up P2.W2).
+    #[error("{exe}: ready refused: {refusal}")] ReadyRefused { exe: String, refusal: ReadyRefusal },
     /// The worker process is gone with this confirmed exit code (spec 10.3 `WorkerExit{code}`). Final for the
     /// process: every later `send` reports it, and `recv` reports it after returning every line the worker wrote
     /// before exiting (a `send` may report it first, while such lines are still queued), then keeps reporting it.
@@ -51,4 +56,54 @@ pub trait WorkerLink: Send {
     fn kill(&mut self);
     fn ready(&self) -> Option<&Ready>;
     fn peak_working_set_bytes(&self) -> u64 { 0 }
+    /// The permanent `ready` refusal this link stands for, when it is a degraded engine's (`RefusedWorker`): every
+    /// request is then answered with it and nothing is launched (spec 12). `None` for a link that can launch a worker.
+    fn refused(&self) -> Option<&ReadyRefusal> { None }
+}
+
+/// The link of a degraded engine (spec 12; ruling 29-I4): the worker binary at `exe` refused `ready` at startup
+/// (`WorkerLinkError::ReadyRefused`), a refusal that holds until the binary is rebuilt. There is no worker behind it and
+/// none is ever launched: every call answers that refusal at once (`send`, `recv`, `restart`), `kill` has nothing to
+/// kill, and `refused` names it, so `serve_request` answers every decision with the §12 version mismatch before any
+/// solve.
+#[derive(Debug, Clone)]
+pub struct RefusedWorker {
+    exe: String,
+    refusal: ReadyRefusal,
+}
+
+impl RefusedWorker {
+    pub fn new(exe: String, refusal: ReadyRefusal) -> Self { Self { exe, refusal } }
+
+    fn error(&self) -> WorkerLinkError { WorkerLinkError::ReadyRefused { exe: self.exe.clone(), refusal: self.refusal.clone() } }
+}
+
+impl WorkerLink for RefusedWorker {
+    fn send(&mut self, _msg: &EngineMessage) -> Result<(), WorkerLinkError> { Err(self.error()) }
+    fn recv(&mut self, _timeout: Duration) -> Result<Option<WorkerMessage>, WorkerLinkError> { Err(self.error()) }
+    /// Never relaunches the refused build.
+    fn restart(&mut self) -> Result<(), WorkerLinkError> { Err(self.error()) }
+    fn kill(&mut self) {}
+    fn ready(&self) -> Option<&Ready> { None }
+    fn refused(&self) -> Option<&ReadyRefusal> { Some(&self.refusal) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A degraded engine's link answers its refusal to everything, relaunches nothing and has no `ready`.
+    #[test]
+    fn a_refused_worker_answers_its_refusal_and_launches_nothing() {
+        let refusal = ReadyRefusal::ProtoVersion { reported: 2 };
+        let mut w = RefusedWorker::new("solver-worker.exe".into(), refusal.clone());
+        let is_refusal = |e: WorkerLinkError| matches!(e, WorkerLinkError::ReadyRefused { exe, refusal: r } if exe == "solver-worker.exe" && r == refusal);
+        assert!(is_refusal(w.send(&EngineMessage::Shutdown { id: "1".into() }).unwrap_err()));
+        assert!(is_refusal(w.recv(Duration::from_secs(3_600)).unwrap_err()));
+        assert!(is_refusal(w.restart().unwrap_err()));
+        w.kill();
+        assert!(w.ready().is_none());
+        assert_eq!(w.refused(), Some(&refusal));
+        assert_eq!(w.error().to_string(), format!("solver-worker.exe: ready refused: proto_version 2 != {}", proto::worker::PROTO_VERSION));
+    }
 }

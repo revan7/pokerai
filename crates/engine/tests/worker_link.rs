@@ -4,7 +4,7 @@
 //! `engine::worker::process`, and the job object's are unit tests of `engine::worker::job_object`.
 use engine::worker::link::{WorkerLink, WorkerLinkError};
 use engine::worker::process::ProcessWorker;
-use engine::worker::ready::{cpu_lacks_avx2, validate_ready};
+use engine::worker::ready::{cpu_lacks_avx2, validate_ready, ReadyRefusal};
 use proto::worker::{AckStatus, EngineMessage, Ready, WorkerMessage, ADAPTER_VERSION, PROTO_VERSION, SOLVER_COMMIT};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -41,22 +41,31 @@ fn require_exe() -> Option<PathBuf> {
 fn ready_validation_rules() {
     let ok = Ready { proto_version: PROTO_VERSION, solver_commit: SOLVER_COMMIT.into(), adapter_version: ADAPTER_VERSION, threads: 16, build_features: vec!["avx2".into()], cpu_features: vec!["avx2".into()], capabilities: vec!["solve".into()] };
     assert!(validate_ready(&ok, 16).is_ok());
-    assert!(validate_ready(&ok, 8).unwrap_err().contains("threads"));
+    // Each refusal is typed (follow-up P2.W2): which check failed and what the worker reported, with the message the
+    // engine shows naming both and the value required.
+    let refused = |r: &Ready, threads: u8| validate_ready(r, threads).unwrap_err();
+    assert_eq!(refused(&ok, 8), ReadyRefusal::Threads { reported: 16, requested: 8 });
+    assert_eq!(refused(&ok, 8).to_string(), "threads 16 != requested 8");
     let mut no_avx = ok.clone(); no_avx.build_features = vec![];
-    assert_eq!(validate_ready(&no_avx, 16).unwrap_err(), "worker built without AVX2");
+    assert_eq!(refused(&no_avx, 16), ReadyRefusal::NoAvx2 { build_features: vec![] });
+    assert_eq!(refused(&no_avx, 16).to_string(), "worker built without AVX2 (build_features [])");
     let mut v = ok.clone(); v.proto_version = 2;
-    assert!(validate_ready(&v, 16).unwrap_err().contains("proto_version"));
+    assert_eq!(refused(&v, 16), ReadyRefusal::ProtoVersion { reported: 2 });
+    assert_eq!(refused(&v, 16).to_string(), format!("proto_version 2 != {PROTO_VERSION}"));
     let mut c = ok.clone(); c.solver_commit = "deadbeef".into();
-    assert!(validate_ready(&c, 16).unwrap_err().contains("commit"));
+    assert_eq!(refused(&c, 16), ReadyRefusal::SolverCommit { reported: "deadbeef".into() });
+    assert_eq!(refused(&c, 16).to_string(), format!("solver commit \"deadbeef\" != pinned {SOLVER_COMMIT}"));
     // Every §4.5 rule is tested (standing ruling): the adapter version too.
     let mut a = ok.clone(); a.adapter_version = ADAPTER_VERSION + 1;
-    assert!(validate_ready(&a, 16).unwrap_err().contains("adapter_version"));
+    assert_eq!(refused(&a, 16), ReadyRefusal::AdapterVersion { reported: ADAPTER_VERSION + 1 });
+    assert_eq!(refused(&a, 16).to_string(), format!("adapter_version {} != {ADAPTER_VERSION}", ADAPTER_VERSION + 1));
     // The commit is compared exactly: a padded string is not the pinned commit.
     let mut padded = ok.clone(); padded.solver_commit = format!("{SOLVER_COMMIT}\n");
-    assert!(validate_ready(&padded, 16).unwrap_err().contains("commit"));
+    assert_eq!(refused(&padded, 16), ReadyRefusal::SolverCommit { reported: format!("{SOLVER_COMMIT}\n") });
     // `avx2` is matched exactly among the BUILD features; neighbours and a CPU feature do not stand in for it.
     let mut near = ok.clone(); near.build_features = vec!["avx".into(), "AVX2".into(), "avx512f".into()];
-    assert_eq!(validate_ready(&near, 16).unwrap_err(), "worker built without AVX2");
+    assert_eq!(refused(&near, 16), ReadyRefusal::NoAvx2 { build_features: near.build_features.clone() });
+    assert_eq!(refused(&near, 16).to_string(), r#"worker built without AVX2 (build_features ["avx", "AVX2", "avx512f"])"#);
     // CPU features never refuse a worker (§3.7): they only feed the startup banner.
     let mut no_cpu = ok.clone(); no_cpu.cpu_features = vec!["fma".into()];
     assert!(validate_ready(&no_cpu, 16).is_ok());

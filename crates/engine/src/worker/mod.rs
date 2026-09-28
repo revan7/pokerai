@@ -5,5 +5,5 @@ pub mod job_object;
 pub mod link;
 pub mod process;
 pub mod ready;
-pub use link::{WorkerLink, WorkerLinkError};
+pub use link::{RefusedWorker, WorkerLink, WorkerLinkError};
 pub use process::ProcessWorker;

@@ -71,12 +71,14 @@
 //!
 //! An `InvalidateIdentity` a kill passes stays, in order, at the front of the script: the mutation still arrives, at
 //! the next worker's first `recv`. `restart` is counted, then fails with `Spawn` (no live worker) when a `SpawnFails`
-//! is next in the script, and otherwise launches a new worker process with `default_ready`, its stdin open and a
-//! timeline of its own: what is left of the script is that worker's, measured from its own start.
+//! is next in the script, or with the typed `ReadyRefused` when a `ReadyRefused` is, and otherwise launches a new
+//! worker process with `default_ready`, its stdin open and a timeline of its own: what is left of the script is that
+//! worker's, measured from its own start.
 use crate::clock::Clock;
 use crate::identity::IdentityState;
 use crate::worker::link::{WorkerLink, WorkerLinkError};
 use crate::worker::process::encode_request;
+use crate::worker::ready::ReadyRefusal;
 use crate::EventSink;
 use proto::worker::{
     validate_solution, AckStatus, EngineMessage, NodeStrategy, Ready, ResultStatus, Stage, StreetSolution, WorkerError, WorkerMessage,
@@ -211,17 +213,40 @@ impl Clock for FakeClock {
     /// clock is not held. A thread that blocks is listed in `waiting` until it returns; its registration wakes
     /// `wait_for_waiter`.
     fn wait_until(&self, t_ms: u64) {
+        self.wait_until_or_stopped(t_ms, &std::sync::atomic::AtomicBool::new(false));
+    }
+
+    /// `wait_until`, ended by a stop (the flag set, then `wake_waiters`) whatever the time, even while the clock is held
+    /// (ruling 29-I2: teardown). The flag is checked under the clock's lock, which `wake_waiters` takes before it
+    /// notifies, so no stop is missed. A stopped wait does not move the clock.
+    fn wait_until_or_stopped(&self, t_ms: u64, stop: &std::sync::atomic::AtomicBool) -> bool {
+        let stopped = || stop.load(std::sync::atomic::Ordering::SeqCst);
         let mut s = lock(&self.state);
+        if stopped() {
+            return true;
+        }
         if s.now >= t_ms && !s.held {
-            return;
+            return false;
         }
         s.waiting.push(t_ms);
         self.cv.notify_all();
-        while s.now < t_ms || s.held {
+        let by_stop = loop {
+            if stopped() {
+                break true;
+            }
+            if s.now >= t_ms && !s.held {
+                break false;
+            }
             s = self.cv.wait(s).unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
+        };
         let me = s.waiting.iter().position(|&w| w == t_ms).expect("a blocked waiter stays listed until it returns");
         s.waiting.swap_remove(me);
+        by_stop
+    }
+
+    fn wake_waiters(&self) {
+        let _s = lock(&self.state);
+        self.cv.notify_all();
     }
 }
 
@@ -293,6 +318,9 @@ pub enum FakeReply {
     /// consumes it, and only as the next item of the script (past any `InvalidateIdentity` a kill left at the front); a
     /// live worker has nothing to say in its place.
     SpawnFails(String),
+    /// The next `restart` launches a worker whose `ready` the process link refuses: `Err(ReadyRefused { exe, refusal })`
+    /// (follow-up P2.W2), leaving no live worker. Consumed like `SpawnFails`, by `restart` only.
+    ReadyRefused { exe: String, refusal: ReadyRefusal },
 }
 
 /// What the fake worker was asked to do, shared with the test.
@@ -469,7 +497,7 @@ impl FakeWorker {
                 FakeReply::StdinClosed => closed_at = Some(i),
                 FakeReply::Exit { code } => return Polled::Exited { code: *code, at: i },
                 FakeReply::Eof => own = self.confirmation_end(i + 1).map_or(i + 1, |end| end + 1),
-                FakeReply::Hang | FakeReply::SpawnFails(_) => break,
+                FakeReply::Hang | FakeReply::SpawnFails(_) | FakeReply::ReadyRefused { .. } => break,
                 // Output written and not yet read, or a mutation (not the process's): the process goes on.
                 FakeReply::Ack { .. } | FakeReply::Progress { .. } | FakeReply::Result { .. } | FakeReply::Malformed(_) | FakeReply::Oversized(_)
                 | FakeReply::InvalidateIdentity => {}
@@ -507,7 +535,7 @@ impl FakeWorker {
                     self.script.pop_front();
                     self.stdin_closed = true;
                 }
-                None | Some(FakeReply::Hang | FakeReply::SpawnFails(_)) => {
+                None | Some(FakeReply::Hang | FakeReply::SpawnFails(_) | FakeReply::ReadyRefused { .. }) => {
                     self.wait_out(deadline, "the worker has nothing more to say (a hang, or the end of the script)");
                     return Ok(None);
                 }
@@ -540,7 +568,8 @@ impl FakeWorker {
                 self.proc = Proc::Exited(code);
                 return Err(WorkerLinkError::Exit { code });
             }
-            FakeReply::Delay { .. } | FakeReply::InvalidateIdentity | FakeReply::StdinClosed | FakeReply::Eof | FakeReply::Hang | FakeReply::SpawnFails(_) =>
+            FakeReply::Delay { .. } | FakeReply::InvalidateIdentity | FakeReply::StdinClosed | FakeReply::Eof | FakeReply::Hang | FakeReply::SpawnFails(_)
+            | FakeReply::ReadyRefused { .. } =>
                 unreachable!("read_stdout handles the timeline before a line"),
         };
         Ok(Some(on_the_wire(msg)))
@@ -705,9 +734,12 @@ impl WorkerLink for FakeWorker {
         lock(&self.state).restarts += 1;
         // The next item, past the identity markers a kill left at the front (they stay for the next worker).
         let next = self.script.iter().position(|r| !matches!(r, FakeReply::InvalidateIdentity));
-        if let Some(i) = next.filter(|i| matches!(self.script[*i], FakeReply::SpawnFails(_))) {
-            let Some(FakeReply::SpawnFails(reason)) = self.script.remove(i) else { unreachable!("the next item was a SpawnFails") };
-            return Err(WorkerLinkError::Spawn(reason));
+        if let Some(i) = next.filter(|i| matches!(self.script[*i], FakeReply::SpawnFails(_) | FakeReply::ReadyRefused { .. })) {
+            return Err(match self.script.remove(i) {
+                Some(FakeReply::SpawnFails(reason)) => WorkerLinkError::Spawn(reason),
+                Some(FakeReply::ReadyRefused { exe, refusal }) => WorkerLinkError::ReadyRefused { exe, refusal },
+                _ => unreachable!("the next item was a SpawnFails or a ReadyRefused"),
+            });
         }
         // A new process: stdin open, its timeline starting at the engine's next call.
         self.proc = Proc::Live;
@@ -830,6 +862,27 @@ mod tests {
     use crate::tree::{build_tree_full, TemplateSelection};
     use proto::worker::{NodeLock, SolveRequest, REQUEST_LINE_MAX};
     use proto::{Card, DecisionIdentity, MaterializedNode, Range1326, Seat, Street, StreetRootSnapshot};
+
+    /// Ruling 29-I2: a stop (the flag set, then `wake_waiters`) ends a fake-clock wait before its time, even while the
+    /// clock is held, and the waiter is listed while it waits and not after; a wait whose time has come reports the time.
+    #[test]
+    fn a_stop_ends_a_fake_clock_wait_even_while_the_clock_is_held() {
+        use std::sync::atomic::AtomicBool;
+        let clock = FakeClock::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let waiter = { let (clock, stop) = (clock.clone(), stop.clone()); std::thread::spawn(move || clock.wait_until_or_stopped(100, &stop)) };
+        clock.wait_for_waiter(100);
+        clock.hold();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        clock.wake_waiters();
+        assert!(waiter.join().unwrap(), "the wait ended because of its stop");
+        assert!(clock.waiting().is_empty(), "the stopped waiter is no longer listed");
+        assert_eq!(clock.now_ms(), 0, "a stop does not move the clock");
+        clock.release();
+        clock.set_ms(100);
+        assert!(!clock.wait_until_or_stopped(100, &AtomicBool::new(false)), "a due wait reports the time");
+    }
+
     #[test]
     fn fake_worker_advances_the_fake_clock_and_resolves_ids() {
         let clock = FakeClock::new();
@@ -1516,6 +1569,16 @@ mod tests {
         assert!(w.ready().is_none());
         assert!(matches!(w.recv(ms(10)), Err(WorkerLinkError::Eof)));
         assert!(matches!(w.send(&EngineMessage::Shutdown { id: "1".into() }), Err(WorkerLinkError::Eof)));
+        w.restart().unwrap();
+        assert_eq!(acked(w.recv(ms(10))), "a");
+        assert_eq!(state.lock().unwrap().restarts, 2);
+        // A relaunched worker whose `ready` the link refuses is the typed refusal (follow-up P2.W2), with no live worker
+        // left either.
+        let refusal = ReadyRefusal::NoAvx2 { build_features: vec![] };
+        let (_clock, _identity, mut w, state) = rig(vec![FakeReply::ReadyRefused { exe: "w.exe".into(), refusal: refusal.clone() }, ack("a")]);
+        assert!(matches!(w.restart(), Err(WorkerLinkError::ReadyRefused { exe, refusal: r }) if exe == "w.exe" && r == refusal));
+        assert!(w.ready().is_none());
+        assert!(matches!(w.recv(ms(10)), Err(WorkerLinkError::Eof)));
         w.restart().unwrap();
         assert_eq!(acked(w.recv(ms(10))), "a");
         assert_eq!(state.lock().unwrap().restarts, 2);

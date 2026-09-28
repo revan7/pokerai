@@ -90,6 +90,7 @@ fn stale_ids_discarded() {
 
 use engine::clock::Clock;
 use engine::worker::link::{WorkerLink, WorkerLinkError};
+use engine::worker::ready::ReadyRefusal;
 use proto::worker::{Ready, WorkerMessage};
 use std::time::Duration;
 
@@ -160,10 +161,11 @@ fn request_deadline_and_margin_per_street() {
 /// a deadline stop). `Terminal::Ok` iff the raw exploitability meets the raw target, compared exactly (`expl * 10_000
 /// <= target_bp * pot` in f64, the predicate of `assemble::coverage_for_solve`). `BestSoFar`, which assembly labels
 /// `DeadlineBestSoFar`, is kept for a genuine deadline stop, a worker `best_so_far`, that misses it. A worker `ok` that
-/// misses the raw target breaks the worker's contract (`ok` means the target was met): the worker stops at an
-/// f32-rounded target, at 30 bp of a 100-chip pot 0.3f32, half an ulp above the raw 0.3 chips, so an immediate `ok` at
-/// 0.3f32 is a non-retryable worker-contract `EngineError` naming both thresholds, never `Exact` and never a deadline
-/// stop it did not have.
+/// misses the raw target breaks the worker's contract (`ok` means the target was met). Before follow-up P2.W1 the worker
+/// stopped at an f32-rounded target, at 30 bp of a 100-chip pot 0.3f32, half an ulp above the raw 0.3 chips; it now
+/// applies the raw predicate itself, so the engine's check is a defence: an immediate `ok` at 0.3f32 is a non-retryable
+/// worker-contract `EngineError` naming the measurement and the raw target, never `Exact` and never a deadline stop it
+/// did not have.
 #[test]
 fn q4_an_ok_short_of_the_raw_target_is_a_worker_contract_error_never_a_deadline_stop() {
     let tree = river_tree();
@@ -175,20 +177,21 @@ fn q4_an_ok_short_of_the_raw_target_is_a_worker_contract_error_never_a_deadline_
         assert_eq!((r.clock.now_ms(), out.restarts, kills_and_restarts(&r.state)), (0, 0, (0, 0)), "{status:?} at {expl} of a {target_bp} bp target");
         out
     };
-    // the worker's own threshold admits 0.3f32 at 30 bp; the raw comparison does not
+    // the f32-rounded threshold the worker used before P2.W1 admits 0.3f32 at 30 bp; the raw comparison does not
     assert!((f64::from(100u32) * 30.0 / 10_000.0) as f32 >= 0.3f32 && f64::from(0.3f32) * 10_000.0 > 30.0 * 100.0);
     for (expl, target_bp) in [(0.3f32, 30u16), (1.9, 50)] {
         let out = run(ResultStatus::Ok, expl, target_bp);
         assert_ne!(out.terminal, Terminal::BestSoFar, "an ok at {expl} of a {target_bp} bp target never claims a deadline stop");
         let (message, retryable) = failed_engine_error(&out.terminal);
-        assert!(message.starts_with("worker contract") && message.contains("raw target") && message.contains("f32-rounded threshold") && !retryable, "{message}");
+        assert!(message.starts_with("worker contract") && message.contains("raw target") && message.ends_with("which the worker's own stop applies") && !retryable,
+            "{message}");
         assert!(out.solution.is_none() && out.reached_bp.is_none(), "nothing of a contract-breaking ok is exposed");
     }
-    // the rounded-threshold case names the measurement, the raw target and the worker's threshold
+    // the rounded-threshold case names the measurement and the raw target, which the worker itself now applies (P2.W1)
     let (message, _) = failed_engine_error(&run(ResultStatus::Ok, 0.3, 30).terminal);
     let f32_chips = f64::from(0.3f32).to_string();
-    assert!(message.contains(&format!("`ok` at {f32_chips} chips")) && message.contains("raw target 0.3 chips (30 bp of the 100-chip pot)")
-        && message.contains(&format!("f32-rounded threshold is {f32_chips} chips")), "{message}");
+    assert_eq!(message, format!("worker contract: `ok` at {f32_chips} chips misses the raw target 0.3 chips (30 bp of the 100-chip pot), \
+        which the worker's own stop applies"));
     // an ok at a representable raw target: Ok, Exact
     let out = run(ResultStatus::Ok, 0.5, 50);
     assert_eq!((out.terminal, out.reached_bp), (Terminal::Ok, Some(50)));
@@ -784,7 +787,8 @@ impl WorkerLink for RestartsToNothing {
 /// failed) relaunches it once before anything is sent and validates the relaunched worker's `ready`. Relaunched, the
 /// solve goes ahead. A relaunch that fails ends it with a non-retryable `EngineError` naming the failure (P2T23-I3):
 /// both a launch that never became ready and the process link's own refusal of the relaunched worker's `ready`
-/// (`worker::process`, `Spawn("<exe>: ready refused: <reason>")`), which the engine never sees as a `ready`. A relaunched
+/// (`worker::process`, the typed `ReadyRefused { exe, refusal }` of follow-up P2.W2), which the engine never sees as a
+/// `ready`; the link error's whole text, naming the check and the reported value, reaches the error. A relaunched
 /// worker whose `ready` the link reports and the engine refuses (no AVX2, spec 3.6/3.7) ends it with the non-retryable
 /// version mismatch of §12.
 #[test]
@@ -794,12 +798,12 @@ fn a_missing_worker_is_relaunched_once_before_the_request() {
     let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
     assert_eq!((out.terminal, out.restarts, kills_and_restarts(&r.state), solves(&r.state).len()), (Terminal::Ok, 1, (1, 1), 1));
 
-    for spawn_failure in [DID_NOT_BECOME_READY, READY_REFUSED] {
-        let mut r = rig(Street::River, vec![FakeReply::SpawnFails(spawn_failure.into())]);
+    for (relaunch, failure) in relaunch_failures() {
+        let mut r = rig(Street::River, vec![relaunch]);
         r.core.worker.kill();
         let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
         let (message, retryable) = failed_engine_error(&out.terminal);
-        assert!(message.contains("no live worker") && message.contains(spawn_failure) && !retryable, "{message}");
+        assert!(message.contains("no live worker") && message.contains(&failure) && !retryable, "{message}");
         assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len(), r.clock.now_ms()), (1, (1, 1), 0, 0));
         assert!(r.core.worker.ready().is_none(), "no live worker is left; the next request tries again");
     }
@@ -827,11 +831,18 @@ fn a_missing_worker_is_relaunched_once_before_the_request() {
     assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len()), (1, (1, 1), 0));
 }
 
-/// The process link's failures of a relaunch (`worker::process::ProcessWorker::start`): no launch became ready, or the
-/// relaunched worker's `ready` was refused, which the link reports as `Spawn` after killing that worker (the engine
-/// never sees the refused `ready`).
+/// The process link's failures of a relaunch (`worker::process::ProcessWorker::start`): no launch became ready
+/// (`Spawn`), or the relaunched worker's `ready` was refused, which the link reports as the typed `ReadyRefused` after
+/// killing that worker (follow-up P2.W2; the engine never sees the refused `ready`). Each comes with the text the
+/// solve's error must carry: the failure's own text, and for the refusal the link error's whole message.
 const DID_NOT_BECOME_READY: &str = r"D:\PokerAI\solver-worker.exe did not become ready after 2 attempts (attempt 1: spawn: startup timeout; attempt 2: spawn: startup timeout)";
-const READY_REFUSED: &str = r"D:\PokerAI\solver-worker.exe: ready refused: worker built without AVX2";
+fn relaunch_failures() -> Vec<(FakeReply, String)> {
+    let exe = r"D:\PokerAI\solver-worker.exe".to_string();
+    let refusal = ReadyRefusal::NoAvx2 { build_features: vec!["sse4.2".into()] };
+    let refused = WorkerLinkError::ReadyRefused { exe: exe.clone(), refusal: refusal.clone() }.to_string();
+    assert_eq!(refused, r#"D:\PokerAI\solver-worker.exe: ready refused: worker built without AVX2 (build_features ["sse4.2"])"#);
+    vec![(FakeReply::SpawnFails(DID_NOT_BECOME_READY.into()), DID_NOT_BECOME_READY.to_string()), (FakeReply::ReadyRefused { exe, refusal }, refused)]
+}
 
 /// Decision 4 mid-request (P2T23-I3): after a failed attempt, a restart that fails leaves no live worker and ends the
 /// solve with a non-retryable `EngineError` naming both causes, whether no launch became ready or the process link
@@ -841,11 +852,11 @@ const READY_REFUSED: &str = r"D:\PokerAI\solver-worker.exe: ready refused: worke
 #[test]
 fn a_failed_restart_or_a_refused_ready_after_a_restart_ends_the_solve() {
     let exits = || vec![ack(), FakeReply::Delay { ms: 1 }, FakeReply::Exit { code: 3 }];
-    for spawn_failure in [DID_NOT_BECOME_READY, READY_REFUSED] {
-        let mut r = rig(Street::River, [exits(), vec![FakeReply::SpawnFails(spawn_failure.into())]].concat());
+    for (relaunch, failure) in relaunch_failures() {
+        let mut r = rig(Street::River, [exits(), vec![relaunch]].concat());
         let out = run_solve(&mut r.core, &r.input, &r.plan, &r.sink);
         let (message, retryable) = failed_engine_error(&out.terminal);
-        assert!(message.contains("WorkerExit{code: 3}") && message.contains(spawn_failure) && !retryable, "{message}");
+        assert!(message.contains("WorkerExit{code: 3}") && message.contains(&failure) && !retryable, "{message}");
         assert_eq!((out.restarts, kills_and_restarts(&r.state), solves(&r.state).len(), r.clock.now_ms()), (1, (0, 1), 1, 1));
         assert!(r.core.worker.ready().is_none());
     }
