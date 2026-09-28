@@ -1,7 +1,8 @@
 //! The state `engine-main` owns (spec 3.4): the worker link, the clock every deadline is measured on, the decision
 //! identity, the watchdog, the decision log, the request-id counter, the memory limit and the furthest stage the live
 //! request has reached, and (Task 27) the snapshot store, the game config and the range source, and (Task 28) the
-//! equity cancellation token of the request served last, and (ruling 29-I2) the threads its requests start.
+//! equity cancellation token of the request served last, and (ruling 29-I2) the threads its requests start, and (plan
+//! 3 Task 17) the preflop store, loaded once before the core is handed to `engine-main`.
 //!
 //! Ownership (rulings 29-I2, 29-I3). `Engine` hands the core to `engine-main`, which owns it alone (no lock around it)
 //! and tears it down on its way out (`shutdown`): every thread the core started is stopped and joined, then the worker
@@ -14,6 +15,7 @@ use crate::ranges::{ExplicitRanges, RangeSource};
 use crate::snapshots::SnapshotStore;
 use crate::watchdog::Watchdog;
 use crate::worker::link::WorkerLink;
+use core_preflop::PreflopStore;
 use proto::worker::EngineMessage;
 use proto::{DecisionIdentity, GameConfig, Rake, SolverPrefs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,6 +115,11 @@ pub struct EngineCore {
     /// decision's request (final review I1), and is settled before anything more is sent to the worker (`run_solve`)
     /// or while `engine-main` is idle. Cleared by the job's `result{cancelled}` and by any kill or restart.
     pub(crate) pending_cancel: Option<crate::solve::PendingCancel>,
+    /// The preflop store (spec 8.1), loaded once, before the core is handed to `engine-main` (`Engine::new` loads it from
+    /// `Paths::preflop`, `preflop::load_store`; a core built for a test takes the store it is given), and shared with
+    /// `Engine`, which hands it out (`Engine::preflop_store`). Read-only from then on: no recommendation reads the disk.
+    /// An empty store until one is installed.
+    pub preflop: Arc<PreflopStore>,
     /// `shutdown` has run.
     shut_down: bool,
 }
@@ -135,6 +142,7 @@ impl EngineCore {
             equity_cancel: Arc::new(Mutex::new(None)),
             tasks: Arc::default(),
             pending_cancel: None,
+            preflop: Arc::new(PreflopStore::from_sources(vec![])),
             shut_down: false,
         }
     }

@@ -489,8 +489,9 @@ fn a_request_admitted_behind_a_hung_solve_gets_its_fast_at_once_and_its_final_by
 
 /// Final fix round 2, ruling F2-N1 (the re-review's probe P2: the settle while `engine-main` is idle). Request A's river
 /// solve hangs; B, at hero's preflop decision of a new hand, is admitted at t0A + 100 ms, while A's receive is in
-/// progress. A's cancel is sent then and left pending, `engine-main` giving way to B, which the classifier answers
-/// without a solve (no worker call). Nothing is queued after B: `engine-main`, idle, waits A's cancel window out and
+/// progress. A's cancel is sent then and left pending, `engine-main` giving way to B, which the preflop path answers at
+/// once without a solve (no worker call; plan 3 Task 17: its `Fast`, then its `Final`, here `MissingPreflopNode` since
+/// this core holds no preflop bundle). Nothing is queued after B: `engine-main`, idle, waits A's cancel window out and
 /// kills the worker at t_cancel + 1.5 s. Nothing is sent to the worker after the `cancel`, and A gets no `Final`.
 #[test]
 fn a_pending_cancel_is_settled_while_engine_main_is_idle() {
@@ -515,7 +516,8 @@ fn a_pending_cancel_is_settled_while_engine_main_is_idle() {
     let (sink, b_events) = RecordingSink::notifying(clock.clone(), None);
     let b = e.recommend(Box::new(sink)).unwrap();
     let _ = resume.send(());
-    let b_first = b_events.wait_for(1).into_iter().next().map(|r| (r.at_ms, r.event));
+    // B's `Fast` and `Final` (its `Equity` follows the `Final` from its own thread).
+    let b_answer: Vec<(u64, proto::RecommendationEvent)> = b_events.wait_for(2).into_iter().take(2).map(|r| (r.at_ms, r.event)).collect();
     let killed_at = killed.recv_timeout(engine::testing::ACK_LIVENESS).ok();
     let calls_at_kill = fake.lock().unwrap().calls.clone();
     e.shutdown();
@@ -523,9 +525,9 @@ fn a_pending_cancel_is_settled_while_engine_main_is_idle() {
     let diagnostics: Vec<engine::log::DiagnosticRecord> = std::fs::read_to_string(log_dir.join("diagnostics.jsonl"))
         .map(|t| t.lines().map(|l| serde_json::from_str(l).unwrap()).collect()).unwrap_or_default();
     assert!(paused_in_a, "A's receive returned at 100 ms");
-    assert!(matches!(&b_first, Some((100, proto::RecommendationEvent::Final(r))) if r.identity == b
-        && matches!(r.coverage, proto::Coverage::Unsupported { reason: proto::UnsupportedReason::EngineError { .. }, .. })),
-        "B is answered at once by the classifier's row, no solve: {b_first:?}");
+    assert!(matches!(b_answer.as_slice(), [(100, proto::RecommendationEvent::Fast(fast)), (100, proto::RecommendationEvent::Final(r))]
+        if fast.identity == b && r.identity == b && matches!(r.coverage, proto::Coverage::Unsupported { reason: proto::UnsupportedReason::MissingPreflopNode { .. }, .. })),
+        "B is answered at once by the preflop path, no solve: {b_answer:?}");
     assert_eq!(killed_at, Some(1_600), "idle, engine-main killed the worker at the end of A's cancel window, t_cancel + 1.5 s");
     let calls: Vec<(u64, &str)> = calls_at_kill.iter().map(|(at, c)| (*at, c.as_str())).collect();
     assert_eq!(calls, [(0, "solve 1"), (100, "cancel 1"), (1_600, "kill")], "nothing is sent to the worker after the cancel");
@@ -536,8 +538,9 @@ fn a_pending_cancel_is_settled_while_engine_main_is_idle() {
 
 /// Final fix round 2, ruling F2-N1: the kill at the end of a cancel window is never skipped, only made late. Request A's
 /// river solve hangs; B, at hero's preflop decision of a new hand, is admitted at t0A + 100 ms, while A's receive is in
-/// progress, so A's cancel is sent then and left pending. B's `Final` (the classifier's, no solve) holds `engine-main`
-/// in its sink callback while the clock passes the end of A's cancel window (t_cancel + 1.5 s) by 5 s, and C, a river
+/// progress, so A's cancel is sent then and left pending. B's first event (its preflop `Fast`, plan 3 Task 17; no solve)
+/// holds `engine-main` in its sink callback while the clock passes the end of A's cancel window (t_cancel + 1.5 s) by 5 s,
+/// and C, a river
 /// decision later in B's hand, is admitted meanwhile. When the callback returns, the pending cancel is settled before
 /// anything of C is sent: the worker is killed at once, at the release time, then C's solve relaunches it, and C is
 /// answered.
@@ -581,7 +584,7 @@ fn the_kill_at_the_end_of_a_cancel_window_is_never_skipped() {
     let c_final = final_of(&c_events);
     e.shutdown();
     let calls: Vec<(u64, String)> = fake.lock().unwrap().calls.clone();
-    assert!(paused_in_a && held, "A's receive returned at 100 ms; B's Final held engine-main");
+    assert!(paused_in_a && held, "A's receive returned at 100 ms; B's first event held engine-main");
     let calls: Vec<(u64, &str)> = calls.iter().map(|(at, c)| (*at, c.as_str())).take(5).collect();
     assert_eq!(calls, [(0, "solve 1"), (100, "cancel 1"), (6_600, "kill"), (6_600, "restart"), (6_600, "solve 3")],
         "the late kill lands before anything of C is sent, never skipped");
@@ -1045,15 +1048,21 @@ mod stand_in {
     use std::path::PathBuf;
 
     /// Each launch appends a line to `launches.txt` next to the script before anything else, as the process link's own
-    /// stand-ins do, so a test counts launches.
+    /// stand-ins do, so a test counts launches. Its `preflop` directory holds the packaged chart pairs of every depth the
+    /// acquisition record lists `available`, as Plan 5's staging puts them in `Paths::preflop` (plan 3 Task 17).
     struct StandIn { dir: PathBuf }
     impl StandIn {
         fn new(tag: &str, ready: &Ready) -> StandIn {
             let dir = std::env::temp_dir().join(format!("pokerai-engine-api-{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::create_dir_all(dir.join("preflop")).unwrap();
             let line = serde_json::to_string(&WorkerMessage::Ready(ready.clone())).unwrap();
             std::fs::write(dir.join("worker.cmd"), format!("@echo off\r\necho x>>\"%~dp0launches.txt\"\r\necho {line}\r\nset /p _=\r\n")).unwrap();
+            for id in chart_ids() {
+                for name in [format!("{id}.manifest.json"), format!("{id}.json")] {
+                    std::fs::copy(charts_dir().join(&name), dir.join("preflop").join(&name)).unwrap();
+                }
+            }
             StandIn { dir }
         }
         fn paths(&self) -> Paths {
@@ -1062,6 +1071,15 @@ mod stand_in {
         fn launches(&self) -> usize { std::fs::read_to_string(self.dir.join("launches.txt")).map(|s| s.lines().count()).unwrap_or(0) }
     }
     impl Drop for StandIn { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.dir); } }
+
+    fn charts_dir() -> PathBuf { std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/charts") }
+    /// The bundle ids of the depths the committed acquisition record lists `available`.
+    fn chart_ids() -> Vec<String> {
+        let record: serde_json::Value = serde_json::from_slice(&std::fs::read(charts_dir().join("sources.manifest.json")).unwrap()).unwrap();
+        let ids: Vec<String> = record["depths"].as_array().unwrap().iter().filter(|d| d["status"] == "available").map(|d| d["bundle_id"].as_str().unwrap().to_string()).collect();
+        assert!(!ids.is_empty(), "at least one chart depth ships");
+        ids
+    }
 
     fn start(s: &StandIn) -> Engine {
         let (cfg, _) = cfg_1_2();
@@ -1078,6 +1096,7 @@ mod stand_in {
         assert_eq!(e.startup_report(), StartupReport { worker_ready: true, worker_threads: 16, build_features: ready.build_features.clone(),
             cpu_features: ready.cpu_features.clone(), capabilities: ready.capabilities.clone(), cpu_lacks_avx2: false, worker_refusal: None,
             quarantined_bundles: vec![], cache_state: "absent".into(), banners: vec![] });
+        assert_eq!(e.preflop_store().bundles().iter().map(|b| b.bundle_info().bundle_id.clone()).collect::<Vec<_>>(), chart_ids(), "the packaged charts");
         assert_eq!(e.state(), None);
         assert_eq!(e.begin_hand(begin()).unwrap().config.config_revision, 1);
         e.shutdown();
@@ -1113,6 +1132,53 @@ mod stand_in {
             e.shutdown();
             assert_eq!(s.launches(), 1, "{tag}: the refused build was launched once, at startup, and never again");
         }
+    }
+
+    /// Plan 3 Task 17 (spec 5 step 1, spec 8.2): `Engine::new` loads the preflop store once, from `Paths::preflop`. An
+    /// installed bundle that fails validation is renamed `.bad`, a packaged pair that fails is left in place, both are
+    /// the report's `quarantined_bundles` with a banner each, and the remaining charts stay active: hero's RFI decision
+    /// is the chart's, with no solve sent to the worker. A missing preflop directory is a banner and an empty store,
+    /// never a construction error.
+    #[test]
+    fn new_loads_the_preflop_store_once_and_reports_its_banners() {
+        let s = StandIn::new("preflop-store", &FakeWorker::default_ready());
+        let preflop = s.dir.join("preflop");
+        std::fs::create_dir_all(preflop.join("broken_pd")).unwrap();
+        std::fs::copy(charts_dir().join(format!("{}.manifest.json", chart_ids()[0])), preflop.join("broken_pd").join("manifest.json")).unwrap();
+        std::fs::write(preflop.join("broken_pd").join("nodes.json"), b"{}").unwrap();
+        std::fs::copy(charts_dir().join(format!("{}.manifest.json", chart_ids()[0])), preflop.join("broken_chart.manifest.json")).unwrap();
+        std::fs::write(preflop.join("broken_chart.json"), b"{}").unwrap();
+        let mut e = start(&s);
+        let rep = e.startup_report();
+        assert!(rep.worker_ready);
+        assert_eq!(rep.quarantined_bundles, vec!["broken_pd".to_string(), "broken_chart".to_string()]);
+        assert_eq!(rep.banners.len(), 2, "{:?}", rep.banners);
+        assert!(rep.banners[0].starts_with("preflop bundle broken_pd quarantined") && rep.banners[1].contains("broken_chart"), "{:?}", rep.banners);
+        assert!(preflop.join("broken_pd.bad").is_dir() && preflop.join("broken_chart.json").is_file());
+        assert_eq!(e.preflop_store().bundles().iter().map(|b| b.bundle_info().bundle_id.clone()).collect::<Vec<_>>(), chart_ids());
+        let (cfg, _) = cfg_1_2();
+        e.set_config(cfg).unwrap();
+        let begin = proto::BeginHand { button: Seat(5), hero: Seat(2), dealt: (0..6).map(Seat).collect(), stacks: vec![1000; 6], hero_cards: Some([Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()]) };
+        e.begin_hand(begin).unwrap();
+        let (sink, recorder) = RecordingSink::notifying(FakeClock::new(), None);
+        e.recommend(Box::new(sink)).unwrap();
+        let answered = recorder.wait_for(2);
+        e.shutdown();
+        match &answered[1].event {
+            proto::RecommendationEvent::Final(f) => assert!(matches!(&f.coverage, proto::Coverage::Approximate { reasons } if reasons.contains(&proto::ApproxReason::ChartRounded)),
+                "hero's RFI decision is the chart's: {:?}", f.coverage),
+            other => panic!("expected the Final after the Fast, got {other:?}"),
+        }
+        assert_eq!(s.launches(), 1, "the preflop decision launched nothing");
+        // No preflop directory at all: a banner and an empty store.
+        let s = StandIn::new("no-preflop", &FakeWorker::default_ready());
+        std::fs::remove_dir_all(s.dir.join("preflop")).unwrap();
+        let mut e = start(&s);
+        let rep = e.startup_report();
+        assert!(rep.worker_ready && rep.quarantined_bundles.is_empty());
+        assert!(rep.banners.iter().any(|b| b.contains("no preflop bundle is loaded")), "{:?}", rep.banners);
+        assert!(e.preflop_store().bundles().is_empty());
+        e.shutdown();
     }
 
     /// §3.7: a CPU without AVX2 gets a startup banner, not a refusal.

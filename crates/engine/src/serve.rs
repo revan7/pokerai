@@ -1,5 +1,7 @@
-//! Spec §5 steps 4-10 for one live request on `engine-main` (Task 28): the river and turn decision path. The preflop
-//! and flop paths attach at the `Classification::Preflop` arm and at the flop guard below (plans 3 and 4).
+//! Spec §5 steps 4-10 for one live request on `engine-main` (Task 28): the river and turn decision path, and (plan 3
+//! Task 17) the preflop decision path, which `crate::preflop::serve_preflop` answers at the `Classification::Preflop`
+//! arm, after the degraded-engine check, through the request's own claim (`settle`) and never with a solve. The flop
+//! path attaches at the flop guard below (plan 4).
 //!
 //! Admission (final review I1, orchestrator ruling F-I1; spec 7, a watchdog independent of the worker client; spec 5
 //! step 4). `Engine::recommend` admits a request through `admit` the moment it allocates its decision, before
@@ -300,7 +302,7 @@ fn request_assumptions(config: &GameConfig) -> Assumptions {
 /// The watchdog's `Unsupported{DeadlineExceeded}` fallback for this decision with what the request knows so far: the
 /// reasons inherited to here and the assumptions (§7; spec 6, inherited reasons survive an `Unsupported` result). The
 /// stage is the watchdog's to fill in at the fire.
-fn deadline_fallback(ctx: &AssemblyCtx, inherited: &[ApproxReason], assumptions: &Assumptions) -> Recommendation {
+pub(crate) fn deadline_fallback(ctx: &AssemblyCtx, inherited: &[ApproxReason], assumptions: &Assumptions) -> Recommendation {
     assemble::unsupported(ctx, UnsupportedReason::DeadlineExceeded { stage: String::new() }, inherited.to_vec(), assumptions.clone())
 }
 
@@ -308,13 +310,15 @@ fn deadline_fallback(ctx: &AssemblyCtx, inherited: &[ApproxReason], assumptions:
 /// its units of work and stops once it is set (ruling 28-I4).
 pub type EquityRoutine = Arc<dyn Fn(&dyn Clock, Option<[Card; 2]>, &Range1326, &[(Seat, Range1326)], &[Card], Duration, &AtomicBool) -> EquitySummary + Send + Sync>;
 
-/// What `serve` runs that a test may replace (`serve_request_with`); production is `Hooks::production()`.
-struct Hooks {
-    equity: EquityRoutine,
+/// What `serve` runs that a test may replace (`serve_request_with`); production is `Hooks::production()`. Crate-visible
+/// for the preflop path (`crate::preflop::serve_preflop`), which runs the same equity routine and seams.
+pub(crate) struct Hooks {
+    pub(crate) equity: EquityRoutine,
     /// Runs on `engine-main` with a candidate `Final` assembled, immediately before its delivery is claimed.
     before_claim: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Runs on `engine-main` right after the `Fast` was handed over (the sink released), before the tree is built.
-    after_fast: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs on `engine-main` right after the `Fast` was handed over (the sink released): on the river and turn before the
+    /// tree is built, on the preflop path before the `Final` is assembled.
+    pub(crate) after_fast: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Runs on `engine-main` once the solve has returned and its decision was found still active, before the watchdog's
     /// claim is consulted.
     after_active_check: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -424,10 +428,10 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     }
     let (root, inherited, facing_allin_flag, opponent) = match class {
         Classification::NoDecision { .. } => unreachable!("a point that is no decision was answered above"),
-        // PLAN 3 HOOK: the preflop store lookup replaces this arm.
+        // Plan 3 Task 17 (spec 5 step 6): replay, the store lookup over the replayed branches, the `Final` through this
+        // request's claim, then its equity. No solve, no arming.
         Classification::Preflop => {
-            let rec = assemble::unsupported(&ctx, engine_error("no preflop path in this build (plan 3)"), vec![], assumptions);
-            settle(core, req, hooks, &claim, d.street, rec);
+            crate::preflop::serve_preflop(core, req, hooks, &claim, &equity_cancel, &ctx, assumptions);
             return;
         }
         Classification::Multiway { pot_eligible } => {
@@ -475,7 +479,7 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     }
     let hero_is_oop = root.oop == req.state.hero;
     let (hero_public, opp_public) = if hero_is_oop { (&ranges.oop, &ranges.ip) } else { (&ranges.ip, &ranges.oop) };
-    spawn_equity(core, req, hero_public.clone(), (opponent, opp_public.clone()), root.board.clone(), hooks.equity.clone(), equity_cancel.clone());
+    spawn_equity(core, req, hero_public.clone(), vec![(opponent, opp_public.clone())], root.board.clone(), hooks.equity.clone(), equity_cancel.clone());
 
     // Tree and solve (§5 step 7): river and turn are rooted at the street root; the turn cache arrives in plan 4.
     let template = if root.street == Street::River { "river_std_v1" } else { "turn_std_v1" };
@@ -585,8 +589,11 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
 /// Cancellable (spec 7; ruling 28-I4): the routine polls `cancel`, the request's token, between its units of work. It
 /// is set on supersession: by a newer request, by `serve_request` when it finds the decision no longer active, and here
 /// when the decision is already stale as the thread starts. The request's own `Final` never sets it.
-fn spawn_equity(core: &EngineCore, req: &LiveRequest, hero_public: Range1326, opponent: (Seat, Range1326), board: Vec<Card>, routine: EquityRoutine,
-    cancel: Arc<AtomicBool>) {
+///
+/// `opponents` are the seats hero's equity is shown against, each with its public range: the one opponent of a
+/// heads-up street, every other seat still in the hand on the preflop path (plan 3 Task 17, spec 6's preflop rows).
+pub(crate) fn spawn_equity(core: &EngineCore, req: &LiveRequest, hero_public: Range1326, opponents: Vec<(Seat, Range1326)>, board: Vec<Card>,
+    routine: EquityRoutine, cancel: Arc<AtomicBool>) {
     let (ids, identity, sink, clock, hero) = (core.identity.clone(), req.identity.clone(), req.sink.clone(), core.clock.clone(), req.state.hero_cards);
     // Owned by the core (ruling 29-I2): joined at the engine's teardown, never detached.
     core.tasks.spawn("fast-path", move || {
@@ -595,7 +602,7 @@ fn spawn_equity(core: &EngineCore, req: &LiveRequest, hero_public: Range1326, op
             cancel.store(true, Ordering::SeqCst);
             return;
         }
-        let equity = routine(clock.as_ref(), hero, &hero_public, &[opponent], &board, Duration::from_millis(EQUITY_BUDGET_MS), &cancel);
+        let equity = routine(clock.as_ref(), hero, &hero_public, &opponents, &board, Duration::from_millis(EQUITY_BUDGET_MS), &cancel);
         deliver(&ids, &identity, &sink, None, RecommendationEvent::Equity { identity: identity.clone(), equity });
     });
 }
@@ -616,9 +623,10 @@ fn analytic_allin(req: &LiveRequest, d: &Derived, hero_public: &Range1326, opp_p
 }
 
 /// A request's side of its one `Final` (§7): what admission armed (its claim, shared with its watchdog, and the record
-/// of what the watchdog delivered when it won it) and the request's equity cancellation token.
-struct Claim<'a> {
-    watch: &'a Watched,
+/// of what the watchdog delivered when it won it) and the request's equity cancellation token. Crate-visible for the
+/// preflop path, which answers through it (`settle`).
+pub(crate) struct Claim<'a> {
+    pub(crate) watch: &'a Watched,
     equity_cancel: &'a AtomicBool,
 }
 
@@ -677,9 +685,9 @@ fn watchdog_final(fired: &Mutex<Option<Fired>>) -> Fired {
     lock(fired).clone().expect("the watchdog claimed the Final, and its fire records what it delivered before emitting it")
 }
 
-/// A `Final` the classifier settles alone: through the request's claim, shared with its watchdog since admission. It
-/// solves no street, so it logs no street verdict.
-fn settle(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, claim: &Claim<'_>, street: Street, rec: Recommendation) {
+/// A `Final` the classifier settles alone, or the preflop path's (plan 3 Task 17): through the request's claim, shared
+/// with its watchdog since admission. It solves no street, so it logs no street verdict.
+pub(crate) fn settle(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, claim: &Claim<'_>, street: Street, rec: Recommendation) {
     finish(core, req, hooks, claim, Candidate::unsolved(rec), Logged::unsolved(street, None, vec![]));
 }
 
@@ -843,7 +851,7 @@ fn accuracy_bound_bp(exploitability_chips: f32, pot: u32) -> f64 {
 /// Milliseconds from the request's admission to `now_ms` on the engine clock. A request ends by its final delivery (at
 /// most 35 s after `t0`), so the span fits a `u32`; a reading before `t0` or a span that does not fit is an engine
 /// bug, asserted rather than wrapped.
-fn elapsed_ms(t0_ms: u64, now_ms: u64) -> u32 {
+pub(crate) fn elapsed_ms(t0_ms: u64, now_ms: u64) -> u32 {
     let span = now_ms.checked_sub(t0_ms).unwrap_or_else(|| panic!("engine clock reading {now_ms} ms precedes the request's admission at t0 {t0_ms} ms"));
     u32::try_from(span).unwrap_or_else(|_| panic!("a request span of {span} ms does not fit u32"))
 }

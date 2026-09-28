@@ -7,6 +7,13 @@
 //! `POKERAI_WORKER`; the engine never searches for it. `with_core` takes a core built elsewhere (the tests' fake worker
 //! and clock).
 //!
+//! The preflop store (plan 3 Task 17, spec 5 step 1, spec 8.2). `Engine::new` loads it once, from `Paths::preflop`
+//! (`preflop::load_store`: installed bundle directories with the store's own quarantine, then the packaged chart pairs
+//! Plan 5 stages there, read-only), before the core is handed to `engine-main`; every loader banner joins the startup
+//! report's, and the sources that failed validation are its `quarantined_bundles`. The core keeps the store behind an
+//! `Arc`, cloned into `Engine` for `preflop_store`, so no recommendation reads the disk. A missing or empty store is a
+//! banner, never a construction error: every preflop decision then answers `MissingPreflopNode`.
+//!
 //! Degraded engine (spec 12 line 658, ruling 29-I4). A worker whose `ready` is refused (protocol version, solver commit,
 //! adapter version, `threads`, or `build_features` without AVX2: `WorkerLinkError::ReadyRefused`, follow-up P2.W2) does
 //! not fail construction: the core gets a `RefusedWorker` link, which never launches anything, `startup_report` says
@@ -62,6 +69,7 @@ use crate::watchdog::Watchdog;
 use crate::worker::link::{RefusedWorker, WorkerLink, WorkerLinkError};
 use crate::worker::process::ProcessWorker;
 use crate::{EngineError, EventSink};
+use core_preflop::PreflopStore;
 use core_model::{apply_action, begin_hand, set_board, set_hero_cards, BeginHand as CoreBeginHand};
 use proto::{Action, Card, DecisionIdentity, GameConfig, HandConfig, HandState, Range1326};
 use std::path::PathBuf;
@@ -69,7 +77,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// All four directories are declared here so downstream plans have nothing to add:
-/// `log_dir` and `worker_exe` are used by this plan, `preflop` by plan 3, `cache` by plan 4.
+/// `log_dir` and `worker_exe` are used by this plan, `preflop` by plan 3 (the directory `preflop::load_store` reads once,
+/// at construction: installed bundle directories and the packaged chart pairs), `cache` by plan 4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths { pub log_dir: PathBuf, pub worker_exe: PathBuf, pub preflop: PathBuf, pub cache: PathBuf }
 
@@ -150,6 +159,8 @@ pub struct Engine {
     /// `EngineCore::watchdog`, shared: `recommend` arms each request at admission (final review I1).
     watchdog: Arc<Watchdog>,
     shared_config: Arc<Mutex<GameConfig>>, range_source: Arc<Mutex<Box<dyn RangeSource>>>, startup: StartupReport,
+    /// `EngineCore::preflop`, loaded once before the core was handed to `engine-main` (plan 3 Task 17).
+    preflop: Arc<PreflopStore>,
     /// `EngineCore::equity_cancel`: the equity cancellation token of the request served last (ruling 28-I4).
     equity_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     slot: Arc<(Mutex<Slot>, Condvar)>,
@@ -165,8 +176,10 @@ pub struct Engine {
 
 impl Engine {
     /// Validates `cfg`, launches the worker at `paths.worker_exe` (its `ready` validated, §4.5: a worker built without
-    /// AVX2 is refused, §3.7) and starts `engine-main`; `cfg` becomes the session's first config revision. A refused
-    /// `ready` leaves a degraded engine (see the module doc); an invalid config or a failed launch is an error.
+    /// AVX2 is refused, §3.7), loads the preflop store from `paths.preflop` (plan 3 Task 17; its banners and quarantined
+    /// bundles join the startup report) and starts `engine-main`; `cfg` becomes the session's first config revision. A
+    /// refused `ready` leaves a degraded engine (see the module doc); an invalid config or a failed launch is an error,
+    /// and neither touches the preflop directory.
     pub fn new(cfg: GameConfig, paths: Paths) -> Result<Engine, EngineError> {
         validate_config(&cfg)?;
         let worker: Box<dyn WorkerLink> = match ProcessWorker::spawn(&paths.worker_exe, cfg.solver.threads) {
@@ -177,8 +190,13 @@ impl Engine {
         };
         let identity = Arc::new(Mutex::new(IdentityState::new()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
-        let core = EngineCore::new(worker, clock, identity, DecisionLog::open(&paths.log_dir));
+        let mut core = EngineCore::new(worker, clock, identity, DecisionLog::open(&paths.log_dir));
+        // Loaded once, here, before the core is handed to `engine-main` (plan 3 Task 17).
+        let loaded = crate::preflop::load_store(&paths.preflop);
+        core.preflop = Arc::new(loaded.store);
         let mut e = Engine::with_core(core);
+        e.startup.banners.extend(loaded.banners);
+        e.startup.quarantined_bundles = loaded.quarantined;
         e.set_config(cfg)?;
         Ok(e)
     }
@@ -198,6 +216,7 @@ impl Engine {
         let range_source = core.range_source.clone();
         let equity_cancel = core.equity_cancel.clone();
         let watchdog = core.watchdog.clone();
+        let preflop = core.preflop.clone();
         let config = core.config();
         // Captured once, before the core is handed to `engine-main`, which owns it from then on.
         let startup = StartupReport::from_worker(core.worker.as_ref());
@@ -235,13 +254,17 @@ impl Engine {
                 }
             }
         }).expect("spawn engine-main");
-        Engine { identity, clock, snapshots, watchdog, shared_config, range_source, startup, equity_cancel, slot, state: None, undo: vec![], config,
+        Engine { identity, clock, snapshots, watchdog, shared_config, range_source, startup, preflop, equity_cancel, slot, state: None, undo: vec![], config,
             queued_config: None, main: Some(main), stopped: false, #[cfg(test)] before_equity_store: None, #[cfg(test)] admitted_stage: Arc::default() }
     }
 
     /// §12 startup diagnostics for the UI; never blocks (the worker's `ready` is captured at construction,
     /// and plans 3 and 4 fill `quarantined_bundles` / `cache_state` at the same point).
     pub fn startup_report(&self) -> StartupReport { self.startup.clone() }
+
+    /// The preflop store the engine loaded once at construction (plan 3 Task 17; plan 4's consumption point): the same
+    /// store every preflop decision reads, never reloaded.
+    pub fn preflop_store(&self) -> &PreflopStore { &self.preflop }
 
     /// §4.2 / §13.3: validates the config, allocates a revision and applies it — immediately when no hand is in
     /// progress, otherwise from the next `begin_hand` (the active hand keeps its frozen `HandConfig`). A rejected config
@@ -612,40 +635,55 @@ mod tests {
         vec![("identity", free(&e.identity)), ("snapshots", free(&e.snapshots)), ("config", free(&e.shared_config)), ("range source", free(&e.range_source)),
             ("equity token slot", free(&e.equity_cancel)), ("stage", stage)]
     }
-    /// Runs its probes in its first callback and reports that event and which locks were free.
+    /// Runs its probes in the callback of the first event `at` selects and reports that event and which locks were free;
+    /// acknowledges an `Equity` event on `equity`, when given.
     type Report = (RecommendationEvent, Vec<(&'static str, bool)>);
-    struct Probe { probes: Probes, report: Option<mpsc::Sender<Report>> }
+    struct Probe { probes: Probes, at: fn(&RecommendationEvent) -> bool, report: Option<mpsc::Sender<Report>>, equity: Option<mpsc::Sender<()>> }
     impl EventSink for Probe {
         fn emit(&mut self, ev: RecommendationEvent) {
-            if let Some(report) = self.report.take() {
-                let free = self.probes.iter().map(|(name, free)| (*name, free())).collect();
-                let _ = report.send((ev, free));
+            if let (RecommendationEvent::Equity { .. }, Some(equity)) = (&ev, &self.equity) {
+                let _ = equity.send(());
+            }
+            if (self.at)(&ev) {
+                if let Some(report) = self.report.take() {
+                    let free = self.probes.iter().map(|(name, free)| (*name, free())).collect();
+                    let _ = report.send((ev, free));
+                }
             }
         }
     }
 
     /// 29-I3 (ruling 28-I1): no engine lock is held while a sink callback runs on `engine-main`, neither while a request's
-    /// `Final` is handed over (`serve::finish`, here hero's preflop decision's) nor while an event goes through
-    /// `serve::deliver` (a river request's `Fast`, probed before its `fast-path` thread exists). Only `engine-main` and
-    /// the test thread run then.
+    /// `Final` is handed over (`serve::finish`, here hero's preflop decision's, through `serve::settle`: plan 3 Task 17;
+    /// probed before its `fast-path` thread exists, which starts after the `Final`) nor while an event goes through
+    /// `serve::deliver` (a river request's `Fast`, probed before its `fast-path` thread exists). The preflop request's
+    /// equity (an instant routine) is acknowledged before the hand moves on, so its thread no longer takes any engine lock
+    /// when the river request is probed. Only `engine-main` and the test thread run then.
     #[test]
     fn no_engine_lock_is_held_during_a_sink_callback() {
+        use crate::serve::{EquityRoutine, ServeSeams};
         let (cfg, _) = cfg_1_2();
         let core = core();
-        let mut e = Engine::with_core(core);
+        let instant: EquityRoutine = Arc::new(|_: &dyn Clock, _: Option<[Card; 2]>, _: &Range1326, _: &[(Seat, Range1326)], _: &[Card], _: std::time::Duration,
+            _: &AtomicBool| crate::equity::pending_summary(&[]));
+        let mut e = Engine::with_core_and_seams(core, ServeSeams { equity: Some(instant), ..ServeSeams::default() });
         e.set_config(cfg).unwrap();
         e.begin_hand(begin()).unwrap();
         for a in [Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold] { e.apply_action(a).unwrap(); }
         let (tx, rx) = mpsc::channel();
-        e.recommend(Box::new(Probe { probes: probes(&e), report: Some(tx) })).unwrap();
+        let (equity_tx, equity_rx) = mpsc::channel();
+        let is_final: fn(&RecommendationEvent) -> bool = |ev| matches!(ev, RecommendationEvent::Final(_));
+        e.recommend(Box::new(Probe { probes: probes(&e), at: is_final, report: Some(tx), equity: Some(equity_tx) })).unwrap();
         let preflop_final = rx.recv_timeout(ACK_LIVENESS).expect("hero's preflop decision was answered");
+        equity_rx.recv_timeout(ACK_LIVENESS).expect("the preflop request's equity was delivered");
         to_the_river(&mut e);
         let board = cards("Kh 7d 2c 4d 9s");
         let mut full = Range1326([1.0; 1326]);
         for (i, w) in full.0.iter_mut().enumerate() { let [a, b] = proto::combo_cards(i as u16); if board.contains(&a) || board.contains(&b) { *w = 0.0; } }
         e.set_explicit_ranges(full.clone(), full);
         let (tx, rx) = mpsc::channel();
-        e.recommend(Box::new(Probe { probes: probes(&e), report: Some(tx) })).unwrap();
+        let is_fast: fn(&RecommendationEvent) -> bool = |ev| matches!(ev, RecommendationEvent::Fast(_));
+        e.recommend(Box::new(Probe { probes: probes(&e), at: is_fast, report: Some(tx), equity: None })).unwrap();
         let river_fast = rx.recv_timeout(ACK_LIVENESS).expect("the river request's Fast was handed over");
         e.shutdown();
         assert!(matches!(preflop_final.0, RecommendationEvent::Final(_)), "hero's preflop decision was answered by its Final: {:?}", preflop_final.0);

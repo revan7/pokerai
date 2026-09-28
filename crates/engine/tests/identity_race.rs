@@ -390,8 +390,10 @@ fn r#try(m: &Mutex<IdentityState>) -> Option<std::sync::MutexGuard<'_, IdentityS
 
 /// Ruling 28-I1: an event is accepted under the identity lock (the stale check and the `Final` claim) and handed to the
 /// sink only after that lock is released, so a sink may read the identity and even mutate the hand from its callback.
-/// A `NoDecision`, a classifier `Final`, a refused-ranges `Final` and a `Fast` whose callback supersedes its own
-/// decision all complete: no callback ran under the identity lock, and the superseded request sends nothing.
+/// A `NoDecision`, a refused-ranges `Final`, a `Fast` whose callback supersedes its own decision, and a preflop
+/// decision's `Fast` and `Final` (plan 3 Task 17, served last, after the sink's one mutation) all complete: no callback
+/// ran under the identity lock, and the superseded request sends nothing. The preflop request's `Equity` arrives from its
+/// own thread at any point after its `Final`, so it is left out of the sequence.
 #[test]
 fn a_sink_that_reads_the_identity_and_mutates_from_its_callback_completes() {
     let s = river_state();
@@ -401,12 +403,14 @@ fn a_sink_that_reads_the_identity_and_mutates_from_its_callback_completes() {
     let start = hand(&(0..6).map(|i| (Seat(i), 1000)).collect::<Vec<_>>(), Seat(0), Seat(2), Some([card("Ah"), card("Ad")]));
     let preflop = play(&start, &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold]);
     serve(&mut r, &start);
-    serve(&mut r, &preflop);
     *r.core.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: None, ip: None });
     serve(&mut r, &s);
     *r.core.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: Some(Range1326([1.0; 1326])), ip: Some(Range1326([1.0; 1326])) });
     let superseded = serve(&mut r, &s);
-    assert_eq!(*seen.lock().unwrap(), ["NoDecision: active true", "Final: active true", "Final: active true", "Fast: active true"]);
+    let instant: EquityRoutine = Arc::new(|_: &dyn Clock, _: Option<[Card; 2]>, _: &Range1326, _: &[(Seat, Range1326)], _: &[Card], _: Duration, _: &AtomicBool| pending_summary(&[]));
+    serve_with(&mut r, &preflop, ServeSeams { equity: Some(instant), ..ServeSeams::default() });
+    let seen: Vec<String> = seen.lock().unwrap().iter().filter(|e| !e.starts_with("Equity")).cloned().collect();
+    assert_eq!(seen, ["NoDecision: active true", "Final: active true", "Fast: active true", "Fast: active true", "Final: active true"]);
     assert!(!r.identity.lock().unwrap().is_active(&superseded) && solves(&r).is_empty(), "the Fast's callback superseded its decision before the solve");
 }
 
@@ -754,7 +758,8 @@ fn superseding_a_request_cancels_its_equity_and_its_own_final_does_not() {
 
 /// The rows the classifier settles alone (§6) and a range source that refuses the root ranges (§12 `InvalidRanges`,
 /// owned by the range source, ruling 27-D3/D4): each answered at once with its one `Final` (or `NoDecision`), no `Fast`,
-/// nothing sent to the worker; every `Final` is logged, a `NoDecision` is not (it has none).
+/// nothing sent to the worker; every `Final` is logged, a `NoDecision` is not (it has none). A preflop decision is no
+/// longer one of these rows: plan 3 Task 17's preflop path answers it (`tests/preflop_replay.rs`).
 #[test]
 fn classifier_rows_and_refused_ranges_are_answered_without_the_worker() {
     let mut r = rig("early", vec![]);
@@ -764,10 +769,8 @@ fn classifier_rows_and_refused_ranges_are_answered_without_the_worker() {
     let no_decision = serve(&mut r, &start);
     let e = events_of(&r, &no_decision);
     assert!(e.len() == 1 && matches!(&e[0].event, RecommendationEvent::NoDecision { reason, .. } if reason == "another seat is to act"), "{e:?}");
-    // BB facing a raise preflop: the plan-3 hook
+    // BB facing a raise preflop (the hand the flop below continues)
     let preflop = play(&start, &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: 30 }, Action::Fold]);
-    let id = serve(&mut r, &preflop);
-    assert_eq!(finals(&r, &id).iter().map(|f| f.2.coverage.clone()).collect::<Vec<_>>(), [unsupported("no preflop path in this build (plan 3)")]);
     // three players see the flop: multiway, no numeric EV
     let three = board(&play(&start, &[Action::Fold, Action::Fold, Action::Call, Action::Call, Action::Fold, Action::Check]), "Kh 7d 2c");
     let id = serve(&mut r, &three);
@@ -783,8 +786,7 @@ fn classifier_rows_and_refused_ranges_are_answered_without_the_worker() {
     for f in r.events.lock().unwrap().iter() { assert!(!matches!(f.event, RecommendationEvent::Fast(_) | RecommendationEvent::Equity { .. })); }
     assert!(r.state.lock().unwrap().sent.is_empty() && kills_and_restarts(&r) == (0, 0), "nothing reaches the worker");
     let logged: Vec<(Street, Coverage)> = records(&r).into_iter().map(|x| (x.street, x.coverage)).collect();
-    assert_eq!(logged, [(Street::Preflop, unsupported("no preflop path in this build (plan 3)")),
-        (Street::Flop, Coverage::Unsupported { reason: UnsupportedReason::MultiwayEv { pot_eligible: 3 }, partial: vec![] }),
+    assert_eq!(logged, [(Street::Flop, Coverage::Unsupported { reason: UnsupportedReason::MultiwayEv { pot_eligible: 3 }, partial: vec![] }),
         (Street::Flop, unsupported("no flop path in this build (plan 4)")),
         (Street::River, Coverage::Unsupported { reason: UnsupportedReason::InvalidRanges, partial: vec![] })]);
 }

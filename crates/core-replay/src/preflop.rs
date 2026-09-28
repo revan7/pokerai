@@ -132,6 +132,32 @@ pub struct ReplayOutput {
 /// baseline caller without the engine passes `model_revision = 0` snapshots only. Replay never
 /// derives the active model from an arbitrary snapshot; the engine remains the identity authority.
 pub fn replay(input: ReplayInput) -> ReplayOutput {
+    replay_with(input, false).0
+}
+
+/// One live branch's lookup of the seat to act once every observed preflop action is applied
+/// (P3.T17, ruling 17-pre): the walk's own answer for that branch -- looked up under the branch's
+/// translated history with the exact source step it carried at each translated edge (ruling
+/// 13-R1), memoized in the same walk -- never a chip-only [`query_translated`], which reports an
+/// unresolved node where the walk resolved one. At a preflop decision point the seat to act is
+/// hero, so these are hero's current-node lookups, one per live branch.
+#[derive(Clone, Debug)]
+pub struct DecisionLookup {
+    pub branch_id: u8,
+    pub answer: PreflopAnswer,
+}
+
+/// [`replay`], plus the walk's own lookup of the seat to act in every live branch at the end of
+/// the preflop walk ([`DecisionLookup`], in branch order) while the hand is still on the preflop
+/// street; on a postflop street the list is empty (the preflop street is closed). The replay
+/// output is exactly [`replay`]'s: the lookups are the ones the walk made when it set each live
+/// branch's `SeatMass::node` for that seat (memo hits), and nothing else changes.
+pub fn replay_decision(input: ReplayInput) -> (ReplayOutput, Vec<DecisionLookup>) {
+    replay_with(input, true)
+}
+
+/// The body of [`replay`] and [`replay_decision`]; `lookups` asks for the latter's list.
+fn replay_with(input: ReplayInput, lookups: bool) -> (ReplayOutput, Vec<DecisionLookup>) {
     let mut output = ReplayOutput {
         ranges: vec![None; 6],
         branches: initial(&input.state.dealt),
@@ -140,8 +166,10 @@ pub fn replay(input: ReplayInput) -> ReplayOutput {
         reasons: vec![],
         unsupported: None,
     };
-    walk_preflop(&input, &mut output);
+    let mut run = ReplayState::default();
+    walk_preflop_with(&input, &mut output, &mut run);
     let current = current_street(input.state);
+    let decision = if lookups && current == Street::Preflop { decision_lookups(&input, &output, &mut run) } else { vec![] };
     if current != Street::Preflop {
         clear_preflop_stops(&mut output);
     }
@@ -152,7 +180,31 @@ pub fn replay(input: ReplayInput) -> ReplayOutput {
     block_and_rescale(&mut output, root_board(input.state, current));
     publish(&mut output, input.state);
     disclose_cap(&mut output, input.state.hero);
+    (output, decision)
+}
+
+/// Every live branch's lookup at the end of the preflop walk (see [`DecisionLookup`]), with the
+/// walk's own carried source steps and memo.
+///
+/// # Panics
+/// Always, if a live branch does not carry one translated action per observed preflop action
+/// (the walk's own invariant).
+fn decision_lookups(input: &ReplayInput, output: &ReplayOutput, run: &mut ReplayState) -> Vec<DecisionLookup> {
+    let prefix = input.state.actions.iter().take_while(|a| a.street == Street::Preflop).count();
     output
+        .branches
+        .iter()
+        .filter(|b| !b.residual && b.stopped.is_none())
+        .map(|b| {
+            assert!(
+                b.translated.len() == prefix,
+                "replay_decision: live branch {} carries {} translated actions after {prefix} observed preflop actions",
+                b.id,
+                b.translated.len()
+            );
+            DecisionLookup { branch_id: b.id, answer: run.lookup(input, prefix, b) }
+        })
+        .collect()
 }
 
 /// Applies every observed preflop action of `input.state`, in order, through
@@ -163,13 +215,18 @@ pub fn replay(input: ReplayInput) -> ReplayOutput {
 /// source size it was mapped to. `output` must be the start state [`replay`] builds (every live
 /// branch carries one translated action per applied observed action).
 pub fn walk_preflop(input: &ReplayInput, output: &mut ReplayOutput) {
-    let mut run = ReplayState::default();
-    refresh_nodes(input, output, &mut run, 0);
+    walk_preflop_with(input, output, &mut ReplayState::default());
+}
+
+/// [`walk_preflop`] on a walk state the caller keeps ([`replay_decision`] looks the decision up
+/// with it afterwards).
+fn walk_preflop_with(input: &ReplayInput, output: &mut ReplayOutput, run: &mut ReplayState) {
+    refresh_nodes(input, output, run, 0);
     for (i, taken) in input.state.actions.iter().enumerate() {
         if taken.street != Street::Preflop {
             break;
         }
-        apply_with(input, output, &mut run, i, taken.seat, &taken.action);
+        apply_with(input, output, run, i, taken.seat, &taken.action);
     }
 }
 
@@ -760,6 +817,32 @@ mod tests {
         assert!(output.branches[1].residual, "the residual stays the residual");
         assert_eq!(output.branches[1].stopped, None);
         assert_eq!((output.branches[0].q, output.branches[1].q), (0.25, 0.5), "no weight changes");
+    }
+
+    /// P3.T17 (ruling 17-pre): `replay_decision` returns `replay`'s output unchanged and, while the hand is on the
+    /// preflop street, the walk's own lookup of the seat to act in every live branch -- for an untranslated history the
+    /// same answer as the observed-prefix query; on a postflop street, none.
+    #[test]
+    fn replay_decision_adds_the_walks_lookup_at_the_decision_and_nothing_else() {
+        let cfg = HandConfig { config_revision: 1, sb_chips: 5, bb_chips: 10, straddle: None, rake: proto::Rake::TimeCharge, chip_label: "$1".into() };
+        let begin = core_model::BeginHand { hand_id: 1, button: Seat(5), hero: Seat(2), dealt: (0..6).map(Seat).collect(), stacks_start: vec![1000; 6], hero_cards: None };
+        let state = core_model::begin_hand(&cfg, begin).expect("a six-max table");
+        let store = PreflopStore::from_sources(vec![]);
+        let input = ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &[] };
+        let (output, lookups) = replay_decision(input);
+        assert_eq!(format!("{output:?}"), format!("{:?}", replay(input)), "the replay output is replay's");
+        assert_eq!(lookups.len(), 1);
+        assert_eq!((lookups[0].branch_id, lookups[0].answer.actor), (0, Some(Seat(2))), "UTG, the seat to act");
+        assert_eq!(lookups[0].answer, store.query(&state.config, &state, 0), "an untranslated history is the observed prefix");
+        let mut flop = state.clone();
+        for a in [Action::Fold, Action::Fold, Action::Fold, Action::Fold, Action::Call, Action::Check] {
+            flop = core_model::apply_action(&flop, a).expect("a legal action");
+        }
+        let flop = core_model::set_board(&flop, &core_model::parse_cards("2c7dTh").expect("a flop")).expect("the flop");
+        let input = ReplayInput { cfg: &flop.config, state: &flop, store: &store, snapshots: &[] };
+        let (output, lookups) = replay_decision(input);
+        assert!(lookups.is_empty(), "the preflop street is closed");
+        assert_eq!(format!("{output:?}"), format!("{:?}", replay(input)));
     }
 
     /// Completed streets are the postflop streets strictly before the current root, in order.
