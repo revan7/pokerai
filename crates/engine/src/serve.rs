@@ -17,10 +17,13 @@
 //! longer active gets no watchdog `Final` and its claim stays untaken, with no retirement hook needed on supersession;
 //! the fire releases the identity lock before its sink callback and keeps only its own generation lock. A mutation that
 //! lands between the acceptance and the callback lets that one event through; the UI refuses it by identity (§5 step
-//! 9). A request whose decision is no longer active, at admission or once its solve returns, ends with no `Final`, no
-//! snapshot and no log record, and its watchdog is retired. Once the solve returns, the identity and the watchdog's
-//! claim are read in two steps; a supersession and a fire landing between them leave the claim untaken, so the
-//! engine's own claim then finds the decision stale (re-review observation O4).
+//! 9). A request whose decision is no longer active, at admission or once its solve returns, ends with no `Final` of
+//! the engine's and no snapshot, and its watchdog is retired; it logs nothing, unless its watchdog had claimed and
+//! delivered its `Final` while the decision was still active and the supersession came after that claim: that
+//! delivered `Final` is then the request's, and it is logged exactly once, with the delivery time and the deadline
+//! verdicts the fire recorded (`retire_stale`, ruling W3-I1; spec 5 step 10). Once the solve returns, the identity and
+//! the watchdog's claim are read in two steps; a supersession and a fire landing between them leave the claim untaken,
+//! so the engine's own claim then finds the decision stale (re-review observation O4).
 //!
 //! One `Final` (§7, ruling 28-I2). The engine's `Final` and the watchdog's race for one claim (`Armed::delivered`); the
 //! fire records what it delivered and when (`Armed::fired`). The engine claims its candidate in `finish`: the snapshot
@@ -343,10 +346,10 @@ fn serve(core: &mut EngineCore, req: LiveRequest, hooks: &Hooks) {
         after_active_check();
     }
     if !active {
-        // Superseded while it ran (§4.4): no `Final`, snapshot or log record for a decision that is no longer active,
-        // and its equity is cancelled (ruling 28-I4).
-        equity_cancel.store(true, Ordering::SeqCst);
-        core.watchdog.disarm();
+        // Superseded while it ran (§4.4): no candidate `Final` and no snapshot for a decision that is no longer active,
+        // and its equity is cancelled (ruling 28-I4); a `Final` its watchdog delivered while it was still active is
+        // logged (ruling W3-I1), and nothing else is.
+        retire_stale(core, &req, &deadlines, &claim, &logged);
     } else if delivered.load(Ordering::SeqCst) {
         // The watchdog won the delivery during the solve (ruling 28-I2): nothing of a candidate is built, no analytic
         // fallback runs, and the `Final` it delivered is the one logged.
@@ -508,10 +511,12 @@ fn settle(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, deadlines: &D
 }
 
 /// The one `Final` path (§5 steps 7, 9, 10; ruling 28-I2). The candidate's delivery is claimed under the identity lock:
-/// a decision no longer active has no `Final` and no log record (and its equity is cancelled); a claim the watchdog
-/// already won discards the candidate, which registers nothing, and logs the watchdog's `Final` with its delivery
-/// time; a claim won registers the candidate's snapshot under the same lock, as part of that accepted delivery, hands
-/// the `Final` to the sink with no engine lock held, and logs it. The watchdog is retired in every case.
+/// a decision no longer active gets no `Final` of the engine's and its candidate registers nothing (its equity is
+/// cancelled), and the log records only a `Final` its watchdog delivered while it was still active (`retire_stale`,
+/// ruling W3-I1); a claim the watchdog already won discards the candidate, which registers nothing, and logs the
+/// watchdog's `Final` with its delivery time; a claim won registers the candidate's snapshot under the same lock, as
+/// part of that accepted delivery, hands the `Final` to the sink with no engine lock held, and logs it. The watchdog is
+/// retired in every case.
 fn finish(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, deadlines: &Deadlines, claim: &Claim<'_>, candidate: Candidate, logged: Logged) {
     if let Some(before_claim) = &hooks.before_claim {
         before_claim();
@@ -525,10 +530,7 @@ fn finish(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, deadlines: &D
         }
     });
     match verdict {
-        Delivery::Stale => {
-            claim.equity_cancel.store(true, Ordering::SeqCst);
-            core.watchdog.disarm();
-        }
+        Delivery::Stale => retire_stale(core, req, deadlines, claim, &logged),
         Delivery::AlreadyDelivered => {
             core.watchdog.disarm();
             let fired = watchdog_final(claim.fired.expect("only a watchdog shares a request's Final claim"));
@@ -539,6 +541,24 @@ fn finish(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, deadlines: &D
             core.watchdog.disarm();
             log_final(core, req, deadlines, Delivered { at_ms, rec: &rec, by_watchdog: false, best_so_far }, &logged);
         }
+    }
+}
+
+/// A stale exit (§4.4, §12; ruling W3-I1): the request's decision is no longer active. Its equity is cancelled (ruling
+/// 28-I4) and its watchdog retired first, so a fire in progress has completed its emission and has recorded what it
+/// delivered (`disarm` returns only after such a fire, which records before it emits). A `Final` the watchdog claimed
+/// while the decision was still active was delivered, and it is the request's `Final`: it is logged, exactly once, as
+/// the watchdog's, with its recorded delivery time and the request's deadline verdicts (spec 5 step 10, every request
+/// and its `Final`; spec 7 and 12, the deadline outcomes). A decision superseded before any claim leaves the slot empty
+/// (the fire of a decision no longer active records nothing, `watchdog`'s "Identity at the fire"): no `Final`, no
+/// record. Nothing of a candidate is accepted or registered here.
+fn retire_stale(core: &mut EngineCore, req: &LiveRequest, deadlines: &Deadlines, claim: &Claim<'_>, logged: &Logged) {
+    claim.equity_cancel.store(true, Ordering::SeqCst);
+    core.watchdog.disarm();
+    let delivered_by_watchdog = claim.fired.and_then(|fired| fired.lock().unwrap().clone());
+    if let Some(fired) = delivered_by_watchdog {
+        assert!(claim.delivered.load(Ordering::SeqCst), "the watchdog recorded a Final of decision {:?} without its claim", req.identity);
+        log_final(core, req, deadlines, Delivered { at_ms: fired.at_ms, rec: &fired.rec, by_watchdog: true, best_so_far: false }, logged);
     }
 }
 
