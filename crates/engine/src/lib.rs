@@ -8,6 +8,7 @@ pub mod clock;
 pub mod core;
 pub mod coverage;
 pub mod deadline;
+pub mod engine;
 pub mod equity;
 pub mod identity;
 pub mod log;
@@ -15,11 +16,15 @@ pub mod ranges;
 pub mod serve;
 pub mod snapshots;
 pub mod solve;
+pub mod startup;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod tree;
 pub mod watchdog;
 pub mod worker;
+
+pub use engine::{Engine, Paths};
+pub use startup::StartupReport;
 
 /// Where the engine delivers a request's `RecommendationEvent`s (spec 3.4: results flow to the UI through a
 /// `Channel<RecommendationEvent>`; tests record them). Called from engine threads, hence `Send`.
