@@ -51,15 +51,17 @@ impl Label {
         matches!(self, Label::Provisional { .. })
     }
 
-    /// The input/model-matching claim this label makes (spec section 2 "Coverage labels"):
-    /// `Coverage::Exact` when no reason applies, else `Coverage::Approximate` with every reason.
-    /// The accuracy axis is not part of it: a `Provisional` label maps to the same coverage its
-    /// reasons alone would give, and the shortfall stays disclosed by `Lookup::Provisional`
-    /// (plan 4 task 7) -- never by a synthesized reason.
-    pub fn coverage(&self) -> proto::Coverage {
-        match self.reasons() {
-            [] => proto::Coverage::Exact,
-            reasons => proto::Coverage::Approximate { reasons: reasons.to_vec() },
+    /// The coverage an accuracy-passing label claims (spec section 2 "Coverage labels"):
+    /// `Some(Coverage::Exact)` for `Exact`, `Some(Coverage::Approximate)` with every reason for
+    /// `Approximate`, and `None` for `Provisional` (plan 4 task 7 fix round 1, review P4T7-I4).
+    /// Spec section 2 makes "requested accuracy reached on the raw exploitability" part of
+    /// `Exact`, so a label whose raw accuracy missed the target claims no coverage at all; its
+    /// shortfall is disclosed by being `Provisional`, never by a synthesized reason.
+    pub fn coverage(&self) -> Option<proto::Coverage> {
+        match self {
+            Label::Exact => Some(proto::Coverage::Exact),
+            Label::Approximate { reasons } => Some(proto::Coverage::Approximate { reasons: reasons.clone() }),
+            Label::Provisional { .. } => None,
         }
     }
 }

@@ -7,22 +7,74 @@
 //! module only judges whether an already key-matched entry's *tree* still matches the query.
 //!
 //! Task 7 adds the lookup itself: the query and result types (`CacheQuery`, `CacheHit`,
-//! `Lookup`), strict menu legality (`legal_menu`), candidate selection over the cells the
-//! `cache-reader` thread read (`select`), and node reconstruction in the query's own chips and
-//! suits (`reconstruct`, `map_rows`, `map_flags`). `Cache::lookup` (in `crate`) drives them. A
-//! canonical key that is absent from the store is a `Miss` to be solved live: nothing here ever
+//! `Lookup`, `MissReason`), strict menu legality (`legal_menu`), candidate selection over the
+//! cells the `cache-reader` thread read (`select`), node reconstruction in the query's own chips
+//! and suits (`reconstruct`, `map_rows`, `map_flags`), and the reader's gated preparation of a
+//! whole outcome (`prepare`, `Stage`, `Prepared`). `Cache::lookup` (in `crate`) posts a
+//! `ReadCommand::Serve` and waits for the prepared outcome until one absolute deadline. A canonical
+//! key that is absent from the store is a `NoMatch` miss to be solved live: nothing here ever
 //! searches another board, another tree signature or another range hash.
 
 use crate::entry::sorted_by_path;
 
+/// The longest a lookup ever waits, whatever its budget (spec 10.4): its absolute deadline is
+/// `min(budget, LOOKUP_BOUND)` from the moment `Cache::lookup` is entered.
+pub const LOOKUP_BOUND: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// A command for the cache's bounded reader thread, the type `Cache::reader`'s channel carries.
-/// `Cells` asks for the cells at up to three cell keys (the `b - 1, b, b + 1` probe; duplicate
-/// keys are read once) and is answered on `reply` with the request's own `token`, so a reply that
-/// arrives after its waiter gave up can never be taken for another request's. `Shutdown` stops the
-/// thread (`Cache::shutdown`).
+///
+/// `Serve` (fix round 1, review P4T7-I3) hands the reader a whole lookup: the cells at up to three
+/// cell keys (the `b - 1, b, b + 1` probe; duplicate keys are read once), the query, and the
+/// request's absolute `deadline`. The reader does all the expensive work -- the reads, `select`,
+/// `reconstruct` (with its `validate_solution` and menu-legality checks), the label and the touch
+/// digest -- asking its gate (deadline, stop flag) before each stage, and answers on `reply` with
+/// the request's own `token` and the `Prepared` outcome, so the waiter only receives. `Shutdown`
+/// stops the thread (`Cache::shutdown`).
 pub enum ReadCommand {
-    Cells { token: u64, keys: [[u8; 32]; 3], reply: std::sync::mpsc::SyncSender<(u64, Vec<crate::storage::Cell>)> },
+    Serve { token: u64, keys: [[u8; 32]; 3], deadline: std::time::Instant, query: Box<CacheQuery>, reply: std::sync::mpsc::SyncSender<(u64, Prepared)> },
     Shutdown,
+}
+
+/// A lookup's outcome as the reader prepared it: the `Lookup`, and for a hit the touch its waiter
+/// sends -- the served entry's cell key and payload digest -- once it has accepted the hit inside
+/// its deadline. A hit that reaches its waiter late is discarded with its touch unsent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prepared {
+    pub outcome: Lookup,
+    pub touch: Option<([u8; 32], Vec<u8>)>,
+}
+
+impl Prepared {
+    pub fn miss(reason: MissReason) -> Prepared {
+        Prepared { outcome: Lookup::Miss { reason }, touch: None }
+    }
+}
+
+/// The reader's work on one lookup over the cells it read: `select`, `reconstruct`, `label` and
+/// the payload digest for the touch. `gate(stage)` is asked before `Stage::Select`,
+/// `Stage::Reconstruct` and `Stage::Label`; an `Err` (deadline passed, stop requested) abandons the
+/// work at once with that miss reason, so no late stage runs.
+pub fn prepare(cells: Vec<crate::storage::Cell>, q: &CacheQuery, gate: &mut dyn FnMut(Stage) -> Result<(), MissReason>) -> Prepared {
+    if let Err(reason) = gate(Stage::Select) {
+        return Prepared::miss(reason);
+    }
+    let Some((entry, comparison)) = select(cells, q) else { return Prepared::miss(MissReason::NoMatch) };
+    if let Err(reason) = gate(Stage::Reconstruct) {
+        return Prepared::miss(reason);
+    }
+    let Some(mut hit) = reconstruct(&entry, q) else { return Prepared::miss(MissReason::Rejected) };
+    if let Err(reason) = gate(Stage::Label) {
+        return Prepared::miss(reason);
+    }
+    let label = crate::label::label(&entry, q.source.spr, &comparison, q.target_bp, &q.reasons);
+    hit.coverage = label.coverage();
+    let touch = Some((entry.key.digest(), payload_digest(&entry)));
+    let outcome = match label {
+        crate::label::Label::Exact => Lookup::Exact { hit },
+        crate::label::Label::Approximate { reasons } => Lookup::Approximate { hit, reasons },
+        crate::label::Label::Provisional { reasons } => Lookup::Provisional { hit, reasons },
+    };
+    Prepared { outcome, touch }
 }
 
 /// One live lookup (spec section 10.4 lookup): the canonical key and exact source inputs of the
@@ -49,31 +101,72 @@ pub struct CacheQuery {
 
 /// A served cache hit: a `StreetSolution` rebuilt in the query's chips and suits (validated
 /// against the query tree), the query tree it indexes, the entry's covered ordinal paths, the
-/// coverage the hit discloses (input/model matching only, never a full-game GTO claim), the raw
-/// stored accuracy, the disclosure notes (the realized menu at the requested node and the source
-/// storage mode), the entry's storage mode and the query's tree signature.
+/// coverage the hit discloses, the raw stored accuracy, the disclosure notes (the realized menu at
+/// the requested node and the source storage mode), the entry's storage mode and the query's tree
+/// signature.
+///
+/// `coverage` (fix round 1, review P4T7-I4) is `Some` only for a hit whose raw accuracy met the
+/// query's target (`Lookup::Exact` / `Lookup::Approximate`): spec section 2 makes the requested
+/// accuracy part of `Exact`. A `Lookup::Provisional` hit carries `None` -- the delivery policy
+/// labels it when it serves it -- and keeps its reasons on the variant and its raw accuracy in
+/// `raw_exploitability_over_p`. Coverage is never a full-game GTO claim.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CacheHit {
     pub solution: proto::worker::StreetSolution,
     pub tree: proto::EffectiveTree,
     pub covered_paths: Vec<proto::OrdinalPath>,
-    pub coverage: proto::Coverage,
+    pub coverage: Option<proto::Coverage>,
     pub raw_exploitability_over_p: f64,
     pub notes: Vec<String>,
     pub source_mode: String,
     pub tree_signature: String,
 }
 
+/// Why a lookup served nothing (fix round 1, review P4T7-I6), so a caller can tell an absent board
+/// class (solve it live) from a lookup that could not finish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissReason {
+    /// The request's budget was spent: zero on entry (nothing is posted), or its deadline passed
+    /// before a prepared result arrived. A result that arrives late is discarded, never touched.
+    BudgetExhausted,
+    /// No reader to ask: a disabled cache, a reader that did not start, one that has been told to
+    /// stop, or a reply that cannot be the request's own.
+    ReaderUnavailable,
+    /// The reader's bounded queue was full; nothing was posted.
+    QueueFull,
+    /// No entry in the three probed buckets is a candidate: none shares the query's key, covers the
+    /// requested node with the query's actor and passes `compare`.
+    NoMatch,
+    /// A candidate was selected, but its reconstruction in the query tree, its validation against
+    /// that tree or the requested node's menu legality failed.
+    Rejected,
+}
+
+/// The stages of preparing one lookup, in order. The reader asks its gate before each one
+/// (deadline passed? stop requested?) and abandons the work as soon as the answer is no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Before each distinct cell read.
+    Read,
+    /// Before `select` over the cells read.
+    Select,
+    /// Before `reconstruct` of the selected entry.
+    Reconstruct,
+    /// Before labelling and the touch digest.
+    Label,
+    /// Before a prepared hit is sent to its waiter.
+    Reply,
+}
+
 /// The lookup outcome (spec section 3.5): `Exact` and `Approximate` pass the query's raw
 /// accuracy target, `Provisional` does not (and carries every reason an accuracy pass would have
-/// carried, possibly none); `Miss` covers everything else -- no candidate, a query-side mismatch,
-/// a disabled or stopped cache, a full reader queue and a spent budget alike.
+/// carried, possibly none); `Miss` covers everything else, with its reason.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Lookup {
     Exact { hit: CacheHit },
     Approximate { hit: CacheHit, reasons: Vec<proto::ApproxReason> },
     Provisional { hit: CacheHit, reasons: Vec<proto::ApproxReason> },
-    Miss,
+    Miss { reason: MissReason },
 }
 
 /// Strict legality of a served menu at the live state: every action must be offered by `legal`
@@ -136,8 +229,9 @@ pub(crate) fn payload_digest(e: &crate::entry::CacheEntry) -> Vec<u8> {
 /// ordinal position; probability and EV rows and availability flags move under
 /// `q.inverse_perm`; EV is `ev_over_P * P_query`, never re-rounded from the entry. The rebuilt
 /// solution is validated against the query tree and the requested node's menu must be strictly
-/// legal (`legal_menu`). Returns `None` for any query-side mismatch: the caller turns that into
-/// `Lookup::Miss` without deleting the source file.
+/// legal (`legal_menu`). Returns `None` for any query-side mismatch: `prepare` turns that into
+/// `Lookup::Miss { reason: MissReason::Rejected }` without deleting the source file. The hit's
+/// `coverage` is left `None` here; `prepare` sets it from the label.
 pub fn reconstruct(e: &crate::entry::CacheEntry, q: &CacheQuery) -> Option<CacheHit> {
     let p = q.source.pot as f32;
     let mut nodes = Vec::with_capacity(e.nodes.len());
@@ -183,7 +277,8 @@ pub fn reconstruct(e: &crate::entry::CacheEntry, q: &CacheQuery) -> Option<Cache
     Some(CacheHit {
         tree: q.tree.clone(),
         covered_paths,
-        coverage: proto::Coverage::Exact,
+        // Unlabelled until `label::label` has judged the query's raw accuracy target.
+        coverage: None,
         raw_exploitability_over_p: e.exploitability_over_P,
         notes: vec![format!("cache realized menu at the requested node: [{realized}]"), format!("cache source storage mode: {}", e.mode)],
         source_mode: e.mode.clone(),

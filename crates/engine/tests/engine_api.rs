@@ -987,10 +987,17 @@ fn new_validates_the_config_first_and_reports_a_missing_worker() {
 }
 
 /// The startup report of a degraded engine (spec 12, ruling 29-I4): no worker ready, the typed refusal, and one banner.
-fn degraded_report(refusal: &engine::worker::ready::ReadyRefusal) -> engine::StartupReport {
-    engine::StartupReport { worker_ready: false, worker_refusal: Some(refusal.clone()), cache_state: "absent".into(),
+/// `cache_state` is the cache's own summary when `Engine::new` opened one (plan 4 Task 7 fix round 1, ruling 7-Q1), and
+/// `"absent"` for a core handed to `Engine::with_core`, whose cache the engine never opened.
+fn degraded_report(refusal: &engine::worker::ready::ReadyRefusal, cache_state: String) -> engine::StartupReport {
+    engine::StartupReport { worker_ready: false, worker_refusal: Some(refusal.clone()), cache_state,
         banners: vec![format!("the solver worker was refused at startup (worker/proto version mismatch: {refusal}); every recommendation answers \
             this error until the worker is rebuilt")], ..Default::default() }
+}
+
+/// The `cache_state` of a cache `Engine::new` opened at `root` with the default quota (plan 4 Task 7 fix round 1).
+fn opened_cache_state(root: &std::path::Path) -> String {
+    format!("open: {} (quota {} bytes)", root.display(), cache::CACHE_QUOTA_BYTES)
 }
 /// Requests a recommendation and returns the message of its answer, which must be a single non-retryable
 /// `Unsupported{EngineError}` `Final`.
@@ -1020,7 +1027,7 @@ fn a_degraded_engine_answers_every_decision_with_the_version_mismatch() {
     let core = EngineCore::new(Box::new(RefusedWorker::new("solver-worker.exe".into(), refusal.clone())), FakeClock::new(), identity,
         DecisionLog::open(&std::env::temp_dir().join("pokerai_engine_api_log")));
     let mut e = Engine::with_core(core);
-    assert_eq!(e.startup_report(), degraded_report(&refusal));
+    assert_eq!(e.startup_report(), degraded_report(&refusal, "absent".into()));
     let (cfg, _) = cfg_1_2();
     e.set_config(cfg).unwrap();
     e.begin_hand(begin()).unwrap();
@@ -1095,7 +1102,7 @@ mod stand_in {
         let mut e = start(&s);
         assert_eq!(e.startup_report(), StartupReport { worker_ready: true, worker_threads: 16, build_features: ready.build_features.clone(),
             cpu_features: ready.cpu_features.clone(), capabilities: ready.capabilities.clone(), cpu_lacks_avx2: false, worker_refusal: None,
-            quarantined_bundles: vec![], cache_state: "absent".into(), banners: vec![] });
+            quarantined_bundles: vec![], cache_state: opened_cache_state(&s.dir.join("cache")), banners: vec![] });
         assert_eq!(e.preflop_store().bundles().iter().map(|b| b.bundle_info().bundle_id.clone()).collect::<Vec<_>>(), chart_ids(), "the packaged charts");
         assert_eq!(e.state(), None);
         assert_eq!(e.begin_hand(begin()).unwrap().config.config_revision, 1);
@@ -1121,7 +1128,7 @@ mod stand_in {
             ("old-proto", old_proto, ReadyRefusal::ProtoVersion { reported: PROTO_VERSION - 1 })] {
             let s = StandIn::new(tag, &ready);
             let mut e = start(&s);
-            assert_eq!(e.startup_report(), degraded_report(&refusal), "{tag}");
+            assert_eq!(e.startup_report(), degraded_report(&refusal, opened_cache_state(&s.dir.join("cache"))), "{tag}");
             let mismatch = format!("worker/proto version mismatch: {refusal}");
             e.begin_hand(begin()).unwrap();
             hero_preflop_via(&mut e);
