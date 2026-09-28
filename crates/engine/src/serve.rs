@@ -20,9 +20,10 @@
 //! replay's, plan 3 Task 18), emits `Fast` (§5 step 5), starts the `fast-path` equity thread (§3.4), solves through the
 //! solve client (`solve::run_solve`, Tasks 22-23), assembles the `Final` (§4.4, §5 step 7), registers a validated
 //! solution as a snapshot (§9.2) and logs the decision (§5 step 10). A heads-up postflop decision that ends with no
-//! solution (the flop guard, a refused range, a failed solve, the watchdog's `Final`) records its miss instead, with the
-//! engine's cause, under the same identity rule (plan 3 Task 18, spec 9.3): a later replay names that cause for a street
-//! left without a snapshot.
+//! solution (the flop guard, a refused range, a failed solve, the watchdog's `Final`, an unserved retirement or a panic
+//! containment) records its miss instead, with the engine's cause, under the same identity rule (plan 3 Task 18, spec
+//! 9.3): a later replay names that cause for a street left without a snapshot, and records the delivered cause as the
+//! street's miss (ruling 18-I2).
 //!
 //! Identity (ruling 28-I1). Every event goes through `deliver` (`emit` for the crate): it is accepted under the
 //! identity lock, where a decision no longer active is refused and a `Final` claims the request's once-only delivery,
@@ -37,9 +38,10 @@
 //! claimed and delivered its `Final` while the decision was still active and the supersession came after that claim:
 //! that delivered `Final` is then the request's, and it is logged exactly once, with the delivery time and the deadline
 //! verdicts the fire recorded (`retire_stale`, ruling W3-I1; spec 5 step 10). The same holds for a request that is never
-//! served (dropped from the depth-1 queue by a newer one, or still queued at shutdown: `retire_unserved`). Once the solve
-//! returns, the identity and the watchdog's claim are read in two steps; a supersession and a fire landing between them
-//! leave the claim untaken, so the engine's own claim then finds the decision stale (re-review observation O4).
+//! served (dropped from the depth-1 queue by a newer one, or still queued at shutdown: `retire_unserved`), and records
+//! the delivered cause as the street's miss (ruling 18-I2). Once the solve returns, the identity and the watchdog's
+//! claim are read in two steps; a supersession and a fire landing between them leave the claim untaken, so the engine's
+//! own claim then finds the decision stale (re-review observation O4).
 //!
 //! One `Final` (§7, ruling 28-I2). The engine's `Final` and the watchdog's race for one claim (`Armed::delivered`); the
 //! fire records what it delivered and when (`Armed::fired`). The engine claims its candidate in `finish`: the snapshot
@@ -57,10 +59,11 @@
 //! Panics (final review I3, ruling F-I3). `engine-main` serves each request inside `catch_unwind`. A panic (an always-on
 //! assert of an internal invariant) is contained at that boundary by `contain_panic`: the request's `Final`, unless the
 //! watchdog already delivered it, is a non-retryable `Unsupported{EngineError("internal: ..")}` delivered through the
-//! request's claim; its watchdog generation is retired, the `Final` delivered is logged once, the worker (which may be
-//! running the request's job) is killed, for the next solve to relaunch, and `engine-main` goes on serving. A panic
-//! after `engine-main` took the claim for its own `Final` and before it handed that `Final` over (final fix round 2,
-//! ruling F2-I3) is answered the same way: the claim is `engine-main`'s (`Watched::claimed_by_engine`, set under the
+//! request's claim; its watchdog generation is retired, the `Final` delivered is logged once and records the delivered
+//! cause as the street's miss (ruling 18-I2), the worker (which may be running the request's job) is killed, for the
+//! next solve to relaunch, and `engine-main` goes on serving. A panic after `engine-main` took the claim for its own
+//! `Final` and before it handed that `Final` over (final fix round 2, ruling F2-I3) is answered the same way: the
+//! claim is `engine-main`'s (`Watched::claimed_by_engine`, set under the
 //! identity lock as the claim is taken), so the containment delivers the internal-error `Final` without claiming again;
 //! a panic after the handover logs the `Final` handed over (`Watched::handed`) if it is not logged yet. Every engine
 //! lock survives a panic (ruling N2): a poisoned lock is used as it stands, its value consistent at every panic point.
@@ -730,12 +733,13 @@ fn watchdog_cause(watch: &Watched) -> Option<String> {
     lock(&watch.fired).as_ref().map(|fired| miss_cause_of_final(&fired.rec))
 }
 
-/// Records `miss`, the miss of a decision whose `Final` its watchdog delivered in the engine's place (plan 3 Task 18).
-/// The fire delivers only to a decision still active, checked under the identity lock (`watchdog`'s "Identity at the
-/// fire"), so the miss is that decision's delivered outcome and is recorded even when a mutation has superseded the
-/// decision since, as its delivered `Final` is logged (ruling W3-I1): the UI may act on that `Final` before
-/// `engine-main` gets here. A replay validates every miss against its own state on read, and the next mutation's
-/// invalidation keeps or drops it like any other. The store's lock is taken alone.
+/// Records `miss`, the miss of a decision whose `Final` was delivered in the engine's place (its watchdog's, or a panic
+/// containment's internal-error `Final`) (plan 3 Task 18). The fire delivers only to a decision still active, checked
+/// under the identity lock (`watchdog`'s "Identity at the fire"), so the miss is that decision's delivered outcome and
+/// is recorded even when a mutation has superseded the decision since, as its delivered `Final` is logged (ruling
+/// W3-I1): the UI may act on that `Final` before `engine-main` gets here. A replay validates every miss against its
+/// own state on read, and the next mutation's invalidation keeps or drops it like any other. The store's lock is taken
+/// alone.
 fn record_delivered_miss(core: &EngineCore, miss: SnapshotMiss) {
     let owner = miss.identity.clone();
     lock(&core.snapshots).record_miss(&owner, miss);

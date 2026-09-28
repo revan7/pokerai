@@ -58,8 +58,8 @@ use core_ranges::{block_public, hash_scaled, hero_conditioned, mass, range_to_st
 use core_replay::{snapshot_root, ReplayInput, ReplayOutput, SnapshotMiss};
 use proto::worker::StreetSolution;
 use proto::{
-    index_materialized, resolve_chip_path_indexed, ApproxReason, Coverage, DecisionIdentity, HandState, OrdinalPath, Range1326, Recommendation, Seat, SolveInput,
-    Street, StreetRootSnapshot, UnsupportedReason,
+    index_materialized, resolve_chip_path_indexed, Action, ApproxReason, Coverage, DecisionIdentity, HandState, OrdinalPath, Range1326, Recommendation, Seat,
+    SolveInput, Street, StreetRootSnapshot, UnsupportedReason,
 };
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -131,9 +131,34 @@ impl RangeSource for ReplayRanges {
 pub fn snapshot_note(street: Street, provenance: &SnapshotProvenance) -> String {
     let id = &provenance.identity_at_solve;
     format!(
-        "{street:?} conditioned through the {} snapshot of decision {} (hand {}, hand revision {}, config revision {}, model revision {}), solved at {:?}",
-        provenance.origin, id.decision_id, id.hand_id, id.hand_revision, id.config_revision, id.model_revision, provenance.solved_prefix
+        "{street:?} conditioned through the {} snapshot of decision {} (hand {}, hand revision {}, config revision {}, model revision {}), {}",
+        provenance.origin, id.decision_id, id.hand_id, id.hand_revision, id.config_revision, id.model_revision, solved_clause(&provenance.solved_prefix)
     )
+}
+
+/// The `solved at`/`solved after` clause of [`snapshot_note`]'s provenance text (fix round 2, ruling 18-N2): `solved at
+/// the street root` for an empty solved prefix, otherwise `solved after` a readable, comma-separated list of its
+/// `(Seat, Action)` entries (`Seat 2 Check, Seat 0 Bet 50`). Neither `proto::Action` nor `Seat` derives `Display`, so
+/// this formats each entry itself rather than falling back to `{:?}` (which read `[(Seat(2), Check)]`).
+fn solved_clause(prefix: &[(Seat, Action)]) -> String {
+    if prefix.is_empty() {
+        "solved at the street root".to_string()
+    } else {
+        format!("solved after {}", prefix.iter().map(format_prefix_entry).collect::<Vec<_>>().join(", "))
+    }
+}
+
+/// One `(Seat, Action)` entry of a solved prefix, e.g. `Seat 2 Check` or `Seat 0 Bet 50`.
+fn format_prefix_entry((seat, action): &(Seat, Action)) -> String {
+    let action = match action {
+        Action::Fold => "Fold".to_string(),
+        Action::Check => "Check".to_string(),
+        Action::Call => "Call".to_string(),
+        Action::Bet { to } => format!("Bet {to}"),
+        Action::Raise { to } => format!("Raise {to}"),
+        Action::AllIn { to } => format!("AllIn {to}"),
+    };
+    format!("Seat {} {}", seat.0, action)
 }
 
 /// The replay behind a decision's root ranges: `state` over `store`, with the snapshots and misses of the decision's
@@ -435,5 +460,23 @@ mod tests {
         assert!(paths[0].is_empty() && !paths[1].is_empty(), "the root is exported first");
         paths[1] = paths[0].clone();
         let _ = snapshot_from_solution(&identity(), &input, &sol, paths, signature, "live", vec![]);
+    }
+
+    /// `snapshot_note`'s `solved at`/`solved after` clause (fix round 2, ruling 18-N2): the street root for an empty
+    /// solved prefix, otherwise a readable, comma-separated `Seat <n> <Action>` list, never `proto::Action`/`Seat`'s
+    /// `Debug` output.
+    #[test]
+    fn snapshot_note_names_the_solved_prefix_readably() {
+        let id = identity();
+        let at_root = SnapshotProvenance { identity_at_solve: id.clone(), solved_prefix: vec![], origin: "live".into() };
+        let note = snapshot_note(Street::Turn, &at_root);
+        assert!(note.ends_with("solved at the street root"), "{note:?}");
+        let mixed = SnapshotProvenance {
+            identity_at_solve: id,
+            solved_prefix: vec![(Seat(2), Action::Check), (Seat(0), Action::Bet { to: 50 })],
+            origin: "live".into(),
+        };
+        let note = snapshot_note(Street::Turn, &mixed);
+        assert!(note.ends_with("solved after Seat 2 Check, Seat 0 Bet 50"), "{note:?}");
     }
 }

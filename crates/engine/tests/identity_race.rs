@@ -706,8 +706,8 @@ fn a_watchdog_final_discloses_the_snapshots_the_range_sources_replay_went_throug
         origin: "cache_approximate".into(),
     };
     let note = engine::replay_bridge::snapshot_note(Street::Turn, &provenance);
-    assert_eq!(note, "Turn conditioned through the cache_approximate snapshot of decision 2 (hand 1, hand revision 3, config revision 1, model revision 0), solved at \
-        [(Seat(2), Check)]");
+    assert_eq!(note, "Turn conditioned through the cache_approximate snapshot of decision 2 (hand 1, hand revision 3, config revision 1, model revision 0), solved \
+        after Seat 2 Check");
     let (mut r, gate) = gated_rig("snapshot_note_watchdog", vec![]);
     *r.core.range_source.lock().unwrap() = Box::new(WithSnapshot(Street::Turn, provenance));
     let (clock, finals_gate) = (r.clock.clone(), gate.clone());
