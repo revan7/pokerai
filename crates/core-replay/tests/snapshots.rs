@@ -1600,6 +1600,60 @@ fn a_projected_root_is_walked_in_its_heads_up_line_with_its_dead_money() {
     assert!((f64::from(translations[0].2[0].0) - a).abs() < 1e-6 && (f64::from(translations[0].2[1].0) - b).abs() < 1e-6);
 }
 
+/// Ruling 15-I2 (brief Step 5): the missing-snapshot cause follows how the street OPENED. The
+/// admitted-projection hand above opened three-way (BB, CO, BTN), and hero's decision after B's
+/// fold has an admitted heads-up root -- which is a financial root, not a snapshot. Replayed with
+/// no snapshot, or with only an incompatible one (keyed by other ranges), the street is
+/// `multiway prior street` once per actual actor in order of first action, every incoming `q` and
+/// mass kept. A compatible snapshot whose root the model cannot reproduce still reports that
+/// concrete provenance. A street that opened heads-up without a compatible snapshot stays
+/// `no compatible snapshot`.
+#[test]
+fn a_street_that_opened_multiway_without_a_compatible_snapshot_is_multiway_even_with_a_projected_root() {
+    let flop = three_way_flop(BTN);
+    let line = [
+        Action::Bet { to: 50 },
+        Action::Call,
+        Action::Raise { to: 150 },
+        Action::Raise { to: 250 },
+        Action::Fold,
+        Action::Raise { to: 700 },
+        Action::Call,
+    ];
+    let decision = act(&flop, &line[..5]);
+    assert_eq!(core_model::street_root(&decision).expect("an admitted projection").projected_from, 3);
+    let turn = core_model::set_board(&act(&flop, &line), &turn_board()).expect("the turn");
+    let incoming = replay_with(&flop, &[]);
+    let hash = |seat: Seat| core_ranges::hash_scaled(incoming.ranges[usize::from(seat.0)].as_ref().expect("a dealt seat's range"));
+    let reproducible_but_incompatible = snapshot_at(&decision, &menu_tree(&[&[]]), &flop_live(), [[7; 32]; 2], 22);
+    let multiway = |seat: Seat| (seat, "multiway prior street".to_string());
+
+    for (snapshots, what) in [(vec![], "no snapshot"), (vec![reproducible_but_incompatible], "an incompatible snapshot")] {
+        let out = replay_with(&turn, &snapshots);
+        assert_eq!(flop_unconditioned(&out), vec![multiway(BB), multiway(CO), multiway(BTN)], "{what}");
+        assert_eq!(out.branches.iter().map(bits).collect::<Vec<_>>(), incoming.branches.iter().map(bits).collect::<Vec<_>>(), "{what}: incoming q and masses");
+        assert_eq!(out.log_reach, incoming.log_reach, "{what}");
+        assert!(cap_reasons(&out).is_empty() && !out.reasons.contains(&inherited()), "{what}: {:?}", out.reasons);
+    }
+
+    // Concrete reconstruction provenance is preferred: compatible, but its prefix reproduces nothing.
+    let mut unreproducible = snapshot_at(&decision, &menu_tree(&[&[]]), &flop_live(), [hash(BB), hash(BTN)], 23);
+    unreproducible.provenance.solved_prefix = vec![(BB, Action::Check)];
+    let out = replay_with(&turn, &[unreproducible]);
+    let cause = "snapshot root not reproducible".to_string();
+    assert_eq!(flop_unconditioned(&out), vec![(BB, cause.clone()), (CO, cause.clone()), (BTN, cause)]);
+
+    // A street that opened heads-up keeps `no compatible snapshot`, with or without an incompatible one.
+    let heads_up = walked_turn(&check_bet73_call());
+    let mut other_ranges = walk_snapshot(&menu_tree(&[&[]]), 24);
+    other_ranges.key.root_range_hashes = [[7; 32]; 2];
+    for snapshots in [vec![], vec![other_ranges]] {
+        let out = replay_with(&heads_up, &snapshots);
+        let cause = "no compatible snapshot".to_string();
+        assert_eq!(flop_unconditioned(&out), vec![(SB, cause.clone()), (BB, cause)]);
+    }
+}
+
 /// The cap runs once per action inside the walk, and each surviving branch keeps its own path.
 /// Three branches enter the flop (weights 0.5 / 0.3 / 0.2 from a combo-independent split on the
 /// UTG, so every mass stays uniform); the BB's 73 splits each into Bet50 and Bet100, six live
@@ -1612,14 +1666,17 @@ fn the_cap_inside_the_walk_keeps_each_survivor_on_its_own_path() {
     let (fa, fb) = harmonic(0.73, 0.5, 1.0);
     let utg = Seat(2);
     let splits = [(Action::Fold, 0.5), (Action::Call, 0.3), (Action::Raise { to: 30 }, 0.2)];
-    let walked = |line: &[Action]| {
+    // `seeded`: reasons already on the output when the walk starts (an earlier boundary's).
+    let walked_from = |line: &[Action], seeded: &[ApproxReason]| {
         let mut out = replay_with(&walk_flop(), &[]);
         out.branches = core_replay::split_action(&out.branches, utg, &splits.iter().map(|&(a, f)| (a, f, vec![1.0; COMBOS])).collect::<Vec<_>>());
+        out.reasons.extend_from_slice(seeded);
         let state = act(&walk_flop(), line);
         let store = PreflopStore::from_sources(vec![]);
         walk_postflop(&ReplayInput { cfg: &state.config, state: &state, store: &store, snapshots: &snapshots }, Street::Flop, &mut out);
         out
     };
+    let walked = |line: &[Action]| walked_from(line, &[]);
     let before_call = walked(&[Action::Check, Action::Bet { to: 73 }]);
     let after_call = walked(&check_bet73_call());
 
@@ -1649,6 +1706,50 @@ fn the_cap_inside_the_walk_keeps_each_survivor_on_its_own_path() {
     close_to(before_call.branches[4].q, b1.q + b2.q, "the residual merges the two lightest");
     assert_eq!(residual.q.to_bits(), before_call.branches[4].q.to_bits(), "the residual is frozen through the call");
     assert!(residual.translated.is_empty());
+
+    // Ruling 15-I1 (spec 8.4): the cap is disclosed as `BranchResidual{seat: hero, cause: "cap"}`,
+    // once, with the residual's share of the total weight as the street leaves it -- recomputed
+    // after the call (the live weights shrink, the frozen residual does not), never the share at
+    // the cap. Independently: `100 * q_R / sum_k q_k` over the expected weights.
+    let merged = b1.q + b2.q;
+    let live_at_cap: f64 = [&a0, &b0, &a1, &a2].iter().map(|e| e.q).sum();
+    let at_cap = 100.0 * merged / (live_at_cap + merged);
+    let called: f64 = survivors.iter().map(|(e, call)| e.take(SB, Action::Call, &column(*call, 1), 1.0).q).sum();
+    let after = 100.0 * merged / (called + merged);
+    for (out, want, rounded, what) in [(&before_call, at_cap, 18.1102, "at the cap"), (&after_call, after, 24.1470, "after the call")] {
+        let caps = cap_reasons(out);
+        assert_eq!(caps.len(), 1, "{what}: one cap disclosure, {:?}", out.reasons);
+        let (seat, pct, cause) = &caps[0];
+        assert_eq!((*seat, cause.as_str()), (BB, "cap"), "{what}: hero's seat and the cap cause");
+        assert!((f64::from(*pct) - want).abs() < 1e-4, "{what}: {pct} != {want}");
+        assert!((want - rounded).abs() < 1e-3, "{what}: {want} vs the review's {rounded}");
+    }
+    // No residual, no cap disclosure: three live branches after the check alone.
+    let uncapped = walked(&[Action::Check]);
+    assert!(uncapped.branches.iter().all(|b| !b.residual) && cap_reasons(&uncapped).is_empty(), "{:?}", uncapped.reasons);
+
+    // A disclosure an earlier boundary recorded is replaced in place by the current share, never
+    // repeated; with no residual left to disclose, a stale one is removed.
+    let stale = ApproxReason::BranchResidual { seat: BB, residual_mass_pct: 99.0, cause: "cap".into() };
+    let other_cause = ApproxReason::BranchResidual { seat: BB, residual_mass_pct: 5.0, cause: "missing node k".into() };
+    let updated = walked_from(&check_bet73_call(), &[stale.clone(), other_cause.clone()]);
+    let caps = cap_reasons(&updated);
+    assert_eq!(caps.len(), 2, "{:?}", updated.reasons);
+    assert!(caps[0].2 == "cap" && (f64::from(caps[0].1) - after).abs() < 1e-4, "replaced in place: {caps:?}");
+    assert_eq!(caps[1], (BB, 5.0, "missing node k".to_string()), "another cause is not the cap's");
+    let cleared = walked_from(&[Action::Check], &[stale]);
+    assert!(!cleared.reasons.iter().any(|r| matches!(r, ApproxReason::BranchResidual { cause, .. } if cause == "cap")), "{:?}", cleared.reasons);
+}
+
+/// Every `BranchResidual` reason of `out`, as `(seat, residual_mass_pct, cause)`.
+fn cap_reasons(out: &ReplayOutput) -> Vec<(Seat, f32, String)> {
+    out.reasons
+        .iter()
+        .filter_map(|r| match r {
+            ApproxReason::BranchResidual { seat, residual_mass_pct, cause } => Some((*seat, *residual_mass_pct, cause.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The engine hands replay one identity's snapshots (`SnapshotStore::for_identity`); a slice
