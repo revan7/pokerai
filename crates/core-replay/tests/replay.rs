@@ -1166,6 +1166,56 @@ fn a_translated_edge_keeps_its_source_size_past_chip_rounding() {
     }
 }
 
+/// [`ladder_nodes`] one level deeper: the CO faces each (UTG size, HJ size) pair with its own two
+/// raise sizes, so an off-menu CO raise splits each of four branches into two.
+fn three_level_ladder() -> MemNodes {
+    let facing = |sizes: &[u32]| [PreflopStep::Fold, PreflopStep::Call].into_iter().chain(sizes.iter().map(|&s| raise_bb_x1000(s))).collect();
+    let after = |open: u32, raise: u32| vec![(Position::Utg, raise_bb_x1000(open)), (Position::Hj, raise_bb_x1000(raise))];
+    let mut nodes = ladder_nodes();
+    nodes.extend([
+        (after(2500, 6000), mem_node(Position::Co, facing(&[15000, 25000]), 4)),
+        (after(2500, 9000), mem_node(Position::Co, facing(&[18000, 27000]), 5)),
+        (after(3500, 7000), mem_node(Position::Co, facing(&[16000, 24000]), 6)),
+        (after(3500, 12000), mem_node(Position::Co, facing(&[15000, 30000]), 7)),
+    ]);
+    nodes
+}
+
+/// Ruling 15-Q5: a residual the PREFLOP cap created is disclosed at `replay`'s output boundary on
+/// every street -- `BranchResidual{seat: hero, residual_mass_pct: 100 * q_R / sum q, cause: "cap"}`
+/// exactly once -- including at a flop decision, where no postflop street is walked, and on the
+/// turn, where the flop walk has already disclosed it (replaced in place, never repeated). UTG
+/// opens to 3 bb (between 2.5 and 3.5), HJ raises to 7.5 bb and CO to 20 bb, each between two sizes
+/// in every branch: 2, 4, then 8 branches, capped to 4 plus the residual. The later preflop nodes
+/// are absent (those branches stop), which changes no weight.
+#[test]
+fn a_preflop_cap_residual_is_disclosed_once_at_the_replay_boundary() {
+    let store = store_of(three_level_ladder());
+    let cfg = config_at(10);
+    let raised = act(&table(&cfg), &[Action::Raise { to: 30 }, Action::Raise { to: 75 }, Action::Raise { to: 200 }]);
+    // BTN, SB, BB and UTG fold, HJ calls: HJ and CO see the flop; both check it.
+    let closed = act(&raised, &[Action::Fold, Action::Fold, Action::Fold, Action::Fold, Action::Call]);
+    let flop = deal(&closed, "2c7dTh");
+    let turn = deal(&act(&flop, &[Action::Check, Action::Check]), "2c7dThJs");
+    for (state, what) in [(&raised, "preflop"), (&closed, "preflop, closed"), (&flop, "flop"), (&turn, "turn")] {
+        let out = run(&store, state);
+        assert_eq!(out.branches.iter().filter(|b| b.residual).count(), 1, "{what}: the preflop cap left a residual");
+        assert_eq!(out.branches.iter().filter(|b| !b.residual).count(), 4, "{what}");
+        let total: f64 = out.branches.iter().map(|b| b.q).sum();
+        let residual = out.branches.iter().find(|b| b.residual).expect("a residual").q;
+        let caps: Vec<&ApproxReason> = out.reasons.iter().filter(|r| matches!(r, ApproxReason::BranchResidual { .. })).collect();
+        assert_eq!(caps.len(), 1, "{what}: exactly one cap disclosure, {:?}", out.reasons);
+        match caps[0] {
+            ApproxReason::BranchResidual { seat, residual_mass_pct, cause } => {
+                assert_eq!((*seat, cause.as_str()), (BB, "cap"), "{what}: hero's seat and the cap cause");
+                let want = 100.0 * residual / total;
+                assert!(want > 0.0 && (f64::from(*residual_mass_pct) - want).abs() < 1e-4, "{what}: {residual_mass_pct} != {want}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
 /// A two-way translated open at the root of [`ladder_nodes`]: the disclosed pot fractions `(s, A,
 /// B)`, the deviation and its prominence (`d > 0.10`, stated by the caller from the hand
 /// calculation), the pseudo-harmonic weights `f_A` and `1 - f_A`, each child's `q = f_X * M_X` and
