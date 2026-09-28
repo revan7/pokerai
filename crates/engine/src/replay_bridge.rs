@@ -98,18 +98,7 @@ impl RangeSource for ReplayRanges {
     /// meanwhile: nothing of it is delivered); the replay's own `unsupported` reason when the replay has one;
     /// `InvalidRanges` for a range the validators refuse.
     fn ranges_at_root(&self, state: &HandState, root: &StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason> {
-        let active = lock(&self.identity).active().cloned().ok_or_else(|| engine_error("no active decision".into()))?;
-        if active.hand_id != state.hand_id || active.config_revision != state.config.config_revision {
-            return Err(engine_error(format!("the active decision is not of hand {} under config revision {}", state.hand_id, state.config.config_revision)));
-        }
-        let (snapshots, misses) = {
-            let store = lock(&self.snapshots);
-            (store.for_identity(&active), store.misses_for_identity(&active))
-        };
-        let replayed = replay_for(&self.store, state, snapshots, misses);
-        if let Some(reason) = &replayed.unsupported {
-            return Err(reason.clone());
-        }
+        let replayed = self.replayed(state)?;
         let published = |seat: Seat| replayed.ranges.get(usize::from(seat.0)).cloned().flatten().ok_or(UnsupportedReason::InvalidRanges);
         let (mut oop, mut ip) = (published(root.oop)?, published(root.ip)?);
         if !weights_valid(&oop) || !weights_valid(&ip) {
@@ -122,6 +111,49 @@ impl RangeSource for ReplayRanges {
         }
         let ranges_used = vec![(root.oop, range_to_string(&oop), mass(&oop)), (root.ip, range_to_string(&ip), mass(&ip))];
         Ok(RootRanges { oop, ip, reasons: replayed.reasons, ranges_used, snapshots_used: replayed.snapshots_used })
+    }
+
+    /// Plan 4 Task 11 (spec 6's surrogate): the replay's published range of every seat in `seats`, in that order, at the
+    /// current street root, from the same replay `ranges_at_root` reads (the active decision's snapshots and misses),
+    /// each validated as `ranges_at_root` validates one side (finite `[0, 1]` weights before board blocking, support
+    /// after it). Hero's cards enter none of it. Joint compatibility is a pair's property: the surrogate's opponent
+    /// choice skips a pair whose equity cannot be computed.
+    fn seat_ranges(&self, state: &HandState, seats: &[Seat]) -> Result<Vec<(Seat, Range1326)>, UnsupportedReason> {
+        let replayed = self.replayed(state)?;
+        seats
+            .iter()
+            .map(|&seat| {
+                let mut range = replayed.ranges.get(usize::from(seat.0)).cloned().flatten().ok_or(UnsupportedReason::InvalidRanges)?;
+                if !weights_valid(&range) {
+                    return Err(UnsupportedReason::InvalidRanges);
+                }
+                block_public(&mut range, &state.board);
+                if mass(&range) <= 0.0 {
+                    return Err(UnsupportedReason::InvalidRanges);
+                }
+                Ok((seat, range))
+            })
+            .collect()
+    }
+}
+
+impl ReplayRanges {
+    /// The replay of `state` for the active decision: a non-retryable `EngineError` when no decision is active or the
+    /// active one is not of `state`'s hand and config revision, the replay's own `unsupported` reason when it has one.
+    fn replayed(&self, state: &HandState) -> Result<ReplayOutput, UnsupportedReason> {
+        let active = lock(&self.identity).active().cloned().ok_or_else(|| engine_error("no active decision".into()))?;
+        if active.hand_id != state.hand_id || active.config_revision != state.config.config_revision {
+            return Err(engine_error(format!("the active decision is not of hand {} under config revision {}", state.hand_id, state.config.config_revision)));
+        }
+        let (snapshots, misses) = {
+            let store = lock(&self.snapshots);
+            (store.for_identity(&active), store.misses_for_identity(&active))
+        };
+        let replayed = replay_for(&self.store, state, snapshots, misses);
+        if let Some(reason) = &replayed.unsupported {
+            return Err(reason.clone());
+        }
+        Ok(replayed)
     }
 }
 

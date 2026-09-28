@@ -28,6 +28,16 @@ pub struct RootRanges {
 /// `InvalidRanges` for empty or jointly incompatible ranges (spec §13 failure table).
 pub trait RangeSource: Send {
     fn ranges_at_root(&self, state: &HandState, root: &StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason>;
+
+    /// Spec 6's `experimental` block (plan 4 Task 11): the public range of every seat in `seats`, in that order, at the
+    /// root of `state`'s current street (the current street's actions not applied: "unconditioned ranges"), blocked by
+    /// the board and never by hero's cards. A multiway decision has no heads-up street root, so it is asked seat by
+    /// seat. The provided answer is that the source holds no per-seat ranges: a source of one OOP and one IP range for
+    /// a heads-up root (`ExplicitRanges`, a bench spot) cannot name a third seat's range, so the surrogate is skipped
+    /// (spec 6: nothing is guessed). The replay's source (`replay_bridge::ReplayRanges`) answers its published ranges.
+    fn seat_ranges(&self, _state: &HandState, _seats: &[Seat]) -> Result<Vec<(Seat, Range1326)>, UnsupportedReason> {
+        Err(UnsupportedReason::EngineError { message: "the range source holds no per-seat street-root ranges".into(), retryable: false })
+    }
 }
 
 /// Fixed public ranges for OOP and IP, as given (for example by a bench spot). `None` on either side is

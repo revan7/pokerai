@@ -741,3 +741,252 @@ pub fn run_flop_script(seeds: Vec<Seed>, raw: f32, status: &str) -> Vec<Recommen
 pub fn final_count(events: &[RecommendationEvent]) -> usize {
     events.iter().filter(|e| matches!(e, RecommendationEvent::Final(_))).count()
 }
+
+// ---- Task 11 helpers ----
+//
+// Plan 4 Task 11 (spec 6's `experimental` block; spec 13.3 `experimental_surrogate_golden`): three-way hands at a
+// multiway decision on the flop, the turn and the river (plan 2's hand builders over `cfg_1_2`, or a 100-chip big
+// blind), a range source answering fixed per-seat street-root public ranges (the shape of the replay's
+// `RangeSource::seat_ranges`), the fake worker's answer to the surrogate's one solve, and one run of the production
+// `serve_request_with` over `FlopRig` (plan 2's fake worker and fake clock, a real cache in the rig's temporary
+// directory). Every name outside this module's own is written in full, so this block adds no `use` line to the shared
+// module.
+
+/// Hero's cards in the big-blind hands: a combo of hero's public range (QQ).
+pub fn three_way_hero_cards() -> [Card; 2] {
+    [Card::parse("Qs").unwrap(), Card::parse("Qh").unwrap()]
+}
+
+/// The preflop of the big-blind hands: hero in the big blind (seat 2); UTG (seat 3, stack `utg_stack`) opens with
+/// `utg_open`, the hijack and the cutoff fold, the button (seat 0, 505 chips) calls, the small blind folds its 5 chips,
+/// hero (785 chips) calls. The others hold 1000.
+fn three_way_preflop(utg_stack: u32, utg_open: Action) -> HandState {
+    let stacks = [(Seat(0), 505), (Seat(1), 1000), (Seat(2), 785), (Seat(3), utg_stack), (Seat(4), 1000), (Seat(5), 1000)];
+    let s = hand(&stacks, BTN, Seat(2), Some(three_way_hero_cards()));
+    play(&s, &[utg_open, Action::Fold, Action::Fold, Action::Call, Action::Fold, Action::Call])
+}
+
+/// Spec 13.3's three-way flop (the Task 11 brief's): hero in the big blind (seat 2), UTG (seat 3) and the button (seat 0)
+/// still in. UTG opens to 85, the button and hero call around the small blind's folded 5 chips; on Kh 7d 2c hero checks,
+/// UTG bets 20 and the button calls: hero to act with 300 chips in the pot, 700 behind, UTG 900 and the button 400.
+pub fn three_way_flop() -> HandState {
+    play(&board(&three_way_preflop(1005, Action::Raise { to: 85 }), FLOP), &[Action::Check, Action::Bet { to: 20 }, Action::Call])
+}
+
+/// The turn of the same hand: hero calls the 20, Kh 7d 2c 4s, hero first to act (320 in the pot; 680, 880 and 380 behind).
+pub fn three_way_turn() -> HandState {
+    board(&play(&three_way_flop(), &[Action::Call]), "Kh 7d 2c 4s")
+}
+
+/// The river of the same hand: the turn checked around, Kh 7d 2c 4s 9c, hero first to act.
+pub fn three_way_river() -> HandState {
+    board(&play(&three_way_turn(), &[Action::Check, Action::Check, Action::Check]), "Kh 7d 2c 4s 9c")
+}
+
+/// A three-way flop whose UTG (seat 3) is all-in: UTG moves in for its 85 chips preflop, the button and hero call; on
+/// Kh 7d 2c hero (the big blind) is first to act with 260 chips in the pot.
+pub fn three_way_flop_with_all_in_opponent() -> HandState {
+    board(&three_way_preflop(85, Action::AllIn { to: 85 }), FLOP)
+}
+
+/// Hero on the button (seat 0) at a 100-chip big blind (50/100, 5% rake capped at 300 chips, stacks 10,000) holding
+/// `cards`: the cutoff (seat 5) opens to 300, hero calls, the small blind folds, the big blind (seat 2) calls; on Kh 7d 2c
+/// the big blind and the cutoff check to hero, who acts last (in position against either): 950 chips in the pot.
+pub fn three_way_flop_ip_hero_bb_100_holding(cards: [Card; 2]) -> HandState {
+    let hc = proto::HandConfig { config_revision: 1, sb_chips: 50, bb_chips: 100, straddle: None,
+        rake: Rake::PotRake { rate: 0.05, cap_mchips: 300_000, no_flop_no_drop: false }, chip_label: "$1".into() };
+    let begin = core_model::BeginHand { hand_id: 1, button: BTN, hero: BTN, hero_cards: Some(cards), dealt: (0..6).map(Seat).collect(), stacks_start: vec![10_000; 6] };
+    let s = core_model::begin_hand(&hc, begin).expect("begin_hand");
+    let s = play(&s, &[Action::Fold, Action::Fold, Action::Raise { to: 300 }, Action::Call, Action::Fold, Action::Call]);
+    play(&board(&s, FLOP), &[Action::Check, Action::Check])
+}
+
+/// The in-position hand holding AhAd (a combo of hero's public range AA).
+pub fn three_way_flop_ip_hero_bb_100() -> HandState {
+    three_way_flop_ip_hero_bb_100_holding([Card::parse("Ah").unwrap(), Card::parse("Ad").unwrap()])
+}
+
+/// The same public spot holding AsAc, another combo of hero's public range AA.
+pub fn three_way_flop_ip_hero_bb_100_other_combo() -> HandState {
+    three_way_flop_ip_hero_bb_100_holding([Card::parse("As").unwrap(), Card::parse("Ac").unwrap()])
+}
+
+/// The street-root public ranges the three-way hands are served with, seat by seat: the button AA, the small blind 99,
+/// the big blind QQ, UTG JJ, the hijack TT, the cutoff KK. Against hero's QQ in the big blind the button's AA has the
+/// highest range-vs-range equity and UTG's JJ the lowest; against hero's AA on the button the cutoff's KK (a set on
+/// Kh 7d 2c) has it.
+pub fn three_way_ranges() -> Vec<(Seat, Range1326)> {
+    [(Seat(0), "AA"), (Seat(1), "99"), (Seat(2), "QQ"), (Seat(3), "JJ"), (Seat(4), "TT"), (Seat(5), "KK")]
+        .iter()
+        .map(|(seat, text)| (*seat, core_ranges::parse_range(text).unwrap()))
+        .collect()
+}
+
+/// A range source of fixed per-seat public ranges (the replay's shape): every read blocks the board, never hero's cards.
+/// `on_ask`, when given, runs inside every per-seat read (a test's stall at that point of the request).
+pub struct SeatRanges {
+    pub ranges: Vec<(Seat, Range1326)>,
+    pub on_ask: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl SeatRanges {
+    /// The three-way hands' ranges (`three_way_ranges`), with no stall.
+    pub fn three_way() -> SeatRanges {
+        SeatRanges { ranges: three_way_ranges(), on_ask: None }
+    }
+
+    fn blocked(&self, seat: Seat, board: &[Card]) -> Option<Range1326> {
+        let mut range = self.ranges.iter().find(|(s, _)| *s == seat)?.1.clone();
+        core_ranges::block_public(&mut range, board);
+        Some(range)
+    }
+}
+
+impl engine::ranges::RangeSource for SeatRanges {
+    fn ranges_at_root(&self, _state: &HandState, root: &StreetRootSnapshot) -> Result<engine::ranges::RootRanges, proto::UnsupportedReason> {
+        let (Some(oop), Some(ip)) = (self.blocked(root.oop, &root.board), self.blocked(root.ip, &root.board)) else {
+            return Err(proto::UnsupportedReason::InvalidRanges);
+        };
+        let ranges_used = vec![(root.oop, core_ranges::range_to_string(&oop), core_ranges::mass(&oop)), (root.ip, core_ranges::range_to_string(&ip), core_ranges::mass(&ip))];
+        Ok(engine::ranges::RootRanges { oop, ip, reasons: vec![], ranges_used, snapshots_used: vec![] })
+    }
+
+    fn seat_ranges(&self, state: &HandState, seats: &[Seat]) -> Result<Vec<(Seat, Range1326)>, proto::UnsupportedReason> {
+        if let Some(on_ask) = &self.on_ask {
+            on_ask();
+        }
+        seats.iter().map(|seat| self.blocked(*seat, &state.board).map(|r| (*seat, r)).ok_or(proto::UnsupportedReason::InvalidRanges)).collect()
+    }
+}
+
+/// Hero's street-root public range and every other pot-eligible seat's, in postflop order (the brief's `RootRanges2`).
+pub struct RootRanges2 {
+    pub hero: Range1326,
+    pub others: Vec<(Seat, Range1326)>,
+}
+
+/// `state`'s street-root public ranges from `ranges` (board-blocked, never hero-conditioned): hero's, and every other
+/// pot-eligible seat's in postflop order.
+pub fn street_root_public_ranges_of(state: &HandState, ranges: &[(Seat, Range1326)]) -> RootRanges2 {
+    let d = core_model::derive(state);
+    let source = SeatRanges { ranges: ranges.to_vec(), on_ask: None };
+    let seats: Vec<Seat> = core_model::postflop_order(state.button, &state.dealt).into_iter().filter(|s| !d.folded[usize::from(s.0)]).collect();
+    let all = engine::ranges::RangeSource::seat_ranges(&source, state, &seats).expect("every seat of the three-way hands has a range");
+    let hero = all.iter().find(|(s, _)| *s == state.hero).expect("hero is pot-eligible").1.clone();
+    RootRanges2 { hero, others: all.into_iter().filter(|(s, _)| *s != state.hero).collect() }
+}
+
+/// `street_root_public_ranges_of` over the three-way hands' ranges: what the rig serves them with.
+pub fn street_root_public_ranges(state: &HandState) -> RootRanges2 {
+    street_root_public_ranges_of(state, &three_way_ranges())
+}
+
+/// The template the rig's engine uses on `state`'s street: the conservative flop policy's `flop_fast_v1`, the turn's and
+/// the river's own.
+pub fn three_way_template(state: &HandState) -> &'static str {
+    match core_model::derive(state).street {
+        Street::Flop => "flop_fast_v1",
+        Street::Turn => "turn_std_v1",
+        Street::River => "river_std_v1",
+        Street::Preflop => panic!("a three-way hand is postflop"),
+    }
+}
+
+/// The surrogate a test expects at `state` over `ranges`, built independently of the engine's multiway arm: the chosen
+/// opponent's synthetic input, the synthetic heads-up root (total pot, both stacks the minimum, empty history, dead 0),
+/// the effective tree the street's template materializes there, and the street-root public ranges it is solved with, OOP
+/// then IP.
+pub struct SurrogateCase {
+    pub input: engine::experimental::SurrogateInput,
+    pub root: StreetRootSnapshot,
+    pub tree: proto::EffectiveTree,
+    pub ranges: [Range1326; 2],
+}
+
+/// The `SurrogateCase` of `state` over `ranges`.
+pub fn surrogate_case(state: &HandState, ranges: &[(Seat, Range1326)]) -> SurrogateCase {
+    let d = core_model::derive(state);
+    let roots = street_root_public_ranges_of(state, ranges);
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let opponent = engine::experimental::choose_opponent(state.hero, &roots.hero, &roots.others, &state.board, Duration::from_millis(500), &cancel)
+        .expect("an opponent's equity is computed");
+    let input = engine::experimental::surrogate_input(&d, state, state.hero, opponent, d.street, three_way_template(state)).expect("the surrogate runs");
+    let opp = roots.others.iter().find(|(s, _)| *s == opponent).expect("the opponent is pot-eligible").1.clone();
+    let (oop, ip, ranges) = if input.hero_role == "oop" { (state.hero, opponent, [roots.hero, opp]) } else { (opponent, state.hero, [opp, roots.hero]) };
+    let root = StreetRootSnapshot { street: d.street, board: state.board.clone(), oop, ip, pot_root: input.pot, stack_oop_root: input.stack, stack_ip_root: input.stack,
+        dead_this_street: 0, projected_from: input.pot_eligible, history: vec![], bb_chips: state.config.bb_chips };
+    let tree = build_tree_full(&root, &TemplateSelection::from_history(&input.template_id, &[])).expect("the synthetic root materializes").tree;
+    SurrogateCase { input, root, tree, ranges }
+}
+
+/// The worker's solution of `case`: a varied solution (rows differ by combo) of the synthetic tree at its root, 1 chip
+/// of exploitability (inside the 50 bp target of every three-way pot here).
+pub fn surrogate_solution(case: &SurrogateCase) -> StreetSolution {
+    varied_solution(&case.tree, &[], 1.0)
+}
+
+/// The fake worker's answer to the surrogate's one solve of `case`: `"ok"` (`surrogate_solution`), `"error"` (a
+/// retryable `internal` error) or `"hang"` (no terminal ever).
+pub fn surrogate_script(case: &SurrogateCase, status: &str) -> Vec<FakeReply> {
+    let ack = FakeReply::Ack { id: IdRef::Last, status: AckStatus::Accepted, reason: None };
+    match status {
+        "ok" => vec![ack, FakeReply::Result { id: IdRef::Last, status: ResultStatus::Ok, solution: Some(surrogate_solution(case)), error: None, elapsed_ms: 5 }],
+        "error" => vec![ack, FakeReply::Result { id: IdRef::Last, status: ResultStatus::Error, solution: None,
+            error: Some(WorkerError { code: "internal".into(), message: "internal".into(), retryable: true, estimate_bytes: None }), elapsed_ms: 5 }],
+        "hang" => vec![ack, FakeReply::Hang],
+        other => panic!("surrogate_script: unknown status {other:?}"),
+    }
+}
+
+/// One served three-way decision: its identity, its events (`Equity` and `Progress` left out), what it left in the
+/// snapshot store (the hand's snapshots, the decision's misses) and in the cache directory (entries on disk once the
+/// writer has handled every earlier command), the solves the fake worker was sent, its kills and restarts, and the
+/// decision log.
+pub struct ThreeWay {
+    pub id: DecisionIdentity,
+    pub events: Vec<RecommendationEvent>,
+    pub snapshots: usize,
+    pub misses: usize,
+    pub cache_entries: usize,
+    pub solves: Vec<SolveRequest>,
+    pub kills: u32,
+    pub restarts: u32,
+    pub records: Vec<DecisionRecord>,
+}
+
+impl ThreeWay {
+    /// The one `Final`; panics naming the events if there is not exactly one.
+    pub fn final_rec(&self) -> &proto::Recommendation {
+        let finals: Vec<&proto::Recommendation> = self.events.iter().filter_map(|e| match e { RecommendationEvent::Final(r) => Some(r), _ => None }).collect();
+        assert_eq!(finals.len(), 1, "exactly one Final: {:?}", self.events);
+        finals[0]
+    }
+}
+
+/// Serves `state` once on a fresh `FlopRig` whose range source is `source` and whose fake worker answers `script`, with
+/// `seams` (the rig's stub equity unless replaced).
+pub fn run_three_way(state: &HandState, source: SeatRanges, script: Vec<FakeReply>, seams: ServeSeams) -> ThreeWay {
+    let mut rig = FlopRig::new(script);
+    *rig.core.range_source.lock().unwrap() = Box::new(source);
+    let served = rig.serve_with(state, seams);
+    let id = served.id.clone();
+    let (snapshots, misses) = {
+        let store = rig.core.snapshots.lock().unwrap();
+        (store.for_hand(id.hand_id).len(), store.misses_for_identity(&id).len())
+    };
+    let cache_entries = rig.stored().len();
+    let solves = rig.solves();
+    let (kills, restarts) = {
+        let w = rig.worker.lock().unwrap();
+        (w.kills, w.restarts)
+    };
+    rig.core.shutdown();
+    let records = rig.records();
+    ThreeWay { id, events: served.events, snapshots, misses, cache_entries, solves, kills, restarts, records }
+}
+
+/// The brief's script: `state` served over the three-way ranges, the worker answering the surrogate's solve `"ok"`.
+pub fn run_three_way_flop_script(state: &HandState) -> ThreeWay {
+    let case = surrogate_case(state, &three_way_ranges());
+    run_three_way(state, SeatRanges::three_way(), surrogate_script(&case, "ok"), ServeSeams::default())
+}

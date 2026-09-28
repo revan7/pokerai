@@ -1,0 +1,20 @@
+{
+  "hero_role": "oop",
+  "note": "experimental, not solved: synthetic root, empty history, unconditioned ranges",
+  "opponent": 0,
+  "pot": 300,
+  "ranges_used": [
+    [
+      2,
+      "QQ",
+      6.0
+    ],
+    [
+      0,
+      "AA",
+      6.0
+    ]
+  ],
+  "stack": 400,
+  "template_id": "flop_fast_v1"
+}
