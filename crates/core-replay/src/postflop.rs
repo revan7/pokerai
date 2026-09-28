@@ -78,7 +78,7 @@
 //! walk uses.
 
 use crate::branches::{cap_branches_with, rescale, residual_reason, split_batch, zero_reason, BatchSplit, BranchChoice, HistoryBranch};
-use crate::preflop::{board_mask, public_range, translation_reason, ReplayInput, ReplayOutput};
+use crate::preflop::{board_mask, prominent, public_range, translation_reason, ReplayInput, ReplayOutput};
 use crate::snapshot::{
     compatible, decision_roots, root_board, select_among, snapshot_node_at, street_history, street_number, CompatKey, StreetSnapshot,
 };
@@ -511,11 +511,11 @@ impl Walk<'_> {
     /// not a wager or has no pot fraction or interpolation there.
     fn translate(&self, path: &[u8], node: &MaterializedNode, strategy: &NodeStrategy, seat: Seat, action: &Action, notes: &mut Vec<ApproxReason>) -> Plan {
         let mapped = wager_to(action).and_then(|to| {
-            let (s, menu, t) = interpolation_at(node, &self.mapped_parent(path, seat)?, seat, to)?;
+            let (s, menu, t, exact) = interpolation_at(node, &self.mapped_parent(path, seat)?, seat, to)?;
             let children = t.choices.iter().map(|&(i, _)| child(path, i)).collect::<Option<Vec<OrdinalPath>>>()?;
-            Some((s, menu, t, children))
+            Some((s, menu, t, exact, children))
         });
-        let Some((s, menu, t, children)) = mapped else {
+        let Some((s, menu, t, exact, children)) = mapped else {
             let cause = match wager_to(action) {
                 Some(_) => format!("unmappable size at {path:?}"),
                 None => format!("unmappable action {action:?} at {path:?}"),
@@ -523,7 +523,7 @@ impl Walk<'_> {
             notes.push(self.unconditioned(seat, cause.clone()));
             return Plan::keep(Next::Freeze(cause));
         };
-        notes.push(translation_reason(self.street, seat, s, &menu, &t));
+        notes.push(translation_reason(self.street, seat, s, &menu, &t, exact));
         Plan {
             choice: BranchChoice::Split(t.choices.iter().map(|&(i, f)| (node.actions[i], f, likelihood(strategy, node, path, i))).collect()),
             next: Next::Children(children),
@@ -547,15 +547,19 @@ impl Walk<'_> {
 /// Spec section 8.4's interpolation of `seat`'s wager to `to` over `node`'s own wager sizes at the
 /// mapped financial parent `money`: `own` is the seat's street contribution, `call = facing - own`,
 /// and the pot is `money.pot`, the pot before the call (Task 10's `wager_fraction`,
-/// `menu_fractions`, `interpolate`). Returns the observed fraction, the menu fractions and the
-/// interpolation; `None` where a size has no pot fraction there or nothing interpolates.
-fn interpolation_at(node: &MaterializedNode, money: &Derived, seat: Seat, to: u32) -> Option<(f64, Vec<(usize, f64)>, Interpolation)> {
+/// `menu_fractions`, `interpolate`). Returns the observed fraction, the menu fractions, the
+/// interpolation and its prominence, decided in exact chips (plan-3 final review F-M2:
+/// `10 * min_X |to - to_X| > pot + call` over the sizes used, `preflop::prominent`); `None` where a
+/// size has no pot fraction there or nothing interpolates.
+fn interpolation_at(node: &MaterializedNode, money: &Derived, seat: Seat, to: u32) -> Option<(f64, Vec<(usize, f64)>, Interpolation, bool)> {
     let own = *money.committed_this_street.get(usize::from(seat.0))?;
     let call = money.facing.checked_sub(own)?;
     let s = wager_fraction(to, own, call, money.pot)?;
     let menu = menu_fractions(&node.actions, own, call, money.pot)?;
     let t = interpolate(s, &menu)?;
-    Some((s, menu, t))
+    let sizes: Vec<(usize, u64)> = node.actions.iter().enumerate().filter_map(|(i, a)| wager_to(a).map(|x| (i, u64::from(x)))).collect();
+    let exact = prominent(u64::from(to), &sizes, &t, u64::from(money.pot) + u64::from(call));
+    Some((s, menu, t, exact))
 }
 
 /// `path` extended by menu index `i`; `None` for an index an ordinal path cannot hold.
@@ -707,7 +711,7 @@ mod tests {
                 for observed in [Action::Bet { to }, Action::Raise { to }, Action::AllIn { to }] {
                     let walked = wager_to(&observed)
                         .and_then(|to| interpolation_at(node, &money, seat, to))
-                        .map(|(_, _, t)| t.choices.iter().filter(|(_, f)| *f > 0.0).map(|(i, _)| *i).collect::<Vec<usize>>());
+                        .map(|(_, _, t, _)| t.choices.iter().filter(|(_, f)| *f > 0.0).map(|(i, _)| *i).collect::<Vec<usize>>());
                     assert_eq!(walked, translated_children(node, level, &observed), "{path:?}, observed {observed:?}");
                     compared += 1;
                 }
@@ -718,7 +722,7 @@ mod tests {
         // 30 dead, so a raise to 150 is (150 - 50) / (180 + 50).
         let money = walk.mapped_parent(&[1], Seat(5)).expect("the IP's node");
         assert_eq!((money.pot, money.facing), (180, 50));
-        let (s, _, _) = interpolation_at(walk.tree.get(&[1][..]).expect("a node"), &money, Seat(5), 150).expect("a raise");
+        let (s, _, _, _) = interpolation_at(walk.tree.get(&[1][..]).expect("a node"), &money, Seat(5), 150).expect("a raise");
         assert_eq!(s, 100.0 / 230.0);
         // A line that does not replay to the node's actor has no mapped parent.
         assert!(walk.mapped_parent(&[1], Seat(1)).is_none());

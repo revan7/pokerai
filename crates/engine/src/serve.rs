@@ -516,6 +516,12 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
     // disclosed, with its origin, in this request's assumptions from here on, the `Fast`, the watchdog's fallback and every
     // `Final` alike. The solve's own `source` and `cache` stay this solve's.
     assumptions.notes.extend(ranges.snapshots_used.iter().map(|(street, provenance)| snapshot_note(*street, provenance)));
+    // Plan-3 final review F-I1 (spec 4.4's `translations` and `mappings`; spec 8.4: every non-exact mapping is recorded
+    // in `assumptions.translations` with its deviation): the inherited reasons' translations and mappings are listed in
+    // the assumptions, before the fallback is refreshed, so the `Fast`, the watchdog's `Final` and every `Final` carry
+    // both lists. One classification of a mapping, the preflop path's (`preflop::is_mapping`).
+    assumptions.translations = inherited.iter().filter(|r| matches!(r, ApproxReason::BetTranslation { .. })).cloned().collect();
+    assumptions.mappings = inherited.iter().filter(|r| crate::preflop::is_mapping(r)).cloned().collect();
     // Ruling 28-I6: from here on a watchdog `Final` keeps the range source's reasons and the ranges used (spec 6).
     *lock(&watch.fallback) = deadline_fallback(&ctx, &inherited, &assumptions);
     emit(core, req, Some(&*watch.delivered), RecommendationEvent::Fast(assemble::fast(&ctx, assemble::accumulate(Coverage::Exact, inherited.clone()), assumptions.clone())));

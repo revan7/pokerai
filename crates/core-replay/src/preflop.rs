@@ -54,7 +54,9 @@
 //! source units, before any chip rounding. The observed amount and every menu size are expressed
 //! in one exact integer scale, milli-chips (a source amount of `x` thousandths of a unit is
 //! `x * unit`, an actual chip amount `c` is `c * 1000`), so fractional source sizes survive; an
-//! `AllIn` menu entry keeps the actor's actual maximum (P3.T9).
+//! `AllIn` menu entry keeps the actor's actual maximum (P3.T9). A translation's prominence
+//! (`d > 0.10`) is decided in that same integer scale, never from two `f64` quotients (plan-3 final
+//! review F-M2).
 //!
 //! # One generation per observed action (ruling 13-R3)
 //!
@@ -564,15 +566,19 @@ fn plan_branch(input: &ReplayInput, run: &mut ReplayState, step: &Observed, b: &
     };
     // Ruling 13-R2: the pot fractions at the SOURCE parent, in one exact scale.
     let parent = source_parent(key, node.actor, answer.unit);
-    let mapped = source_fraction(u64::from(to) * 1000, &parent)
-        .zip(source_menu(node, expanded, &parent, answer.unit))
+    let observed_to = u64::from(to) * 1000;
+    let sizes = source_sizes(node, expanded, answer.unit);
+    let mapped = source_fraction(observed_to, &parent)
+        .zip(source_menu(&sizes, &parent))
         .and_then(|(s, menu)| interpolate(s, &menu).map(|t| (s, menu, t)));
     let Some((s, menu, t)) = mapped else {
         let cause = format!("unmappable size at {}", answer.key);
         notes.events.push(stop_reason(seat, &cause));
         return Plan::only(BranchChoice::Stop(cause));
     };
-    notes.events.push(translation_reason(Street::Preflop, seat, s, &menu, &t));
+    // Final review F-M2: prominence decided in the same exact milli-chip scale.
+    let exact = prominent(observed_to, &sizes, &t, parent.pot + parent.call);
+    notes.events.push(translation_reason(Street::Preflop, seat, s, &menu, &t, exact));
     Plan {
         choice: BranchChoice::Split(t.choices.iter().map(|&(a, f)| (expanded.actions[a], f, likelihood(expanded, a))).collect()),
         steps: t.choices.iter().map(|&(a, _)| node.actions[a].clone()).collect(),
@@ -696,37 +702,62 @@ fn source_fraction(to: u64, parent: &SourceParent) -> Option<f64> {
     s.is_finite().then_some(s)
 }
 
-/// The node's own wager sizes as the `(menu index, pot fraction)` pairs `interpolate` takes, at
-/// `parent` (spec section 8.4: "the source node's menu fractions"): a `Raise` at its exact source
-/// size (`to_bb_x1000 * unit` milli-chips, never its chip rounding) and `AllIn` at the actor's
-/// ACTUAL maximum, the expanded node's chip amount (P3.T9), times 1000. `None` when any size has
-/// no fraction there, so a bracket is never silently narrowed (as `core_preflop::menu_fractions`).
+/// The node's own wager sizes as `(menu index, milli-chip to)` pairs (spec section 8.4: "the source
+/// node's menu"): a `Raise` at its exact source size (`to_bb_x1000 * unit` milli-chips, never its
+/// chip rounding) and `AllIn` at the actor's ACTUAL maximum, the expanded node's chip amount
+/// (P3.T9), times 1000.
 ///
 /// # Panics
 /// Always, if the expanded node's action at a source `AllIn` is not an `AllIn`.
-fn source_menu(node: &PreflopNode, expanded: &ExpandedNode, parent: &SourceParent, unit: u32) -> Option<Vec<(usize, f64)>> {
+fn source_sizes(node: &PreflopNode, expanded: &ExpandedNode, unit: u32) -> Vec<(usize, u64)> {
     node.actions
         .iter()
         .enumerate()
-        .filter_map(|(i, step)| {
-            let to = match step {
-                PreflopStep::Raise { to_bb_x1000 } => u64::from(*to_bb_x1000) * u64::from(unit),
-                PreflopStep::AllIn => match expanded.actions[i] {
-                    Action::AllIn { to } => u64::from(to) * 1000,
-                    other => panic!("source_menu: the source all-in at menu index {i} expanded to {other:?}"),
-                },
-                PreflopStep::Fold | PreflopStep::Check | PreflopStep::Call => return None,
-            };
-            Some(source_fraction(to, parent).map(|s| (i, s)))
+        .filter_map(|(i, step)| match step {
+            PreflopStep::Raise { to_bb_x1000 } => Some((i, u64::from(*to_bb_x1000) * u64::from(unit))),
+            PreflopStep::AllIn => match expanded.actions[i] {
+                Action::AllIn { to } => Some((i, u64::from(to) * 1000)),
+                other => panic!("source_sizes: the source all-in at menu index {i} expanded to {other:?}"),
+            },
+            PreflopStep::Fold | PreflopStep::Check | PreflopStep::Call => None,
         })
         .collect()
 }
 
+/// The node's own wager `sizes` ([`source_sizes`]) as the `(menu index, pot fraction)` pairs
+/// `interpolate` takes, at `parent` (spec section 8.4: "the source node's menu fractions"). `None`
+/// when any size has no fraction there, so a bracket is never silently narrowed (as
+/// `core_preflop::menu_fractions`).
+fn source_menu(sizes: &[(usize, u64)], parent: &SourceParent) -> Option<Vec<(usize, f64)>> {
+    sizes.iter().map(|&(i, to)| source_fraction(to, parent).map(|s| (i, s))).collect()
+}
+
+/// Spec section 8.4's `prominent = d > 0.10`, decided in exact integers (plan-3 final review F-M2),
+/// never from the difference of two `f64` quotients, which can land on either side of the literal
+/// `0.10` at an exact `d = 1/10`. Every size at one node shares the denominator `pot + call`, so
+/// `d = min_X |to - to_X| / (pot + call)` over the sizes `X` the interpolation `t` used, and
+/// `prominent <=> 10 * min_X |to - to_X| > pot + call`. `to`, the `sizes` (`(menu index, to_X)`)
+/// and `pot_plus_call` are in one integer scale: milli-chips at the source parent preflop, chips at
+/// the mapped financial parent postflop. Computed in `u128`, so nothing can overflow.
+///
+/// # Panics
+/// Always, if `t` uses no size or one of `t`'s sizes has no amount in `sizes`.
+pub(crate) fn prominent(to: u64, sizes: &[(usize, u64)], t: &Interpolation, pot_plus_call: u64) -> bool {
+    let nearest = t
+        .choices
+        .iter()
+        .map(|&(i, _)| to.abs_diff(sizes.iter().find(|(j, _)| *j == i).map(|&(_, x)| x).expect("an interpolation choice is a menu size")))
+        .min()
+        .expect("an interpolation uses at least one menu size");
+    10 * u128::from(nearest) > u128::from(pot_plus_call)
+}
+
 /// Spec section 8.4's disclosure of one translated wager: the observed pot fraction, the mapped
 /// menu sizes (as pot fractions at the mapped parent: the source parent preflop, the snapshot
-/// node's mapped financial prefix postflop) with their interpolation weights, the deviation, and
-/// `prominent = d > 0.10`.
-pub(crate) fn translation_reason(street: Street, seat: Seat, s: f64, menu: &[(usize, f64)], t: &Interpolation) -> ApproxReason {
+/// node's mapped financial prefix postflop) with their interpolation weights, the deviation (the
+/// `f64` value, for display), and `prominent = d > 0.10` as the caller decided it in exact
+/// integers ([`prominent`]).
+pub(crate) fn translation_reason(street: Street, seat: Seat, s: f64, menu: &[(usize, f64)], t: &Interpolation, prominent: bool) -> ApproxReason {
     let size = |i: usize| menu.iter().find(|(j, _)| *j == i).map(|(_, x)| *x).expect("an interpolation choice is a menu size");
     ApproxReason::BetTranslation {
         street,
@@ -734,7 +765,7 @@ pub(crate) fn translation_reason(street: Street, seat: Seat, s: f64, menu: &[(us
         observed_pct: s as f32,
         mapped: t.choices.iter().map(|&(i, f)| (size(i) as f32, f as f32)).collect(),
         deviation: t.deviation as f32,
-        prominent: t.deviation > 0.10,
+        prominent,
     }
 }
 

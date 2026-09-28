@@ -546,7 +546,10 @@ const F32_CARRIER_SLACK: f64 = 1e-5;
 ///   ([`destination_map`]/[`legalize_row`], P3.T10), so every action is a live chip action and no
 ///   action appears twice; `None` when the branch's key has no node.
 /// - `key`: the key the lookup used, retained for diagnostics whether or not a node was found; it
-///   names the missing node in `MissingPreflopNode` and in `BranchResidual`'s cause.
+///   names the missing node in `MissingPreflopNode` and in `BranchResidual`'s cause. It is read
+///   only for a branch whose key has no node (live, or stopped on a missing node); a branch stopped
+///   for another cause is disclosed by its own stop (plan-3 final review F-M3), whatever key it
+///   carries.
 /// - `created`: the destinations on `node`'s menu that the legality-after-mapping rule **created**
 ///   (no legal source action owns them), each with the ORIGINAL source action whose probability
 ///   was moved there first -- `(destination, from)`, exactly the `MovedProbability { from }` that
@@ -579,9 +582,10 @@ pub struct BranchNode {
 ///   whenever a node strategy exists, and the only strategy output under `HeroComboOutOfSupport`.
 /// - `reasons`: `ChartRounded` / `EvReferenceUnverified` for the sources that contributed, and,
 ///   whenever `unresolved_mass > 0`, one `BranchResidual` per cause actually incurred (spec section
-///   8.4's vocabulary; ruling 19-I1): `cause: "cap"` with the cap residual's posterior share, and
-///   `cause: "missing node <key>"` with the share of the positive branches whose key has no node;
-///   their shares sum to `unresolved_mass`. No duplicates.
+///   8.4's vocabulary; ruling 19-I1; plan-3 final review F-M3 and Q1): `cause: "cap"` with the cap
+///   residual's posterior share, `cause: "missing node <key>"` with the share of the positive
+///   branches whose key has no node, and `cause: "stopped <cause>"` with the share of the positive
+///   branches stopped for each other cause; their shares sum to `unresolved_mass`. No duplicates.
 /// - `notes`: `"x% of the posterior has no strategy"` whenever `unresolved_mass > 0`, and the
 ///   range mix's excluded share.
 /// - `unsupported`: `MissingPreflopNode { key }` when hero has a node in no positive-posterior
@@ -691,11 +695,13 @@ fn check_mix_inputs(pi: &[f64], probs: &[Option<f64>], evs: &[Option<f64>]) {
 ///    a stopped branch never resumes at a later present node, and for lookups behaves like the
 ///    residual) and its entry carries a node. `unresolved_mass = sum_{k without node} pi_k`.
 /// 2. No node in any branch of `B+` (or in any branch at all): `Unsupported { MissingPreflopNode {
-///    key } }`, with no advice and no range mix. `key` is chosen from the heaviest (`q`, ties by
-///    creation order) positive-posterior branch, selected **before** the residual is excluded
-///    (fix round 1, T16-R2): its retained key; if it has no source key -- the residual never has
-///    one -- the heaviest known stopped/live key across **all** branches; never an empty invented
-///    node.
+///    key } }`, with no advice and no range mix. `key` is the retained key of the heaviest (`q`,
+///    ties by creation order) branch of `B+` (of every branch when `B+` is empty) that retains one
+///    and whose key has no node -- live, or stopped on a missing node; never the residual, which
+///    has no source key, never a branch stopped for another cause, and never a zero-posterior
+///    branch (T16-R2 as amended by the plan-3 final review, Q2 and F-M3). When none retains one,
+///    the key is the label `"cap residual (no node)"` if the residual is the only such branch,
+///    else `"no retained key"`; never an empty invented node.
 /// 3. Hero's combo has zero public mass (`B+` empty), or a node of some branch in `B+` marks its
 ///    class explicitly unreachable: `Unsupported { HeroComboOutOfSupport }`; every union action
 ///    is listed with no frequency and no EV (`HeroOutOfSupport`), and the range-level mix is the
@@ -712,15 +718,21 @@ fn check_mix_inputs(pi: &[f64], probs: &[Option<f64>], evs: &[Option<f64>]) {
 /// `range_mix` weights each combo by `sum_{k has node} q_k * w_{H,k}[c]`, independently of hero's
 /// combo, and divides by that covered mass (the excluded share is disclosed in `notes`).
 /// Whenever `unresolved_mass > 0`, hero's unresolved share is disclosed by cause (spec section 8.4's
-/// `"cap" | "missing node <key>"`; section 2: only reasons actually incurred; ruling 19-I1, which
-/// replaces plan 3 Task 16's single `"missing node"` wording): the persistent cap residual's
-/// posterior share as `BranchResidual { seat: hero, residual_mass_pct: 100 * pi_R, cause: "cap" }`,
-/// then the share of the positive branches whose key has no node (stopped, or live without a node)
-/// as `BranchResidual { seat: hero, residual_mass_pct: 100 * sum pi_k, cause: "missing node <key>" }`
+/// `"cap" | "missing node <key>" | "stopped <cause>"`; section 2: only reasons actually incurred;
+/// ruling 19-I1, which replaces plan 3 Task 16's single `"missing node"` wording, and the plan-3
+/// final review's F-M3 and Q1): the persistent cap residual's posterior share as `BranchResidual {
+/// seat: hero, residual_mass_pct: 100 * pi_R, cause: "cap" }`; then the share of the positive
+/// branches whose key has no node (stopped on a missing node, or live without a node) as
+/// `BranchResidual { seat: hero, residual_mass_pct: 100 * sum pi_k, cause: "missing node <key>" }`
 /// naming the heaviest such branch's retained key (`"no retained key"` when none retains one --
-/// never a key whose node is present). A residual-only share therefore has only the cap reason, and
-/// both shares sum to `unresolved_mass`, whose total is the note `"x% of the posterior has no
-/// strategy"`. Contributing chart nodes add `ChartRounded`
+/// never a key whose node is present); then, for each other cause a positive branch was stopped
+/// for (spec section 9.3's bounded fallback: an unmappable action or size, a rejected split), in
+/// branch order, the share of the branches stopped for it as `BranchResidual { seat: hero,
+/// residual_mass_pct: 100 * sum pi_k, cause: "stopped <cause>" }`, the cause read from the
+/// branch's own stop (such a stop names a node that exists, so it is never a missing node). A
+/// residual-only share therefore has only the cap reason, and the shares sum to `unresolved_mass`,
+/// whose total is the note `"x% of the posterior has no strategy"`. Contributing chart nodes add
+/// `ChartRounded`
 /// and unverified PokerData nodes add `EvReferenceUnverified`. Branches are read, never mutated:
 /// stopping a branch belongs to the replay walk, and nothing is renormalized.
 ///
@@ -792,16 +804,30 @@ pub fn mix_nodes(branches: &[HistoryBranch], nodes: &[BranchNode], hero: Seat, h
     if unresolved > 0.0 {
         let pct = 100.0 * unresolved;
         assert!(pct.is_finite() && pct <= 100.0 * (1.0 + MASS_TOLERANCE), "mix_nodes: unresolved share {pct}% is not a percentage");
-        // Ruling 19-I1 (spec sections 2 and 8.4): one reason per cause actually incurred -- the cap
-        // residual's share first, then the share of the positive branches whose key has no node.
-        let (capped, missing): (Vec<usize>, Vec<usize>) =
-            positive.iter().copied().filter(|&k| entry[k].is_none()).partition(|&k| branches[k].residual);
+        // Ruling 19-I1 (spec sections 2 and 8.4) and the plan-3 final review (F-M3, Q1): one reason
+        // per cause actually incurred -- the cap residual's share first, then the share of the
+        // positive branches whose key has no node, then each other stop's share, in branch order.
+        let without: Vec<usize> = positive.iter().copied().filter(|&k| entry[k].is_none()).collect();
+        let capped: Vec<usize> = without.iter().copied().filter(|&k| branches[k].residual).collect();
+        let missing: Vec<usize> = without.iter().copied().filter(|&k| lacks_its_node(&branches[k])).collect();
+        let mut stopped: Vec<(&str, Vec<usize>)> = Vec::new();
+        for &k in &without {
+            if let Some(cause) = other_stop(&branches[k]) {
+                match stopped.iter_mut().find(|(c, _)| *c == cause) {
+                    Some((_, ks)) => ks.push(k),
+                    None => stopped.push((cause, vec![k])),
+                }
+            }
+        }
         if !capped.is_empty() {
             push_unique(&mut out.reasons, residual_share(hero, &pi, &capped, "cap".into()));
         }
         if !missing.is_empty() {
-            let cause = format!("missing node {}", residual_cause_key(branches, nodes, &missing));
+            let cause = format!("{MISSING_NODE_STOP}{}", residual_cause_key(branches, nodes, &missing));
             push_unique(&mut out.reasons, residual_share(hero, &pi, &missing, cause));
+        }
+        for (cause, ks) in stopped {
+            push_unique(&mut out.reasons, residual_share(hero, &pi, &ks, format!("stopped {cause}")));
         }
         out.notes.push(format!("{pct:.1}% of the posterior has no strategy"));
     }
@@ -1066,6 +1092,26 @@ fn push_unique(reasons: &mut Vec<ApproxReason>, reason: ApproxReason) {
 /// branch's key.
 const NO_RETAINED_KEY: &str = "no retained key";
 
+/// `MissingPreflopNode`'s label when the cap residual is hero's only positive-posterior branch (the
+/// residual has no source key; plan-3 final review Q2).
+const CAP_RESIDUAL_NO_NODE: &str = "cap residual (no node)";
+
+/// The prefix of the replay's stop on an absent node (spec section 9.3: `missing node <key>`).
+const MISSING_NODE_STOP: &str = "missing node ";
+
+/// Whether branch `b`, having no node, lacks it because its key has none: it is not the residual and
+/// is live (hero's lookup found no node) or stopped on a missing node.
+fn lacks_its_node(b: &HistoryBranch) -> bool {
+    !b.residual && b.stopped.as_deref().is_none_or(|stop| stop.starts_with(MISSING_NODE_STOP))
+}
+
+/// The cause branch `b` was stopped for, when it is not the residual and stopped for a cause other
+/// than a missing node (spec section 9.3's bounded fallback: an unmappable action or size, a
+/// rejected split) -- a stop at a node that exists.
+fn other_stop(b: &HistoryBranch) -> Option<&str> {
+    b.stopped.as_deref().filter(|stop| !b.residual && !stop.starts_with(MISSING_NODE_STOP))
+}
+
 /// Branch `k`'s retained key: the lookup key of its [`BranchNode`] entry, when it has an entry
 /// with a non-empty key (the residual has no source key).
 fn key_of<'a>(branches: &[HistoryBranch], nodes: &'a [BranchNode], k: usize) -> Option<&'a str> {
@@ -1077,32 +1123,35 @@ fn heaviest(branches: &[HistoryBranch], ks: impl Iterator<Item = usize>) -> Opti
     ks.max_by(|&a, &b| branches[a].q.total_cmp(&branches[b].q).then(branches[b].id.cmp(&branches[a].id)))
 }
 
-/// The heaviest known stopped/live key among `ks`: the key of the heaviest non-residual branch of
-/// `ks` that retains one.
+/// The heaviest known missing-node key among `ks`: the key of the heaviest branch of `ks` whose key
+/// has no node ([`lacks_its_node`]: never the residual, never a branch stopped for another cause)
+/// and that retains one.
 fn heaviest_known_key(branches: &[HistoryBranch], nodes: &[BranchNode], ks: impl Iterator<Item = usize>) -> Option<String> {
-    let keyed = ks.filter(|&k| !branches[k].residual && key_of(branches, nodes, k).is_some());
+    let keyed = ks.filter(|&k| lacks_its_node(&branches[k]) && key_of(branches, nodes, k).is_some());
     heaviest(branches, keyed).and_then(|k| key_of(branches, nodes, k)).map(str::to_string)
 }
 
 /// `MissingPreflopNode`'s key when hero has a node in no positive-posterior branch (spec section
-/// 8.4: "the key of the heaviest branch (largest `q_k`)"; fix round 1, T16-R2): the heaviest branch
-/// of `candidates` is selected **before** the residual is excluded (ties by creation order); its
-/// retained key when it has one; if it has no source key -- the residual never has one -- the
-/// heaviest known stopped/live key across **all** branches, zero-posterior ones included; else
-/// [`NO_RETAINED_KEY`].
+/// 8.4: "the key of the heaviest branch (largest `q_k`)"; T16-R2 as amended by the plan-3 final
+/// review, Q2 and F-M3): the retained key of the heaviest branch of `candidates` (the
+/// positive-posterior branches, ties by creation order) whose key has no node -- never a branch
+/// outside `candidates`, whose node may be present. When none retains one: [`CAP_RESIDUAL_NO_NODE`]
+/// if the residual is the only candidate, else [`NO_RETAINED_KEY`].
 fn missing_node_key(branches: &[HistoryBranch], nodes: &[BranchNode], candidates: &[usize]) -> String {
-    heaviest(branches, candidates.iter().copied())
-        .filter(|&k| !branches[k].residual)
-        .and_then(|k| key_of(branches, nodes, k))
-        .map(str::to_string)
-        .or_else(|| heaviest_known_key(branches, nodes, 0..branches.len()))
-        .unwrap_or_else(|| NO_RETAINED_KEY.into())
+    heaviest_known_key(branches, nodes, candidates.iter().copied()).unwrap_or_else(|| {
+        if !candidates.is_empty() && candidates.iter().all(|&k| branches[k].residual) {
+            CAP_RESIDUAL_NO_NODE.into()
+        } else {
+            NO_RETAINED_KEY.into()
+        }
+    })
 }
 
 /// The key in the partial-coverage `BranchResidual` cause ("missing node <key>"): the heaviest
-/// known key among `missing`, the positive-posterior branches (never the residual) whose key has no
-/// node; [`NO_RETAINED_KEY`] when none of them retains one. Ruling 19-I1: never another branch's
-/// key, whose node is present -- the residual's own share is disclosed as the cap instead.
+/// known key among `missing`, the positive-posterior branches whose key has no node (never the
+/// residual, never a branch stopped for another cause); [`NO_RETAINED_KEY`] when none of them
+/// retains one. Ruling 19-I1: never another branch's key, whose node is present -- the residual's
+/// own share is disclosed as the cap instead, and another stop's as `stopped <cause>`.
 fn residual_cause_key(branches: &[HistoryBranch], nodes: &[BranchNode], missing: &[usize]) -> String {
     heaviest_known_key(branches, nodes, missing.iter().copied()).unwrap_or_else(|| NO_RETAINED_KEY.into())
 }
