@@ -451,16 +451,24 @@ fn a_deadline_exceeded_with_no_job_outstanding_restarts_nothing() {
     assert_eq!(kinds, ["Final"], "the request's events but its Equity: no Fast after the delivered Final");
 }
 
-/// A range source that refuses the root ranges late: it moves the fake clock to `until_ms`, waits for the watchdog to
-/// acknowledge that point (its wait for the fire once it has recorded the street deadline, or its `Final` once it has
-/// fired), then answers `InvalidRanges`.
-struct LateRefusal { clock: Arc<FakeClock>, until_ms: u64, finals: Option<Finals> }
+/// How late a `LateRefusal` answers, and what of the watchdog it waits for first.
+enum Late {
+    /// At this time, once the watchdog has recorded the street deadline and waits for its fire.
+    AfterTheStreetDeadline(u64),
+    /// At the fire, once the watchdog's `Final` is recorded.
+    AfterTheWatchdogFinal(Finals),
+    /// At the fire, with the watchdog held in its street-deadline wait (a suspend: the clock jumped past both deadlines
+    /// before the watchdog thread ran); the test releases the clock after the request.
+    WatchdogHeldAtTheStreetDeadline,
+}
+/// A range source that refuses the root ranges late (see `Late`), answering `InvalidRanges`.
+struct LateRefusal { clock: Arc<FakeClock>, late: Late }
 impl RangeSource for LateRefusal {
     fn ranges_at_root(&self, _state: &HandState, _root: &proto::StreetRootSnapshot) -> Result<RootRanges, UnsupportedReason> {
-        self.clock.set_ms(self.until_ms);
-        match &self.finals {
-            Some(finals) => wait_finals(finals, 1),
-            None => self.clock.wait_for_waiter(14_900),
+        match &self.late {
+            Late::AfterTheStreetDeadline(at_ms) => { self.clock.set_ms(*at_ms); self.clock.wait_for_waiter(14_900); }
+            Late::AfterTheWatchdogFinal(finals) => { self.clock.set_ms(14_900); wait_finals(finals, 1); }
+            Late::WatchdogHeldAtTheStreetDeadline => { self.clock.wait_for_waiter(2_000); self.clock.hold(); self.clock.set_ms(14_900); }
         }
         Err(UnsupportedReason::InvalidRanges)
     }
@@ -470,11 +478,14 @@ impl RangeSource for LateRefusal {
 /// ends before any solve logs no street verdict while it is answered before the watchdog's fire, even past its street
 /// deadline (here refused at 2 500 ms, after the watchdog recorded the 2 000 ms deadline): it made no attempt to judge.
 /// Answered at or after the fire, it logs the shared street deadline's verdict, here violated: the watchdog's `Final`
-/// is the one delivered and logged, and no terminal arrived by the street deadline.
+/// is the one delivered and logged, and no terminal arrived by the street deadline. Ruling 28-N3: the same when the
+/// engine's own early-exit `Final` wins the claim at the fire before the watchdog thread recorded the street deadline
+/// (a suspend-style jump): the request expired with no terminal, so the street deadline was violated, as the solve
+/// client judges a no-terminal outcome from the clock.
 #[test]
 fn an_early_exit_logs_the_street_verdict_only_after_the_fire() {
     let (mut r, gate) = gated_rig("early_exit_before_fire", vec![]);
-    *r.core.range_source.lock().unwrap() = Box::new(LateRefusal { clock: r.clock.clone(), until_ms: 2_500, finals: None });
+    *r.core.range_source.lock().unwrap() = Box::new(LateRefusal { clock: r.clock.clone(), late: Late::AfterTheStreetDeadline(2_500) });
     let id = serve(&mut r, &river_state());
     let f = finals(&r, &id);
     assert!(f.len() == 1 && f[0].0 == 2_500 && matches!(f[0].2.coverage, Coverage::Unsupported { reason: UnsupportedReason::InvalidRanges, .. }), "{f:?}");
@@ -482,12 +493,20 @@ fn an_early_exit_logs_the_street_verdict_only_after_the_fire() {
     assert_eq!((recs.len(), recs[0].street_violation, recs[0].final_violation), (1, false, false), "before the fire: no verdict");
     drop(gate);
     let (mut r, gate) = gated_rig("early_exit_after_fire", vec![]);
-    *r.core.range_source.lock().unwrap() = Box::new(LateRefusal { clock: r.clock.clone(), until_ms: 14_900, finals: Some(gate) });
+    *r.core.range_source.lock().unwrap() = Box::new(LateRefusal { clock: r.clock.clone(), late: Late::AfterTheWatchdogFinal(gate) });
     let id = serve(&mut r, &river_state());
     let f = finals(&r, &id);
     assert!(f.len() == 1 && f[0].0 == 14_900 && matches!(f[0].2.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { .. }, .. }), "{f:?}");
     let recs = records(&r);
     assert_eq!((recs.len(), &recs[0].coverage, recs[0].street_violation, recs[0].final_violation), (1, &f[0].2.coverage, true, true), "after the fire: the street deadline's verdict");
+    let (mut r, _gate) = gated_rig("early_exit_after_fire_engine_wins", vec![]);
+    *r.core.range_source.lock().unwrap() = Box::new(LateRefusal { clock: r.clock.clone(), late: Late::WatchdogHeldAtTheStreetDeadline });
+    let id = serve(&mut r, &river_state());
+    r.clock.release();
+    let f = finals(&r, &id);
+    assert!(f.len() == 1 && f[0].0 == 14_900 && matches!(f[0].2.coverage, Coverage::Unsupported { reason: UnsupportedReason::InvalidRanges, .. }), "the engine's own Final wins: {f:?}");
+    let recs = records(&r);
+    assert_eq!((recs.len(), recs[0].street_violation, recs[0].final_violation), (1, true, true), "after the fire, the watchdog never having recorded the street deadline");
 }
 
 // --- The delivery race after the solve (ruling 28-I2) and the equity's cancellation (ruling 28-I4), through the test
@@ -556,6 +575,28 @@ fn a_watchdog_final_during_the_allin_fallback_is_the_one_delivered_and_logged() 
     let seams = fire_before_claim(&r, &gate);
     let id = serve_with(&mut r, &s, seams);
     assert_the_watchdog_final_is_delivered_and_logged(&r, &id, "analytic candidate");
+}
+
+/// Ruling 28-O1b (ruling 28-I6's first half): the watchdog's fallback is refreshed as soon as the range source has
+/// answered, before the tree is built. The `after_fast` seam fires the watchdog right after the `Fast` (the window
+/// between the two refreshes) and waits for its `Final`, which carries the range source's reason and the ranges used,
+/// with no template yet (the second refresh, after the tree, has not run). The decision log records that `Final`.
+#[test]
+fn a_watchdog_fire_before_the_tree_keeps_the_range_sources_reasons() {
+    let sentinel = ApproxReason::UnconditionedPriorStreet { street: Street::Turn, seat: Seat(0), cause: "sentinel".into() };
+    let (mut r, gate) = gated_rig("fire_after_fast", vec![]);
+    *r.core.range_source.lock().unwrap() = Box::new(WithReason(sentinel.clone()));
+    let (clock, finals_gate) = (r.clock.clone(), gate.clone());
+    let seams = ServeSeams { after_fast: Some(Arc::new(move || { clock.set_ms(14_900); wait_finals(&finals_gate, 1); })), ..ServeSeams::default() };
+    let id = serve_with(&mut r, &river_state(), seams);
+    let f = finals(&r, &id);
+    assert_eq!(f.len(), 1);
+    let (at, _, rec) = &f[0];
+    assert_eq!((*at, &rec.coverage), (14_900, &Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { stage: "fast".into() }, partial: vec![sentinel.clone()] }));
+    assert_eq!((rec.assumptions.ranges_used.len(), rec.assumptions.template_id.as_str()), (2, ""), "the first refresh's fallback: ranges, no tree yet");
+    let recs = records(&r);
+    assert_eq!((recs.len(), &recs[0].coverage, &recs[0].reasons), (1, &rec.coverage, &vec![sentinel]));
+    assert_eq!((solves(&r).len(), kills_and_restarts(&r)), (0, (0, 0)), "no room was left to send a solve");
 }
 
 /// One command to an acknowledged equity runner: run the next unit of work (replying whether it stopped instead,
