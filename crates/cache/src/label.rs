@@ -50,6 +50,18 @@ impl Label {
     pub fn is_provisional(&self) -> bool {
         matches!(self, Label::Provisional { .. })
     }
+
+    /// The input/model-matching claim this label makes (spec section 2 "Coverage labels"):
+    /// `Coverage::Exact` when no reason applies, else `Coverage::Approximate` with every reason.
+    /// The accuracy axis is not part of it: a `Provisional` label maps to the same coverage its
+    /// reasons alone would give, and the shortfall stays disclosed by `Lookup::Provisional`
+    /// (plan 4 task 7) -- never by a synthesized reason.
+    pub fn coverage(&self) -> proto::Coverage {
+        match self.reasons() {
+            [] => proto::Coverage::Exact,
+            reasons => proto::Coverage::Approximate { reasons: reasons.to_vec() },
+        }
+    }
 }
 
 /// Whether raw stored exploitability `raw` -- a pot-relative fraction, never rounded to whole

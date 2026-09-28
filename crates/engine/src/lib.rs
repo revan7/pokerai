@@ -4,6 +4,7 @@
 pub mod allin;
 pub mod assemble;
 pub mod bench_support;
+pub mod cache_bridge;
 pub mod clock;
 pub mod core;
 pub mod coverage;
