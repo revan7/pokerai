@@ -444,7 +444,9 @@ pub fn load_store(dir: &Path) -> LoadedStore {
         (0..installed.bundles().len()).map(|index| Box::new(Installed { store: installed.clone(), index }) as Box<dyn PreflopSource>).collect();
     for name in file_names(dir) {
         let Some(stem) = name.strip_suffix(".manifest.json") else { continue };
-        if name == ACQUISITION_RECORD {
+        // A directory or link named like a manifest is `PreflopStore::open`'s candidate, loaded, quarantined or reported
+        // there (ruling 17-N1): never a packaged pair.
+        if name == ACQUISITION_RECORD || !is_file(&dir.join(&name)) {
             continue;
         }
         match packaged_pair(dir, &name, stem) {
@@ -513,32 +515,55 @@ fn occupied(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
+/// Whether `path` is an ordinary file itself (a link is not followed, a directory is not one): the only kind of entry
+/// the packaged pass treats as, or renames as, part of a packaged pair (ruling 17-N1).
+fn is_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
 /// Spec 8.2's quarantine of a failing packaged pair (ruling 17-I1), the packaged twin of `PreflopStore::open`'s: each of
-/// its entries present in `dir` (the manifest `manifest_name`, then the nodes file `<stem>.json` when there is one) is
-/// renamed within `dir` to `<entry>.bad`, or, when either name is taken, to `<entry>.<n>.bad` with the smallest `n >= 1`
-/// free for both, so a stale quarantine is never overwritten and the pair keeps one suffix. A link is renamed as the link
-/// entry itself, never its target, and every source and target is an immediate child of `dir`. Returns the new paths;
-/// `Err` names the rename that failed (an unwritable location, a file held open) and any entry already renamed, so the
-/// caller reports the unsuccessful quarantine and still excludes the pair. The manifest goes first: while it keeps its
-/// name the pair is not half quarantined.
+/// its entries in `dir` that is an ordinary file (the manifest `manifest_name`, then the nodes file `<stem>.json` when
+/// there is one) is renamed within `dir` to `<entry>.bad`, or, when either name is taken, to `<entry>.<n>.bad` with the
+/// smallest `n >= 1` free for both, so a stale quarantine is never overwritten and the pair keeps one suffix. A directory
+/// or link entry is `PreflopStore::open`'s candidate and is never renamed here (ruling 17-N1); every source and target
+/// is an immediate child of `dir`. All or nothing (ruling 17-N2): a later failure restores any entry already renamed,
+/// in reverse order, so the pair is left whole under its names, never half renamed, and the next start sees and reports
+/// it again. Returns the new paths; `Err` names the rename that failed (an unwritable location, a file held open) and
+/// the rollback's outcome, so the caller reports the unsuccessful quarantine and still excludes the pair.
 fn quarantine_pair(dir: &Path, manifest_name: &str, stem: &str) -> Result<String, String> {
     let nodes_name = format!("{stem}.json");
-    let entries: Vec<&str> = [manifest_name, nodes_name.as_str()].into_iter().filter(|name| occupied(&dir.join(name))).collect();
+    let entries: Vec<&str> = [manifest_name, nodes_name.as_str()].into_iter().filter(|name| is_file(&dir.join(name))).collect();
+    if entries.is_empty() {
+        return Err(format!("no entry of {manifest_name} and {nodes_name} is an ordinary file to rename"));
+    }
     let suffix = (0u32..)
         .map(|n| if n == 0 { ".bad".to_string() } else { format!(".{n}.bad") })
         .find(|suffix| entries.iter().all(|name| !occupied(&dir.join(format!("{name}{suffix}")))))
         .expect("a free quarantine name exists");
-    let mut renamed: Vec<String> = Vec::new();
+    let mut renamed: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
     for name in entries {
         let (from, to) = (dir.join(name), dir.join(format!("{name}{suffix}")));
-        let done = if renamed.is_empty() { String::new() } else { format!("; already renamed: {}", renamed.join(", ")) };
-        if from.parent() != Some(dir) || to.parent() != Some(dir) {
-            return Err(format!("{} would leave the preflop directory{done}", from.display()));
+        let moved = if from.parent() != Some(dir) || to.parent() != Some(dir) {
+            Err(format!("{} would leave the preflop directory", from.display()))
+        } else {
+            std::fs::rename(&from, &to).map_err(|e| format!("{} could not be renamed to {}: {e}", from.display(), to.display()))
+        };
+        if let Err(mut failure) = moved {
+            let mut whole = true;
+            for (back, at) in renamed.iter().rev() {
+                if let Err(e) = std::fs::rename(at, back) {
+                    whole = false;
+                    failure.push_str(&format!("; and {} could not be restored to {}: {e}", at.display(), back.display()));
+                } else {
+                    failure.push_str(&format!("; {} restored", back.display()));
+                }
+            }
+            failure.push_str(if whole { "; the pair is left in place under its names" } else { "; the pair is left partly renamed" });
+            return Err(failure);
         }
-        std::fs::rename(&from, &to).map_err(|e| format!("{} could not be renamed to {}: {e}{done}", from.display(), to.display()))?;
-        renamed.push(to.display().to_string());
+        renamed.push((from, to));
     }
-    Ok(renamed.join(" and "))
+    Ok(renamed.iter().map(|(_, to)| to.display().to_string()).collect::<Vec<_>>().join(" and "))
 }
 
 /// A bundle `PreflopStore::open` admitted, kept in the engine's one store beside the packaged ones: it answers exactly

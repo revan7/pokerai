@@ -88,6 +88,40 @@ const HJ: Seat = Seat(3);
 const CO: Seat = Seat(4);
 const BTN: Seat = Seat(5);
 
+/// A fresh temporary directory of this test process, removed (with everything in it) when the guard drops, a failing
+/// assertion's unwinding included, so no run leaves a directory behind.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    /// `<temp>/pokerai_preflop_<tag>_<pid>`, emptied if a previous run left it; created when `create`.
+    fn new(tag: &str, create: bool) -> TempDir {
+        let dir = std::env::temp_dir().join(format!("pokerai_preflop_{tag}_{}", std::process::id()));
+            if create {
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+        TempDir(dir)
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
 }
@@ -293,7 +327,8 @@ struct Rig {
     sink: SharedSink,
     events: Arc<Mutex<Vec<Recorded>>>,
     calls: Arc<Mutex<Vec<EquityCall>>>,
-    log_dir: PathBuf,
+    /// The rig's decision log directory, removed when the rig drops (declared last, so after the core).
+    log_dir: TempDir,
 }
 
 /// An engine core on a scripted worker with nothing scripted (a `solve` would hang, and is recorded), a fake clock, a
@@ -303,8 +338,7 @@ fn rig(name: &str, store: PreflopStore) -> Rig {
     let identity = Arc::new(Mutex::new(IdentityState::new()));
     identity.lock().unwrap().set_config();
     let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), vec![]);
-    let log_dir = std::env::temp_dir().join(format!("pokerai_preflop_{name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&log_dir);
+    let log_dir = TempDir::new(name, false);
     let mut core = EngineCore::new(worker, clock.clone(), identity.clone(), DecisionLog::open(&log_dir));
     core.preflop = Arc::new(store);
     let (sink, events) = RecordingSink::new(clock.clone(), Some(fake.clone()));
@@ -842,7 +876,8 @@ fn the_engine_hands_out_its_loaded_store_and_recommends_from_it() {
     let clock = FakeClock::new();
     let identity = Arc::new(Mutex::new(IdentityState::new()));
     let (worker, fake) = FakeWorker::scripted(clock.clone(), identity.clone(), vec![]);
-    let mut core = EngineCore::new(worker, clock.clone(), identity, DecisionLog::open(&std::env::temp_dir().join("pokerai_preflop_engine_log")));
+    let log_dir = TempDir::new("engine_log", false);
+    let mut core = EngineCore::new(worker, clock.clone(), identity, DecisionLog::open(&log_dir));
     core.preflop = Arc::new(PreflopStore::from_sources(charts()));
     let calls: Arc<Mutex<Vec<EquityCall>>> = Arc::default();
     let mut e = Engine::with_core_and_seams(core, ServeSeams { equity: Some(stub_equity(calls.clone())), ..ServeSeams::default() });
@@ -865,10 +900,8 @@ fn the_engine_hands_out_its_loaded_store_and_recommends_from_it() {
 
 /// Copies of the available chart pairs (`<id>.manifest.json` + `<id>.json`, the packaged layout) into a fresh
 /// directory: the loader is never pointed at `fixtures/charts` itself, whose subdirectories a quarantine would rename.
-fn staged_charts(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("pokerai_preflop_store_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn staged_charts(tag: &str) -> TempDir {
+    let dir = TempDir::new(&format!("store_{tag}"), true);
     for (_, id) in available_chart_depths() {
         for name in [format!("{id}.manifest.json"), format!("{id}.json")] {
             std::fs::copy(fixtures().join("charts").join(&name), dir.join(&name)).unwrap();
@@ -920,7 +953,6 @@ fn the_store_loads_packaged_pairs_and_quarantines_every_failing_bundle() {
     assert_eq!(again.store.bundles().iter().map(|b| b.bundle_info().bundle_id.clone()).collect::<Vec<_>>(), ids);
     assert!(again.quarantined.is_empty(), "{:?}", again.quarantined);
     assert_eq!(again.banners.len(), 1, "{:?}", again.banners);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Ruling 17-I1: a failing packaged pair whose quarantine rename cannot be performed (its manifest is held open without
@@ -949,7 +981,77 @@ fn a_failing_packaged_pair_that_cannot_be_renamed_is_excluded_and_reported() {
         "{banner}");
     assert!(dir.join("broken_chart.manifest.json").is_file() && dir.join("broken_chart.json").is_file(), "nothing was renamed");
     assert!(!dir.join("broken_chart.manifest.json.bad").exists() && !dir.join("broken_chart.json.bad").exists(), "no half quarantine");
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ruling 17-N1: the packaged pass renames ordinary files only; a directory is `PreflopStore::open`'s candidate. A valid
+/// installed bundle folder `foo.json/` beside a file `foo.manifest.json` (a failing pair: its nodes entry is no file)
+/// stays a folder and keeps loading, while the pair's one file is quarantined; a valid installed bundle folder named like
+/// a manifest (`bar.manifest.json/`) is not a packaged pair at all: no banner, nothing quarantined, nothing renamed.
+#[test]
+fn the_packaged_pass_never_touches_an_installed_bundle_directory() {
+    use engine::preflop::load_store;
+    let installed = |dir: &Path, name: &str| {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        for file in ["manifest.json", "nodes.json"] {
+            std::fs::copy(fixtures().join("preflop/synthetic_v2").join(file), dir.join(name).join(file)).unwrap();
+        }
+    };
+    let ids = |loaded: &engine::preflop::LoadedStore| loaded.store.bundles().iter().map(|b| b.bundle_info().bundle_id.clone()).collect::<Vec<_>>();
+    let charts: Vec<String> = available_chart_depths().into_iter().map(|(_, id)| id).collect();
+    let with_synthetic: Vec<String> = std::iter::once("synthetic_v2_100bb".to_string()).chain(charts.iter().cloned()).collect();
+    // A folder named like a nodes file, paired with a manifest file.
+    let dir = staged_charts("installed_json");
+    installed(&dir, "foo.json");
+    std::fs::copy(fixtures().join(format!("charts/{}.manifest.json", charts[0])), dir.join("foo.manifest.json")).unwrap();
+    let loaded = load_store(&dir);
+    assert_eq!(ids(&loaded), with_synthetic, "the installed folder loads");
+    assert!(dir.join("foo.json").is_dir() && dir.join("foo.json").join("nodes.json").is_file(), "the installed folder is untouched");
+    assert!(dir.join("foo.manifest.json.bad").is_file() && !dir.join("foo.json.bad").exists(), "only the pair's file is quarantined");
+    assert_eq!(loaded.quarantined, vec!["foo".to_string()]);
+    assert_eq!(loaded.banners.len(), 1, "{:?}", loaded.banners);
+    assert!(loaded.banners[0].starts_with("packaged preflop bundle foo quarantined as ") && !loaded.banners[0].contains("foo.json.bad"), "{:?}", loaded.banners);
+    let again = load_store(&dir);
+    assert_eq!((ids(&again), again.banners.clone(), again.quarantined.clone()), (with_synthetic, vec![], vec![]), "the next start still loads it, silently");
+    // A folder named like a manifest.
+    let dir = TempDir::new("store_installed_manifest", true);
+    installed(&dir, "bar.manifest.json");
+    for _ in 0..2 {
+        let loaded = load_store(&dir);
+        assert_eq!((ids(&loaded), loaded.banners.clone(), loaded.quarantined.clone()), (vec!["synthetic_v2_100bb".to_string()], vec![], vec![]));
+        assert!(dir.join("bar.manifest.json").is_dir() && !dir.join("bar.manifest.json.bad").exists(), "never renamed");
+    }
+}
+
+/// Ruling 17-N2: a pair's quarantine is all or nothing. When the manifest renames but the nodes file cannot (held open
+/// without delete sharing), the manifest's rename is rolled back: both files keep their names, no `.bad` exists, the
+/// banner reports the unsuccessful quarantine and the pair is excluded; the next start sees the pair and reports it
+/// again, and once the file is released it is quarantined whole.
+#[cfg(windows)]
+#[test]
+fn a_pair_whose_nodes_file_cannot_be_renamed_is_rolled_back_whole() {
+    use engine::preflop::load_store;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x1;
+    let dir = staged_charts("half_renamed");
+    let ids: Vec<String> = available_chart_depths().into_iter().map(|(_, id)| id).collect();
+    std::fs::copy(fixtures().join(format!("charts/{}.manifest.json", ids[0])), dir.join("broken_chart.manifest.json")).unwrap();
+    std::fs::write(dir.join("broken_chart.json"), b"{}").unwrap();
+    let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(dir.join("broken_chart.json")).unwrap();
+    for start in ["first", "second"] {
+        let loaded = load_store(&dir);
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).filter(|n| n.starts_with("broken_chart")).collect();
+        assert_eq!(loaded.store.bundles().iter().map(|b| b.bundle_info().bundle_id.clone()).collect::<Vec<_>>(), ids, "{start}: the valid sources stay active");
+        assert_eq!(loaded.quarantined, vec!["broken_chart".to_string()], "{start}");
+        assert_eq!(names, ["broken_chart.json", "broken_chart.manifest.json"], "{start}: both files keep their names, no .bad");
+        assert_eq!(loaded.banners.len(), 1, "{start}: {:?}", loaded.banners);
+        let banner = &loaded.banners[0];
+        assert!(banner.starts_with("packaged preflop bundle broken_chart failed validation") && banner.contains("could not be quarantined")
+            && banner.contains("broken_chart.json could not be renamed") && banner.contains("restored") && banner.contains("excluded"), "{start}: {banner}");
+    }
+    drop(held);
+    let loaded = load_store(&dir);
+    assert!(loaded.banners[0].starts_with("packaged preflop bundle broken_chart quarantined as "), "{:?}", loaded.banners);
+    assert!(dir.join("broken_chart.manifest.json.bad").is_file() && dir.join("broken_chart.json.bad").is_file());
 }
 
 /// A preflop directory that is missing, or that holds no loadable source, leaves an empty store and says so in a banner:
@@ -957,8 +1059,7 @@ fn a_failing_packaged_pair_that_cannot_be_renamed_is_excluded_and_reported() {
 #[test]
 fn a_missing_preflop_directory_is_a_banner_and_an_empty_store() {
     use engine::preflop::load_store;
-    let dir = std::env::temp_dir().join(format!("pokerai_preflop_store_absent_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TempDir::new("store_absent", false);
     let loaded = load_store(&dir);
     assert!(loaded.store.bundles().is_empty() && loaded.quarantined.is_empty());
     assert!(loaded.banners.iter().any(|b| b.contains("no preflop bundle is loaded")), "{:?}", loaded.banners);
