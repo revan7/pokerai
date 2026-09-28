@@ -292,6 +292,35 @@ fn capped_ladder_nodes() -> MemNodes {
     nodes
 }
 
+/// [`capped_ladder_nodes`] plus, after every one of its eight UTG/HJ/CO size triples, the rest of an orbit in which the
+/// button acts after the cap and decides again: BTN calls, SB and BB fold, UTG raises to 60 bb, HJ and CO fold, and the
+/// button faces the raise. Every live branch has every node of the orbit, each with its own class-varying rows, so the
+/// button's call conditions its masses differently per live branch while the frozen residual keeps its own.
+fn capped_orbit_nodes() -> MemNodes {
+    use PreflopStep::{AllIn, Call, Fold};
+    let mut nodes = capped_ladder_nodes();
+    let triples: Vec<Vec<(Position, PreflopStep)>> = nodes.iter().filter(|(h, n)| n.actor == Position::Btn && h.len() == 3).map(|(h, _)| h.clone()).collect();
+    assert_eq!(triples.len(), 8, "the button's node after every size triple");
+    for (i, triple) in triples.into_iter().enumerate() {
+        let seed = 40 + 6 * i;
+        let mut h = triple;
+        h.push((Position::Btn, Call));
+        let orbit = [
+            (Position::Sb, vec![Fold, Call], Fold),
+            (Position::Bb, vec![Fold, Call], Fold),
+            (Position::Utg, vec![Fold, Call, raise(60000)], raise(60000)),
+            (Position::Hj, vec![Fold, Call], Fold),
+            (Position::Co, vec![Fold, Call], Fold),
+        ];
+        for (k, (actor, menu, taken)) in orbit.into_iter().enumerate() {
+            nodes.push((h.clone(), mem_node(actor, menu, seed + k)));
+            h.push((actor, taken));
+        }
+        nodes.push((h, mem_node(Position::Btn, vec![Fold, Call, AllIn], seed + 5)));
+    }
+    nodes
+}
+
 // ---------------------------------------------------------------------------------------------
 // The rig: Plan 2's engine test surfaces, a recording worker, a stub equity routine.
 // ---------------------------------------------------------------------------------------------
@@ -704,12 +733,12 @@ fn a_previous_replay_reason_survives_a_current_exact_lookup() {
     assert_eq!(headline_note(&f), None, "a solved source with an incomplete EV menu has no headline wording (spec 4.4)");
 }
 
-/// Item 5 of the dispatch (ruling 15-Q5 carry): the cap residual and the assembly's "missing node" residual are
-/// different disclosures. Here UTG, HJ and CO each raise between two source sizes (8 branches, capped to 4 live plus
-/// the residual) and hero (the button) has a node in every live branch: the only posterior without a strategy is the
-/// residual's. It is disclosed exactly once, by the replay boundary's `BranchResidual{cause: "cap"}`; the assembly's
-/// "missing node" wording, which would name a node that is present, is not added; hero's unresolved share stays on the
-/// `Final` (`unresolved_mass` and its note), and there is no headline.
+/// Item 5 of the dispatch (ruling 15-Q5 carry), as rulings 19-I1 and 19f-C1 state it: here UTG, HJ and CO each raise
+/// between two source sizes (8 branches, capped to 4 live plus the residual) and hero (the button) has a node in every
+/// live branch, so the only posterior without a strategy is the residual's. The `Final` discloses it exactly once, as
+/// `BranchResidual{seat: hero, cause: "cap"}` (the assembly's, spec 8.4; hero has not acted, so it equals the replay's
+/// residual share), no reason names a missing node (every node is present), hero's unresolved share is on the `Final`
+/// (`unresolved_mass` and exactly one "x% of the posterior has no strategy" note), and there is no headline.
 #[test]
 fn a_cap_residual_alone_is_disclosed_once_as_the_cap() {
     let nodes = capped_ladder_nodes();
@@ -737,12 +766,78 @@ fn a_cap_residual_alone_is_disclosed_once_as_the_cap() {
     assert_eq!(translated, [UTG, HJ, HJ, CO, CO, CO, CO], "{rs:?}");
     close(f64::from(f.unresolved_mass), share, 1e-6, "hero's unresolved share is the residual's");
     close(frequencies(&f).iter().sum::<f64>() + f64::from(f.unresolved_mass), 1.0, 1e-6, "sum(frequency) + unresolved_mass = 1");
-    assert!(f.assumptions.notes.iter().any(|n| n.ends_with("% of the posterior has no strategy")), "{:?}", f.assumptions.notes);
-    // Ruling 19-I1 (P3.T19 fix round 1): the assembly itself now discloses the residual-only share as the cap (spec
-    // 8.4), which deduplicates by value with the replay's cap reason above; it never produces the "missing node" wording
-    // that the engine used to withdraw with a note, so there is nothing to withdraw and no such note.
+    assert_eq!(unresolved_notes(&f), vec![format!("{:.1}% of the posterior has no strategy", 100.0 * share)], "the unresolved share, rendered once");
     assert!(rs.iter().all(|x| !matches!(x, ApproxReason::BranchResidual { cause, .. } if cause.starts_with("missing node "))), "no missing-node wording: {rs:?}");
     assert!(f.actions.iter().all(|a| !a.headline) && headline_note(&f).is_none());
+}
+
+/// The `Final`'s notes rendering hero's unresolved share.
+fn unresolved_notes(rec: &Recommendation) -> Vec<String> {
+    rec.assumptions.notes.iter().filter(|n| n.ends_with("% of the posterior has no strategy")).cloned().collect()
+}
+
+/// Ruling 19f-C3: at a preflop decision the `Final` carries one cap disclosure, the assembly's -- hero's posterior share on
+/// the residual branch, the mass without a strategy that the no-headline rule reads -- never the replay's residual share
+/// of the branch weights beside it. Here the button (hero) acts after the cap: it calls the CO's raise at nodes whose call
+/// probabilities differ per live branch, which conditions hero's masses in the live branches only (the residual is
+/// frozen), then decides again facing UTG's 60 bb raise. So the two figures differ; the replay (and the `Fast`, built from
+/// it) states its own, the `Final` states the assembly's alone.
+#[test]
+fn after_hero_acts_past_the_cap_the_final_keeps_the_assemblys_cap_share_alone() {
+    let nodes = capped_orbit_nodes();
+    let line = [
+        Action::Raise { to: 30 },
+        Action::Raise { to: 75 },
+        Action::Raise { to: 200 },
+        Action::Call,
+        Action::Fold,
+        Action::Fold,
+        Action::Raise { to: 600 },
+        Action::Fold,
+        Action::Fold,
+    ];
+    let state = act(&table(100, BTN, "AhKd"), &line);
+    assert_eq!(state.derived.to_act, Some(BTN), "the button decides again");
+    let out = replayed(&mem_store(nodes.clone()), &state);
+    assert_eq!((out.branches.iter().filter(|b| b.residual).count(), out.branches.iter().filter(|b| !b.residual && b.stopped.is_none()).count()), (1, 4),
+        "capped to 4 live branches that walk the whole orbit, plus the residual");
+    let residual = out.branches.iter().position(|b| b.residual).expect("the residual");
+    let total: f64 = out.branches.iter().map(|b| b.q).sum();
+    let replay_pct = 100.0 * out.branches[residual].q / total;
+    let (combo, _) = hero_class(&state);
+    let assembly_pct = 100.0 * core_replay::posterior(&out.branches, BTN, combo)[residual];
+    assert!((replay_pct - assembly_pct).abs() > 0.1, "hero acted after the cap, so the figures differ: replay {replay_pct}, assembly {assembly_pct}");
+    let cap_pcts = |rs: &[ApproxReason]| -> Vec<f64> {
+        rs.iter()
+            .filter_map(|x| match x {
+                ApproxReason::BranchResidual { seat, residual_mass_pct, cause } if cause == "cap" => {
+                    assert_eq!(*seat, BTN, "hero's residual");
+                    Some(f64::from(*residual_mass_pct))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let replay_caps = cap_pcts(&out.reasons);
+    assert_eq!(replay_caps.len(), 1, "the replay discloses its own figure: {:?}", out.reasons);
+    close(replay_caps[0], replay_pct, 1e-3, "the replay's residual share");
+
+    let mut r = rig("cap_after_hero", mem_store(nodes));
+    let id = serve(&mut r, &state);
+    let served = finish(r);
+    let fast = cap_pcts(&reasons(&the_fast(&served, &id)));
+    assert_eq!(fast.len(), 1, "the Fast (the replay's reasons) keeps the replay's figure");
+    close(fast[0], replay_pct, 1e-3, "the Fast's cap share");
+    let f = the_final(&served, &id);
+    let rs = reasons(&f);
+    let caps = cap_pcts(&rs);
+    assert_eq!(caps.len(), 1, "one cap disclosure on the Final: {rs:?}");
+    close(caps[0], assembly_pct, 1e-4, "the Final's cap share is the assembly's");
+    assert!(rs.iter().all(|x| !matches!(x, ApproxReason::BranchResidual { cause, .. } if cause != "cap")), "no other residual cause: {rs:?}");
+    close(f64::from(f.unresolved_mass), assembly_pct / 100.0, 1e-6, "hero's unresolved share is its posterior on the residual");
+    close(frequencies(&f).iter().sum::<f64>() + f64::from(f.unresolved_mass), 1.0, 1e-6, "sum(frequency) + unresolved_mass = 1");
+    assert_eq!(unresolved_notes(&f), vec![format!("{assembly_pct:.1}% of the posterior has no strategy")], "the unresolved share, rendered once");
+    assert!(f.actions.iter().all(|a| !a.headline) && headline_note(&f).is_none(), "no headline while unresolved_mass > 0");
 }
 
 /// Spec 8.4's legality after mapping on hero's node: hero (UTG, AKs) holds 20 chips, so the source's 2.5 bb open (25
