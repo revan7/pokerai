@@ -30,7 +30,8 @@ thiserror.workspace = true
 engine = { path = ".", features = ["testing", "test-templates"] }
 
 [features]
-# Fake clock, fake worker and recording sink (Task 19). Never enabled by a release consumer.
-testing = []
+# Fake clock, fake worker and recording sink (Task 19). Never enabled by a release consumer. It forwards the cache's own
+# `testing` seam (plan 4 Task 10 fix round 1, P4T10-I5: a lookup deadline on the fake clock, `Cache::with_logical_clock`).
+testing = ["cache/testing"]
 # Extra tree templates registered by a downstream test harness (plan 4 Task 8).
 test-templates = []

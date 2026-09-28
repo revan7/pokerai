@@ -604,11 +604,19 @@ impl FlopRig {
     }
 
     /// A rig whose cache is `cache` (a disabled one, say), with `cache_dir` as the directory `stored` lists.
+    ///
+    /// Review P4T10-I5: the rig's cache measures every lookup deadline on the rig's fake clock
+    /// (`cache::Cache::with_logical_clock`, the cache's `testing` seam), the clock the engine measures the cache phase
+    /// on: the engine's budget and the cache's bound are then one logical limit, and the machine's load never turns an
+    /// expected hit into a `BudgetExhausted` miss. The entries are real cells on disk and the lookup is otherwise the
+    /// production one (reader, selection, reconstruction, label, touch).
     pub fn with_cache(script: Vec<FakeReply>, cache: Cache, cache_dir: TempDir) -> FlopRig {
         let clock = FakeClock::new();
         let identity = Arc::new(Mutex::new(IdentityState::new()));
         let (worker_link, worker) = FakeWorker::scripted(clock.clone(), identity.clone(), script);
         let log_dir = TempDir::new();
+        let logical = clock.clone();
+        let cache = cache.with_logical_clock(Arc::new(move || logical.now_ms()));
         let core = EngineCore::new(worker_link, clock.clone(), identity.clone(), DecisionLog::open(&log_dir.0)).with_cache(cache);
         core.set_config(game_config());
         *core.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: Some(full_range()), ip: Some(full_range()) });
@@ -629,10 +637,23 @@ impl FlopRig {
 
     /// Serves `state` as the next decision of the hand, with the stub equity and `seams`.
     pub fn serve_with(&mut self, state: &HandState, seams: ServeSeams) -> Served {
+        let now = self.clock.now_ms();
+        self.serve_at(state, now, seams)
+    }
+
+    /// Serves `state` with the stub equity and no other seam.
+    pub fn serve(&mut self, state: &HandState) -> Served {
+        self.serve_with(state, ServeSeams::default())
+    }
+
+    /// Admits `state` as the next decision at the clock's current time (its `t0`), then moves the fake clock to
+    /// `now_ms` before `engine-main` serves it (a request that waited behind others), with `seams`.
+    pub fn serve_at(&mut self, state: &HandState, now_ms: u64, seams: ServeSeams) -> Served {
         let id = self.identity.lock().unwrap().next_decision().expect("a hand is in progress");
         let (sink, events) = RecordingSink::new(self.clock.clone(), Some(self.worker.clone()));
         let sink: engine::watchdog::SharedSink = Arc::new(Mutex::new(Box::new(sink)));
         let req = LiveRequest::admitted(&self.core, id.clone(), state.clone(), self.clock.now_ms(), sink);
+        self.clock.set_ms(now_ms);
         serve_request_with(&mut self.core, req, ServeSeams { equity: Some(seams.equity.clone().unwrap_or_else(stub_equity)), ..seams });
         let events = events
             .lock()
@@ -644,9 +665,9 @@ impl FlopRig {
         Served { id, events }
     }
 
-    /// Serves `state` with the stub equity and no other seam.
-    pub fn serve(&mut self, state: &HandState) -> Served {
-        self.serve_with(state, ServeSeams::default())
+    /// The snapshots of hand 1 registered for decision `decision_id`, in registration order.
+    pub fn snapshots_of(&self, decision_id: u64) -> Vec<engine::snapshots::StreetSnapshot> {
+        self.core.snapshots.lock().unwrap().for_hand(1).into_iter().filter(|s| s.provenance.identity_at_solve.decision_id == decision_id).cloned().collect()
     }
 
     /// Every `solve` the fake worker was sent, in order.

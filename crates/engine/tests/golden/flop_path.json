@@ -667,7 +667,7 @@
                 "action": {
                   "kind": "check"
                 },
-                "ev_bb": 10.399999618530273,
+                "ev_bb": 10.399999618530272,
                 "frequency": 0.125,
                 "headline": false,
                 "unavailable": null
@@ -677,7 +677,7 @@
                   "kind": "bet",
                   "to": 50
                 },
-                "ev_bb": 11.399999618530273,
+                "ev_bb": 11.399999618530272,
                 "frequency": 0.875,
                 "headline": true,
                 "unavailable": null
@@ -969,6 +969,11 @@
           "reasons": [
             {
               "kind": "ChartRounded"
+            },
+            {
+              "kind": "DeadlineBestSoFar",
+              "reached_bp": 190,
+              "target_bp": 50
             }
           ]
         },
@@ -1015,6 +1020,11 @@
               "reasons": [
                 {
                   "kind": "ChartRounded"
+                },
+                {
+                  "kind": "DeadlineBestSoFar",
+                  "reached_bp": 190,
+                  "target_bp": 50
                 }
               ]
             },
@@ -1077,6 +1087,11 @@
               "reasons": [
                 {
                   "kind": "ChartRounded"
+                },
+                {
+                  "kind": "DeadlineBestSoFar",
+                  "reached_bp": 190,
+                  "target_bp": 50
                 }
               ]
             },
@@ -1193,6 +1208,11 @@
               "reasons": [
                 {
                   "kind": "ChartRounded"
+                },
+                {
+                  "kind": "DeadlineBestSoFar",
+                  "reached_bp": 190,
+                  "target_bp": 50
                 }
               ]
             },
@@ -1320,7 +1340,7 @@
             },
             {
               "kind": "DeadlineBestSoFar",
-              "reached_bp": 300,
+              "reached_bp": 190,
               "target_bp": 50
             }
           ]
@@ -1368,6 +1388,11 @@
               "reasons": [
                 {
                   "kind": "ChartRounded"
+                },
+                {
+                  "kind": "DeadlineBestSoFar",
+                  "reached_bp": 190,
+                  "target_bp": 50
                 }
               ]
             },
@@ -1433,7 +1458,7 @@
                 },
                 {
                   "kind": "DeadlineBestSoFar",
-                  "reached_bp": 300,
+                  "reached_bp": 190,
                   "target_bp": 50
                 }
               ]
@@ -2336,7 +2361,13 @@
             "cache": "provisional",
             "coverage": {
               "kind": "Approximate",
-              "reasons": []
+              "reasons": [
+                {
+                  "kind": "DeadlineBestSoFar",
+                  "reached_bp": 120,
+                  "target_bp": 50
+                }
+              ]
             },
             "decision_id": 1,
             "hand_revision": 1,
