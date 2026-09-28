@@ -497,10 +497,15 @@ def normalized(xs: list) -> list:
     return f32_vector([x / peak for x in xs])
 
 
-def bet_translation_reason(seat: int, s: float, mapped: list, deviation: float) -> dict:
-    """Spec section 8.4's disclosure of one translated wager, `prominent = d > 0.10`."""
+def bet_translation_reason(seat: int, s: float, mapped: list, deviation: Fraction) -> dict:
+    """Spec section 8.4's disclosure of one translated wager, `prominent = d > 0.10`: `deviation` is
+    the exact `d` (a `Fraction`), compared exactly with 1/10 as `prominence_cases` does (plan-3 final
+    review F-M2), and written as a float for display only."""
+    if not isinstance(deviation, Fraction):
+        raise TypeError(f"the deviation must be the exact Fraction, not {type(deviation).__name__}")
     return {"kind": "BetTranslation", "street": "preflop", "seat": seat, "observed_pct": s,
-            "mapped": [[size, f] for size, f in mapped], "deviation": deviation, "prominent": deviation > 0.10}
+            "mapped": [[size, f] for size, f in mapped], "deviation": float(deviation),
+            "prominent": deviation > Fraction(1, 10)}
 
 
 def build_replay_weights_golden() -> dict:
@@ -604,7 +609,7 @@ def build_replay_weights_golden() -> dict:
             "reasons": [
                 {"kind": "ShortHandedMapped", "dealt": 3},
                 bet_translation_reason(0, float(s), [(float(menu[0]), off["f"][0]), (float(menu[1]), off["f"][1])],
-                                       float(min(abs(s - x) for x in menu))),
+                                       min(abs(s - x) for x in menu)),
             ],
         },
     }
@@ -908,9 +913,7 @@ def prominence_cases() -> dict:
             },
             "deviation_exact": f"{d.numerator}/{d.denominator}",
             "expected_prominent": d > Fraction(1, 10),
-            "expected": {"reasons": [
-                dict(bet_translation_reason(2, float(s), [(float(a), 1.0)], float(d)), prominent=d > Fraction(1, 10))
-            ]},
+            "expected": {"reasons": [bet_translation_reason(2, float(s), [(float(a), 1.0)], d)]},
         })
     return {"sources": [source], "cases": cases}
 

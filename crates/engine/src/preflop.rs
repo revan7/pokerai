@@ -35,18 +35,21 @@
 //! `assemble::unsupported`: equity only, every inherited reason in `partial`. `HeroComboOutOfSupport` keeps the
 //! range-level mix as its only strategy output. A replay the store cannot answer at all (`ReplayOutput::unsupported`)
 //! is `Unsupported` with that reason. Reasons accumulate, each once by value (`assemble::accumulate`): the replay's
-//! (translations, stops, earlier actors' mappings, the cap residual), then hero's own lookup's mappings, then the
-//! assembly's. Charts carry `ChartRounded` and no EV (their EV absence says nothing about a later postflop EV: charts are
+//! (translations, stops, earlier actors' mappings, the cap residual, unless the assembly disclosed hero's cap share
+//! (ruling 19f-C3, `one_cap_disclosure`)), then hero's own lookup's mappings, then the assembly's. Charts carry `ChartRounded` and no EV (their EV absence says nothing about a later postflop EV: charts are
 //! incoming-range provenance there).
 //!
-//! # Residual disclosures (Task 15 carry, rulings 15-I1, 15-Q5, 19-I1 and 19f-C3)
+//! # Residual disclosures (Task 15 carry, rulings 15-I1, 15-Q5, 19-I1 and 19f-C3; plan-3 final review F-M3 and Q1)
 //!
 //! Hero's unresolved share is disclosed by cause, the assembly's `BranchResidual`s (spec 8.4's vocabulary; ruling 19-I1):
 //! the cap residual's own share as `BranchResidual{seat: hero, cause: "cap"}` -- hero's posterior share on the residual
-//! branch, the mass without a strategy that drives the no-headline rule -- and the share of the positive-posterior
-//! branches whose key has no node (a stopped branch, or a live branch without hero's node) as `BranchResidual{seat: hero,
-//! cause: "missing node <key>"}`; the two shares sum to `unresolved_mass`, which the "x% of the posterior has no
-//! strategy" note renders once. The replay boundary also discloses the cap residual, as the residual's share of the
+//! branch, the mass without a strategy that drives the no-headline rule -- the share of the positive-posterior branches
+//! whose key has no node (a branch stopped on a missing node, or a live branch without hero's node) as
+//! `BranchResidual{seat: hero, cause: "missing node <key>"}`, and the share of the branches stopped for another cause
+//! (spec 9.3's bounded fallback: an unmappable action or size, a rejected split) as `BranchResidual{seat: hero, cause:
+//! "stopped <cause>"}`, one per cause. A stopped branch enters the assembly with its missing node's key only when it
+//! stopped on one, otherwise with no key (`stopped_node`). The shares sum to `unresolved_mass`, which the "x% of the
+//! posterior has no strategy" note renders once. The replay boundary also discloses the cap residual, as the residual's share of the
 //! branch weights; that figure is the `Fast`'s (and a watchdog `Final`'s) cap disclosure. At a preflop decision the
 //! `Final` carries one cap disclosure (ruling 19f-C3): where the assembly disclosed hero's cap share, the replay's hero
 //! cap reason is dropped as the two sets of reasons meet (`one_cap_disclosure`); every other reason is kept, each once by
@@ -228,9 +231,10 @@ impl Replayed {
         let mut nodes: Vec<BranchNode> = Vec::new();
         let mut source: Option<(SourceKind, EvReference)> = None;
         for b in branches.iter().filter(|b| !b.residual) {
-            // Spec 9.3: a branch stopped on the preflop street has no node for any seat; its key is where it stopped.
+            // Spec 9.3: a branch stopped on the preflop street has no node for any seat; its key is its missing node's,
+            // when it stopped on one.
             if let Some(cause) = &b.stopped {
-                nodes.push(BranchNode { branch_id: b.id, key: cause.strip_prefix("missing node ").unwrap_or(cause).to_string(), ..Default::default() });
+                nodes.push(stopped_node(b.id, cause));
                 continue;
             }
             let lookup = self.lookups.iter().find(|l| l.branch_id == b.id).unwrap_or_else(|| panic!("preflop: live branch {} has no lookup from the replay walk", b.id));
@@ -300,6 +304,14 @@ fn missing_node_note(key: &str) -> String {
     format!("missing preflop node: {key}")
 }
 
+/// The assembly's entry for branch `branch_id`, stopped on the preflop street with `cause` (spec 9.3): no node, and the
+/// key of its missing node when it stopped on one (`missing node <key>`); a branch stopped for any other cause (an
+/// unmappable action or size, a rejected split) is handed no key, since its stop is not a lookup key (plan-3 final review
+/// F-M3). The assembly reads the stop's cause from the branch itself.
+fn stopped_node(branch_id: u8, cause: &str) -> BranchNode {
+    BranchNode { branch_id, key: cause.strip_prefix("missing node ").map(str::to_string).unwrap_or_default(), ..Default::default() }
+}
+
 /// The seats still in the hand (dealt, not folded), by seat id.
 fn in_hand(state: &HandState) -> Vec<Seat> {
     let mut seats: Vec<Seat> = state.dealt.iter().copied().filter(|s| !state.derived.folded[usize::from(s.0)]).collect();
@@ -313,8 +325,10 @@ fn opponents(output: &ReplayOutput, state: &HandState) -> Vec<(Seat, Range1326)>
     in_hand(state).into_iter().filter(|s| *s != state.hero).filter_map(|s| output.ranges[usize::from(s.0)].clone().map(|r| (s, r))).collect()
 }
 
-/// Spec 4.4's mapping reasons (the lookup's own, spec 8.3), as distinct from translations and approximations.
-fn is_mapping(r: &ApproxReason) -> bool {
+/// Spec 4.4's mapping reasons (the lookup's own, spec 8.3), as distinct from translations and approximations: the one
+/// classification of `assumptions.mappings`, on the preflop path and on the turn and river path (`serve`, final review
+/// F-I1) alike.
+pub(crate) fn is_mapping(r: &ApproxReason) -> bool {
     matches!(
         r,
         ApproxReason::DepthBucket { .. }
@@ -609,5 +623,19 @@ mod tests {
         let rec = replayed.decide(&ctx, &state, assemble::empty_assumptions(""));
         assert_eq!(rec.coverage, Coverage::Unsupported { reason, partial: vec![] });
         assert!(rec.actions.iter().all(|a| a.frequency.is_none() && a.unavailable == Some(Unavailable::NotEvaluated)), "{:?}", rec.actions);
+    }
+
+    /// Plan-3 final review F-M3: a branch stopped on the preflop street enters the assembly with the key of its missing
+    /// node only when it stopped on one (`missing node <key>`); a branch stopped for another cause (an unmappable size
+    /// or action, a rejected split) is handed no key -- its stop is not a lookup key, and the assembly reads its cause
+    /// from the branch itself.
+    #[test]
+    fn a_stopped_branch_is_handed_a_key_only_for_a_missing_node() {
+        let key = r#"[100,"5% cap 0.5bb",false,[["UTG",{"Raise":{"to_bb_x1000":2500}}]]]"#;
+        assert_eq!(stopped_node(3, &format!("missing node {key}")), BranchNode { branch_id: 3, key: key.into(), ..Default::default() });
+        let jam = r#"[100,"5% cap 0.5bb",false,[["UTG","AllIn"]]]"#;
+        for cause in [format!("unmappable size at {jam}"), format!("unmappable action Check at {jam}"), "zero support after Raise { to: 90 }".into()] {
+            assert_eq!(stopped_node(4, &cause), BranchNode { branch_id: 4, ..Default::default() }, "{cause}");
+        }
     }
 }

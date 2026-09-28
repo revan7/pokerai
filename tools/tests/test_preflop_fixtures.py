@@ -258,6 +258,25 @@ def test_prominence_cases_sit_on_and_just_above_the_boundary():
         assert reason["kind"] == "BetTranslation" and reason["prominent"] == c["expected_prominent"]
 
 
+def test_bet_translation_reason_decides_prominence_from_the_exact_deviation():
+    """Plan-3 final review F-M2: the oracle's `BetTranslation` takes `prominent` from an exact
+    `Fraction` comparison (`d > 1/10`), as `prominence_cases` does, and keeps the float `deviation`
+    for display only. A deviation just above 1/10 whose float rounds to the literal 0.1 is still
+    prominent; exactly 1/10 is not; and a float deviation is refused, so no caller compares floats."""
+    just_above = Fraction(1, 10) + Fraction(1, 10**20)
+    assert float(just_above) == 0.1
+    reason = gpf.bet_translation_reason(2, 1.6, [(1.5, 1.0)], just_above)
+    assert reason["prominent"] is True and reason["deviation"] == 0.1
+    exact = gpf.bet_translation_reason(2, 1.6, [(1.5, 1.0)], Fraction(16, 10) - Fraction(15, 10))
+    assert exact["prominent"] is False and exact["deviation"] == 0.1 and isinstance(exact["deviation"], float)
+    try:
+        gpf.bet_translation_reason(2, 1.6, [(1.5, 1.0)], 1.6 - 1.5)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("a float deviation must be refused")
+
+
 def test_legal_move_and_assembly_rows_conserve_mass():
     g = golden("bet_translation_golden.json")
     for case in g["legal_moves"]:

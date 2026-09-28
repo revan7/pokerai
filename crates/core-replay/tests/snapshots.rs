@@ -1152,6 +1152,27 @@ fn replay_snapshot_prefix_reuse() {
     assert!(gap > 1e-10, "forcing the inserted size to 1 must differ from its solved probability (gap {gap})");
 }
 
+/// Plan-3 final review F-M2 through the postflop walk (spec 8.4: `prominent = d > 0.10`, decided in
+/// exact integers). After the SB's check the BB bets 110 into the 100-chip pot against the
+/// snapshot's Bet50/Bet100 menu: `s = 110 / 100` lies above the largest size, so it clamps to
+/// Bet100 with `d = |110 - 100| / 100 = 1/10` exactly, which is NOT prominent (in `f64`,
+/// `1.1 - 1.0` is `0.10000000000000009`, above the literal `0.1`). One chip more, `d = 11/100` is
+/// prominent.
+#[test]
+fn a_flop_bet_a_tenth_of_the_pot_above_the_menu_is_not_prominent() {
+    for (to, want_d, want_prominent) in [(110, 0.10, false), (111, 0.11, true)] {
+        let turn = walked_turn(&[Action::Check, Action::Bet { to }, Action::Call]);
+        let out = replay_with(&turn, &[walk_snapshot(&menu_tree(&[&[], &[0], &[0, 1], &[0, 2]]), 6)]);
+        let translations = flop_translations(&out);
+        assert_eq!(translations.len(), 1, "{translations:?}");
+        let (seat, observed, mapped, deviation, prominent) = &translations[0];
+        assert_eq!((*seat, mapped.clone()), (BB, vec![(1.0, 1.0)]), "the clamp to Bet100");
+        assert!((f64::from(*observed) - f64::from(to) / 100.0).abs() < 1e-6, "s = {observed}");
+        assert!((f64::from(*deviation) - want_d).abs() < 1e-6, "d = {deviation}");
+        assert_eq!(*prominent, want_prominent, "a bet to {to}: d = {deviation}");
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Frozen navigation (spec section 9.2 as amended by revision 6, S14): "A branch whose mapped
 // continuation is not covered freezes navigation for that branch for the remainder of the street;

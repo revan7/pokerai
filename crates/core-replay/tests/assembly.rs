@@ -485,12 +485,14 @@ fn missing_node_in_every_positive_branch_names_the_heaviest_retained_key() {
 }
 
 #[test]
-fn a_heaviest_residual_names_the_heaviest_known_key_across_all_branches() {
-    // T16-R2, the reviewer's combined case. q = [0.6 residual, 0.1 stopped "positive-key", 0.3 live
-    // with a present node but zero mass for hero's combo 0]. Both positive-posterior branches lack
-    // a node, so the decision is MissingPreflopNode; the heaviest positive-posterior branch is the
-    // residual, which has no source key, so the key is the heaviest known stopped/live key across
-    // ALL branches: branch 2's (q = 0.3), not the lighter positive branch 1's (q = 0.1).
+fn a_heaviest_residual_names_the_heaviest_positive_branch_that_retains_a_key() {
+    // T16-R2 as amended by the plan-3 final review (Q2; ruling 16-R2 amended by the orchestrator):
+    // the reviewer's combined case. q = [0.6 residual, 0.1 stopped "positive-key", 0.3 live with a
+    // present node but zero mass for hero's combo 0]. Both positive-posterior branches lack a node,
+    // so the decision is MissingPreflopNode; the heaviest positive-posterior branch is the residual,
+    // which has no source key, so the key is that of the heaviest positive-posterior branch that
+    // retains one: branch 1's missing key (q = 0.1), never branch 2's (q = 0.3), whose node is
+    // present and which carries none of hero's posterior.
     let mut bs = branches(&[0.6, 0.1, 0.3]);
     bs[0].residual = true;
     bs[1].stopped = Some("missing node positive-key".into());
@@ -501,9 +503,21 @@ fn a_heaviest_residual_names_the_heaviest_known_key_across_all_branches() {
     let live = verified(&[(FOLD, 0.5, Some(0.0)), (CALL, 0.5, Some(2.0))]);
     let nodes = vec![at(0, None, ""), at(1, None, "positive-key"), at(2, Some(live.clone()), "heaviest-known-key")];
     let m = mix_nodes(&bs, &nodes, H, 0, 2);
-    assert_eq!(m.unsupported, Some(UnsupportedReason::MissingPreflopNode { key: "heaviest-known-key".into() }));
+    assert_eq!(m.unsupported, Some(UnsupportedReason::MissingPreflopNode { key: "positive-key".into() }));
     assert!(m.actions.is_empty());
     assert_eq!(m.range_mix, None);
+    close(f64::from(m.unresolved_mass), 1.0);
+
+    // The residual is hero's only positive-posterior branch: q = [0.6 residual, 0.4 live with a
+    // present node and zero mass for hero's combo 0]. No positive branch retains a key, so the key
+    // is the residual's label, never the live branch's key, whose node is present.
+    let mut bs = branches(&[0.6, 0.4]);
+    bs[0].residual = true;
+    bs[1].seats[1].mass[0] = 0.0;
+    bs[1].seats[1].mass[1] = 2.0;
+    rescale(&mut bs, &mut [0.0; 2]);
+    let m = mix_nodes(&bs, &[at(0, None, ""), at(1, Some(live.clone()), "live-key")], H, 0, 2);
+    assert_eq!(m.unsupported, Some(UnsupportedReason::MissingPreflopNode { key: "cap residual (no node)".into() }));
     close(f64::from(m.unresolved_mass), 1.0);
 
     // Guard: the partial-coverage reason keeps its preference for an actual missing key. q = [0.5
@@ -614,6 +628,58 @@ fn a_missing_node_without_a_retained_key_names_no_present_key() {
     let nodes = vec![at(0, Some(verified(&[(FOLD, 0.5, Some(0.0)), (CALL, 0.5, Some(2.0))])), "k-present")];
     let m = mix_nodes(&bs, &nodes, H, 0, 2);
     assert_causes(&m, &[(30.0, "missing node no retained key")]);
+}
+
+/// Plan-3 final review F-M3 and Q1 (the `BranchResidual` vocabulary gains `"stopped <cause>"`,
+/// spec 9.3's bounded fallback): a branch the replay stopped for a cause other than a missing node
+/// -- an unmappable size or action, a rejected split, whose node at the key exists -- discloses its
+/// share as `stopped <cause>`, the cause read from the branch's own stop, never as a missing node.
+/// Branches stopped for one cause share one reason (their shares summed); a branch stopped on an
+/// actual missing node keeps `missing node <key>`. q = [0.2 live with hero's node, 0.3 and 0.2
+/// stopped by one rejected split, 0.1 stopped on an unmappable action, 0.2 stopped on a missing
+/// node].
+#[test]
+fn a_branch_stopped_for_another_cause_is_disclosed_as_stopped_with_its_cause() {
+    let mut bs = branches(&[0.2, 0.3, 0.2, 0.1, 0.2]);
+    bs[1].stopped = Some("zero support after Raise { to: 90 }".into());
+    bs[2].stopped = Some("zero support after Raise { to: 90 }".into());
+    bs[3].stopped = Some("unmappable action Call at k-mapped".into());
+    bs[4].stopped = Some("missing node k-missing".into());
+    let live = verified(&[(FOLD, 0.5, Some(0.0)), (CALL, 0.5, Some(2.0))]);
+    // The engine hands a stopped branch no key unless it stopped on a missing node; the stop's own
+    // text is what names the cause.
+    let nodes = vec![at(0, Some(live.clone()), "k-live"), at(1, None, ""), at(2, None, ""), at(3, None, ""), at(4, None, "k-missing")];
+    let m = mix_nodes(&bs, &nodes, H, 0, 2);
+    assert_eq!(m.unsupported, None);
+    close(f64::from(m.unresolved_mass), 0.8);
+    let expected =
+        [(20.0, "missing node k-missing"), (50.0, "stopped zero support after Raise { to: 90 }"), (10.0, "stopped unmappable action Call at k-mapped")];
+    assert_causes(&m, &expected);
+    assert!(m.reasons.iter().all(|r| !matches!(r, ApproxReason::BranchResidual { cause, .. } if cause.starts_with("missing node unmappable")
+        || cause.starts_with("missing node zero support"))), "{:?}", m.reasons);
+    let shares: f64 = residual_causes(&m).iter().map(|(pct, _)| f64::from(*pct)).sum();
+    close(shares / 100.0, f64::from(m.unresolved_mass));
+    assert!(m.notes.iter().any(|n| n == "80.0% of the posterior has no strategy"), "{:?}", m.notes);
+    // A key handed to a branch stopped for another cause is never a missing node's key.
+    let keyed = vec![at(0, Some(live), "k-live"), at(1, None, "k-split"), at(2, None, "k-split"), at(3, None, "k-mapped"), at(4, None, "k-missing")];
+    assert_causes(&mix_nodes(&bs, &keyed, H, 0, 2), &expected);
+}
+
+/// Plan-3 final review F-M3: `MissingPreflopNode`'s key is selected only from the positive branches
+/// whose key has no node (stopped on a missing node, or live without one), never from a branch
+/// stopped for another cause, however heavy and whatever key it was handed; with no such branch the
+/// key is `no retained key`.
+#[test]
+fn a_missing_node_key_never_comes_from_a_branch_stopped_for_another_cause() {
+    let mut bs = branches(&[0.6, 0.4]);
+    bs[0].stopped = Some("unmappable size at k-mapped".into());
+    bs[1].stopped = Some("missing node k-missing".into());
+    let m = mix_nodes(&bs, &[at(0, None, "k-mapped"), at(1, None, "k-missing")], H, 0, 2);
+    assert_eq!(m.unsupported, Some(UnsupportedReason::MissingPreflopNode { key: "k-missing".into() }));
+    let mut bs = branches(&[1.0]);
+    bs[0].stopped = Some("unmappable size at k-mapped".into());
+    let m = mix_nodes(&bs, &[at(0, None, "k-mapped")], H, 0, 2);
+    assert_eq!(m.unsupported, Some(UnsupportedReason::MissingPreflopNode { key: "no retained key".into() }));
 }
 
 /// Hero's node built from real P3.T10 output, one source row repeated on every combo: source

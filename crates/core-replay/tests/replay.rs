@@ -1405,3 +1405,47 @@ fn a_raise_below_the_mapped_call_stops_as_an_unmappable_size() {
     assert!(!out.reasons.contains(&zero_reason(Street::Preflop, HJ, &Action::Raise { to: 30 })));
     assert_eq!(out.unsupported, None);
 }
+
+/// The UTG open's `BetTranslation`, as `(observed, mapped, deviation, prominent)`, if the open was
+/// translated.
+fn open_translation(out: &ReplayOutput) -> Option<(f32, Vec<(f32, f32)>, f32, bool)> {
+    out.reasons.iter().find_map(|r| match r {
+        ApproxReason::BetTranslation { street: Street::Preflop, seat, observed_pct, mapped, deviation, prominent } if *seat == UTG => {
+            Some((*observed_pct, mapped.clone(), *deviation, *prominent))
+        }
+        _ => None,
+    })
+}
+
+/// Plan-3 final review F-M2 (spec 8.4: `prominent = d > 0.10`, decided in exact integers). Every
+/// size at one node shares the denominator `pot + call`, so `d = min_X |to - to_X| / (pot + call)`
+/// and `prominent <=> 10 * min_X |to - to_X| > pot + call`, never from the difference of two `f64`
+/// quotients. The source menu is 4.75 bb and 6 bb; at the UTG source parent own = 0, call = 1 bb
+/// and pot = 1.5 bb, so the menu fractions are `A = 3.75 / 2.5 = 1.5` and `B = 5 / 2.5 = 2.0`.
+///
+/// - At 2/4 chips an open to 20 chips (5 bb) is `s = 4 / 2.5 = 1.6`: `d = |20 - 19| / 10 = 1/10`
+///   exactly, which is NOT prominent. In `f64`, `16000 / 10000 - 1.5` is `0.10000000000000009`,
+///   above the literal `0.1`, which the float comparison called prominent.
+/// - At 1/2 chips an open to 11 chips (5.5 bb) is `s = 9 / 5 = 1.8`: `d = min(0.3, 0.2) = 0.2`,
+///   prominent.
+/// - At 1/2 chips an open to 10 chips lies half a chip from 4.75 bb (9.5 chips), within spec 8.3's
+///   size rule, so it is on the menu and nothing is translated: the exact 1/10 boundary at the UTG
+///   root is off the menu only from a 3-chip unit up (`|to - to_X| = 0.25 bb` must exceed half a
+///   chip), hence the 2/4 table above.
+#[test]
+fn a_translation_exactly_a_tenth_of_the_pot_off_the_menu_is_not_prominent() {
+    let store = store_of(vec![(vec![], mem_node(Position::Utg, raise_menu(&[4750, 6000]), 1))]);
+    let boundary = run(&store, &act(&table(&config_at(4)), &[Action::Raise { to: 20 }]));
+    let (observed, mapped, deviation, prominent) = open_translation(&boundary).expect("the 20-chip open is translated");
+    assert_eq!((observed, mapped.iter().map(|m| m.0).collect::<Vec<_>>()), (1.6, vec![1.5, 2.0]), "s and the bracketing menu fractions");
+    assert!((f64::from(deviation) - 0.1).abs() < 1e-6, "d = {deviation}");
+    assert!(!prominent, "d is exactly 1/10, which is not above 0.10");
+    let above = run(&store, &act(&table(&config_at(2)), &[Action::Raise { to: 11 }]));
+    let (observed, _, deviation, prominent) = open_translation(&above).expect("the 11-chip open is translated");
+    assert_eq!(observed, 1.8);
+    assert!((f64::from(deviation) - 0.2).abs() < 1e-6 && prominent, "d = {deviation} is above 0.10");
+    let on_menu = run(&store, &act(&table(&config_at(2)), &[Action::Raise { to: 10 }]));
+    assert_eq!(open_translation(&on_menu), None, "10 chips is 4.75 bb within half a chip: {:?}", on_menu.reasons);
+    assert_eq!(on_menu.branches.len(), 1);
+    assert_eq!(on_menu.branches[0].translated, vec![(UTG, Action::Raise { to: 10 })]);
+}

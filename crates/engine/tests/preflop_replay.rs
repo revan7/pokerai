@@ -840,6 +840,56 @@ fn after_hero_acts_past_the_cap_the_final_keeps_the_assemblys_cap_share_alone() 
     assert!(f.actions.iter().all(|a| !a.headline) && headline_note(&f).is_none(), "no headline while unresolved_mass > 0");
 }
 
+/// Plan-3 final review F-M3 and Q1 (the `BranchResidual` vocabulary gains `"stopped <cause>"`, spec 9.3's bounded
+/// fallback): a branch the replay stopped for a cause other than a missing node is disclosed as `stopped <cause>`,
+/// never as a missing node whose node exists. The source offers UTG 2.5 bb or all-in, lists the HJ's fold, call and
+/// 9 bb 3-bet after 2.5 bb, the HJ's fold and call after the all-in (so the node after the all-in exists), and the CO's
+/// node after 2.5 bb and 9 bb. UTG opens 3 bb (split onto 2.5 bb and the all-in), the HJ 3-bets to 9 bb: on the menu
+/// after 2.5 bb, while the all-in branch cannot map it (the HJ owes the whole stack at its source parent) and stops with
+/// `unmappable size at <key>`. Hero (the CO) has its node in the 2.5 bb branch; the stopped branch's share is disclosed
+/// as `stopped unmappable size at <key>`, and no cause starts with `missing node unmappable`.
+#[test]
+fn a_branch_stopped_on_an_unmappable_size_is_disclosed_as_stopped_not_as_a_missing_node() {
+    use PreflopStep::{AllIn, Call, Fold};
+    let after_open = vec![(Position::Utg, raise(2500))];
+    let after_jam = vec![(Position::Utg, AllIn)];
+    let after_3bet = vec![(Position::Utg, raise(2500)), (Position::Hj, raise(9000))];
+    let nodes: MemNodes = vec![
+        (vec![], mem_node(Position::Utg, vec![Fold, raise(2500), AllIn], 1)),
+        (after_open, mem_node(Position::Hj, vec![Fold, Call, raise(9000)], 2)),
+        (after_jam.clone(), mem_node(Position::Hj, vec![Fold, Call], 3)),
+        (after_3bet, mem_node(Position::Co, vec![Fold, Call, raise(20000)], 4)),
+    ];
+    let state = act(&table(100, CO, "AhKd"), &[Action::Raise { to: 30 }, Action::Raise { to: 90 }]);
+    let out = replayed(&mem_store(nodes.clone()), &state);
+    assert_eq!(out.branches.len(), 2, "the open split onto 2.5 bb and the all-in");
+    let stopped = out.branches.iter().find(|b| b.stopped.is_some()).expect("the all-in branch stopped");
+    let stop = stopped.stopped.clone().unwrap();
+    assert_eq!(stop, format!("unmappable size at {}", key(after_jam)), "the node after the all-in exists; the 3-bet cannot be mapped there");
+    let share = stopped.q / out.branches.iter().map(|b| b.q).sum::<f64>(); // the CO has not acted: hero's posterior
+    let mut r = rig("stopped_unmappable", mem_store(nodes));
+    let id = serve(&mut r, &state);
+    let f = the_final(&finish(r), &id);
+    assert!(matches!(f.coverage, Coverage::Approximate { .. }), "{:?}", f.coverage);
+    let rs = reasons(&f);
+    let residuals: Vec<(f32, String)> = rs
+        .iter()
+        .filter_map(|x| match x {
+            ApproxReason::BranchResidual { seat, residual_mass_pct, cause } => {
+                assert_eq!(*seat, CO, "hero's residual");
+                Some((*residual_mass_pct, cause.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(residuals.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), [format!("stopped {stop}")], "{rs:?}");
+    close(f64::from(residuals[0].0), 100.0 * share, 1e-4, "the stopped branch's share");
+    assert!(rs.iter().all(|x| !matches!(x, ApproxReason::BranchResidual { cause, .. } if cause.starts_with("missing node"))), "no missing-node wording: {rs:?}");
+    close(f64::from(f.unresolved_mass), share, 1e-6, "hero's unresolved share is the stopped branch's");
+    close(frequencies(&f).iter().sum::<f64>() + f64::from(f.unresolved_mass), 1.0, 1e-6, "sum(frequency) + unresolved_mass = 1");
+    assert!(!f.assumptions.notes.iter().any(|n| n.starts_with("missing preflop node")), "{:?}", f.assumptions.notes);
+}
+
 /// Spec 8.4's legality after mapping on hero's node: hero (UTG, AKs) holds 20 chips, so the source's 2.5 bb open (25
 /// chips) is above the live maximum and its probability moves to the legal all-in, a destination the move created:
 /// hero's advice is fold and all-in, the fold keeps its exact 0 EV, the all-in has no EV and says why
@@ -1523,6 +1573,81 @@ fn replay_feeds_street_root_solves() {
     let origin = |street: Street, o: &str| (street, o.to_string());
     assert_eq!(t.origins(d4.hand_id), [origin(Street::Flop, "cache_exact"), origin(Street::Turn, "live"), origin(Street::Turn, "live"), origin(Street::Turn, "live"),
         origin(Street::River, "live")], "a cache hit, three live ok Finals and a live best_so_far, all through one rule");
+    t.e.shutdown();
+}
+
+/// Spec 4.4's mapping reasons, as the engine classifies them for `assumptions.mappings`.
+fn is_mapping(r: &ApproxReason) -> bool {
+    matches!(
+        r,
+        ApproxReason::DepthBucket { .. }
+            | ApproxReason::AsymmetricStacks { .. }
+            | ApproxReason::RakeProfileMapped { .. }
+            | ApproxReason::StraddleMapped { .. }
+            | ApproxReason::ShortHandedMapped { .. }
+    )
+}
+
+/// Plan-3 final review F-I1 (spec 4.4's `translations` and `mappings`; spec 8.4: "every non-exact mapping is recorded
+/// in `assumptions.translations` with its deviation"). On a turn decision after the big blind's translated 44-chip flop
+/// bet, the replay's `BetTranslation{Flop}` is listed in `assumptions.translations` and its preflop mapping reasons in
+/// `assumptions.mappings` -- exactly those of the replay's reasons -- on the `Fast`, on the watchdog's `Final` and on
+/// the engine's own `Final` alike. The first request is held right after its `Fast` until its watchdog fires, so its
+/// `Final` is the fallback the watchdog delivers (refreshed once the range source answered); released, it starts no
+/// work. The second request at the same decision is served in full.
+#[test]
+fn replay_feeds_street_root_solves_listing_the_replays_translations_and_mappings() {
+    let flop_line: &[Action] = &[Action::Check, Action::Bet { to: 44 }, Action::Call];
+    let turn_root = line("KdJd", &[(FLOP, flop_line), (TURN, &[])]);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(Some((entered_tx, release_rx))));
+    let hold_first: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let taken = gate.lock().unwrap().take();
+        if let Some((entered, release)) = taken {
+            entered.send(()).unwrap();
+            release.recv_timeout(engine::testing::ACK_LIVENESS).expect("the test releases the request it holds");
+        }
+    });
+    let seams = ServeSeams { after_fast: Some(hold_first), ..ServeSeams::default() };
+    let mut t = street_rig_with("assumption_lists", vec![ack(), answer(ResultStatus::Ok, solved(&turn_root, "turn_std_v1", 0.2))], seams);
+    let preflop = t.preflop.clone();
+    t.begin("KdJd");
+    t.play(&PREFLOP);
+    t.deal(FLOP);
+    let flop = t.state();
+    let (d1, _) = t.ask();
+    let s_flop = snapshot_at(&flop, &d1, &preflop, &[], "flop_full_v1", "cache_exact", 0.3);
+    assert!(t.e.register_snapshot(&d1, s_flop.clone()));
+    t.play(flop_line);
+    t.deal(TURN);
+    let turn = t.state();
+    let replayed = direct(&preflop, &turn, &[s_flop], &[]);
+    let translations: Vec<ApproxReason> = replayed.reasons.iter().filter(|r| matches!(r, ApproxReason::BetTranslation { .. })).cloned().collect();
+    let mappings: Vec<ApproxReason> = replayed.reasons.iter().filter(|r| is_mapping(r)).cloned().collect();
+    assert!(matches!(translations.as_slice(), [ApproxReason::BetTranslation { street: Street::Flop, seat, .. }] if *seat == BB), "{:?}", replayed.reasons);
+    assert!(!mappings.is_empty(), "the chart path's preflop mappings: {:?}", replayed.reasons);
+    let lists = |rec: &Recommendation| (rec.assumptions.translations.clone(), rec.assumptions.mappings.clone());
+    let fast_of = |events: &[Recorded]| events.iter().find_map(|r| match &r.event { RecommendationEvent::Fast(f) => Some(f.clone()), _ => None }).expect("the Fast");
+
+    // The first request: held after its Fast; its watchdog fires and delivers the fallback.
+    let t0 = t.clock.now_ms();
+    let (held, recorder) = t.recommend();
+    entered_rx.recv_timeout(engine::testing::ACK_LIVENESS).expect("the first request is held after its Fast");
+    t.clock.set_ms(engine::deadline::Deadlines::for_request(t0, Street::Turn, 10).watchdog_fire_ms());
+    let (watchdog_final, events) = final_of(&recorder, &held, false);
+    release_tx.send(()).unwrap();
+    assert!(matches!(&watchdog_final.coverage, Coverage::Unsupported { reason: UnsupportedReason::DeadlineExceeded { .. }, .. }), "{:?}", watchdog_final.coverage);
+    assert_eq!(lists(&fast_of(&events)), (translations.clone(), mappings.clone()), "the Fast");
+    assert_eq!(lists(&watchdog_final), (translations.clone(), mappings.clone()), "the watchdog's Final");
+
+    // The second request at the same decision: served in full.
+    let (served, recorder) = t.recommend();
+    let (engine_final, events) = final_of(&recorder, &served, true);
+    assert!(matches!(engine_final.coverage, Coverage::Approximate { .. }), "{:?}", engine_final.coverage);
+    assert_eq!(lists(&fast_of(&events)), (translations.clone(), mappings.clone()), "the Fast");
+    assert_eq!(lists(&engine_final), (translations, mappings), "the engine's Final");
+    assert_eq!(t.solves().len(), 1, "the held request started no work once its watchdog had delivered");
     t.e.shutdown();
 }
 
