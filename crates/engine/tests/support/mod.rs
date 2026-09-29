@@ -741,3 +741,86 @@ pub fn run_flop_script(seeds: Vec<Seed>, raw: f32, status: &str) -> Vec<Recommen
 pub fn final_count(events: &[RecommendationEvent]) -> usize {
     events.iter().filter(|e| matches!(e, RecommendationEvent::Final(_))).count()
 }
+
+// ---- Task 12 helpers ----
+//
+// Plan 4 Task 12 (cache snapshots replayed across streets): a single-raised pot with chosen stacks, a solution whose
+// action columns differ by combo, node and action, and a stored entry exporting one of spec 9.2's three coverages,
+// written by the production entry writer. Namespaced so they never meet another task's helpers in this shared file.
+
+pub mod snapshot_replay {
+    use super::*;
+
+    /// Which decision nodes of its street a stored entry exports (spec 9.2's three export coverages).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Export {
+        /// The requested node alone (`export: "truncated"`).
+        RequestedOnly,
+        /// The street root alone (`export: "truncated"`).
+        RootOnly,
+        /// Every decision node of the street (`export: "street"`).
+        Complete,
+    }
+
+    /// The rig's single-raised pot with `stack` chips for the button and the small blind (1000 for the others) and
+    /// hero in `hero`'s seat holding `cards`: the button opens to `open`, the small blind calls, the big blind folds.
+    /// The flop pot is `2 * open + 10`, with `stack - open` behind each.
+    pub fn srp_with(hero: Seat, cards: [Card; 2], stack: u32, open: u32) -> HandState {
+        let stacks = (0..6).map(|i| (Seat(i), if i <= 1 { stack } else { 1000 })).collect::<Vec<_>>();
+        let s = hand(&stacks, BTN, hero, Some(cards));
+        play(&s, &[Action::Fold, Action::Fold, Action::Fold, Action::Raise { to: open }, Action::Call, Action::Fold])
+    }
+
+    /// A valid solution of `tree`'s root street requested at the chip path `requested`, at `exploitability_chips`:
+    /// at the node of ordinal path `o`, combo `c` plays action `a` with weight `1 + (c (2a + 1) + 7a + 11 s) mod 13`
+    /// (`s` a salt of `o`), normalized over the node's actions, so the columns differ by combo, by action and by node
+    /// (a translated wager's two mapped sizes condition differently); every non-fold EV is `10a + c mod 5` chips and a
+    /// fold's exactly 0. Every combo is available.
+    pub fn leaning_solution(tree: &proto::EffectiveTree, requested: &[Action], exploitability_chips: f32) -> StreetSolution {
+        let mut sol = engine::testing::uniform_solution(tree, requested, exploitability_chips);
+        for node in &mut sol.nodes {
+            let ordinal = proto::resolve_chip_path(&tree.materialized, &node.path).expect("an exported node resolves");
+            let salt: usize = ordinal.iter().enumerate().map(|(k, i)| (k + 1) * (usize::from(*i) + 1)).sum();
+            let width = node.actions.len();
+            for c in 0..proto::COMBOS {
+                let w: Vec<f32> = (0..width).map(|a| 1.0 + ((c * (2 * a + 1) + 7 * a + 11 * salt) % 13) as f32).collect();
+                let total: f32 = w.iter().sum();
+                node.probs[c] = w.iter().map(|x| x / total).collect();
+                node.ev_chips[c] = node.actions.iter().enumerate().map(|(a, action)| if *action == Action::Fold { 0.0 } else { (10 * a + c % 5) as f32 }).collect();
+            }
+        }
+        proto::worker::validate_solution(&sol, &tree.materialized).expect("the leaning solution is valid");
+        sol
+    }
+
+    /// The entry the production writer (`cache_bridge::entry_from_solution`, over the shared `canonical_perm`) stores
+    /// for a solve of `template` at `root` (its history cleared: an entry is keyed at the street root) over the public
+    /// root ranges `ranges` (OOP then IP; hero's cards in neither) and `rake`: `leaning_solution` at raw accuracy
+    /// `raw_over_p`, requested at the chip path `requested`, exporting `export`'s nodes, with no inherited reason.
+    pub fn export_entry(root: &StreetRootSnapshot, template: &str, ranges: [Range1326; 2], rake: Rake, export: Export, requested: &[Action], raw_over_p: f64) -> CacheEntry {
+        let root = StreetRootSnapshot { history: vec![], ..root.clone() };
+        let built = build_tree_full(&root, &TemplateSelection::from_history(template, &[])).unwrap_or_else(|e| panic!("{template} at {root:?}: {e:?}"));
+        let signature = tree_signature(&built.tree, built.pot);
+        let perm = engine::cache_bridge::canonical_perm(&root.board, &ranges[0], &ranges[1]);
+        let wanted = proto::resolve_chip_path(&built.tree.materialized, requested).expect("the requested node is in the tree");
+        let mut sol = leaning_solution(&built.tree, requested, (raw_over_p * f64::from(built.pot)) as f32);
+        let exported = |path: &[Action]| {
+            let ordinal = proto::resolve_chip_path(&built.tree.materialized, path).expect("an exported node resolves");
+            match export {
+                Export::RequestedOnly => ordinal == wanted,
+                Export::RootOnly => ordinal.is_empty(),
+                Export::Complete => true,
+            }
+        };
+        sol.nodes.retain(|n| exported(&n.path));
+        sol.covered_paths = sol.nodes.iter().map(|n| n.path.clone()).collect();
+        let requested_at = sol.nodes.iter().position(|n| n.path == requested).expect("the requested node is exported");
+        sol.requested = u32::try_from(requested_at).expect("a node index fits in u32");
+        if export != Export::Complete {
+            sol.export = "truncated".into();
+        }
+        let input = SolveInput { root, ranges, tree: built.tree, target_bp: 50 };
+        engine::cache_bridge::entry_from_solution(&input, &sol, &[], input.root.bb_chips, &rake, &signature, &perm, 100, 50)
+            .unwrap_or_else(|e| panic!("{template} {export:?}: the writer refuses the entry: {e:?}"))
+    }
+}
