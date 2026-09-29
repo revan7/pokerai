@@ -885,6 +885,15 @@ fn flop_path_golden() {
         let mut rig = FlopRig::new(support::live_script(&facing_check, "flop_fast_v1", 0.4, "ok"));
         rig.seed(&[Seed::exact(pre).truncated()]);
         let served = rig.serve(&facing_check);
+        // P4.W1: the live solve's full-street entry ties the seeded root-only one on SPR distance and raw accuracy (both
+        // 40 bp, same cell), so the cell keeps the one covering more ordinal paths: the root-only export no longer shadows it.
+        let seeded = support::seed_entry(&Seed::exact(pre).truncated());
+        let kept = rig.stored();
+        assert_eq!(kept.len(), 1, "one representative survives the tie");
+        assert_eq!(kept[0].key.digest(), seeded.key.digest(), "the two entries share a cell");
+        assert_eq!(kept[0].exploitability_over_P, seeded.exploitability_over_P, "the two entries tie on raw accuracy");
+        assert_eq!(kept[0].export, "street", "the fuller, full-street entry is the one retained");
+        assert!(kept[0].covered_paths.len() > seeded.covered_paths.len(), "it covers strictly more ordinal paths than the root-only export");
         cases.insert("missed_path".into(), project_rig(&mut rig, &[served]));
         rig.core.shutdown();
     }

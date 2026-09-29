@@ -732,8 +732,8 @@
     "stored": [
       {
         "exploitability_over_P": 0.004000000059604645,
-        "export": "truncated",
-        "nodes": 1,
+        "export": "street",
+        "nodes": 10,
         "pot": 100,
         "reasons": [],
         "street": "flop",

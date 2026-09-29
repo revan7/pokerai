@@ -68,10 +68,11 @@
 //! (plan 4 task 6): the cell's own geometric center, `1.02^spr_bucket`, with distance measured
 //! relatively (`|SPR - center| / center`). This is a *storage-selection* rule only -- a lookup
 //! always measures `delta` against the actual query SPR (`crate::lookup::compare`), never against
-//! this center. Ties fall back to raw accuracy and then to the canonical payload digest, so
-//! arrival order never decides which representative survives, and `entry_digest` excludes the
-//! mutable `created`/`last_hit` timestamps so that merely *hitting* an entry cannot reorder
-//! replacement.
+//! this center. Ties fall back to raw accuracy, then to the entry that covers more ordinal paths
+//! (`covered_paths.len()`, so a root-only `truncated` export never shadows an equally accurate
+//! full-street one), and finally to the canonical payload digest, so arrival order never decides
+//! which representative survives, and `entry_digest` excludes the mutable `created`/`last_hit`
+//! timestamps so that merely *hitting* an entry cannot reorder replacement.
 
 use crate::entry::{validate_entry, CacheEntry};
 use crate::storage::{encode, entry_path, read_cell, write_atomic, Cell};
@@ -147,7 +148,10 @@ pub fn entry_digest(e: &CacheEntry) -> Vec<u8> {
 ///
 /// Every comparison is total and deterministic: relative distance to `1.02^spr_bucket` (all
 /// entries in one cell share that bucket, so one center serves them all), then raw
-/// `exploitability_over_P`, then the canonical payload digest.
+/// `exploitability_over_P`, then `covered_paths.len()` descending (an entry that covers strictly
+/// more ordinal paths beats an equally close, equally accurate one, so a root-only `truncated`
+/// entry can never displace a fuller one at a tie -- follow-up P4.W1, ruling 10-C2), and only
+/// then the canonical payload digest.
 pub fn retain_two(entries: Vec<CacheEntry>) -> Vec<CacheEntry> {
     if entries.len() <= 1 {
         return entries;
@@ -166,10 +170,16 @@ fn retain_two_tagged(mut tagged: Vec<([u8; 32], CacheEntry)>) -> Vec<([u8; 32], 
         let center = 1.02_f64.powi(a.key.spr_bucket);
         let distance_a = (a.source.spr.value() - center).abs() / center;
         let distance_b = (b.source.spr.value() - center).abs() / center;
-        distance_a.total_cmp(&distance_b).then(a.exploitability_over_P.total_cmp(&b.exploitability_over_P)).then(da.cmp(db))
+        distance_a
+            .total_cmp(&distance_b)
+            .then(a.exploitability_over_P.total_cmp(&b.exploitability_over_P))
+            .then(b.covered_paths.len().cmp(&a.covered_paths.len()))
+            .then(da.cmp(db))
     });
     let closest = tagged.remove(0);
-    tagged.sort_by(|(da, a), (db, b)| a.exploitability_over_P.total_cmp(&b.exploitability_over_P).then(da.cmp(db)));
+    tagged.sort_by(|(da, a), (db, b)| {
+        a.exploitability_over_P.total_cmp(&b.exploitability_over_P).then(b.covered_paths.len().cmp(&a.covered_paths.len())).then(da.cmp(db))
+    });
     if tagged[0].1.exploitability_over_P < closest.1.exploitability_over_P {
         let accurate = tagged.remove(0);
         vec![closest, accurate]

@@ -205,6 +205,148 @@ fn retain_two_ties_use_the_payload_digest_and_ignore_timestamps() {
     assert_eq!(after_a_hit[0].iterations, forwards[0].iterations, "a hit must not change replacement ordering");
 }
 
+// --- retain_two: fuller path coverage outranks the digest (follow-up P4.W1) ----------------------
+
+/// A root-only `truncated` export of `e`: the one node the fixture's first sorted path names, with
+/// `covered_paths` cut to match. It is the shape a worker returns when it materializes only the
+/// requested node, and it is a valid entry in its own right -- it just covers strictly fewer
+/// ordinal paths than the four-node `street` fixture it was cut from.
+fn truncated(mut e: CacheEntry) -> CacheEntry {
+    e.nodes.truncate(1);
+    e.covered_paths.truncate(1);
+    e.export = "truncated".into();
+    assert!(validate_entry(&e).is_ok(), "the truncated fixture must still be a valid entry");
+    e
+}
+
+/// A `(truncated, full)` pair at the same SPR and with the same raw accuracy -- so distance and
+/// exploitability tie and only coverage and the payload digest are left to decide -- whose digests
+/// sort as asked: `full_digest_higher` puts the fuller entry *after* the truncated one, which is
+/// the case the digest-first tie-break got wrong. `iterations` is the knob: it moves the full
+/// entry's digest without touching its key, its SPR, its accuracy or its coverage.
+fn coverage_tie(stacks: u32, exploitability: f64, full_digest_higher: bool) -> (CacheEntry, CacheEntry) {
+    let base = entry_at(stacks, exploitability);
+    let trunc = truncated(base.clone());
+    for iterations in 100..400 {
+        let mut full = base.clone();
+        full.iterations = iterations;
+        if (quota::entry_digest(&full) > quota::entry_digest(&trunc)) == full_digest_higher {
+            assert!(full.covered_paths.len() > trunc.covered_paths.len(), "the pair must differ in coverage, or it tests nothing");
+            assert_eq!(full.exploitability_over_P, trunc.exploitability_over_P);
+            assert_eq!(full.source.spr, trunc.source.spr);
+            return (trunc, full);
+        }
+    }
+    panic!("no iteration count orders the digests as asked");
+}
+
+fn digests(entries: &[CacheEntry]) -> Vec<Vec<u8>> {
+    entries.iter().map(quota::entry_digest).collect()
+}
+
+/// Every ordering of three candidates, so no assertion below can lean on arrival order.
+fn orderings(a: &CacheEntry, b: &CacheEntry, c: &CacheEntry) -> Vec<Vec<CacheEntry>> {
+    let all = [a, b, c];
+    [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]].iter().map(|order| order.iter().map(|&i| all[i].clone()).collect()).collect()
+}
+
+/// P4.W1 (ruling 10-C2): two entries that tie on SPR distance and raw accuracy used to fall to the
+/// canonical digest, so a root-only `truncated` entry whose digest happened to sort lower displaced
+/// a full-street entry that covers strictly more ordinal paths -- for good, because the digest
+/// never changes. More coverage now comes first, whatever the digests say and whichever arrives
+/// first.
+#[test]
+fn retain_two_prefers_the_fuller_coverage_over_a_lower_digest_at_a_tie() {
+    let (trunc, full) = coverage_tie(500, 0.004, true);
+    assert!(quota::entry_digest(&full) > quota::entry_digest(&trunc), "the fuller entry must carry the HIGHER digest, the case the digest-first tie-break got wrong");
+    assert!(full.covered_paths.len() > trunc.covered_paths.len());
+    for candidates in [vec![trunc.clone(), full.clone()], vec![full.clone(), trunc.clone()]] {
+        let kept = quota::retain_two(candidates);
+        assert_eq!(kept.len(), 1, "a tie on distance and accuracy keeps one representative");
+        assert_eq!(quota::entry_digest(&kept[0]), quota::entry_digest(&full), "the fuller entry must be the one retained");
+        assert_eq!(kept[0].covered_paths.len(), full.covered_paths.len());
+        assert_eq!(kept[0].export, "street");
+    }
+
+    // Coverage, not the digest, is the deciding key: with the digests the other way round the
+    // fuller entry wins too.
+    let (trunc, full) = coverage_tie(500, 0.004, false);
+    assert!(quota::entry_digest(&full) < quota::entry_digest(&trunc));
+    for candidates in [vec![trunc.clone(), full.clone()], vec![full.clone(), trunc]] {
+        let kept = quota::retain_two(candidates);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(quota::entry_digest(&kept[0]), quota::entry_digest(&full));
+    }
+}
+
+/// With a third entry of distinct accuracy present, the fuller entry still wins its tie -- in
+/// either role: the closest-SPR tie (first comparator) and the most-accurate tie (second one).
+#[test]
+fn retain_two_prefers_the_fuller_coverage_when_a_third_entry_of_distinct_accuracy_is_present() {
+    // The closest-SPR role: the truncated/full pair sits at 4.95, the more accurate third at 5.0.
+    let (trunc, full) = coverage_tie(495, 0.004, true);
+    let accurate = entry_at(500, 0.001);
+    let expected = digests(&[full.clone(), accurate.clone()]);
+    for candidates in orderings(&trunc, &full, &accurate) {
+        let kept = quota::retain_two(candidates);
+        assert_eq!(digests(&kept), expected, "closest role: the fuller entry, then the strictly more accurate one");
+        assert_eq!(kept[0].covered_paths.len(), full.covered_paths.len());
+    }
+
+    // The most-accurate role: the closest (4.95, 0.004) is a third entry; the pair ties on both
+    // distance and accuracy farther out, at 5.0 with 0.001.
+    let closest = entry_at(495, 0.004);
+    let (trunc, full) = coverage_tie(500, 0.001, true);
+    let expected = digests(&[closest.clone(), full.clone()]);
+    for candidates in orderings(&closest, &trunc, &full) {
+        let kept = quota::retain_two(candidates);
+        assert_eq!(digests(&kept), expected, "accuracy role: the closest entry, then the fuller of the two equally accurate ones");
+        assert_eq!(kept[1].covered_paths.len(), full.covered_paths.len());
+    }
+}
+
+/// Coverage sits *after* distance and accuracy, never before them: a truncated entry that is
+/// closer, or strictly more accurate, keeps the role it earned.
+#[test]
+fn retain_two_still_ranks_distance_and_accuracy_above_coverage() {
+    let closer_but_truncated = truncated(entry_at(495, 0.004));
+    let farther_but_full = entry_at(500, 0.004);
+    assert!(closer_but_truncated.covered_paths.len() < farther_but_full.covered_paths.len());
+    let kept = quota::retain_two(vec![farther_but_full, closer_but_truncated.clone()]);
+    assert_eq!(digests(&kept), digests(std::slice::from_ref(&closer_but_truncated)), "a closer truncated entry outranks a farther full one, which is no more accurate and so is dropped");
+
+    let closest = entry_at(495, 0.004);
+    let accurate_but_truncated = truncated(entry_at(500, 0.001));
+    let less_accurate_but_full = entry_at(500, 0.002);
+    let kept = quota::retain_two(vec![less_accurate_but_full, accurate_but_truncated.clone(), closest.clone()]);
+    assert_eq!(digests(&kept), digests(&[closest, accurate_but_truncated]), "a strictly more accurate truncated entry outranks a less accurate full one for the accuracy role");
+}
+
+/// The same rule through the writer: whichever of the pair is stored first, the cell ends up
+/// holding the fuller entry, and a truncated entry offered against a full one at a tie is
+/// reported as not stored.
+#[test]
+fn cache_store_keeps_the_fuller_entry_at_a_tie_whichever_arrives_first() {
+    let (trunc, full) = coverage_tie(500, 0.004, true);
+    let key = full.key.digest();
+
+    let dir = TempDir::new("fuller-arrives-second");
+    let cache = Cache::open(dir.path().to_path_buf(), CACHE_QUOTA_BYTES);
+    store_and_wait(&cache, &trunc);
+    assert!(cache.store_tracked(&full).wait(WRITER_BUDGET), "the fuller entry displaces the truncated one at a tie");
+    let on_disk = cell_on_disk(dir.path(), key).expect("the cell must be on disk");
+    assert_eq!(digests(&on_disk), digests(std::slice::from_ref(&full)), "the fuller entry is the one on disk");
+    cache.shutdown();
+
+    let dir = TempDir::new("fuller-arrives-first");
+    let cache = Cache::open(dir.path().to_path_buf(), CACHE_QUOTA_BYTES);
+    store_and_wait(&cache, &full);
+    assert!(!cache.store_tracked(&trunc).wait(WRITER_BUDGET), "a truncated entry offered against a full one at a tie is dominated, so not stored");
+    let on_disk = cell_on_disk(dir.path(), key).expect("the cell must be on disk");
+    assert_eq!(digests(&on_disk), digests(std::slice::from_ref(&full)));
+    cache.shutdown();
+}
+
 // --- the writer: publication, retention, monotone last_hit ---------------------------------------
 
 #[test]
