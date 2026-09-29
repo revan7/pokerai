@@ -26,6 +26,15 @@
 //! (plan 3 Task 18, spec 9.3): a later replay names that cause for a street left without a snapshot, and records the
 //! delivered cause as the street's miss (ruling 18-I2).
 //!
+//! The multiway row (plan 4 Task 11; spec 6). A decision with three or more pot-eligible players is answered with the
+//! classifier's `Unsupported{MultiwayEv}` row as before, through the request's claim (`settle`), and beside it, never in
+//! its `actions`, the `experimental` block of the synthetic-root surrogate (`with_experimental`, `crate::experimental`):
+//! the seats' street-root public ranges from the range source, the opponent by range-vs-range equity, one isolated
+//! solve through the solve client's shared transport inside the request's own street deadline. It never asks or stores
+//! the cache, registers no snapshot and records no miss; a surrogate that cannot answer leaves a note naming why the
+//! block is absent. The watchdog is never armed again: the multiway `Final` is retained for it (`set_retained`) before
+//! the surrogate starts and once it has answered.
+//!
 //! The cache (plan 4 Task 10; spec 5 step 7, 7, 10.4, 10.5). After the `Fast`, a flop or turn decision probes the cache
 //! (`cache_phase`): on the flop the pre-solver's template first and then the live template the flop policy picks (Task
 //! 9: `flop_min_v1` only for an admitted single-raised pot), when it differs; on the turn its one template. The probes
@@ -133,6 +142,7 @@ use crate::core::EngineCore;
 use crate::coverage::{classify, decision_point, seat_index, Classification};
 use crate::deadline::Deadlines;
 use crate::equity::{equity_summary_with_clock, pending_summary, EQUITY_BUDGET_MS};
+use crate::experimental::{Skipped, SurrogateRequest};
 use crate::flop::{cacheable, choose_cache_route, is_street_violation, preflop_wagers, CacheRoute, ProvisionalHit, PRESOLVER_TEMPLATE};
 use crate::identity::IdentityState;
 use crate::log::{DecisionRecord, InputRecord};
@@ -150,8 +160,8 @@ use core_ranges::hash_scaled;
 use core_replay::SnapshotMiss;
 use proto::worker::SOLVER_COMMIT;
 use proto::{
-    combo_index, ApproxReason, Assumptions, Card, Coverage, DecisionIdentity, Derived, EffectiveTree, EquitySummary, GameConfig, HandState, LegalAction, Phase,
-    Range1326, Recommendation, RecommendationEvent, Seat, SolveInput, Street, StreetRootSnapshot, UnsupportedReason,
+    combo_index, ApproxReason, Assumptions, Card, Coverage, DecisionIdentity, Derived, EffectiveTree, EquitySummary, ExperimentalHu, GameConfig, HandState,
+    LegalAction, Phase, Range1326, Recommendation, RecommendationEvent, Seat, SolveInput, Street, StreetRootSnapshot, UnsupportedReason,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -211,7 +221,8 @@ pub struct Watched {
 /// (`deliver_provisional`): the promoted payload is retained inside the `Provisional`'s accepted delivery, under the
 /// identity lock (the watchdog's lock order puts the identity lock before this slot, and the watchdog never waits on
 /// the identity lock while it holds this slot), so a watchdog that claims the `Final` after that acceptance delivers
-/// exactly it. A later call replaces the payload; one landing after the fire changes nothing delivered. Takes the
+/// exactly it. Plan 4 Task 11's multiway row retains its `Final` through it too (`with_experimental`), from
+/// `engine-main` holding no engine lock. A later call replaces the payload; one landing after the fire changes nothing delivered. Takes the
 /// retained slot's lock alone, one step: never call it holding the sink, the fallback or the stage slot (`watchdog`'s
 /// lock order). `req` must be armed (a request at a decision point) and `rec` must answer its decision: either is a
 /// caller bug.
@@ -510,7 +521,15 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
             return;
         }
         Classification::Multiway { pot_eligible } => {
-            settle(core, req, hooks, &claim, d.street, assemble::unsupported(&ctx, UnsupportedReason::MultiwayEv { pot_eligible }, vec![], assumptions));
+            // Plan 4 Task 11 (spec 6): the multiway row as before, with the `experimental` block beside it when the
+            // synthetic-root surrogate answers (`with_experimental`), through the request's own claim.
+            let rec = assemble::unsupported(&ctx, UnsupportedReason::MultiwayEv { pot_eligible }, vec![], assumptions);
+            let (rec, outstanding_job) = with_experimental(core, req, watch, &d, rec, &equity_cancel);
+            settle(core, req, hooks, &claim, d.street, rec);
+            // Ruling 28-I3: a surrogate job left running at the watchdog's fire is killed once the `Final` is out.
+            if outstanding_job {
+                kill_the_busy_worker(core);
+            }
             return;
         }
         Classification::Unsupported(reason) => {
@@ -779,6 +798,73 @@ fn live_template(core: &EngineCore, state: &HandState, street: Street) -> &'stat
         Street::Flop => core.flop_policy.live_template(preflop_wagers(state)),
         Street::Preflop => unreachable!("a heads-up street root is postflop"),
     }
+}
+
+/// Spec 6's multiway row (plan 4 Task 11): `rec`, the `Unsupported{MultiwayEv}` `Final` exactly as the classifier's row
+/// answers it, with the `experimental` block of the synthetic-root surrogate beside it (`experimental`'s module doc),
+/// or, when the surrogate is skipped, with a note naming why the block is absent and nothing else changed. Returns that
+/// `Final` and whether the surrogate's solve left a job running at the watchdog's fire (ruling 28-I3).
+///
+/// The request's watchdog, armed at admission, is never armed again: before the surrogate starts, the multiway `Final`
+/// (block absent, with the note that it was not ready) is retained for it (`set_retained`), so a fire during the
+/// surrogate delivers the multiway row rather than its `DeadlineExceeded` fallback; once the surrogate has answered,
+/// the `Final` about to be claimed is retained in its place. The cache, the snapshot store and the main result's
+/// assumptions are never touched, and no engine lock is held across the surrogate's solve.
+fn with_experimental(core: &mut EngineCore, req: &LiveRequest, watch: &Watched, d: &Derived, mut rec: Recommendation, equity_cancel: &AtomicBool) -> (Recommendation, bool) {
+    let mut pending = rec.clone();
+    pending.assumptions.notes.push(crate::experimental::absent_note("the surrogate had not answered by the final delivery"));
+    set_retained(req, pending);
+    let outstanding_job = match surrogate_block(core, req, watch, d, equity_cancel) {
+        Ok(block) => {
+            rec.experimental = Some(block);
+            false
+        }
+        Err(Skipped { why, outstanding_job }) => {
+            rec.assumptions.notes.push(crate::experimental::absent_note(&why));
+            outstanding_job
+        }
+    };
+    set_retained(req, rec.clone());
+    (rec, outstanding_job)
+}
+
+/// The surrogate of a multiway decision (spec 6): the street-root public ranges of every seat in the pot from the range
+/// source (`RangeSource::seat_ranges`: the replay's, never hero-conditioned), the opponent by range-vs-range equity
+/// within the equity phase's own budget (`EQUITY_BUDGET_MS`, never past the street deadline) and the request's equity
+/// token (set on supersession, ruling 28-I4), the synthetic root on the street's template (`live_template`), and the
+/// isolated solve (`experimental::run_surrogate`) with the hand's big blind and rake, the request's target, deadlines,
+/// street deadline and claim. Hero's cards reach only the advice row.
+fn surrogate_block(core: &mut EngineCore, req: &LiveRequest, watch: &Watched, d: &Derived, equity_cancel: &AtomicBool) -> Result<ExperimentalHu, Skipped> {
+    let skip = |why: String| Skipped { why, outstanding_job: false };
+    let state = &req.state;
+    if watch.delivered.load(Ordering::SeqCst) {
+        return Err(skip("the request's Final was delivered at the final delivery before the surrogate started".into()));
+    }
+    let hero_cards = state.hero_cards.ok_or_else(|| skip("hero's cards are not entered".into()))?;
+    // Every seat in the pot (all-in seats included, spec 6), in postflop order.
+    let seats: Vec<Seat> = core_model::postflop_order(state.button, &state.dealt).into_iter().filter(|s| !d.folded[usize::from(s.0)]).collect();
+    // The range source's lock is released at the end of this statement, before any equity or solve.
+    let ranges = lock(&core.range_source).seat_ranges(state, &seats);
+    let ranges = ranges.map_err(|reason| skip(format!("no street-root public ranges of the seats in the pot ({})", miss_cause(&reason))))?;
+    let hero_public = ranges.iter().find(|(s, _)| *s == state.hero).map(|(_, r)| r.clone()).ok_or_else(|| skip("no street-root public range of hero's".into()))?;
+    let others: Vec<(Seat, Range1326)> = ranges.into_iter().filter(|(s, _)| *s != state.hero).collect();
+    let budget_ms = watch.deadlines.street_deadline_ms.saturating_sub(core.clock.now_ms()).min(EQUITY_BUDGET_MS);
+    let opponent = crate::experimental::choose_opponent(state.hero, &hero_public, &others, &state.board, Duration::from_millis(budget_ms), equity_cancel)
+        .ok_or_else(|| {
+            skip(if equity_cancel.load(Ordering::SeqCst) {
+                "the request's equity was cancelled before an opponent was chosen".into()
+            } else {
+                "the equity phase overran: no seat's range-vs-range equity was computed within its budget".into()
+            })
+        })?;
+    let template = live_template(core, state, d.street);
+    let input = crate::experimental::synthetic_root(d, state, state.hero, opponent, d.street, template).map_err(skip)?;
+    let opp_public = others.into_iter().find(|(s, _)| *s == opponent).map(|(_, r)| r).expect("the chosen opponent is one of the other seats in the pot");
+    let ranges = if input.hero_role == "oop" { [hero_public, opp_public] } else { [opp_public, hero_public] };
+    let request = SurrogateRequest { identity: req.identity.clone(), deadlines: watch.deadlines, street_deadline: watch.street_deadline.clone(),
+        final_claim: Some(watch.delivered.clone()) };
+    crate::experimental::run_surrogate(core, &input, ranges, &state.board, hero_cards, state.config.bb_chips, &state.config.rake, req.config.solver.target_bp, &request,
+        &req.sink)
 }
 
 /// §7: the whole decision may spend at most this long in cache lookups, every probe together.

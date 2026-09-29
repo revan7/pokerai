@@ -78,6 +78,15 @@
 //! receive result, a link failure included, before it is classified or anything is recovered. At the watchdog's fire
 //! the client stops and cleans nothing up: the watchdog delivers the `Final`, and the kill of a still-busy worker after
 //! it is `serve_request`'s, which it conditions on `SolveOutcome::outstanding_job` (ruling 28-I3).
+//!
+//! The shared transport (plan 4 Task 11). One attempt's request is built from its parts (`solve_request_from_parts`:
+//! request id, spot identity, memory limit, rake, history, `background`) and sent, received, validated and judged by
+//! `send_attempt` (the one-attempt transport above: sliced receives, identity and expiry on each, heartbeat, progress,
+//! cancel of a superseded job); `worker_for_request` readies the worker before anything is sent. `run_solve` is the
+//! `SolveInput` adapter over them, and keeps the main path's own policy: the requested-node and hero-actor checks, the
+//! first attempt's street verdict, the restart and the `_min` retry under admission. Spec 6's experimental surrogate
+//! sends through the same functions without a `SolveInput` (`send_solve_request`): one attempt, the whole solution
+//! validated, no retry, no restart, its terminal never the street's.
 
 use crate::clock::WAIT_SLICE_MS;
 use crate::core::EngineCore;
@@ -108,7 +117,9 @@ const RESULT_GRACE_MS: u64 = 500;
 /// `run_solve` serves a live decision only (final review M5): its identity must be the active decision (checked before
 /// anything is built, before the send and on every reply), its deadlines are `Deadlines::for_request`'s street budgets
 /// and its progress goes to the decision's sink. It cannot run plan 4's pre-solver jobs (`background: true`, 600 s,
-/// no decision), whose executor needs a transport and bookkeeping of its own (plan 4 Tasks 11 and 16).
+/// no decision), whose executor needs bookkeeping of its own (plan 4 Task 16). Plan 4 Task 11 extracted the transport
+/// under it (`solve_request_from_parts`, `send_attempt`), which spec 6's surrogate, a separate contract of the same live
+/// request, sends through (`send_solve_request`).
 #[derive(Clone)]
 pub struct SolvePlan {
     pub identity: DecisionIdentity,
@@ -383,16 +394,26 @@ pub(crate) enum AttemptEnd {
     DeadlinePassed { outstanding: bool },
 }
 
-/// The `solve` for one attempt: the tree `b` at the root's chips, both ranges, the rake, the relative `deadline_ms` and
-/// the street's extraction margin, the engine's memory limit, the request's `target_bp` and `background` flag.
+/// The `solve` for one attempt of `run_solve`: `solve_request_from_parts` over the solve input's street root, public
+/// ranges and target.
 pub(crate) fn request(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, b: &TreeBuild, deadline_ms: u32) -> SolveRequest {
+    solve_request_from_parts(core, &input.root, &input.ranges, input.target_bp, plan, b, deadline_ms)
+}
+
+/// The worker `solve` for one attempt, built from its parts (plan 4 Task 11: the request builder `run_solve` and spec
+/// 6's experimental surrogate share, the surrogate without a `SolveInput`): the tree `b` at the root's chips, the
+/// root's board and stacks, both public ranges (OOP then IP), the plan's rake, the relative `deadline_ms` and the
+/// street's extraction margin, the engine's memory limit, `target_bp` and the plan's `background` flag, under the next
+/// request id, with the spot identity of what it solves.
+pub(crate) fn solve_request_from_parts(core: &mut EngineCore, root: &proto::StreetRootSnapshot, ranges: &[proto::Range1326; 2], target_bp: u16, plan: &SolvePlan,
+    build: &TreeBuild, deadline_ms: u32) -> SolveRequest {
     // `materialize` refuses a zero pot, so every tree that exists was built at a positive one (the divisor of every
     // basis-point and percentage figure of this attempt).
-    assert!(b.pot > 0, "solve request for a tree built at a zero pot");
+    assert!(build.pot > 0, "solve request for a tree built at a zero pot");
     let (rake_rate, rake_cap_mchips) = match plan.rake { Rake::PotRake { rate, cap_mchips, .. } => (rate, cap_mchips), Rake::TimeCharge => (0.0, 0) };
-    let mut req = SolveRequest { id: core.next_id(), spot: String::new(), board: input.root.board.clone(),
-        oop_range: input.ranges[0].clone(), ip_range: input.ranges[1].clone(), pot: b.pot, stack_oop: input.root.stack_oop_root, stack_ip: input.root.stack_ip_root,
-        rake_rate, rake_cap_mchips, tree: b.tree.clone(), history: b.history.clone(), target_bp: input.target_bp, deadline_ms,
+    let mut req = SolveRequest { id: core.next_id(), spot: String::new(), board: root.board.clone(),
+        oop_range: ranges[0].clone(), ip_range: ranges[1].clone(), pot: build.pot, stack_oop: root.stack_oop_root, stack_ip: root.stack_ip_root,
+        rake_rate, rake_cap_mchips, tree: build.tree.clone(), history: build.history.clone(), target_bp, deadline_ms,
         extraction_margin_ms: plan.deadlines.extraction_margin_ms, memory_limit_bytes: core.memory_limit_bytes, background: plan.background };
     // The identity reads every field above but `id` and `spot` itself (see `spot_hash`).
     req.spot = spot_hash(&req);
@@ -670,6 +691,161 @@ pub(crate) fn validate(b: &TreeBuild, plan: &SolvePlan, sol: &StreetSolution) ->
     Ok(paths)
 }
 
+/// What the shared transport's validation checks of a solution (`send_attempt`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Validation {
+    /// `validate`: the whole solution, then the requested node against the decision node and hero's role (the main
+    /// path, `run_solve`).
+    RequestedNode,
+    /// The whole solution alone (`validate_solution`): a separate contract that selects its own node afterwards (spec
+    /// 6's surrogate, `send_solve_request`).
+    WholeSolution,
+}
+
+/// How one attempt of the shared transport ended once judged (`send_attempt`).
+pub(crate) enum Sent {
+    /// A validated `ok` or `best_so_far` solution, its terminal (`terminal_for`) and every node's ordinal path, still
+    /// wanted when it was exposed (the decision active, the watchdog's fire not come).
+    Solved { sol: StreetSolution, paths: Vec<OrdinalPath>, terminal: Terminal },
+    /// A solution that arrived and was refused: invalid, an `ok` short of the raw target, or no longer wanted when it
+    /// was to be exposed (ruling 22-I1).
+    Refused(UnsupportedReason),
+    /// The decision is no longer active; a job the worker may still be running was cancelled (or the worker killed, its
+    /// link having failed in the same receive).
+    Superseded,
+    /// The watchdog's fire came: it delivers the `Final`; `outstanding` as `AttemptEnd::DeadlinePassed`'s.
+    DeadlinePassed { outstanding: bool },
+    /// Any other end, as `classify` maps it: the §12 reason, whether a `_min` retry is allowed, whether the worker must
+    /// be restarted.
+    Failed { reason: UnsupportedReason, retry_allowed: bool, restart: bool },
+}
+
+/// One attempt of the shared transport: how it ended, when its terminal arrived (`run_attempt`) and the engine-clock
+/// time read the moment `run_attempt` returned (where `run_solve` judges the street verdict of a received solution).
+pub(crate) struct Attempt {
+    pub(crate) sent: Sent,
+    pub(crate) terminal_ms: Option<u64>,
+    pub(crate) returned_ms: u64,
+}
+
+/// The shared transport of one attempt (plan 4 Task 11), `run_solve`'s and `send_solve_request`'s: `run_attempt` (the
+/// send, the sliced receives with identity and expiry judged on each, the heartbeat, progress through `serve::deliver`,
+/// the absolute deadlines; `first` publishes the terminal's arrival to the request's street deadline), then, for a
+/// received `ok` or `best_so_far`, `validation`, `terminal_for` against `req.target_bp` and the identity and expiry
+/// once more before the success is exposed; for a superseded job, its cancel (or the kill of a worker whose link
+/// failed in that receive); a `tree_mismatch` recorded with both trees (final review M2); every other end classified.
+/// Restarts, retries and street verdicts are the caller's.
+pub(crate) fn send_attempt(core: &mut EngineCore, plan: &SolvePlan, sink: &SharedSink, req: &SolveRequest, build: &TreeBuild, first: Option<&StreetDeadline>,
+    validation: Validation) -> Attempt {
+    let (end, terminal_ms) = run_attempt(core, plan, sink, req, first);
+    let returned_ms = core.clock.now_ms();
+    let sent = match end {
+        AttemptEnd::Result { status: status @ (ResultStatus::Ok | ResultStatus::BestSoFar), solution: Some(sol), .. } => {
+            let validated = match validation {
+                Validation::RequestedNode => validate(build, plan, &sol),
+                Validation::WholeSolution => validate_solution(&sol, &build.tree.materialized),
+            };
+            match validated {
+                Err(e) => Sent::Refused(engine_error(format!("invalid solution: {e}"), false)),
+                Ok(paths) => match terminal_for(status, sol.exploitability_chips, build.pot, req.target_bp) {
+                    Err(reason) => Sent::Refused(reason),
+                    // Identity and expiry again before the success is exposed: the checks after the receive held when the
+                    // result was observed, and validation can take the client past the watchdog's fire (ruling 22-I1).
+                    Ok(terminal) => match ended_at(core, plan, core.clock.now_ms(), Watch::AfterTerminal) {
+                        Some(end) => Sent::Refused(classify(end, &core.stage()).0),
+                        None => Sent::Solved { sol, paths, terminal },
+                    },
+                },
+            }
+        }
+        // A worker whose link failed in the receive that observed the supersession is killed at once and sent no
+        // cancel, as `cancel_or_kill` answers a link failure in its window (§12, ruling 23-N1). A job the worker may
+        // still be running on a live link is cancelled (§7/§12). Before the send nothing was sent, and once its terminal
+        // arrived there is nothing left to cancel (final review I2). Neither relaunches the worker (ruling F2-Q1): the
+        // next solve does, before its send.
+        AttemptEnd::Superseded { running, link_failed } => {
+            assert!(!(running && link_failed), "a superseded attempt is either waiting on a live link or has a failed link");
+            if link_failed {
+                kill_worker(core, "the link failed in the receive that observed the supersession");
+            } else if running {
+                cancel_or_kill(core, &req.id);
+            }
+            Sent::Superseded
+        }
+        // The watchdog delivers the `Final` (§7); the cleanup after it is `serve_request`'s, not the client's.
+        AttemptEnd::DeadlinePassed { outstanding } => Sent::DeadlinePassed { outstanding },
+        end => {
+            // Spec 12: a `tree_mismatch` (a rules bug) is logged with both trees: the engine's, and the worker's report of
+            // where the library's first differs (final review M2).
+            if let AttemptEnd::Result { error: Some(e), .. } = &end {
+                if e.code == "tree_mismatch" {
+                    let detail = format!("{}: {}", e.code, e.message);
+                    diagnose(core, core.clock.now_ms(), "tree_mismatch", Some(&plan.identity), detail, Some(&build.tree));
+                }
+            }
+            let (reason, retry_allowed, restart) = classify(end, &core.stage());
+            Sent::Failed { reason, retry_allowed, restart }
+        }
+    };
+    Attempt { sent, terminal_ms, returned_ms }
+}
+
+/// Before anything is sent for `plan` (`run_solve` before its first attempt, spec 6's surrogate before its one): the
+/// cancel the previous request left pending is settled (a decision superseded meanwhile gives way in turn: the cancel
+/// stays pending, and this is `superseded`), a missing worker is relaunched once (counted in `restarts`; a relaunch that
+/// fails is not retryable, P2T23-I3), and the worker's `ready` is validated (§4.5, §12).
+pub(crate) fn worker_for_request(core: &mut EngineCore, plan: &SolvePlan, restarts: &mut u8) -> Result<(), UnsupportedReason> {
+    // A cancel the request before this one left pending, giving way to this request's fast phase (final review I1), is
+    // settled before anything is sent: confirmed, or the worker killed at the end of its window (and relaunched just
+    // below). A decision superseded meanwhile gives way in turn, and the cancel stays pending for the newer request.
+    if let CancelEnd::Interrupted = await_pending_cancel(core, &mut |core| !core.identity_active(&plan.identity)) {
+        return Err(superseded());
+    }
+    // No live worker (a cleanup's kill, ruling F2-Q1; a restart that failed earlier): one relaunch before anything is
+    // sent (review P2T22R), after this request's `Fast`. A relaunch that fails is not retryable, as any failed restart
+    // (`restart_failed`, P2T23-I3).
+    if core.worker.ready().is_none() {
+        *restarts += 1;
+        if let Err(e) = restart_worker(core, "no live worker before the request") {
+            return Err(engine_error(format!("worker not ready: no live worker, and relaunching it failed: {e}"), false));
+        }
+    }
+    ready_for_requests(core)
+}
+
+/// Spec 6's separate contract (plan 4 Task 11): one attempt of `request` on the shared transport (`send_attempt`), for
+/// a solve that is not the decision's own, spec 6's experimental surrogate. The caller readied the worker
+/// (`worker_for_request`) and built `request` (`solve_request_from_parts`) with what is left until `plan`'s street
+/// deadline; nothing here builds a `SolveInput`. The whole solution is validated; the caller selects and checks its own
+/// node. There is no `_min` retry and no restart: a failure `classify` answers with a restart kills the worker instead
+/// (the next solve relaunches it, ruling F2-Q1), a superseded job is cancelled, and a job left running at the watchdog's
+/// fire is reported in `outstanding_job` for the cleanup after the `Final` (ruling 28-I3). Its terminal is never
+/// published to `plan`'s street deadline (the request's street verdict is never the surrogate's): `first_terminal_ms`
+/// stays `None` and `street_violation` false.
+pub(crate) fn send_solve_request(core: &mut EngineCore, request: SolveRequest, plan: &SolvePlan, build: &TreeBuild, sink: &SharedSink) -> SolveOutcome {
+    let t_start = core.clock.now_ms();
+    let attempt = send_attempt(core, plan, sink, &request, build, None, Validation::WholeSolution);
+    let refused = |core: &EngineCore, reason: UnsupportedReason| failed(core, t_start, reason, &build.tree, &plan.template_id, 0, false, None);
+    match attempt.sent {
+        Sent::Solved { sol, paths, terminal } => succeeded(core, t_start, build, &plan.template_id, sol, paths, terminal, false, 0, None),
+        Sent::Refused(reason) => refused(core, reason),
+        Sent::Superseded => refused(core, superseded()),
+        Sent::DeadlinePassed { outstanding } => {
+            let stage = core.stage();
+            let mut out = refused(core, UnsupportedReason::DeadlineExceeded { stage });
+            out.outstanding_job = outstanding;
+            out
+        }
+        Sent::Failed { reason, restart, .. } => {
+            if restart {
+                let cause = match &reason { UnsupportedReason::EngineError { message, .. } => message.clone(), other => format!("{other:?}") };
+                kill_worker(core, &format!("{cause} (a separate-contract solve: killed, not restarted; the next solve relaunches it)"));
+            }
+            refused(core, reason)
+        }
+    }
+}
+
 /// A validated solution with its terminal (`terminal_for`: `Ok` or `BestSoFar`). `Terminal::Ok` always means the raw
 /// target was met, so assembly never sees an `ok` above target (ruling 26-Q4).
 pub(crate) fn succeeded(core: &EngineCore, t_start: u64, b: &TreeBuild, template: &str, sol: StreetSolution, paths: Vec<OrdinalPath>, terminal: Terminal, street_violation: bool, restarts: u8, first_terminal_ms: Option<u64>) -> SolveOutcome {
@@ -680,8 +856,8 @@ pub(crate) fn succeeded(core: &EngineCore, t_start: u64, b: &TreeBuild, template
         outstanding_job: false }
 }
 
-pub(crate) fn failed(core: &EngineCore, t_start: u64, reason: UnsupportedReason, input: &SolveInput, template: &str, restarts: u8, street_violation: bool, first_terminal_ms: Option<u64>) -> SolveOutcome {
-    SolveOutcome { terminal: Terminal::Failed(reason), solution: None, ordinal_paths: vec![], decision_path: vec![], tree: input.tree.clone(),
+pub(crate) fn failed(core: &EngineCore, t_start: u64, reason: UnsupportedReason, tree: &EffectiveTree, template: &str, restarts: u8, street_violation: bool, first_terminal_ms: Option<u64>) -> SolveOutcome {
+    SolveOutcome { terminal: Terminal::Failed(reason), solution: None, ordinal_paths: vec![], decision_path: vec![], tree: tree.clone(),
         elapsed_ms: ms_between(t_start, core.clock.now_ms()), template_used: template.to_string(), street_violation, first_terminal_ms, restarts, reached_bp: None,
         outstanding_job: false }
 }
@@ -741,7 +917,7 @@ pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, si
     // Every failure, with the street verdict judged at the return from the first attempt's terminal arrival.
     let fail = |core: &EngineCore, reason: UnsupportedReason, template: &str, restarts: u8, first_terminal_ms: Option<u64>| {
         let violated = street_violated(street_deadline_ms, first_terminal_ms, core.clock.now_ms());
-        failed(core, t_start, reason, input, template, restarts, violated, first_terminal_ms)
+        failed(core, t_start, reason, &input.tree, template, restarts, violated, first_terminal_ms)
     };
     let mut template = plan.template_id.clone();
     let mut restarts = 0u8;
@@ -751,22 +927,8 @@ pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, si
         Ok(b) => b,
         Err(r) => return fail(core, r, &template, restarts, None),
     };
-    // A cancel the request before this one left pending, giving way to this request's fast phase (final review I1), is
-    // settled before anything is sent: confirmed, or the worker killed at the end of its window (and relaunched just
-    // below). A decision superseded meanwhile gives way in turn, and the cancel stays pending for the newer request.
-    if let CancelEnd::Interrupted = await_pending_cancel(core, &mut |core| !core.identity_active(&plan.identity)) {
-        return fail(core, superseded(), &template, restarts, None);
-    }
-    // No live worker (a cleanup's kill, ruling F2-Q1; a restart that failed earlier): one relaunch before anything is
-    // sent (review P2T22R), after this request's `Fast`. A relaunch that fails is not retryable, as any failed restart
-    // (`restart_failed`, P2T23-I3).
-    if core.worker.ready().is_none() {
-        restarts += 1;
-        if let Err(e) = restart_worker(core, "no live worker before the request") {
-            return fail(core, engine_error(format!("worker not ready: no live worker, and relaunching it failed: {e}"), false), &template, restarts, None);
-        }
-    }
-    if let Err(reason) = ready_for_requests(core) { return fail(core, reason, &template, restarts, None); }
+    // The pending cancel settled, a missing worker relaunched once, its `ready` validated (`worker_for_request`).
+    if let Err(reason) = worker_for_request(core, plan, &mut restarts) { return fail(core, reason, &template, restarts, None); }
     // The first attempt's terminal arrival (ruling 22-I4): a retry's never replaces it.
     let mut first_terminal_ms = None;
     for attempt_no in 0..2u8 {
@@ -785,55 +947,31 @@ pub fn run_solve(core: &mut EngineCore, input: &SolveInput, plan: &SolvePlan, si
                 // Advances only: a retry that starts at Building never rewinds the stage the first attempt reached.
                 core.set_stage("building");
                 let req = request(core, input, plan, &b, deadline_ms);
-                // Only the first attempt publishes its terminal's arrival to the request's street deadline.
-                let (end, terminal_ms) = run_attempt(core, plan, sink, &req, (attempt_no == 0).then_some(plan.street_deadline.as_ref()));
-                if attempt_no == 0 { first_terminal_ms = terminal_ms; }
-                if let AttemptEnd::Result { status: status @ (ResultStatus::Ok | ResultStatus::BestSoFar), solution: Some(sol), .. } = end {
-                    let violated = street_violated(street_deadline_ms, first_terminal_ms, core.clock.now_ms());
-                    let refused = |core: &EngineCore, reason: UnsupportedReason| failed(core, t_start, reason, input, &template, restarts, violated, first_terminal_ms);
-                    let paths = match validate(&b, plan, &sol) { Ok(paths) => paths, Err(e) => return refused(core, engine_error(format!("invalid solution: {e}"), false)) };
-                    let terminal = match terminal_for(status, sol.exploitability_chips, b.pot, input.target_bp) { Ok(terminal) => terminal, Err(reason) => return refused(core, reason) };
-                    // Identity and expiry again before the success is exposed: the checks after the receive held when the
-                    // result was observed, and validation can take the client past the watchdog's fire (ruling 22-I1).
-                    if let Some(end) = ended_at(core, plan, core.clock.now_ms(), Watch::AfterTerminal) {
-                        let (reason, _retry_allowed, _restart) = classify(end, &core.stage());
-                        return refused(core, reason);
+                // The shared transport (`send_attempt`, plan 4 Task 11). Only the first attempt publishes its terminal's
+                // arrival to the request's street deadline.
+                let attempt = send_attempt(core, plan, sink, &req, &b, (attempt_no == 0).then_some(plan.street_deadline.as_ref()), Validation::RequestedNode);
+                if attempt_no == 0 { first_terminal_ms = attempt.terminal_ms; }
+                match attempt.sent {
+                    // The street verdict of a received solution is judged when the attempt returned, before it was
+                    // validated, from the first attempt's terminal arrival.
+                    Sent::Solved { sol, paths, terminal } => {
+                        let violated = street_violated(street_deadline_ms, first_terminal_ms, attempt.returned_ms);
+                        return succeeded(core, t_start, &b, &template, sol, paths, terminal, violated, restarts, first_terminal_ms);
                     }
-                    return succeeded(core, t_start, &b, &template, sol, paths, terminal, violated, restarts, first_terminal_ms);
-                }
-                match end {
-                    // A worker whose link failed in the receive that observed the supersession is killed at once and sent
-                    // no cancel, as `cancel_or_kill` answers a link failure in its window (§12, ruling 23-N1). A job the
-                    // worker may still be running on a live link is cancelled (§7/§12). Before the send nothing was
-                    // sent, and once its terminal arrived there is nothing left to cancel (final review I2). Neither
-                    // relaunches the worker (ruling F2-Q1): the next solve does, before its send.
-                    AttemptEnd::Superseded { running, link_failed } => {
-                        assert!(!(running && link_failed), "a superseded attempt is either waiting on a live link or has a failed link");
-                        if link_failed {
-                            kill_worker(core, "the link failed in the receive that observed the supersession");
-                        } else if running {
-                            cancel_or_kill(core, &req.id);
-                        }
-                        return fail(core, superseded(), &template, restarts, first_terminal_ms);
+                    Sent::Refused(reason) => {
+                        let violated = street_violated(street_deadline_ms, first_terminal_ms, attempt.returned_ms);
+                        return failed(core, t_start, reason, &input.tree, &template, restarts, violated, first_terminal_ms);
                     }
+                    // Its running job was cancelled, or its worker killed (`send_attempt`).
+                    Sent::Superseded => return fail(core, superseded(), &template, restarts, first_terminal_ms),
                     // The watchdog delivers the `Final` (§7); the cleanup after it is `serve_request`'s, not the client's.
-                    AttemptEnd::DeadlinePassed { outstanding } => {
+                    Sent::DeadlinePassed { outstanding } => {
                         let stage = core.stage();
                         let mut out = fail(core, UnsupportedReason::DeadlineExceeded { stage }, &template, restarts, first_terminal_ms);
                         out.outstanding_job = outstanding;
                         return out;
                     }
-                    end => {
-                        // Spec 12: a `tree_mismatch` (a rules bug) is logged with both trees: the engine's, and the
-                        // worker's report of where the library's first differs (final review M2).
-                        if let AttemptEnd::Result { error: Some(e), .. } = &end {
-                            if e.code == "tree_mismatch" {
-                                let detail = format!("{}: {}", e.code, e.message);
-                                diagnose(core, core.clock.now_ms(), "tree_mismatch", Some(&plan.identity), detail, Some(&b.tree));
-                            }
-                        }
-                        classify(end, &core.stage())
-                    }
+                    Sent::Failed { reason, retry_allowed, restart } => (reason, retry_allowed, restart),
                 }
             }
         };
