@@ -389,15 +389,24 @@ fn a_request_superseded_before_it_is_served_reads_no_ranges_and_runs_no_equity()
     let req = LiveRequest::admitted(&rig.core, a.clone(), state.clone(), rig.clock.now_ms(), sink);
     let b = rig.identity.lock().unwrap().next_decision().unwrap();
     assert!(b != a && b.hand_id == a.hand_id, "B re-requests the same hand");
-    serve_request_with(&mut rig.core, req, ServeSeams { equity: Some(support::stub_equity()), opponent_equity: Some(opponent_equity), ..ServeSeams::default() });
-    let token = rig.core.equity_cancel.lock().unwrap().clone().expect("A installed its equity token");
+    // Fix round 2, 11-N1: the token A installed is read in `finish` before its `Final` is claimed (the `before_claim`
+    // seam), before the stale exit (`retire_stale`) and the teardown (`EngineCore::shutdown`) would set it anyway, so
+    // only the guard can have set it by then.
+    let (slot, seen_at_claim) = (rig.core.equity_cancel.clone(), Arc::new(AtomicBool::new(false)));
+    let seen = seen_at_claim.clone();
+    let before_claim: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let token = slot.lock().unwrap().clone().expect("A installed its equity token");
+        seen.store(token.load(Ordering::SeqCst), Ordering::SeqCst);
+    });
+    serve_request_with(&mut rig.core, req, ServeSeams { equity: Some(support::stub_equity()), opponent_equity: Some(opponent_equity), before_claim: Some(before_claim),
+        ..ServeSeams::default() });
     let solves = rig.solves();
     rig.core.shutdown();
     assert_eq!(asked.load(Ordering::SeqCst), 0, "the stale request read no street-root ranges");
     assert_eq!(estimates.load(Ordering::SeqCst), 0, "the stale request ran no opponent equity");
     assert!(solves.is_empty(), "nothing reaches the worker");
     assert!(events.lock().unwrap().is_empty(), "no event of the stale decision");
-    assert!(token.load(Ordering::SeqCst), "the stale request's equity token is set");
+    assert!(seen_at_claim.load(Ordering::SeqCst), "the guard set the stale request's token before its Final was claimed");
 }
 
 /// Fix round 1, P4T11-M1 (ruling 11-M1): public ranges with no pairwise-compatible holdings (hero publicly only on AsAh,
