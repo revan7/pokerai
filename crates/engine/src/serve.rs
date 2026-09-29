@@ -142,7 +142,7 @@ use crate::core::EngineCore;
 use crate::coverage::{classify, decision_point, seat_index, Classification};
 use crate::deadline::Deadlines;
 use crate::equity::{equity_summary_with_clock, pending_summary, EQUITY_BUDGET_MS};
-use crate::experimental::{Skipped, SurrogateRequest};
+use crate::experimental::{PairEquity, Skipped, SurrogateRequest};
 use crate::flop::{cacheable, choose_cache_route, is_street_violation, preflop_wagers, CacheRoute, ProvisionalHit, PRESOLVER_TEMPLATE};
 use crate::identity::IdentityState;
 use crate::log::{DecisionRecord, InputRecord};
@@ -397,11 +397,14 @@ pub(crate) struct Hooks {
     /// Runs on `engine-main` immediately before each flop or turn cache lookup (plan 4 Task 10), where a lookup holds
     /// `engine-main` for up to its bound.
     before_lookup: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The pairwise estimate of the multiway surrogate's opponent selection (plan 4 Task 11): `equity::range_vs_range`.
+    opponent_equity: PairEquity,
 }
 
 impl Hooks {
     fn production() -> Self {
-        Self { equity: Arc::new(equity_summary_with_clock), before_claim: None, after_fast: None, after_active_check: None, at_registration: None, before_lookup: None }
+        Self { equity: Arc::new(equity_summary_with_clock), before_claim: None, after_fast: None, after_active_check: None, at_registration: None, before_lookup: None,
+            opponent_equity: Arc::new(crate::equity::range_vs_range) }
     }
 }
 
@@ -416,7 +419,9 @@ impl Hooks {
 /// of the engine's own `Final`, under the identity lock, immediately before a solved candidate's snapshot is registered
 /// (final fix round 2, ruling F2-I3: the re-review's probe P7 site, a panic after the claim and before the handover);
 /// `before_lookup` runs on `engine-main` immediately before each flop or turn cache lookup (plan 4 Task 10: a lookup
-/// that holds `engine-main` to its bound, a supersession or a watchdog fire landing while the cache is asked).
+/// that holds `engine-main` to its bound, a supersession or a watchdog fire landing while the cache is asked);
+/// `opponent_equity` replaces the multiway surrogate's pairwise estimate (plan 4 Task 11 fix round 1, P4T11-I2: an
+/// estimate that spends the equity phase's cutoff on the fake clock).
 /// `None` keeps production behaviour. A seam that panics exercises `engine-main`'s containment (final review I3).
 #[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Default)]
@@ -427,6 +432,7 @@ pub struct ServeSeams {
     pub after_active_check: Option<Arc<dyn Fn() + Send + Sync>>,
     pub at_registration: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_lookup: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub opponent_equity: Option<PairEquity>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -434,7 +440,8 @@ impl ServeSeams {
     fn hooks(&self) -> Hooks {
         let production = Hooks::production();
         Hooks { equity: self.equity.clone().unwrap_or(production.equity), before_claim: self.before_claim.clone(), after_fast: self.after_fast.clone(),
-            after_active_check: self.after_active_check.clone(), at_registration: self.at_registration.clone(), before_lookup: self.before_lookup.clone() }
+            after_active_check: self.after_active_check.clone(), at_registration: self.at_registration.clone(), before_lookup: self.before_lookup.clone(),
+            opponent_equity: self.opponent_equity.clone().unwrap_or(production.opponent_equity) }
     }
 }
 
@@ -524,7 +531,7 @@ fn serve(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks) {
             // Plan 4 Task 11 (spec 6): the multiway row as before, with the `experimental` block beside it when the
             // synthetic-root surrogate answers (`with_experimental`), through the request's own claim.
             let rec = assemble::unsupported(&ctx, UnsupportedReason::MultiwayEv { pot_eligible }, vec![], assumptions);
-            let (rec, outstanding_job) = with_experimental(core, req, watch, &d, rec, &equity_cancel);
+            let (rec, outstanding_job) = with_experimental(core, req, hooks, watch, &d, rec, &equity_cancel);
             settle(core, req, hooks, &claim, d.street, rec);
             // Ruling 28-I3: a surrogate job left running at the watchdog's fire is killed once the `Final` is out.
             if outstanding_job {
@@ -810,11 +817,12 @@ fn live_template(core: &EngineCore, state: &HandState, street: Street) -> &'stat
 /// surrogate delivers the multiway row rather than its `DeadlineExceeded` fallback; once the surrogate has answered,
 /// the `Final` about to be claimed is retained in its place. The cache, the snapshot store and the main result's
 /// assumptions are never touched, and no engine lock is held across the surrogate's solve.
-fn with_experimental(core: &mut EngineCore, req: &LiveRequest, watch: &Watched, d: &Derived, mut rec: Recommendation, equity_cancel: &AtomicBool) -> (Recommendation, bool) {
+fn with_experimental(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, watch: &Watched, d: &Derived, mut rec: Recommendation, equity_cancel: &AtomicBool)
+    -> (Recommendation, bool) {
     let mut pending = rec.clone();
     pending.assumptions.notes.push(crate::experimental::absent_note("the surrogate had not answered by the final delivery"));
     set_retained(req, pending);
-    let outstanding_job = match surrogate_block(core, req, watch, d, equity_cancel) {
+    let outstanding_job = match surrogate_block(core, req, hooks, watch, d, equity_cancel) {
         Ok(block) => {
             rec.experimental = Some(block);
             false
@@ -830,13 +838,29 @@ fn with_experimental(core: &mut EngineCore, req: &LiveRequest, watch: &Watched, 
 
 /// The surrogate of a multiway decision (spec 6): the street-root public ranges of every seat in the pot from the range
 /// source (`RangeSource::seat_ranges`: the replay's, never hero-conditioned), the opponent by range-vs-range equity
-/// within the equity phase's own budget (`EQUITY_BUDGET_MS`, never past the street deadline) and the request's equity
-/// token (set on supersession, ruling 28-I4), the synthetic root on the street's template (`live_template`), and the
-/// isolated solve (`experimental::run_surrogate`) with the hand's big blind and rake, the request's target, deadlines,
-/// street deadline and claim. Hero's cards reach only the advice row.
-fn surrogate_block(core: &mut EngineCore, req: &LiveRequest, watch: &Watched, d: &Derived, equity_cancel: &AtomicBool) -> Result<ExperimentalHu, Skipped> {
+/// (`experimental::select_opponent` over the hooks' `opponent_equity`, `equity::range_vs_range` in production) with one
+/// absolute cutoff on the engine clock, `EQUITY_BUDGET_MS` after the equity phase starts or the street deadline when
+/// that comes first (fix round 1, P4T11-I2), and the request's equity token (set on supersession, ruling 28-I4), the
+/// synthetic root on the street's template (`live_template`), and the isolated solve (`experimental::run_surrogate`)
+/// with the hand's big blind and rake, the request's target, deadlines, street deadline and claim. Hero's cards reach
+/// only the advice row.
+///
+/// Fix round 1, P4T11-I1 (ruling 11-I1): before any range read or equity work, the request's own decision is checked
+/// under the identity lock, as the `fast-path` equity checks it before its routine (`spawn_equity`). A request
+/// superseded before `engine-main` installed its token (the newer request cancelled the token then in the slot, not
+/// this one) sets its own token here and is skipped; one superseded after that has its installed token set by the
+/// supersession itself. The lock is released before anything else runs.
+fn surrogate_block(core: &mut EngineCore, req: &LiveRequest, hooks: &Hooks, watch: &Watched, d: &Derived, equity_cancel: &AtomicBool)
+    -> Result<ExperimentalHu, Skipped> {
     let skip = |why: String| Skipped { why, outstanding_job: false };
     let state = &req.state;
+    {
+        let ids = lock(&core.identity);
+        if !ids.is_active(&req.identity) {
+            equity_cancel.store(true, Ordering::SeqCst);
+            return Err(skip("superseded by a newer request before the surrogate started".into()));
+        }
+    }
     if watch.delivered.load(Ordering::SeqCst) {
         return Err(skip("the request's Final was delivered at the final delivery before the surrogate started".into()));
     }
@@ -848,15 +872,11 @@ fn surrogate_block(core: &mut EngineCore, req: &LiveRequest, watch: &Watched, d:
     let ranges = ranges.map_err(|reason| skip(format!("no street-root public ranges of the seats in the pot ({})", miss_cause(&reason))))?;
     let hero_public = ranges.iter().find(|(s, _)| *s == state.hero).map(|(_, r)| r.clone()).ok_or_else(|| skip("no street-root public range of hero's".into()))?;
     let others: Vec<(Seat, Range1326)> = ranges.into_iter().filter(|(s, _)| *s != state.hero).collect();
-    let budget_ms = watch.deadlines.street_deadline_ms.saturating_sub(core.clock.now_ms()).min(EQUITY_BUDGET_MS);
-    let opponent = crate::experimental::choose_opponent(state.hero, &hero_public, &others, &state.board, Duration::from_millis(budget_ms), equity_cancel)
-        .ok_or_else(|| {
-            skip(if equity_cancel.load(Ordering::SeqCst) {
-                "the request's equity was cancelled before an opponent was chosen".into()
-            } else {
-                "the equity phase overran: no seat's range-vs-range equity was computed within its budget".into()
-            })
-        })?;
+    // The equity phase's one absolute cutoff (spec 7: its own 0.5 s, never past the street deadline).
+    let cutoff_ms = core.clock.now_ms().saturating_add(EQUITY_BUDGET_MS).min(watch.deadlines.street_deadline_ms);
+    let opponent = crate::experimental::select_opponent(core.clock.as_ref(), cutoff_ms, state.hero, &hero_public, &others, &state.board, equity_cancel,
+        hooks.opponent_equity.as_ref())
+        .map_err(|cause| skip(cause.why().into()))?;
     let template = live_template(core, state, d.street);
     let input = crate::experimental::synthetic_root(d, state, state.hero, opponent, d.street, template).map_err(skip)?;
     let opp_public = others.into_iter().find(|(s, _)| *s == opponent).map(|(_, r)| r).expect("the chosen opponent is one of the other seats in the pot");
