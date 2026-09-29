@@ -30,6 +30,7 @@ use cache::entry::CacheEntry;
 use cache::lookup::CacheHit;
 use core_ranges::hash_scaled;
 use core_replay::{board_mask, snapshot_node_at, HistoryBranch, ReplayInput, ReplayOutput, SnapshotProvenance, SnapshotStore, StreetSnapshot};
+use engine::ranges::ExplicitRanges;
 use engine::replay_bridge::{snapshot_from_solution, snapshot_note, NO_REQUEST, ORIGINS};
 use engine::testing::{board, play};
 use engine::tree::{build_tree_full, tree_signature, TemplateSelection};
@@ -870,6 +871,44 @@ fn a_cache_snapshot_is_reused_only_by_its_own_hand_config_model_ranges_and_board
     rig.identity.lock().unwrap().mutate();
     rig.core.snapshots.lock().unwrap().invalidate(&other_flop);
     assert!(rig.origins().is_empty(), "another board drops both: {:?}", rig.origins());
+    rig.core.shutdown();
+}
+
+/// Review P4T12-M1 (ruling 12-M1): the delivery path keeps the public root ranges in order from the range source to the
+/// snapshot key. Every other delivery scenario here has equal OOP and IP root ranges, so an exchange of the pair between
+/// the range source and the snapshot input would pass them unseen. Here the range source (`core.range_source`, explicit
+/// ranges) gives OOP every combo at 1 and IP every combo at 1 but one unblocked combo at 0.5; the entry is seeded with that
+/// ordered pair, board-blocked as the source publishes it; the flop decision is a cache hit delivered through
+/// `rig.serve`, and its registered snapshot is keyed by the two distinct hashes in OOP-then-IP order.
+#[test]
+fn a_cache_hit_keys_its_snapshot_by_the_ordered_root_ranges_it_was_served() {
+    let case = off_menu(Street::Flop, Export::Complete);
+    let (cached, _) = states(&case);
+    let root = core_model::street_root(&cached).expect("hero's flop decision");
+    assert_eq!((root.oop, root.ip), (SB, BTN));
+    let oop_given = support::full_range();
+    let mut ip_given = support::full_range();
+    let marked = usize::from(proto::combo_index(Card::parse("Qs").unwrap(), Card::parse("Js").unwrap()));
+    ip_given.0[marked] = 0.5;
+    let mut rig = FlopRig::new(vec![]);
+    *rig.core.range_source.lock().unwrap() = Box::new(ExplicitRanges { oop: Some(oop_given.clone()), ip: Some(ip_given.clone()) });
+    let (mut oop, mut ip) = (oop_given, ip_given);
+    core_ranges::block_public(&mut oop, &root.board);
+    core_ranges::block_public(&mut ip, &root.board);
+    assert!(ip.0[marked] == 0.5, "the marked combo is not blocked by the board");
+    let expected = [hash_scaled(&oop), hash_scaled(&ip)];
+    assert_ne!(expected[0], expected[1], "the two root ranges hash apart");
+    let rake = Rake::PotRake { rate: support::RATE, cap_mchips: 5000, no_flop_no_drop: false };
+    let entry = export_entry(&root, "flop_fast_v1", [oop, ip], rake, Export::Complete, &[], 0.004);
+    assert!(rig.core.cache.store_tracked(&entry).wait(Duration::from_secs(60)), "the writer stores the entry");
+    let served = rig.serve(&cached);
+    let f = served.final_rec();
+    assert_eq!((served.kinds(), f.assumptions.cache.as_str(), &f.coverage), (vec!["Fast", "Final"], "exact", &Coverage::Exact), "a cache hit at target");
+    assert!(f.assumptions.source.starts_with("cache@") && rig.solves().is_empty(), "delivered from the cache: {:?}", f.assumptions);
+    let snapshots = rig.snapshots_of(served.id.decision_id);
+    assert_eq!(snapshots.len(), 1, "registered with its Final");
+    assert_eq!(snapshots[0].provenance.origin, "cache_exact");
+    assert_eq!(snapshots[0].key.root_range_hashes, expected, "OOP then IP, as served");
     rig.core.shutdown();
 }
 
