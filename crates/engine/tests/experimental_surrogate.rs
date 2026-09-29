@@ -19,9 +19,15 @@ use engine::assemble::{empty_assumptions, unsupported, AssemblyCtx};
 use engine::deadline::Deadlines;
 use engine::identity::IdentityState;
 use engine::ranges::{ExplicitRanges, RangeSource};
-use engine::serve::ServeSeams;
-use proto::{combo_index, Action, ActionAdvice, Coverage, HandState, Range1326, Recommendation, RecommendationEvent, Seat, Street, UnsupportedReason};
-use std::sync::atomic::AtomicBool;
+use engine::clock::Clock;
+use engine::serve::{serve_request_with, LiveRequest, ServeSeams};
+use engine::experimental::{select_opponent, NoOpponent, PairEquity};
+use engine::testing::{FakeClock, RecordingSink};
+use engine::watchdog::SharedSink;
+use proto::{
+    combo_index, Action, ActionAdvice, Card, Coverage, EquityMethod, HandState, Range1326, Recommendation, RecommendationEvent, Seat, Street, UnsupportedReason,
+};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::{FlopRig, SeatRanges};
@@ -355,4 +361,159 @@ fn the_replay_range_source_answers_every_seats_street_root_public_range() {
     }
     let explicit = ExplicitRanges { oop: Some(Range1326([1.0; 1326])), ip: Some(Range1326([1.0; 1326])) };
     assert!(explicit.seat_ranges(&state, &seats).is_err(), "one OOP and one IP range name no third seat");
+}
+
+/// Fix round 1, P4T11-I1 (ruling 11-I1; spec 7, ruling 28-I4): a request admitted and then superseded (here by a
+/// re-request of the same hand) before `engine-main` serves it reads no ranges and runs no opponent equity: its active
+/// identity is checked under the identity lock right after it installs its equity token, the token is set, and the
+/// surrogate is skipped. Nothing reaches the worker and no event of the stale decision is emitted.
+#[test]
+fn a_request_superseded_before_it_is_served_reads_no_ranges_and_runs_no_equity() {
+    let state = support::three_way_flop();
+    let mut rig = FlopRig::new(vec![]);
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = asked.clone();
+    let on_ask: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
+    *rig.core.range_source.lock().unwrap() = Box::new(SeatRanges { ranges: support::three_way_ranges(), on_ask: Some(on_ask) });
+    let estimates = Arc::new(AtomicUsize::new(0));
+    let counted = estimates.clone();
+    let opponent_equity: PairEquity = Arc::new(move |_opp: &Range1326, _hero: &Range1326, _board: &[Card], _allowance: Duration, _cancel: &AtomicBool| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Some((0.5, EquityMethod::Exact))
+    });
+    let a = rig.identity.lock().unwrap().next_decision().unwrap();
+    let (sink, events) = RecordingSink::new(rig.clock.clone(), Some(rig.worker.clone()));
+    let sink: SharedSink = Arc::new(Mutex::new(Box::new(sink)));
+    let req = LiveRequest::admitted(&rig.core, a.clone(), state.clone(), rig.clock.now_ms(), sink);
+    let b = rig.identity.lock().unwrap().next_decision().unwrap();
+    assert!(b != a && b.hand_id == a.hand_id, "B re-requests the same hand");
+    serve_request_with(&mut rig.core, req, ServeSeams { equity: Some(support::stub_equity()), opponent_equity: Some(opponent_equity), ..ServeSeams::default() });
+    let token = rig.core.equity_cancel.lock().unwrap().clone().expect("A installed its equity token");
+    let solves = rig.solves();
+    rig.core.shutdown();
+    assert_eq!(asked.load(Ordering::SeqCst), 0, "the stale request read no street-root ranges");
+    assert_eq!(estimates.load(Ordering::SeqCst), 0, "the stale request ran no opponent equity");
+    assert!(solves.is_empty(), "nothing reaches the worker");
+    assert!(events.lock().unwrap().is_empty(), "no event of the stale decision");
+    assert!(token.load(Ordering::SeqCst), "the stale request's equity token is set");
+}
+
+/// Fix round 1, P4T11-M1 (ruling 11-M1): public ranges with no pairwise-compatible holdings (hero publicly only on AsAh,
+/// every opponent only on combos holding the As) leave the block absent with a note that names that cause, never an
+/// equity-phase overrun, and send nothing to the worker.
+#[test]
+fn incompatible_public_ranges_are_never_reported_as_an_overrun() {
+    let state = support::three_way_flop();
+    let mut ranges = support::three_way_ranges();
+    for (seat, text) in [(Seat(2), "AsAh"), (Seat(3), "AsKs,AsQs"), (Seat(0), "AsJs,AsTs")] {
+        ranges.iter_mut().find(|(s, _)| *s == seat).unwrap().1 = core_ranges::parse_range(text).unwrap();
+    }
+    let run = support::run_three_way(&state, SeatRanges { ranges, on_ask: None }, vec![], ServeSeams::default());
+    let last = run.final_rec();
+    assert!(last.experimental.is_none());
+    let notes = absent_notes(last);
+    assert_eq!(notes.len(), 1, "{:?}", last.assumptions.notes);
+    assert!(!notes[0].contains("overran") && !notes[0].contains("within its budget"), "no timeout is claimed: {notes:?}");
+    assert!(notes[0].contains("compatible"), "the cause is named: {notes:?}");
+    assert!(run.solves.is_empty(), "nothing reaches the worker");
+}
+
+/// `select_opponent` over the fake clock `clock` up to `cutoff_ms`, with an estimator that follows `script` (per call:
+/// the fake milliseconds it spends, and its answer) and records the allowance each call was given.
+#[allow(clippy::too_many_arguments)]
+fn select_with(clock: &Arc<FakeClock>, cutoff_ms: u64, hero: Seat, hero_public: &Range1326, others: &[(Seat, Range1326)], board: &[Card], cancel: &AtomicBool,
+    script: Vec<(u64, Option<f32>)>) -> (Result<Seat, NoOpponent>, Vec<u64>) {
+    let script = Mutex::new(script.into_iter());
+    let allowances = Mutex::new(Vec::new());
+    let estimate = |_opp: &Range1326, _hero: &Range1326, _board: &[Card], allowance: Duration, _cancel: &AtomicBool| {
+        allowances.lock().unwrap().push(u64::try_from(allowance.as_millis()).unwrap());
+        let (spend, answer) = script.lock().unwrap().next().expect("an estimate the script did not expect was started");
+        clock.advance_ms(spend);
+        answer.map(|equity| (equity, EquityMethod::Exact))
+    };
+    let chosen = select_opponent(clock.as_ref(), cutoff_ms, hero, hero_public, others, board, cancel, &estimate);
+    (chosen, allowances.into_inner().unwrap())
+}
+
+/// Fix round 1, P4T11-I2 (ruling 11-I2; spec 6 "skipped ... when the equity phase overran", spec 7 "every phase
+/// receives only the remaining time"): opponent selection keeps one absolute cutoff on the engine clock. The clock is
+/// read again before each candidate, each estimate gets at most the lesser of its share and what is left, no estimate
+/// starts once the cutoff has come, and a selection that finishes after it is refused. The skip causes stay apart
+/// (P4T11-M1): no pairwise-compatible holdings, no estimate computed, cancelled, no other seat.
+#[test]
+fn opponent_selection_keeps_one_absolute_cutoff() {
+    let state = support::three_way_flop();
+    let roots = support::street_root_public_ranges(&state);
+    assert_eq!(roots.others.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [Seat(3), Seat(0)], "UTG, then the button");
+    let live = AtomicBool::new(false);
+    let select = |cutoff_ms: u64, script: Vec<(u64, Option<f32>)>| {
+        let clock = FakeClock::new();
+        select_with(&clock, cutoff_ms, state.hero, &roots.hero, &roots.others, &state.board, &live, script)
+    };
+    // Two 250 ms shares of a 500 ms phase; the highest equity wins.
+    assert_eq!(select(500, vec![(100, Some(0.2)), (100, Some(0.8))]), (Ok(Seat(0)), vec![250, 250]));
+    // The first estimate spends 400 ms: the second gets only the 100 ms left, not a fresh 250 ms share.
+    assert_eq!(select(500, vec![(400, Some(0.8)), (50, Some(0.2))]), (Ok(Seat(3)), vec![250, 100]));
+    // The first estimate spends the whole phase: the second is never started.
+    assert_eq!(select(500, vec![(500, Some(0.8))]), (Err(NoOpponent::Overran), vec![250]));
+    // The last estimate finishes after the cutoff: the selection is refused, even with an opponent found.
+    assert_eq!(select(500, vec![(100, Some(0.2)), (401, Some(0.8))]), (Err(NoOpponent::Overran), vec![250, 250]));
+    // The cutoff has already come: nothing is started.
+    let late = FakeClock::new();
+    late.set_ms(600);
+    assert_eq!(select_with(&late, 500, state.hero, &roots.hero, &roots.others, &state.board, &live, vec![]), (Err(NoOpponent::Overran), vec![]));
+    // Every estimate ends without a value inside the phase: not an overrun.
+    assert_eq!(select(500, vec![(10, None), (10, None)]), (Err(NoOpponent::NotComputed), vec![250, 250]));
+    // Cancelled (the request superseded): nothing is started.
+    let clock = FakeClock::new();
+    assert_eq!(select_with(&clock, 500, state.hero, &roots.hero, &roots.others, &state.board, &AtomicBool::new(true), vec![]), (Err(NoOpponent::Cancelled), vec![]));
+    // No other seat.
+    assert_eq!(select_with(&clock, 500, state.hero, &roots.hero, &[], &state.board, &live, vec![]), (Err(NoOpponent::NoCandidates), vec![]));
+    // No pairwise-compatible holdings (hero only on AsAh, the others only on combos holding the As): no estimate, and
+    // that cause, never an overrun. One compatible seat among incompatible ones is given the whole phase.
+    let only = |text: &str| core_ranges::parse_range(text).unwrap();
+    let incompatible = vec![(Seat(3), only("AsKs,AsQs")), (Seat(0), only("AsJs,AsTs"))];
+    assert_eq!(select_with(&clock, 500, state.hero, &only("AsAh"), &incompatible, &state.board, &live, vec![]), (Err(NoOpponent::Incompatible), vec![]));
+    let mixed = vec![(Seat(3), only("AsKs")), (Seat(0), only("QcQd"))];
+    assert_eq!(select_with(&clock, 500, state.hero, &only("AsAh"), &mixed, &state.board, &live, vec![(0, Some(0.1))]), (Ok(Seat(0)), vec![500]));
+    // Each cause's note: only an overrun claims one.
+    assert!(NoOpponent::Overran.why().contains("overran"));
+    for cause in [NoOpponent::NoCandidates, NoOpponent::Cancelled, NoOpponent::Incompatible, NoOpponent::NotComputed] {
+        assert!(!cause.why().contains("overran"), "{cause:?}: {}", cause.why());
+    }
+    assert_eq!(NoOpponent::NotComputed.why(), "no opponent had computable pairwise-compatible equity within the budget");
+}
+
+/// Fix round 1, P4T11-I2 at the request (ruling 11-I2): the multiway arm's opponent selection has one cutoff, 500 ms
+/// after the equity phase starts on the engine clock (here 0 ms). An earlier candidate that spends it means no later
+/// estimate is started; a last candidate that finishes after it refuses the selection. Either way no surrogate solve
+/// is sent, and the note names the overrun.
+#[test]
+fn a_candidate_that_spends_the_equity_cutoff_stops_selection_and_the_surrogate() {
+    let state = support::three_way_flop();
+    for (spends, started) in [(vec![500u64], vec![500u64 / 2]), (vec![0, 501], vec![250, 250])] {
+        let mut rig = FlopRig::new(vec![]);
+        *rig.core.range_source.lock().unwrap() = Box::new(SeatRanges::three_way());
+        let allowances = Arc::new(Mutex::new(Vec::new()));
+        let (clock, log) = (rig.clock.clone(), allowances.clone());
+        let script = spends.clone();
+        let opponent_equity: PairEquity = Arc::new(move |_opp: &Range1326, _hero: &Range1326, _board: &[Card], allowance: Duration, _cancel: &AtomicBool| {
+            let mut log = log.lock().unwrap();
+            let spend = *script.get(log.len()).expect("an estimate the script did not expect was started");
+            log.push(u64::try_from(allowance.as_millis()).unwrap());
+            clock.advance_ms(spend);
+            Some((0.5, EquityMethod::Exact))
+        });
+        let served = rig.serve_with(&state, ServeSeams { opponent_equity: Some(opponent_equity), ..ServeSeams::default() });
+        let solves = rig.solves();
+        rig.core.shutdown();
+        assert_eq!(*allowances.lock().unwrap(), started, "{spends:?}: the estimates started and their allowances");
+        assert!(solves.is_empty(), "{spends:?}: no surrogate solve");
+        let last = served.final_rec();
+        assert!(last.experimental.is_none() && matches!(last.coverage, Coverage::Unsupported { reason: UnsupportedReason::MultiwayEv { pot_eligible: 3 }, .. }));
+        let notes = absent_notes(last);
+        assert!(notes.len() == 1 && notes[0].contains("overran"), "{spends:?}: {:?}", last.assumptions.notes);
+    }
 }

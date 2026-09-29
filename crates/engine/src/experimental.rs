@@ -3,7 +3,9 @@
 //!
 //! The surrogate (spec 6, "`experimental` (multiway only; outline §5)"):
 //! - the opponent is the seat whose street-root public range has the highest range-vs-range equity against hero's
-//!   public range (`choose_opponent`, over plan 2 Task 25's `equity::range_vs_range`, the one equity routine);
+//!   public range (`select_opponent` / `choose_opponent`, over plan 2 Task 25's `equity::range_vs_range`, the one
+//!   equity routine), chosen inside one absolute cutoff of the equity phase on the engine clock (fix round 1,
+//!   P4T11-I2); a selection that cannot finish inside it, or finds no opponent, names its cause (`NoOpponent`);
 //! - the synthetic root (`surrogate_input`) takes the current total pot at the decision (every chip committed, on every
 //!   street), both stacks the smaller of hero's and that opponent's remaining stacks, an **empty history**, and hero OOP
 //!   iff hero precedes the opponent in postflop order (`core_model::postflop_order`); it is skipped when the opponent is
@@ -23,17 +25,19 @@
 //! killed; the next solve relaunches it). Whatever keeps it from answering is a `Skipped` whose reason the multiway
 //! `Final` names in a note (`absent_note`); that `Final` is otherwise exactly what it was without the surrogate.
 
+use crate::clock::{Clock, SystemClock};
 use crate::core::EngineCore;
 use crate::deadline::Deadlines;
+use crate::ranges::jointly_compatible;
 use crate::replay_bridge::miss_cause;
 use crate::solve::{send_solve_request, solve_request_from_parts, worker_for_request, SolvePlan, Terminal};
 use crate::tree::{build_tree_full, TemplateSelection};
 use crate::watchdog::{SharedSink, StreetDeadline};
 use proto::{
-    combo_index, resolve_chip_path, Action, ActionAdvice, Card, DecisionIdentity, Derived, ExperimentalHu, HandState, Rake, Range1326, Seat, Street,
+    combo_index, resolve_chip_path, Action, ActionAdvice, Card, DecisionIdentity, Derived, EquityMethod, ExperimentalHu, HandState, Rake, Range1326, Seat, Street,
     StreetRootSnapshot, EXPERIMENTAL_NOTE,
 };
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,23 +63,104 @@ pub struct SurrogateInput {
     pub pot_eligible: u8,
 }
 
+/// The pairwise estimate opponent selection runs: the first range's equity against the second's on `board`, within
+/// the allowance given, polling the cancellation token. Production is `equity::range_vs_range` (spec 6: the same equity
+/// routine as spec 4.4's range-vs-range population), the only evaluator; a test may replace it
+/// (`serve::ServeSeams::opponent_equity`).
+pub type PairEquity = Arc<dyn Fn(&Range1326, &Range1326, &[Card], Duration, &AtomicBool) -> Option<(f32, EquityMethod)> + Send + Sync>;
+
+/// Why opponent selection chose no seat (fix round 1, P4T11-M1): each cause is named as it is, and only the cutoff is an
+/// overrun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoOpponent {
+    /// No seat but hero was offered.
+    NoCandidates,
+    /// The request's equity token was set (the decision superseded, ruling 28-I4).
+    Cancelled,
+    /// The equity phase's cutoff came before an opponent was chosen: an estimate was never started, or the selection
+    /// finished after it (spec 6: skipped when the equity phase overran).
+    Overran,
+    /// No other seat's public range holds a combo compatible with one of hero's: no pairwise-compatible equity exists.
+    Incompatible,
+    /// Every estimate started ended inside the phase without a value (its allowance ran out, or its pair cannot reach a
+    /// showdown on this board): the pair's cause is not told apart.
+    NotComputed,
+}
+
+impl NoOpponent {
+    /// The reason a multiway `Final`'s note gives for the absent block.
+    pub fn why(self) -> &'static str {
+        match self {
+            NoOpponent::NoCandidates => "no other seat is in the pot",
+            NoOpponent::Cancelled => "the request's equity was cancelled (the decision was superseded) before an opponent was chosen",
+            NoOpponent::Overran => "the equity phase overran: its cutoff came before an opponent was chosen",
+            NoOpponent::Incompatible => "no other seat's street-root public range holds a combo compatible with hero's: no pairwise-compatible equity exists",
+            NoOpponent::NotComputed => "no opponent had computable pairwise-compatible equity within the budget",
+        }
+    }
+}
+
 /// Spec 6: the seat of `others` whose public range has the highest range-vs-range equity against hero's public range
-/// (`equity::range_vs_range`, the opponent's range first: its equity). Hero is never its own opponent. `budget` is
-/// divided evenly among the seats; a seat whose equity is not computed within its share (over budget, cancelled, no
-/// compatible holdings) is skipped rather than guessed, and with no equity computed there is no opponent. A tie keeps
-/// the seat that comes first in `others`.
+/// (`equity::range_vs_range`, the opponent's range first: its equity), within `budget` from now (`select_opponent` on the
+/// system clock). `None` when no seat was chosen (`select_opponent`'s causes).
 pub fn choose_opponent(hero: Seat, hero_public: &Range1326, others: &[(Seat, Range1326)], board: &[Card], budget: Duration, cancel: &AtomicBool) -> Option<Seat> {
+    let clock = SystemClock::new();
+    let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+    let cutoff_ms = clock.now_ms().saturating_add(budget_ms);
+    select_opponent(&clock, cutoff_ms, hero, hero_public, others, board, cancel, &crate::equity::range_vs_range).ok()
+}
+
+/// Spec 6's opponent choice with one absolute cutoff `cutoff_ms` on `clock` (fix round 1, P4T11-I2; spec 7: every phase
+/// receives only the remaining time): the seat of `others` (hero never) with the highest `estimate` of its public
+/// range's equity against hero's; a tie keeps the seat that comes first. Seats with no holding compatible with one of
+/// hero's (`ranges::jointly_compatible`) are not estimated. The phase left when selection starts is shared evenly among
+/// the other seats; the clock is read again before each estimate, which gets at most the lesser of its share and what
+/// is left, and none is started once the cutoff has come (or the token is set). A seat whose estimate has no value is
+/// skipped, never guessed. A selection that finishes after the cutoff is refused (spec 6: the surrogate is skipped when
+/// the equity phase overran), even with an opponent found.
+#[allow(clippy::too_many_arguments)]
+pub fn select_opponent(clock: &dyn Clock, cutoff_ms: u64, hero: Seat, hero_public: &Range1326, others: &[(Seat, Range1326)], board: &[Card], cancel: &AtomicBool,
+    estimate: &dyn Fn(&Range1326, &Range1326, &[Card], Duration, &AtomicBool) -> Option<(f32, EquityMethod)>) -> Result<Seat, NoOpponent> {
     let candidates: Vec<&(Seat, Range1326)> = others.iter().filter(|(seat, _)| *seat != hero).collect();
-    let per_seat = budget.checked_div(u32::try_from(candidates.len()).ok()?.max(1))?;
+    if candidates.is_empty() {
+        return Err(NoOpponent::NoCandidates);
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err(NoOpponent::Cancelled);
+    }
+    let compatible: Vec<&(Seat, Range1326)> = candidates.into_iter().filter(|(_, range)| jointly_compatible(hero_public, range)).collect();
+    if compatible.is_empty() {
+        return Err(NoOpponent::Incompatible);
+    }
+    let start_ms = clock.now_ms();
+    if start_ms >= cutoff_ms {
+        return Err(NoOpponent::Overran);
+    }
+    let seats = u64::try_from(compatible.len()).expect("at most five other seats");
+    let share_ms = ((cutoff_ms - start_ms) / seats).max(1);
     let mut best: Option<(Seat, f32)> = None;
-    for (seat, range) in candidates {
-        let Some((equity, _method)) = crate::equity::range_vs_range(range, hero_public, board, per_seat, cancel) else { continue };
+    for (seat, range) in compatible {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(NoOpponent::Cancelled);
+        }
+        let now_ms = clock.now_ms();
+        if now_ms >= cutoff_ms {
+            return Err(NoOpponent::Overran);
+        }
+        let allowance = Duration::from_millis(share_ms.min(cutoff_ms - now_ms));
+        let Some((equity, _method)) = estimate(range, hero_public, board, allowance, cancel) else { continue };
         match best {
             Some((_, leader)) if equity <= leader => {}
             _ => best = Some((*seat, equity)),
         }
     }
-    best.map(|(seat, _)| seat)
+    if clock.now_ms() > cutoff_ms {
+        return Err(NoOpponent::Overran);
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err(NoOpponent::Cancelled);
+    }
+    best.map(|(seat, _)| seat).ok_or(NoOpponent::NotComputed)
 }
 
 /// Spec 6's synthetic root against `opponent` at `state`'s decision on `street` with `template_id`; `None` skips the
